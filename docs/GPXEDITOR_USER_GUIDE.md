@@ -1,0 +1,313 @@
+# myCamino GPX Editor User Guide
+
+`myCamino GPX Editor` edits one or more GPX files and saves one combined GPX
+file in the current table order. It is a native macOS Cocoa application and can
+run standalone or be opened from `myCamino GPS Track Show`.
+
+Start standalone with:
+
+```bash
+./.venv/bin/python GPXEditor.py
+./.venv/bin/python GPXEditor.py input.gpx --output-file output.gpx
+```
+
+When installed from the DMG, launch `myCamino GPX Editor.app` directly for
+standalone GPX work.
+
+When opened from the main GPS Track Show GUI, it receives input GPX files and a
+default output file automatically.
+
+If the editor is already open from the main GUI, pressing Add & Edit Tracks
+again brings the existing editor window to the front instead of opening a
+second editor.
+
+## Main Window
+
+The main window contains:
+
+- Output GPX file field and folder button.
+- Project name field.
+- Track table.
+- Selection field.
+- Action buttons.
+- Status line.
+
+The output field shows where Save and Save & Exit will write the GPX file.
+Edit the field, press Enter, or use the folder button to choose an output file.
+
+The project name is stored in GPX metadata when saved.
+
+## Loading Tracks
+
+Use Add Tracks to choose one or more `.gpx` files.
+
+Behavior:
+
+- Multiple files can be selected.
+- Selection order is preserved.
+- The first loaded GPX basename becomes the project name if the table was
+  empty.
+- Original GPX structure and metadata are preserved as much as possible.
+- Every track receives a unique `Nr.` that is not changed by sorting.
+
+If an autosave recovery file exists from a previous session, the editor offers
+to load it.
+
+## Track Table
+
+The table shows one row per track plus a final summary row.
+
+Columns include:
+
+- Row
+- Nr.
+- Show
+- Name
+- Date & Time
+- Length
+- Duration
+- Sum
+- Distance
+- Avg Speed
+- Ascent
+- Descent
+- NPoints
+
+Important behavior:
+
+- Name and Date & Time are editable.
+- Show controls whether a track is included in statistics, overview plots, and
+  PDF output.
+- Numeric values are calculated from track points.
+- Distance is measured from the current anchor point.
+- The final row summarizes visible tracks.
+- Click a column header to sort.
+- If multiple rows are selected, sorting reorders only the selected rows.
+- Drag selected rows to reorder tracks manually.
+- Backspace/Delete deletes selected tracks after confirmation.
+- Double-click a track row to open the waypoint inspector and raise the track
+  plot plus the associated elevation profile.
+
+Date sorting uses a special rule for tracks with missing, zero, or invalid
+duration: those tracks are placed by distance from the anchor among the regular
+date-sorted tracks.
+
+## Track Selection
+
+Use normal table selection with mouse clicks, Shift-click, or drag.
+
+The selection field accepts track numbers and ranges:
+
+```text
+1,3-5,8
+```
+
+Buttons:
+
+- Select All: select all tracks.
+- Unselect All: clear the selection.
+
+Selected tracks affect Join Tracks, Plot Track(s), Plot Overview highlighting,
+and some exports.
+
+## Saving
+
+Buttons:
+
+- Save: save to the current output file.
+- Save & Exit: save and close the editor.
+- Quit: ask whether to save unsaved changes.
+
+If the output file already exists, the editor creates a `.bak` backup before
+overwriting it.
+
+The editor periodically writes a recovery autosave to:
+
+```text
+/tmp/myCamino-GPXEditor-recovery.gpx
+```
+
+Clean saves remove the recovery file.
+
+## Editing Track Metadata
+
+Editable table fields:
+
+- Name
+- Date & Time
+
+Changing a track date/time updates track metadata and shifts track point times
+as needed. If timing information is incomplete, the editor estimates timestamps
+from distance and speed.
+
+Undo and Redo support recent main-table actions.
+
+## Joining Tracks
+
+To join tracks:
+
+1. Select at least two tracks.
+2. Press Join Tracks.
+3. Choose which selected track provides the metadata.
+
+The editor merges the selected tracks into the first selected track and removes
+the other selected tracks from the table. Metrics and plots are refreshed.
+
+## Anchor Point
+
+The anchor point is used for distance calculations.
+
+Ways to set it:
+
+- Press Set Anchorpoint to use the first point of the first selected track.
+- In a plot window, move the cursor to a point and press `a`.
+
+The anchor is stored in GPX metadata/extensions when saved.
+
+## Plot Overview Window
+
+Press Plot Overview to open an OpenStreetMap overview.
+
+Behavior:
+
+- Shows all visible tracks.
+- If tracks are selected, the overview zooms to them and highlights them.
+- Selecting tracks in the table updates the highlight.
+- Click a track on the map to select it in the table.
+- Double-click a point to open that track and waypoint in the inspector.
+
+Common keys:
+
+- `i`: toggle point information overlay.
+- `h`: show help.
+- `a`: set anchor at current cursor point.
+- `+` / `-`: zoom in/out.
+- Cmd-+ / Cmd--: zoom two steps in or out.
+- `c`: center on cursor.
+- `z`: zoom to current selection.
+- `r`: reset to full map extent.
+- `p`: save current plot as PNG.
+- `u`: clear plot selection.
+- `e`: open or focus elevation profile.
+- `q`: close plot window.
+
+Mouse:
+
+- Click or drag to move the white cursor dot to the nearest waypoint.
+- Scroll/pan behavior depends on the plot mode and current map view.
+
+## Plot Track(s) Window
+
+Press Plot Track(s) to open a detailed map for selected tracks.
+
+Behavior:
+
+- Shows selected track maps.
+- Arrow keys switch between selected tracks.
+- Click or drag to move the cursor to the nearest waypoint.
+- Double-click a point to open the waypoint inspector.
+
+Track editing keys:
+
+- `m` or Shift-click: set a marker.
+- `m` does not open the point information overlay.
+- Delete/Backspace: delete the point range from marker to cursor after
+  confirmation.
+- `x`: cut the track at the cursor after confirmation.
+- `a`, `i`, `h`, `+`, `-`, `c`, `z`, `r`, `p`, `e`, `q`: same general behavior
+  as the overview plot.
+
+When points are deleted or a track is cut, the table and open plots are updated.
+If an inspector table edit changes or deletes points, the open track plot and
+elevation profile for that track are refreshed.
+
+## Elevation Profile Window
+
+Plot windows can open an elevation profile.
+
+The profile shows elevation versus distance and follows the current plot cursor
+and selection. It can also open the waypoint inspector by double-clicking when
+appropriate.
+
+When the editor closes, plot and elevation windows close with it. Closing a
+track plot also closes its associated elevation profile, and closing an
+inspector closes the plot/elevation windows associated with that track.
+
+## Waypoint Inspector
+
+Open the inspector by:
+
+- Double-clicking a track row.
+- Pressing Inspect Track after selecting one track.
+- Double-clicking a point in a plot window.
+
+The inspector shows all waypoints of one track.
+
+Inspector actions:
+
+- Edit waypoint cells and press Enter.
+- Delete selected waypoints with Backspace/Delete after confirmation.
+- Undo inspector edits.
+- Plot the inspected track.
+- Save inspector edits to memory.
+- Save & Exit to save edits to memory and close the inspector.
+- Readjust Time to recalculate selected waypoint timestamps.
+- Split Track to split at the selected waypoint.
+
+The main editor Save writes all accepted inspector edits to disk.
+
+## File Exports
+
+PNG:
+
+- Saves the current plot.
+- If a multi-track plot is active, the editor can save multiple track PNGs.
+
+PDF:
+
+- Exports the track table.
+- Lets you choose included columns.
+- Can include overview and track map pages.
+- Can include elevation profiles.
+- Supports orientation and map rotation options.
+- The main GPS Track Show GUI exposes the same export panel as `PDF Summary`
+  next to the Start button.
+
+View File:
+
+- Opens the source GPX file of the selected track in TextEdit.
+- If unsaved edits exist, the editor asks whether to save first.
+
+## Files Created by GPXEditor
+
+Normal output:
+
+- `<output>.gpx`: combined edited GPX.
+- `<output>.gpx.bak`: backup of overwritten output.
+
+Temporary recovery:
+
+- `/tmp/myCamino-GPXEditor-recovery.gpx`
+
+Optional exports:
+
+- PNG plot images.
+- PDF reports.
+
+Embedded use from GPS Track Show:
+
+- The editor returns the most recently saved GPX file to the main GUI.
+- The main GUI uses that returned path as the active GPX track file.
+- The main GUI then regenerates the track summary file, checks which track maps
+  are stale, and checks whether the slide-show control file needs track-map
+  updates.
+
+## Troubleshooting
+
+- If Save does nothing, check that an output file is set.
+- If plotting is unavailable, required plotting dependencies may be missing.
+- If map tiles are slow, the editor may be waiting for OpenStreetMap tile
+  downloads.
+- If a track has no time information, date edits may estimate point timestamps.
+- If the main GUI opened the editor, use Save or Save & Exit so the saved GPX
+  path is returned to the main GUI.
