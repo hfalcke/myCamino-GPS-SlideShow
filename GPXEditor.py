@@ -158,6 +158,8 @@ AUTOSAVE_SECONDS = 300.0
 DRAG_TYPE = "myCaminoGPXEditorRows"
 MAX_BASEMAP_TILES = 48
 PDF_MAX_BASEMAP_TILES = 24
+PDF_EXPORT_DPI = 200
+PDF_MAP_PIXEL_DPI = 600.0
 OSM_REQUEST_TIMEOUT_SECONDS = 12.0
 APP_CACHE_DIR = Path.home() / "Library" / "Caches" / "myCamino-GPXEditor"
 TILE_CACHE_DIR = APP_CACHE_DIR / "tiles"
@@ -3029,6 +3031,27 @@ class GPXEditorWindowDelegate(NSObject):
         self.controller.finalize_editor_close(delete_recovery=True)
 
 
+class GPXEditorPdfSummaryWindowDelegate(NSObject):
+    def initWithController_(self, controller):
+        self = objc.super(GPXEditorPdfSummaryWindowDelegate, self).init()
+        if self is None:
+            return None
+        self.controller = controller
+        return self
+
+    def windowDidResize_(self, _notification):
+        self.controller.layout_pdf_summary_window()
+
+    def windowWillClose_(self, notification):
+        window = notification.object()
+        self.controller.unregister_auxiliary_window(window)
+        self.controller.pdf_summary_window = None
+        self.controller.pdf_summary_browse_button = None
+        self.controller.pdf_summary_export_button = None
+        self.controller.pdf_summary_close_button = None
+        self.controller.pdf_summary_delegate = None
+
+
 class GPXEditorController(NSObject):
     def initStandalone_(self, standalone=True):
         self = objc.super(GPXEditorController, self).init()
@@ -3053,6 +3076,10 @@ class GPXEditorController(NSObject):
         self.pdf_summary_orientation_menu = None
         self.pdf_summary_options = {}
         self.pdf_summary_status_label = None
+        self.pdf_summary_browse_button = None
+        self.pdf_summary_export_button = None
+        self.pdf_summary_close_button = None
+        self.pdf_summary_delegate = None
         self.on_close_callback = None
         self.on_save_callback = None
         self.help_window = None
@@ -4611,39 +4638,43 @@ class GPXEditorController(NSObject):
     def build_pdf_summary_window(self):
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
         window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(180, 180, 620, 430), style, NSBackingStoreBuffered, False
+            NSMakeRect(180, 180, 760, 460), style, NSBackingStoreBuffered, False
         )
         window.setReleasedWhenClosed_(False)
         window.setTitle_("PDF Summary")
-        window.setMinSize_(NSMakeSize(560, 390))
+        window.setMinSize_(NSMakeSize(700, 430))
         root = NSView.alloc().initWithFrame_(window.contentView().bounds())
         root.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         window.contentView().addSubview_(root)
 
         title = self.make_label("PDF Summary", 17, True, 0)
-        title.setFrame_(NSMakeRect(20, 386, 220, 26))
+        title.setFrame_(NSMakeRect(20, 416, 220, 26))
         root.addSubview_(title)
         hint = self.make_label("The GPX Editor table remains available. Select tracks there before exporting if needed.", 12, False, 0)
-        hint.setFrame_(NSMakeRect(20, 360, 560, 22))
+        hint.setFrame_(NSMakeRect(20, 390, 700, 22))
+        hint.setAutoresizingMask_(NSViewWidthSizable)
         root.addSubview_(hint)
 
         path_label = self.make_label("PDF file", 12, False, 0)
-        path_label.setFrame_(NSMakeRect(20, 324, 70, FIELD_HEIGHT))
+        path_label.setFrame_(NSMakeRect(20, 354, 70, FIELD_HEIGHT))
         root.addSubview_(path_label)
-        self.pdf_summary_path_field = NSTextField.alloc().initWithFrame_(NSMakeRect(92, 324, 408, FIELD_HEIGHT))
+        self.pdf_summary_path_field = NSTextField.alloc().initWithFrame_(NSMakeRect(92, 354, 548, FIELD_HEIGHT))
         self.pdf_summary_path_field.setStringValue_(str(self.default_pdf_path()))
         self.pdf_summary_path_field.setToolTip_("Full path of the PDF file to write.")
+        self.pdf_summary_path_field.setAutoresizingMask_(NSViewWidthSizable)
         root.addSubview_(self.pdf_summary_path_field)
-        browse_button = NSButton.alloc().initWithFrame_(NSMakeRect(510, 324, 84, BUTTON_HEIGHT))
+        browse_button = NSButton.alloc().initWithFrame_(NSMakeRect(650, 354, 84, BUTTON_HEIGHT))
         browse_button.setTitle_("Browse")
         browse_button.setBezelStyle_(NSBezelStyleRounded)
         browse_button.setTarget_(self)
         browse_button.setAction_("choosePdfSummaryOutput:")
         browse_button.setToolTip_("Choose the PDF output file.")
+        browse_button.setAutoresizingMask_(0)
         root.addSubview_(browse_button)
+        self.pdf_summary_browse_button = browse_button
 
         columns_title = self.make_label("Columns", 13, True, 0)
-        columns_title.setFrame_(NSMakeRect(20, 286, 120, 22))
+        columns_title.setFrame_(NSMakeRect(20, 316, 120, 22))
         root.addSubview_(columns_title)
         self.pdf_summary_checkboxes = {}
         default_off = {"nr", "show", "speed", "ascent", "descent", "npoints"}
@@ -4651,7 +4682,7 @@ class GPXEditorController(NSObject):
             column_index = index % 2
             row_index = index // 2
             x = 20 + column_index * 265
-            y = 256 - row_index * 27
+            y = 286 - row_index * 27
             checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, 245, 24))
             checkbox.setButtonType_(NSButtonTypeSwitch)
             checkbox.setTitle_(title_text.replace("\n", " ").strip())
@@ -4661,21 +4692,21 @@ class GPXEditorController(NSObject):
             self.pdf_summary_checkboxes[identifier] = checkbox
 
         maps_title = self.make_label("Maps", 13, True, 0)
-        maps_title.setFrame_(NSMakeRect(20, 70, 80, 22))
+        maps_title.setFrame_(NSMakeRect(20, 76, 80, 22))
         root.addSubview_(maps_title)
-        include_overview = NSButton.alloc().initWithFrame_(NSMakeRect(20, 44, 170, 24))
+        include_overview = NSButton.alloc().initWithFrame_(NSMakeRect(20, 50, 170, 24))
         include_overview.setButtonType_(NSButtonTypeSwitch)
         include_overview.setTitle_("Overview plot")
         include_overview.setState_(NSControlStateValueOff)
         include_overview.setToolTip_("Add an overview map page after the table.")
         root.addSubview_(include_overview)
-        elevation_profile = NSButton.alloc().initWithFrame_(NSMakeRect(190, 44, 170, 24))
+        elevation_profile = NSButton.alloc().initWithFrame_(NSMakeRect(190, 50, 170, 24))
         elevation_profile.setButtonType_(NSButtonTypeSwitch)
         elevation_profile.setTitle_("Elevation Profile")
         elevation_profile.setState_(NSControlStateValueOn)
         elevation_profile.setToolTip_("Add an elevation profile above each PDF map.")
         root.addSubview_(elevation_profile)
-        rotate_maps = NSButton.alloc().initWithFrame_(NSMakeRect(360, 44, 130, 24))
+        rotate_maps = NSButton.alloc().initWithFrame_(NSMakeRect(360, 50, 130, 24))
         rotate_maps.setButtonType_(NSButtonTypeSwitch)
         rotate_maps.setTitle_("Rotate maps")
         rotate_maps.setState_(NSControlStateValueOff)
@@ -4683,36 +4714,41 @@ class GPXEditorController(NSObject):
         root.addSubview_(rotate_maps)
 
         track_label = self.make_label("Track plots", 12, False, 0)
-        track_label.setFrame_(NSMakeRect(20, 14, 80, FIELD_HEIGHT))
+        track_label.setFrame_(NSMakeRect(20, 20, 80, FIELD_HEIGHT))
         root.addSubview_(track_label)
-        track_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(100, 14, 135, FIELD_HEIGHT), False)
+        track_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(100, 20, 135, FIELD_HEIGHT), False)
         track_menu.addItemsWithTitles_(["None", "All", "Visible", "Selected"])
         track_menu.selectItemAtIndex_(0)
         track_menu.setToolTip_("All includes tracks hidden in the Show column. Selected uses the current GPX Editor table selection.")
         root.addSubview_(track_menu)
         orientation_label = self.make_label("Page", 12, False, 0)
-        orientation_label.setFrame_(NSMakeRect(250, 14, 42, FIELD_HEIGHT))
+        orientation_label.setFrame_(NSMakeRect(250, 20, 42, FIELD_HEIGHT))
         root.addSubview_(orientation_label)
-        self.pdf_summary_orientation_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(294, 14, 120, FIELD_HEIGHT), False)
+        self.pdf_summary_orientation_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(294, 20, 120, FIELD_HEIGHT), False)
         self.pdf_summary_orientation_menu.addItemsWithTitles_(["Portrait", "Landscape"])
         self.pdf_summary_orientation_menu.selectItemAtIndex_(0)
         self.pdf_summary_orientation_menu.setToolTip_("Choose the PDF page orientation.")
         root.addSubview_(self.pdf_summary_orientation_menu)
-        export_button = NSButton.alloc().initWithFrame_(NSMakeRect(430, 14, 82, BUTTON_HEIGHT))
+        export_button = NSButton.alloc().initWithFrame_(NSMakeRect(570, 20, 82, BUTTON_HEIGHT))
         export_button.setTitle_("Export")
         export_button.setBezelStyle_(NSBezelStyleRounded)
         export_button.setTarget_(self)
         export_button.setAction_("exportPdfSummaryNow:")
+        export_button.setAutoresizingMask_(0)
         root.addSubview_(export_button)
-        close_button = NSButton.alloc().initWithFrame_(NSMakeRect(520, 14, 74, BUTTON_HEIGHT))
+        self.pdf_summary_export_button = export_button
+        close_button = NSButton.alloc().initWithFrame_(NSMakeRect(660, 20, 74, BUTTON_HEIGHT))
         close_button.setTitle_("Close")
         close_button.setBezelStyle_(NSBezelStyleRounded)
         close_button.setTarget_(self)
         close_button.setAction_("closePdfSummary:")
+        close_button.setAutoresizingMask_(0)
         root.addSubview_(close_button)
+        self.pdf_summary_close_button = close_button
 
         self.pdf_summary_status_label = self.make_label("Ready. Select tracks in the GPX Editor table if using Selected.", 11, False, 0)
-        self.pdf_summary_status_label.setFrame_(NSMakeRect(20, 94, 570, 18))
+        self.pdf_summary_status_label.setFrame_(NSMakeRect(20, 4, 720, 16))
+        self.pdf_summary_status_label.setAutoresizingMask_(NSViewWidthSizable)
         root.addSubview_(self.pdf_summary_status_label)
         self.pdf_summary_options = {
             "include_overview": include_overview,
@@ -4721,7 +4757,26 @@ class GPXEditorController(NSObject):
             "rotate_maps": rotate_maps,
         }
         self.pdf_summary_window = window
+        self.pdf_summary_delegate = GPXEditorPdfSummaryWindowDelegate.alloc().initWithController_(self)
+        window.setDelegate_(self.pdf_summary_delegate)
         self.register_auxiliary_window(window)
+        self.layout_pdf_summary_window()
+
+    def layout_pdf_summary_window(self):
+        if self.pdf_summary_window is None:
+            return
+        width = self.pdf_summary_window.contentView().bounds().size.width
+        right = max(width - 20.0, 680.0)
+        if self.pdf_summary_browse_button is not None:
+            self.pdf_summary_browse_button.setFrame_(NSMakeRect(right - 84.0, 354.0, 84.0, BUTTON_HEIGHT))
+        if self.pdf_summary_path_field is not None:
+            self.pdf_summary_path_field.setFrame_(NSMakeRect(92.0, 354.0, max(120.0, right - 92.0 - 94.0), FIELD_HEIGHT))
+        if self.pdf_summary_close_button is not None:
+            self.pdf_summary_close_button.setFrame_(NSMakeRect(right - 74.0, 20.0, 74.0, BUTTON_HEIGHT))
+        if self.pdf_summary_export_button is not None:
+            self.pdf_summary_export_button.setFrame_(NSMakeRect(right - 164.0, 20.0, 82.0, BUTTON_HEIGHT))
+        if self.pdf_summary_status_label is not None:
+            self.pdf_summary_status_label.setFrame_(NSMakeRect(20.0, 4.0, max(120.0, right - 20.0), 16.0))
 
     @objc.IBAction
     def choosePdfSummaryOutput_(self, _sender):
@@ -4893,7 +4948,7 @@ class GPXEditorController(NSObject):
             for page_index, start in enumerate(range(0, len(rows), rows_per_page), start=1):
                 page_rows = rows[start : start + rows_per_page]
                 table_height = (len(page_rows) + 1) * row_height_fraction
-                fig, ax = plt.subplots(figsize=page_size)
+                fig, ax = plt.subplots(figsize=page_size, dpi=PDF_EXPORT_DPI)
                 fig.patch.set_facecolor("white")
                 ax.axis("off")
                 ax.text(
@@ -4948,7 +5003,7 @@ class GPXEditorController(NSObject):
                         elif row_index % 2 == 0:
                             cell.set_facecolor("#f7f9fb")
                 fig.tight_layout(pad=0.3)
-                pdf.savefig(fig)
+                pdf.savefig(fig, dpi=PDF_EXPORT_DPI)
                 plt.close(fig)
             self.write_pdf_map_pages(pdf, page_size, orientation, pdf_options or {}, plt)
 
@@ -4971,7 +5026,7 @@ class GPXEditorController(NSObject):
             )
             if fig is not None:
                 save_start = time.perf_counter()
-                pdf.savefig(fig)
+                pdf.savefig(fig, dpi=PDF_EXPORT_DPI)
                 save_done = time.perf_counter()
                 if self.debug:
                     print(f"GPXEditor PDF benchmark: save overview page={save_done - save_start:.3f}s", flush=True)
@@ -5000,7 +5055,7 @@ class GPXEditorController(NSObject):
             )
             if fig is not None:
                 save_start = time.perf_counter()
-                pdf.savefig(fig)
+                pdf.savefig(fig, dpi=PDF_EXPORT_DPI)
                 save_done = time.perf_counter()
                 if self.debug:
                     print(
@@ -5018,7 +5073,7 @@ class GPXEditorController(NSObject):
         if hasattr(cx, "tile") and hasattr(cx.tile, "set_cache_dir"):
             cx.tile.set_cache_dir(str(self.tile_cache_dir))
         import_done = time.perf_counter()
-        fig = plt.figure(figsize=page_size)
+        fig = plt.figure(figsize=page_size, dpi=PDF_EXPORT_DPI)
         fig.patch.set_facecolor("white")
         page_w, page_h = page_size
         left_inches = 0.72 if options.get("elevation_profile") else 0.42
@@ -5056,8 +5111,8 @@ class GPXEditorController(NSObject):
             requested_zoom = self.overview_zoom_for_tracks(tracks, requested_zoom)
         tile_zoom, diagnostics = self.effective_tile_zoom_for_limit(extent, requested_zoom, PDF_MAX_BASEMAP_TILES)
         missing_tiles = self.missing_osm_tile_count(diagnostics, tile_zoom)
-        pixel_width = int(max(map_rect[2] * page_w * 300.0, 1.0))
-        pixel_height = int(max(map_rect[3] * page_h * 300.0, 1.0))
+        pixel_width = int(max(map_rect[2] * page_w * PDF_MAP_PIXEL_DPI, 1.0))
+        pixel_height = int(max(map_rect[3] * page_h * PDF_MAP_PIXEL_DPI, 1.0))
         map_label = "overview" if mode == "overview" else f"track #{tracks[0].nr}"
         self.set_status(
             f"PDF export: plotting {map_label} at {pixel_width}x{pixel_height}px, "

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +62,7 @@ from AppKit import (
     NSAlert,
     NSWorkspace,
     NSControlTextDidEndEditingNotification,
+    NSControlStateValueOff,
     NSControlStateValueOn,
     NSDragOperationMove,
     NSEventModifierFlagCommand,
@@ -651,6 +653,7 @@ class SlideShowMediaViewerView(NSView):
         self.controller = controller
         self.show_info = True
         self.show_help = False
+        self.hint_until = 0.0
         return self
 
     def acceptsFirstResponder(self):
@@ -719,6 +722,15 @@ class SlideShowMediaViewerView(NSView):
 
         if self.show_info:
             self._draw_info_overlay(item, bounds)
+        if not self.show_help and time.time() < self.hint_until:
+            self._draw_panel(
+                [
+                    "Press h for help.",
+                    "Use cursor keys to move photos backward and forward.",
+                ],
+                bounds,
+                width=430.0,
+            )
         if self.show_help:
             self._draw_panel(
                 [
@@ -861,6 +873,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_result_path = None
         self.geolocations_mode = None
         self.geolocations_temp_paths = []
+        self.geolocations_places_overwrite = False
         self.status_refresh_generation = 0
         self.media_counts_cache = None
         self.control_ready_cache = None
@@ -888,6 +901,7 @@ class GPXTrackerController(NSObject):
         self.media_viewer_source = "control"
         self.media_viewer_sort_mode = "filename"
         self.media_viewer_image_cache = {}
+        self.media_viewer_hint_timer = None
         self.media_browser_window = None
         self.media_browser_table = None
         self.media_browser_data_source = None
@@ -993,6 +1007,10 @@ class GPXTrackerController(NSObject):
         self.description_text.setRichText_(False)
         self.description_text.setFont_(NSFont.systemFontOfSize_(13.0))
         self.description_text.setString_("")
+        self.description_text.setAutoresizingMask_(NSViewWidthSizable)
+        description_container = self.description_text.textContainer()
+        if description_container is not None:
+            description_container.setWidthTracksTextView_(True)
         self.description_scroll.setDocumentView_(self.description_text)
         self.root_view.addSubview_(self.description_scroll)
 
@@ -1082,11 +1100,18 @@ class GPXTrackerController(NSObject):
         self.control_file_create_button = self._make_button("Create", "createControlFile:")
         self.control_file_edit_button = self._make_button("Edit", "editControlFile:")
         self.control_file_places_button = self._make_button("Add Place Names", "getPlaceNames:")
+        self.control_file_places_overwrite_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 90, FIELD_HEIGHT))
+        self.control_file_places_overwrite_checkbox.setButtonType_(NSButtonTypeSwitch)
+        self.control_file_places_overwrite_checkbox.setTitle_("overwrite")
+        self.control_file_places_overwrite_checkbox.setState_(NSControlStateValueOff)
+        self.control_file_places_overwrite_checkbox.setTarget_(self)
+        self.control_file_places_overwrite_checkbox.setAction_("fieldChanged:")
         self.control_file_merge_tracks_button = self._make_button("Update Tracks", "mergeTracksIntoControlFile:")
         self.control_file_merge_media_button = self._make_button("Merge New Media", "mergeMediaIntoControlFile:")
         self.root_view.addSubview_(self.control_file_create_button)
         self.root_view.addSubview_(self.control_file_edit_button)
         self.root_view.addSubview_(self.control_file_places_button)
+        self.root_view.addSubview_(self.control_file_places_overwrite_checkbox)
         self.root_view.addSubview_(self.control_file_merge_tracks_button)
         self.root_view.addSubview_(self.control_file_merge_media_button)
         self.control_file_summary_label = self._make_label("No slide show control file available.", size=12.0)
@@ -1330,6 +1355,7 @@ class GPXTrackerController(NSObject):
         self.control_file_create_button.setToolTip_("Run GetGeoLocations to create the sorted slide-show control file.")
         self.control_file_edit_button.setToolTip_("Open the editable control-file table.")
         self.control_file_places_button.setToolTip_("Reverse-geocode media with GPS coordinates and add missing place names to the editable control-file table without regenerating its order.")
+        self.control_file_places_overwrite_checkbox.setToolTip_("Overwrite existing place names in media sidecar files and in the slide-show control table.")
         self.control_file_merge_tracks_button.setToolTip_("Update track map entries in the existing user-edited control file.")
         self.control_file_merge_media_button.setToolTip_("Choose additional photos or videos and merge them into the existing user-edited control file at their sorted positions.")
         self.control_file_summary_label.setToolTip_("Shows whether a control file exists and counts images, videos, track maps, dates, and overview map.")
@@ -1368,7 +1394,8 @@ class GPXTrackerController(NSObject):
         self.media_edit_button.setNextKeyView_(self.control_file_create_button)
         self.control_file_create_button.setNextKeyView_(self.control_file_edit_button)
         self.control_file_edit_button.setNextKeyView_(self.control_file_places_button)
-        self.control_file_places_button.setNextKeyView_(self.control_file_merge_tracks_button)
+        self.control_file_places_button.setNextKeyView_(self.control_file_places_overwrite_checkbox)
+        self.control_file_places_overwrite_checkbox.setNextKeyView_(self.control_file_merge_tracks_button)
         self.control_file_merge_tracks_button.setNextKeyView_(self.control_file_merge_media_button)
         self.control_file_merge_media_button.setNextKeyView_(self.slideshow_start_button)
         self.slideshow_start_button.setNextKeyView_(self.pdf_summary_button)
@@ -1423,6 +1450,11 @@ class GPXTrackerController(NSObject):
         row_y -= DESCRIPTION_HEIGHT + ROW_GAP
         self.description_label.setFrame_(NSMakeRect(left_x, row_y + DESCRIPTION_HEIGHT - 18.0, LABEL_WIDTH, 18.0))
         self.description_scroll.setFrame_(NSMakeRect(field_x, row_y, description_width, DESCRIPTION_HEIGHT))
+        self.description_text.setFrame_(NSMakeRect(0, 0, description_width, DESCRIPTION_HEIGHT))
+        description_container = self.description_text.textContainer()
+        if description_container is not None:
+            description_container.setContainerSize_(NSMakeSize(description_width, 10_000_000.0))
+            description_container.setWidthTracksTextView_(True)
 
         current_top = row_y - BLOCK_GAP
 
@@ -1509,8 +1541,11 @@ class GPXTrackerController(NSObject):
         place_button_width = 132.0
         places_x = edit_x + SMALL_BUTTON_WIDTH + INNER_GAP
         self.control_file_places_button.setFrame_(NSMakeRect(places_x, row_y, place_button_width, FIELD_HEIGHT))
+        overwrite_width = 92.0
+        overwrite_x = places_x + place_button_width + 2.0
+        self.control_file_places_overwrite_checkbox.setFrame_(NSMakeRect(overwrite_x, row_y, overwrite_width, FIELD_HEIGHT))
         merge_tracks_width = 132.0
-        merge_tracks_x = places_x + place_button_width + INNER_GAP
+        merge_tracks_x = overwrite_x + overwrite_width + INNER_GAP
         self.control_file_merge_tracks_button.setFrame_(NSMakeRect(merge_tracks_x, row_y, merge_tracks_width, FIELD_HEIGHT))
         merge_media_width = 132.0
         merge_media_x = merge_tracks_x + merge_tracks_width + INNER_GAP
@@ -2771,7 +2806,8 @@ class GPXTrackerController(NSObject):
                 self._finish_geolocations_run(status, "Control-file creation failed.")
             return
         if mode == "places":
-            updated_count = self.update_place_names_from_sidecars()
+            overwrite = bool(getattr(self, "geolocations_places_overwrite", False))
+            updated_count = self.update_place_names_from_sidecars(overwrite=overwrite)
             self._cleanup_geolocations_temp_paths()
             self._finish_geolocations_run(
                 f"Finished. Updated {updated_count} place name(s) in the table.",
@@ -3406,9 +3442,22 @@ class GPXTrackerController(NSObject):
             self.media_viewer_view = view
             self.media_viewer_delegate = delegate
         self.update_media_viewer_title()
+        self.media_viewer_view.hint_until = time.time() + 3.0
         self.media_viewer_view.setNeedsDisplay_(True)
+        if self.media_viewer_hint_timer is not None:
+            self.media_viewer_hint_timer.invalidate()
+        self.media_viewer_hint_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            3.05, self, "hideMediaViewerHint:", None, False
+        )
         self.media_viewer_window.makeKeyAndOrderFront_(None)
         self.media_viewer_window.makeFirstResponder_(self.media_viewer_view)
+
+    @objc.IBAction
+    def hideMediaViewerHint_(self, _sender):
+        self.media_viewer_hint_timer = None
+        if self.media_viewer_view is not None:
+            self.media_viewer_view.hint_until = 0.0
+            self.media_viewer_view.setNeedsDisplay_(True)
         NSApp().activateIgnoringOtherApps_(True)
 
     @objc.IBAction
@@ -3428,6 +3477,9 @@ class GPXTrackerController(NSObject):
         self.close_media_viewer()
 
     def close_media_viewer(self):
+        if self.media_viewer_hint_timer is not None:
+            self.media_viewer_hint_timer.invalidate()
+            self.media_viewer_hint_timer = None
         if self.media_viewer_window is not None:
             self.media_viewer_window.close()
 
@@ -3505,13 +3557,42 @@ class GPXTrackerController(NSObject):
             metadata = read_photo_metadata(sidecar_path)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
-        place = metadata.get("place") if isinstance(metadata, dict) else None
+        if isinstance(metadata, dict):
+            details = metadata.get("place_details")
+            if isinstance(details, dict):
+                place_from_details = self.format_place_details_for_display(details)
+                if place_from_details and not is_missing_place_text(place_from_details):
+                    return place_from_details
+            place = metadata.get("place")
+        else:
+            place = None
         place_text = str(place).strip() if isinstance(place, str) else ""
         if is_missing_place_text(place_text):
             return None
         return place_text
 
-    def update_place_names_from_sidecars(self):
+    def format_place_details_for_display(self, details):
+        city = str(details.get("locality") or "").strip() if isinstance(details, dict) else ""
+        sublocality = str(details.get("subLocality") or "").strip() if isinstance(details, dict) else ""
+        administrative_area = str(details.get("administrativeArea") or "").strip() if isinstance(details, dict) else ""
+        name = str(details.get("name") or "").strip() if isinstance(details, dict) else ""
+        areas = details.get("areasOfInterest") if isinstance(details, dict) else None
+        area_text = ""
+        if isinstance(areas, list):
+            area_text = ", ".join(str(item).strip() for item in areas if str(item).strip())
+        elif areas:
+            area_text = str(areas).strip()
+        primary = city
+        if sublocality and sublocality != primary:
+            primary = f"{primary}-{sublocality}" if primary else sublocality
+        if administrative_area and administrative_area not in {city, sublocality}:
+            primary = f"{primary} ({administrative_area})" if primary else administrative_area
+        secondary = name or area_text
+        if primary and secondary and secondary != primary:
+            return f"{primary}, {secondary}"
+        return primary or secondary or None
+
+    def update_place_names_from_sidecars(self, overwrite=False):
         """Merge newly reverse-geocoded place names into the editable control table."""
         control_file_path = self._control_file_path()
         if control_file_path is None:
@@ -3527,10 +3608,12 @@ class GPXTrackerController(NSObject):
             row_type = str(row.get("type", "")).upper()
             if row_type not in {"IMG", "VID"}:
                 continue
-            if not is_missing_place_text(str(row.get("place", ""))):
+            if not overwrite and not is_missing_place_text(str(row.get("place", ""))):
                 continue
             place_text = self.place_name_from_sidecar_for_row(row)
             if place_text is None:
+                continue
+            if str(row.get("place", "")).strip() == place_text:
                 continue
             if not rows_changed:
                 self._push_control_table_undo()
@@ -4460,7 +4543,12 @@ class GPXTrackerController(NSObject):
             self.appendGeoLocationsOutputLine_(f"Tracks summary: {tracks_summary_path}")
         else:
             self.appendGeoLocationsOutputLine_("Tracks summary: none")
-        self.appendGeoLocationsOutputLine_("Reverse geocoding missing place names from sidecar metadata.")
+        overwrite_places = self.control_file_places_overwrite_checkbox.state() == NSControlStateValueOn
+        self.geolocations_places_overwrite = overwrite_places
+        if overwrite_places:
+            self.appendGeoLocationsOutputLine_("Reverse geocoding and overwriting existing place names in sidecar metadata.")
+        else:
+            self.appendGeoLocationsOutputLine_("Reverse geocoding missing place names from sidecar metadata.")
         self.set_status("Reverse geocoding place names...")
         self.set_progress(0.0, 1.0)
 
@@ -4487,6 +4575,7 @@ class GPXTrackerController(NSObject):
                     photolist=temp_photolist_path,
                     tracks=tracks_summary_path,
                     redo_reverse_geolocation=True,
+                    overwrite_reverse_geolocation=overwrite_places,
                     sort_date_sections_by_tracks=self._use_track_order(),
                     progress_callback=progress_callback,
                     stdout=output_writer,

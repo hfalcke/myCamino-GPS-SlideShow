@@ -167,6 +167,7 @@ class Params:
     file_filter: str
     getclearnames: bool
     redo_reverse_geolocation: bool
+    overwrite_reverse_geolocation: bool
     photos: Optional[str]
     photonames: Optional[str]
     ignorejson: bool
@@ -189,6 +190,7 @@ class PhotoRecord:
     latitude: Optional[float]
     longitude: Optional[float]
     place: Optional[str]
+    place_details: Optional[dict[str, Any]]
     source: str
     geocode_requested: bool
     place_updated: bool
@@ -220,6 +222,7 @@ class KnownPlace:
     latitude: float
     longitude: float
     place: str
+    place_details: Optional[dict[str, Any]]
 
 
 def collect_input_parameters(argv: list[str]) -> Params:
@@ -274,6 +277,11 @@ def collect_input_parameters(argv: list[str]) -> Params:
         "-r",
         action="store_true",
         help="Redo reverse geolocation for records with GPS but missing place names.",
+    )
+    parser.add_argument(
+        "--overwrite_reverse_geolocation",
+        action="store_true",
+        help="Redo reverse geolocation and overwrite existing place names in media sidecar files.",
     )
     parser.add_argument(
         "--photos",
@@ -356,6 +364,7 @@ def collect_input_parameters(argv: list[str]) -> Params:
         file_filter=args.file_filter,
         getclearnames=bool(args.getclearnames),
         redo_reverse_geolocation=bool(args.redo_reverse_geolocation),
+        overwrite_reverse_geolocation=bool(args.overwrite_reverse_geolocation),
         photos=args.photos,
         photonames=args.photonames,
         ignorejson=bool(args.ignorejson),
@@ -375,6 +384,7 @@ def params_from_options(
     file_filter: str = "ALL",
     getclearnames: bool = False,
     redo_reverse_geolocation: bool = False,
+    overwrite_reverse_geolocation: bool = False,
     photos: Optional[str] = None,
     photonames: Optional[str] = None,
     ignorejson: bool = False,
@@ -456,6 +466,7 @@ def params_from_options(
         file_filter=normalized_filter,
         getclearnames=bool(getclearnames),
         redo_reverse_geolocation=bool(redo_reverse_geolocation),
+        overwrite_reverse_geolocation=bool(overwrite_reverse_geolocation),
         photos=photos,
         photonames=photonames,
         ignorejson=bool(ignorejson),
@@ -913,9 +924,8 @@ def get_photo_datetime_prefer_exif_with_debug(file_path: Path) -> tuple[datetime
     return get_photo_datetime_with_debug(file_path)
 
 
-def build_place_name_from_placemark(placemark: object) -> Optional[str]:
-    """Build a concise location label from a placemark."""
-
+def placemark_place_details(placemark: object) -> dict[str, Any]:
+    """Extract normalized place fields from a CoreLocation placemark."""
     def get_value(attribute_name: str) -> Any:
         attribute = getattr(placemark, attribute_name, None)
         if attribute is None:
@@ -928,36 +938,78 @@ def build_place_name_from_placemark(placemark: object) -> Optional[str]:
         text = str(value).strip()
         return text or None
 
-    primary = None
     areas_of_interest = get_value("areasOfInterest")
+    area_names: list[str] = []
     if areas_of_interest:
         try:
-            if len(areas_of_interest) > 0:
-                primary = clean_text(areas_of_interest[0])
+            for item in areas_of_interest:
+                cleaned = clean_text(item)
+                if cleaned:
+                    area_names.append(cleaned)
         except Exception:
-            primary = None
+            area_names = []
 
-    if not primary:
-        for field_name in ("locality", "subLocality", "subAdministrativeArea"):
-            primary = clean_text(get_value(field_name))
-            if primary:
-                break
+    return {
+        "name": clean_text(get_value("name")),
+        "locality": clean_text(get_value("locality")),
+        "subLocality": clean_text(get_value("subLocality")),
+        "administrativeArea": clean_text(get_value("administrativeArea")),
+        "areasOfInterest": area_names,
+    }
 
-    if not primary:
+
+def build_place_name_from_details(details: Optional[dict[str, Any]]) -> Optional[str]:
+    """Build the table/slideshow place label from normalized place fields."""
+    if not isinstance(details, dict):
         return None
 
-    region = clean_text(get_value("administrativeArea"))
-    if region and region != primary:
-        return f"{primary} ({region})"
-    return primary
+    city = str(details.get("locality") or "").strip()
+    sublocality = str(details.get("subLocality") or "").strip()
+    administrative_area = str(details.get("administrativeArea") or "").strip()
+    name = str(details.get("name") or "").strip()
+    areas = details.get("areasOfInterest")
+    area_text = ""
+    if isinstance(areas, list):
+        area_text = ", ".join(str(item).strip() for item in areas if str(item).strip())
+    elif areas:
+        area_text = str(areas).strip()
+
+    location_parts = []
+    if city:
+        location_parts.append(city)
+    if sublocality and sublocality != city:
+        if location_parts:
+            location_parts[-1] = f"{location_parts[-1]}-{sublocality}"
+        else:
+            location_parts.append(sublocality)
+    if administrative_area and administrative_area not in {city, sublocality}:
+        if location_parts:
+            location_parts[-1] = f"{location_parts[-1]} ({administrative_area})"
+        else:
+            location_parts.append(administrative_area)
+
+    primary = location_parts[0] if location_parts else ""
+    secondary = name or area_text
+    if primary and secondary and secondary != primary:
+        return f"{primary}, {secondary}"
+    if primary:
+        return primary
+    if secondary:
+        return secondary
+    return None
 
 
-def reverse_geocode_location_name_with_debug(
+def build_place_name_from_placemark(placemark: object) -> Optional[str]:
+    """Build a concise location label from a placemark."""
+    return build_place_name_from_details(placemark_place_details(placemark))
+
+
+def reverse_geocode_location_details_with_debug(
     latitude: float,
     longitude: float,
     timeout_seconds: float = 10.0,
-) -> tuple[Optional[str], dict[str, Any]]:
-    """Reverse-geocode one coordinate pair into a human-readable place name with debug details."""
+) -> tuple[Optional[str], Optional[dict[str, Any]], dict[str, Any]]:
+    """Reverse-geocode one coordinate pair into place text/details with debug details."""
     check_cancelled()
     debug_info: dict[str, Any] = {
         "latitude": latitude,
@@ -966,7 +1018,7 @@ def reverse_geocode_location_name_with_debug(
     }
     if not CORELOCATION_AVAILABLE:
         debug_info["status"] = "corelocation_unavailable"
-        return None, debug_info
+        return None, None, debug_info
 
     location = CLLocation.alloc().initWithLatitude_longitude_(latitude, longitude)
     retry_delays = [0.4, 1.2, 2.5]
@@ -974,7 +1026,7 @@ def reverse_geocode_location_name_with_debug(
     for attempt_index in range(len(retry_delays) + 1):
         geocoder = CLGeocoder.alloc().init()
         attempt_info: dict[str, Any] = {"attempt": attempt_index + 1}
-        state: dict[str, Any] = {"done": False, "place": None, "error": None, "placemark_count": 0}
+        state: dict[str, Any] = {"done": False, "place": None, "details": None, "error": None, "placemark_count": 0}
 
         def completion_handler(placemarks, error) -> None:
             try:
@@ -986,7 +1038,9 @@ def reverse_geocode_location_name_with_debug(
                     except Exception:
                         state["placemark_count"] = 0
                 if error is None and placemarks and len(placemarks) > 0:
-                    state["place"] = build_place_name_from_placemark(placemarks[0])
+                    details = placemark_place_details(placemarks[0])
+                    state["details"] = details
+                    state["place"] = build_place_name_from_details(details)
             finally:
                 state["done"] = True
 
@@ -1006,23 +1060,45 @@ def reverse_geocode_location_name_with_debug(
         attempt_info["error"] = state["error"]
         attempt_info["placemark_count"] = state["placemark_count"]
         attempt_info["place"] = state["place"]
+        attempt_info["place_details"] = state["details"]
         debug_info["attempts"].append(attempt_info)
 
         if state["place"]:
             debug_info["status"] = "success"
             debug_info["place"] = str(state["place"])
-            return str(state["place"]), debug_info
+            debug_info["place_details"] = state["details"]
+            return str(state["place"]), state["details"], debug_info
 
         if attempt_index < len(retry_delays):
             sleep_with_cancel(retry_delays[attempt_index])
 
     debug_info["status"] = "failed"
-    return None, debug_info
+    return None, None, debug_info
+
+
+def reverse_geocode_location_details(
+    latitude: float,
+    longitude: float,
+    timeout_seconds: float = 10.0,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Reverse-geocode one coordinate pair into place text and structured fields."""
+    place, details, _ = reverse_geocode_location_details_with_debug(latitude, longitude, timeout_seconds=timeout_seconds)
+    return place, details
+
+
+def reverse_geocode_location_name_with_debug(
+    latitude: float,
+    longitude: float,
+    timeout_seconds: float = 10.0,
+) -> tuple[Optional[str], dict[str, Any]]:
+    """Reverse-geocode one coordinate pair into a human-readable place name with debug details."""
+    place, _details, debug = reverse_geocode_location_details_with_debug(latitude, longitude, timeout_seconds=timeout_seconds)
+    return place, debug
 
 
 def reverse_geocode_location_name(latitude: float, longitude: float, timeout_seconds: float = 10.0) -> Optional[str]:
     """Reverse-geocode one coordinate pair into a human-readable place name."""
-    place, _ = reverse_geocode_location_name_with_debug(latitude, longitude, timeout_seconds=timeout_seconds)
+    place, _details = reverse_geocode_location_details(latitude, longitude, timeout_seconds=timeout_seconds)
     return place
 
 
@@ -1341,6 +1417,14 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
     latitude = data.get("latitude")
     longitude = data.get("longitude")
     place = data.get("place")
+    place_details = data.get("place_details")
+    if not isinstance(place_details, dict):
+        top_level_details = {
+            key: data.get(key)
+            for key in ("name", "locality", "subLocality", "administrativeArea", "areasOfInterest")
+            if key in data
+        }
+        place_details = top_level_details if top_level_details else None
 
     try:
         latitude_value = float(latitude) if latitude is not None else None
@@ -1350,6 +1434,8 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
         longitude_value = None
 
     place_value = str(place).strip() if isinstance(place, str) and place.strip() else None
+    if place_value is None and isinstance(place_details, dict):
+        place_value = build_place_name_from_details(place_details)
     return PhotoRecord(
         source_filename=photo_path.name,
         display_filename=json_path.name,
@@ -1359,6 +1445,7 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
         latitude=latitude_value,
         longitude=longitude_value,
         place=place_value,
+        place_details=place_details if isinstance(place_details, dict) else None,
         source="json",
         geocode_requested=False,
         place_updated=False,
@@ -1369,7 +1456,7 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
 def build_record_from_photo(
     photo_path: Path,
     getclearnames: bool,
-    geocode_cache: dict[tuple[float, float], Optional[str]],
+    geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]],
     known_places: list[KnownPlace],
     place_distance_m: float,
     debug: bool,
@@ -1414,13 +1501,14 @@ def build_record_from_photo(
             photo_datetime = get_photo_datetime(photo_path)
 
     place = None
+    place_details = None
 
     if latitude is not None and longitude is not None and getclearnames:
         cache_key = (round(latitude, GEOCODE_ROUND_DIGITS), round(longitude, GEOCODE_ROUND_DIGITS))
         if cache_key not in geocode_cache:
             nearby_place, nearby_distance = find_nearby_known_place(latitude, longitude, known_places, place_distance_m)
             if nearby_place is not None:
-                geocode_cache[cache_key] = nearby_place.place
+                geocode_cache[cache_key] = (nearby_place.place, nearby_place.place_details)
                 if debug:
                     debug_info["geocode"] = {
                         "cache_key": cache_key,
@@ -1430,15 +1518,15 @@ def build_record_from_photo(
                     }
             else:
                 if debug:
-                    place, geocode_debug = reverse_geocode_location_name_with_debug(latitude, longitude)
-                    geocode_cache[cache_key] = place
+                    place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(latitude, longitude)
+                    geocode_cache[cache_key] = (place, place_details)
                     debug_info["geocode"] = {"cache_key": cache_key, "requested": True, **geocode_debug}
                 else:
-                    geocode_cache[cache_key] = reverse_geocode_location_name(latitude, longitude)
+                    geocode_cache[cache_key] = reverse_geocode_location_details(latitude, longitude)
                 sleep_between_geocode_requests()
         elif debug:
-            debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key]}
-        place = geocode_cache[cache_key]
+            debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key][0]}
+        place, place_details = geocode_cache[cache_key]
     elif debug:
         debug_info["geocode"] = {"requested": False, "place": None}
 
@@ -1451,6 +1539,7 @@ def build_record_from_photo(
         latitude=latitude,
         longitude=longitude,
         place=place,
+        place_details=place_details,
         source="photo",
         geocode_requested=getclearnames,
         place_updated=False,
@@ -1460,7 +1549,7 @@ def build_record_from_photo(
 
 def resolve_place_for_record(
     record: PhotoRecord,
-    geocode_cache: dict[tuple[float, float], Optional[str]],
+    geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]],
     known_places: list[KnownPlace],
     place_distance_m: float,
     debug: bool,
@@ -1486,7 +1575,7 @@ def resolve_place_for_record(
             place_distance_m,
         )
         if nearby_place is not None:
-            geocode_cache[cache_key] = nearby_place.place
+            geocode_cache[cache_key] = (nearby_place.place, nearby_place.place_details)
             if debug:
                 debug_info["geocode"] = {
                     "cache_key": cache_key,
@@ -1496,18 +1585,19 @@ def resolve_place_for_record(
                 }
         else:
             if debug:
-                place, geocode_debug = reverse_geocode_location_name_with_debug(record.latitude, record.longitude)
-                geocode_cache[cache_key] = place
+                place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(record.latitude, record.longitude)
+                geocode_cache[cache_key] = (place, place_details)
                 debug_info["geocode"] = {"cache_key": cache_key, "requested": True, **geocode_debug}
             else:
-                geocode_cache[cache_key] = reverse_geocode_location_name(record.latitude, record.longitude)
+                geocode_cache[cache_key] = reverse_geocode_location_details(record.latitude, record.longitude)
             sleep_between_geocode_requests()
     elif debug:
-        debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key]}
+        debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key][0]}
 
-    new_place = geocode_cache[cache_key]
+    new_place, new_place_details = geocode_cache[cache_key]
     if is_resolved_place_name(new_place):
         record.place = str(new_place)
+        record.place_details = new_place_details
         record.place_updated = True
     record.geocode_requested = True
     record.debug_info = debug_info or None
@@ -1531,6 +1621,7 @@ def write_record_json(record: PhotoRecord, protected_json_paths: set[Path]) -> N
         latitude=record.latitude,
         longitude=record.longitude,
         place=record.place,
+        place_details=record.place_details,
     )
     write_photo_metadata(payload, record.json_path)
 
@@ -1989,7 +2080,7 @@ def collect_photo_location_and_dates(params: Params) -> None:
         emit_tracks_file_debug(photo_files, tracks_summary)
     photo_files = select_photo_files(photo_files, params.photos)
     photo_files = filter_photo_files_by_name(photo_files, params.photonames)
-    geocode_cache: dict[tuple[float, float], Optional[str]] = {}
+    geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]] = {}
     known_places: list[KnownPlace] = []
     collected_records: list[PhotoRecord] = []
     protected_json_paths: set[Path] = set()
@@ -2015,18 +2106,28 @@ def collect_photo_location_and_dates(params: Params) -> None:
             if record is None:
                 record = build_record_from_photo(
                     photo_path,
-                    params.getclearnames or params.redo_reverse_geolocation,
+                    params.getclearnames or params.redo_reverse_geolocation or params.overwrite_reverse_geolocation,
                     geocode_cache,
                     known_places,
                     params.distance,
                     params.debug,
                 )
-                if params.redo_reverse_geolocation and is_resolved_place_name(record.place):
+                if (params.redo_reverse_geolocation or params.overwrite_reverse_geolocation) and is_resolved_place_name(record.place):
                     record.place_updated = True
-                if params.redo_reverse_geolocation:
+                if params.redo_reverse_geolocation or params.overwrite_reverse_geolocation:
                     if record.place_updated:
                         write_record_json(record, protected_json_paths)
                 else:
+                    write_record_json(record, protected_json_paths)
+            elif params.overwrite_reverse_geolocation and record.latitude is not None and record.longitude is not None:
+                record = resolve_place_for_record(
+                    record,
+                    geocode_cache,
+                    known_places,
+                    params.distance,
+                    params.debug,
+                )
+                if record.place_updated:
                     write_record_json(record, protected_json_paths)
             elif params.redo_reverse_geolocation and needs_place_repair(record):
                 record = resolve_place_for_record(
@@ -2049,6 +2150,7 @@ def collect_photo_location_and_dates(params: Params) -> None:
                         latitude=record.latitude,
                         longitude=record.longitude,
                         place=str(record.place),
+                        place_details=record.place_details,
                     )
                 )
 

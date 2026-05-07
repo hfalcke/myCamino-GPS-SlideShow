@@ -74,9 +74,10 @@ def build_photo_metadata_payload(
     latitude,
     longitude,
     place,
+    place_details=None,
 ):
     """Build one normalized photo sidecar JSON payload."""
-    return {
+    payload = {
         "source_filename": source_filename,
         "photo_path": str(photo_path),
         "datetime_iso": photo_datetime.isoformat(),
@@ -87,6 +88,12 @@ def build_photo_metadata_payload(
         "place": place,
         "has_gps": latitude is not None and longitude is not None,
     }
+    if isinstance(place_details, dict):
+        payload["place_details"] = place_details
+        for key in ("name", "locality", "subLocality", "administrativeArea", "areasOfInterest"):
+            if key in place_details:
+                payload[key] = place_details.get(key)
+    return payload
 
 
 def write_photo_metadata(payload, output_path):

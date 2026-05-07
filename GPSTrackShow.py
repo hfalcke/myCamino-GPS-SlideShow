@@ -625,6 +625,19 @@ def parse_photo_entry(line: str) -> PhotoListEntry:
     return PhotoListEntry(filename, time_text, latitude, longitude, place)
 
 
+def format_place_for_slideshow(raw_place: str) -> str:
+    """Show detailed POI/place names on a second overlay line."""
+    place = str(raw_place or "").strip()
+    if "," not in place:
+        return place
+    primary, secondary = place.split(",", 1)
+    primary = primary.strip()
+    secondary = secondary.strip()
+    if primary and secondary:
+        return f"{primary}\n{secondary}"
+    return primary or secondary
+
+
 def safe_float(value: object) -> Optional[float]:
     """Convert one value to float when possible."""
     try:
@@ -1248,22 +1261,28 @@ def create_place_overlay_image(width: float, height: float, place_text: str, fon
     image.lockFocus()
     font = NSFont.fontWithName_size_("Arial Bold", float(font_size)) or NSFont.boldSystemFontOfSize_(float(font_size))
     outline_width = max(1.0, font_size / 12.0)
-    text_size = NSString.stringWithString_(place_text).sizeWithAttributes_(
-        {
-            NSFontAttributeName: font,
-            NSForegroundColorAttributeName: ns_color(font_color),
-        }
-    )
-    baseline_y = max(10.0, height - text_size.height - 18.0)
-    draw_outlined_text(
-        place_text,
-        width / 2.0,
-        baseline_y,
-        font,
-        font_color,
-        COLOR_NAMES["black"],
-        outline_width,
-    )
+    lines = [line.strip() for line in str(place_text).splitlines() if line.strip()] or [str(place_text)]
+    line_sizes = [
+        NSString.stringWithString_(line).sizeWithAttributes_(
+            {
+                NSFontAttributeName: font,
+                NSForegroundColorAttributeName: ns_color(font_color),
+            }
+        )
+        for line in lines
+    ]
+    line_height = max((size.height for size in line_sizes), default=float(font_size)) + max(4.0, font_size * 0.12)
+    top_y = max(10.0, height - line_height * len(lines) - 18.0)
+    for index, line in enumerate(lines):
+        draw_outlined_text(
+            line,
+            width / 2.0,
+            top_y + (len(lines) - 1 - index) * line_height,
+            font,
+            font_color,
+            COLOR_NAMES["black"],
+            outline_width,
+        )
     image.unlockFocus()
     return image
 
@@ -3390,10 +3409,12 @@ class GPSTrackShowApp:
         transition_change_pending = self.transition_change_armed
         place_text = None
         raw_place = photo_metadata.get("place")
+        if not isinstance(raw_place, str) or not raw_place.strip():
+            raw_place = entry.place
         if isinstance(raw_place, str):
             cleaned_place = raw_place.strip()
             if cleaned_place and cleaned_place.lower() not in {"kein ort", "unknown"}:
-                place_text = cleaned_place
+                place_text = format_place_for_slideshow(cleaned_place)
         photo_transition = self._effective_photo_transition()
         photo_identity = str(photo_path.resolve())
 
