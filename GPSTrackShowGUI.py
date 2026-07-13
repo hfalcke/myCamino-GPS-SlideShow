@@ -25,6 +25,8 @@ from AppKit import (
     NSButton,
     NSButtonTypeSwitch,
     NSColor,
+    NSColorSpace,
+    NSColorWell,
     NSComboBox,
     NSFont,
     NSFontAttributeName,
@@ -45,6 +47,7 @@ from AppKit import (
     NSProgressIndicator,
     NSScrollView,
     NSSortDescriptor,
+    NSStepper,
     NSTableColumn,
     NSTableView,
     NSTableViewSolidVerticalGridLineMask,
@@ -91,7 +94,6 @@ from gpx_tracks_table import (
     prepare_with_options,
     run_with_options as run_gpx_tracks_table_with_options,
     selected_track_numbers,
-    upgrade_timed_track_sidecars,
 )
 from plot_metadata_utils import media_sidecar_matches_media, media_sidecar_path, read_photo_metadata, read_plot_metadata, read_table_data
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
@@ -100,6 +102,20 @@ from track_map_layout_utils import (
     canonical_track_map_name,
     resolve_track_map_variant,
     track_map_variant_names,
+)
+from adventure_parameters import (
+    PARAMETER_SPECS,
+    SECTION_ORDER,
+    SPECS_BY_KEY,
+    changed_parameter_keys,
+    default_parameters,
+    map_affecting_parameter_keys,
+    normalize_parameter_value,
+    normalize_parameters,
+    parameter_payload,
+    parameter_subset,
+    validate_parameters,
+    visible_specs_for_section,
 )
 
 
@@ -555,6 +571,24 @@ class GPSTrackShowGUIWindowDelegate(NSObject):
         return True
 
 
+class GPSTrackShowGUIParameterWindowDelegate(NSObject):
+    """Keep the parameter editor modal-like without blocking the main GUI."""
+
+    def initWithController_(self, controller):
+        self = objc.super(GPSTrackShowGUIParameterWindowDelegate, self).init()
+        if self is None:
+            return None
+        self.controller = controller
+        return self
+
+    def windowDidResize_(self, _notification):
+        self.controller.layoutParameterWindow()
+
+    def windowShouldClose_(self, _sender):
+        self.controller.cancelParameterEditor_(None)
+        return False
+
+
 class GPSTrackShowGUIAlbumSelectionDelegate(NSObject):
     """Album selection modal delegate."""
 
@@ -848,9 +882,11 @@ class GPXTrackerController(NSObject):
         self.current_project_file = None
         self.recent_adventures = self._load_recent_adventures()
         self.last_picture_import_directory = None
-        self.time_lapse_media_min_fraction = 0.5
-        self.track_maps_for_time_lapse = True
-        self.track_map_edge_margin_fraction = DEFAULT_TRACK_EDGE_MARGIN_FRACTION
+        self.parameters = default_parameters()
+        self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
+        self.track_maps_for_time_lapse = self.parameters["trackmaps.variant"] == "time_lapse"
+        self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
+        self.slideshow_resume_position = None
         self.project_dirty = False
         self.skip_next_project_dir_dirty = False
         self.gpx_field_manually_changed = False
@@ -923,6 +959,20 @@ class GPXTrackerController(NSObject):
         self.media_browser_sort_column = "name"
         self.media_browser_sort_ascending = True
         self.main_help_window = None
+        self.parameter_window = None
+        self.parameter_window_delegate = None
+        self.parameter_form_scroll = None
+        self.parameter_form_view = None
+        self.parameter_section_buttons = []
+        self.parameter_controls = {}
+        self.parameter_steppers = {}
+        self.parameter_tag_to_key = {}
+        self.parameter_draft = {}
+        self.parameter_current_section = SECTION_ORDER[0]
+        self.parameter_show_advanced = False
+        self.parameter_advanced_checkbox = None
+        self.parameter_error_label = None
+        self.parameter_apply_button = None
         self.gpx_editor_controller = None
         self.plot_creation_thread = None
         self.plot_cancel_event = None
@@ -973,6 +1023,14 @@ class GPXTrackerController(NSObject):
         if logo_path.exists():
             self.header_logo_view.setImage_(NSImage.alloc().initWithContentsOfFile_(str(logo_path)))
         self.root_view.addSubview_(self.header_logo_view)
+
+        self.parameter_button = self._make_icon_button(
+            ["sf:gearshape", "NSActionTemplate"],
+            "Settings",
+            "showParameterEditor:",
+        )
+        self.parameter_button.setToolTip_("Edit project-specific workflow, slide-show, map, GPX, PDF, location, and map-service settings.")
+        self.root_view.addSubview_(self.parameter_button)
 
         self.adventure_status_checkbox = self._make_section_status_checkbox()
         self.root_view.addSubview_(self.adventure_status_checkbox)
@@ -1378,7 +1436,7 @@ class GPXTrackerController(NSObject):
         self.slideshow_box.setToolTip_("Launch the final slide show or export a GPX track PDF summary.")
         self.slideshow_label.setToolTip_("Start the slide show after tracks, media, and the control file are ready.")
         self.slideshow_start_button.setToolTip_("Launch GPSTrackShow with the project directory, slide-show control file, and trackimages directory.")
-        self.slideshow_time_lapse_button.setToolTip_("Launch the stage-map GPS time-lapse slide show. Track-map timing metadata is upgraded first when possible.")
+        self.slideshow_time_lapse_button.setToolTip_("Launch the stage-map GPS time-lapse slide show using the current track-map metadata.")
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
 
         self.edit_button.setToolTip_("Save the current adventure settings to the .adv file.")
@@ -1442,9 +1500,14 @@ class GPXTrackerController(NSObject):
         title_height = 58.0
         logo_size = 112.0
         logo_x = field_x + description_width - logo_size
-        text_width = max(180.0, logo_x - left_x - INNER_GAP)
+        parameter_button_size = 34.0
+        parameter_button_x = logo_x - parameter_button_size - INNER_GAP
+        text_width = max(180.0, parameter_button_x - left_x - INNER_GAP)
         self.header_text_label.setFrame_(
             NSMakeRect(left_x, current_top - title_height + 13.0, text_width, 34.0)
+        )
+        self.parameter_button.setFrame_(
+            NSMakeRect(parameter_button_x, current_top - title_height + 12.0, parameter_button_size, parameter_button_size)
         )
         self.header_logo_view.setFrame_(
             NSMakeRect(logo_x, current_top - logo_size + 26.0, logo_size, logo_size)
@@ -1925,26 +1988,16 @@ class GPXTrackerController(NSObject):
         return self._plot_context_for_values(gpx_path, project_name, trackimages_dir, self._use_track_order())
 
     def _plot_context_for_values(self, gpx_path, project_name, trackimages_dir, use_track_order):
-        return prepare_with_options(
-            str(gpx_path),
-            plot_tracks="all",
-            print_labels="none",
-            line_width=4.0,
-            line_color="blue",
-            dot_color="white",
-            dot_size=0.0,
-            size=(1920, 1080),
-            fontsize=2.2,
-            zoom=15,
-            header=project_name,
-            output_dir=str(trackimages_dir),
-            output_base=project_name,
-            create_output_dir=False,
-            nojson=False,
-            verbose=False,
-            sort_original=use_track_order,
-            sort_date=not use_track_order,
+        options = self._plot_common_options(project_name, trackimages_dir)
+        options.update(
+            {
+                "plot_tracks": "all",
+                "create_output_dir": False,
+                "sort_original": use_track_order,
+                "sort_date": not use_track_order,
+            }
         )
+        return prepare_with_options(str(gpx_path), **options)
 
     def _regenerate_tracks_summary_json(self, gpx_path):
         project_name = self._current_project_name()
@@ -1965,6 +2018,11 @@ class GPXTrackerController(NSObject):
             verbose=False,
             sort_original=use_track_order,
             sort_date=not use_track_order,
+            remove_prefix=self.parameters["trackmaps.remove_name_prefix"],
+            gpx_threshold_distance=self.parameters["gpx.minimum_point_spacing_m"],
+            gpx_threshold_accuracy=self.parameters["gpx.maximum_accuracy_m"],
+            fallback_walking_speed_kmh=self.parameters["gpx.fallback_walking_speed_kmh"],
+            adventure_processing_parameters=self._track_summary_parameter_signature(),
         )
         table_json_path = result.get("table_json_path")
         return Path(table_json_path).resolve(strict=False) if table_json_path else None
@@ -2032,6 +2090,9 @@ class GPXTrackerController(NSObject):
         """Return overview/track numbers whose map images are missing or stale."""
         update_numbers = set()
         current_fingerprints = self._track_fingerprints_by_table_number(context)
+        selected_variant = "time-lapse" if self.track_maps_for_time_lapse else "standard"
+        expected_track_parameters = self._track_map_parameter_signature(selected_variant)
+        expected_overview_parameters = self._track_map_parameter_signature("overview")
         try:
             gpx_mtime = Path(gpx_path).stat().st_mtime
         except OSError:
@@ -2042,6 +2103,12 @@ class GPXTrackerController(NSObject):
             update_numbers.add(0)
         else:
             overview_metadata = self._plot_metadata_for_image(overview_path)
+            if not self._metadata_parameters_are_current(
+                overview_metadata,
+                expected_overview_parameters,
+                "overview",
+            ):
+                update_numbers.add(0)
             saved_fingerprints = overview_metadata.get("source_track_fingerprints") if isinstance(overview_metadata, dict) else None
             if isinstance(saved_fingerprints, list) and current_fingerprints:
                 if [str(item) for item in saved_fingerprints] != list(current_fingerprints.values()):
@@ -2064,6 +2131,12 @@ class GPXTrackerController(NSObject):
                 continue
             current_fingerprint = current_fingerprints.get(track_number)
             plot_metadata = self._plot_metadata_for_image(existing)
+            if not self._metadata_parameters_are_current(
+                plot_metadata,
+                expected_track_parameters,
+                selected_variant,
+            ):
+                update_numbers.add(track_number)
             saved_fingerprint = plot_metadata.get("track_fingerprint") if isinstance(plot_metadata, dict) else None
             if saved_fingerprint:
                 if current_fingerprint and str(saved_fingerprint) != current_fingerprint:
@@ -2113,6 +2186,14 @@ class GPXTrackerController(NSObject):
             fingerprints[number] = str(fingerprint)
         return fingerprints
 
+    def _summary_processing_parameters(self, table_json_path):
+        try:
+            payload = read_table_data(table_json_path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        value = payload.get("adventure_processing_parameters") if isinstance(payload, dict) else None
+        return value if isinstance(value, dict) else None
+
     def _track_fingerprints_by_table_number(self, context):
         fingerprints = {}
         for track in context.get("tracks", []):
@@ -2139,6 +2220,9 @@ class GPXTrackerController(NSObject):
         summary_has_fingerprints = bool(summary_fingerprints)
         summary_path = Path(context["table_json_path"])
         summary_exists = summary_path.exists()
+        summary_parameters = self._summary_processing_parameters(summary_path) if summary_exists else None
+        expected_summary_parameters = self._track_summary_parameter_signature()
+        default_summary_parameters = self._track_summary_parameter_signature(default_parameters())
         tracks = context.get("tracks", [])
         track_total = len(tracks)
         standard_count = 0
@@ -2156,9 +2240,14 @@ class GPXTrackerController(NSObject):
             and summary_has_fingerprints
             and summary_fingerprints != current_fingerprints
         )
+        if summary_exists:
+            if summary_parameters is not None:
+                summary_out_of_date = summary_out_of_date or summary_parameters != expected_summary_parameters
+            elif expected_summary_parameters != default_summary_parameters:
+                summary_out_of_date = True
         if not summary_has_fingerprints and summary_exists and gpx_mtime is not None:
             try:
-                summary_out_of_date = summary_path.stat().st_mtime < gpx_mtime
+                summary_out_of_date = summary_out_of_date or summary_path.stat().st_mtime < gpx_mtime
             except OSError:
                 summary_out_of_date = True
 
@@ -2184,14 +2273,19 @@ class GPXTrackerController(NSObject):
                     time_lapse_count += 1
                 plot_metadata = self._plot_metadata_for_image(existing)
                 saved_fingerprint = plot_metadata.get("track_fingerprint") if isinstance(plot_metadata, dict) else None
-                stale = False
+                variant_name = "standard" if count_key == "standard" else "time-lapse"
+                stale = not self._metadata_parameters_are_current(
+                    plot_metadata,
+                    self._track_map_parameter_signature(variant_name),
+                    variant_name,
+                )
                 if saved_fingerprint:
-                    stale = bool(current_fingerprint and str(saved_fingerprint) != current_fingerprint)
+                    stale = stale or bool(current_fingerprint and str(saved_fingerprint) != current_fingerprint)
                 else:
                     missing_metadata_count += 1
                     if gpx_mtime is not None:
                         try:
-                            stale = Path(existing).stat().st_mtime < gpx_mtime
+                            stale = stale or Path(existing).stat().st_mtime < gpx_mtime
                         except OSError:
                             stale = True
                 if stale:
@@ -2207,6 +2301,11 @@ class GPXTrackerController(NSObject):
         overview_out_of_date = False
         if overview_exists:
             overview_metadata = self._plot_metadata_for_image(overview_path)
+            overview_out_of_date = not self._metadata_parameters_are_current(
+                overview_metadata,
+                self._track_map_parameter_signature("overview"),
+                "overview",
+            )
             saved_fingerprints = None
             if isinstance(overview_metadata, dict):
                 saved_fingerprints = overview_metadata.get("source_track_fingerprints")
@@ -2283,7 +2382,13 @@ class GPXTrackerController(NSObject):
         self.refresh_section_status_indicators()
 
     def _format_gpx_summary(self, gpx_path):
-        tracks = parse_gpx_file(str(gpx_path), "", 10.0, 10.0, False)
+        tracks = parse_gpx_file(
+            str(gpx_path),
+            self.parameters["trackmaps.remove_name_prefix"],
+            self.parameters["gpx.minimum_point_spacing_m"],
+            self.parameters["gpx.maximum_accuracy_m"],
+            False,
+        )
         if not tracks:
             return f"Tracks: 0 | Name: {gpx_path.name} | Date range: N/A"
         start_candidates = [track.get("start_time") or track.get("time") for track in tracks if (track.get("start_time") or track.get("time")) is not None]
@@ -2420,6 +2525,8 @@ class GPXTrackerController(NSObject):
             "time_lapse_media_min_fraction": self.time_lapse_media_min_fraction,
             "track_maps_for_time_lapse": self.track_maps_for_time_lapse,
             "track_map_edge_margin_fraction": self.track_map_edge_margin_fraction,
+            "parameters": parameter_payload(self.parameters),
+            "slideshow_resume_position": self.slideshow_resume_position,
         }
 
     def _find_adventure_file_in_directory(self, project_dir):
@@ -2454,7 +2561,43 @@ class GPXTrackerController(NSObject):
 
         self.title_field.setStringValue_(str(data.get("project_name", "") or ""))
         self.description_text.setString_(str(data.get("description", "") or ""))
-        self._set_track_order_mode(bool(data.get("control_file_track_order", True)))
+        raw_parameter_payload = data.get("parameters")
+        self.parameters = normalize_parameters(raw_parameter_payload)
+        raw_parameter_values = (
+            raw_parameter_payload.get("values", {})
+            if isinstance(raw_parameter_payload, dict) and isinstance(raw_parameter_payload.get("values"), dict)
+            else {}
+        )
+        if "trackmaps.ordering" not in raw_parameter_values:
+            self.parameters["trackmaps.ordering"] = (
+                "track_number" if bool(data.get("control_file_track_order", True)) else "date"
+            )
+        if "trackmaps.variant" not in raw_parameter_values:
+            self.parameters["trackmaps.variant"] = (
+                "time_lapse" if bool(data.get("track_maps_for_time_lapse", True)) else "standard"
+            )
+        if "timelapse.media_min_fraction" not in raw_parameter_values:
+            try:
+                legacy_media_fraction = float(
+                    data.get(
+                        "time_lapse_media_min_fraction",
+                        data.get("time_lapse_media_max_fraction", 0.5),
+                    )
+                )
+            except (TypeError, ValueError):
+                legacy_media_fraction = 0.5
+            if 0.0 < legacy_media_fraction <= 1.0:
+                self.parameters["timelapse.media_min_fraction"] = legacy_media_fraction
+        if "trackmaps.edge_margin_fraction" not in raw_parameter_values:
+            try:
+                legacy_map_margin = float(
+                    data.get("track_map_edge_margin_fraction", DEFAULT_TRACK_EDGE_MARGIN_FRACTION)
+                )
+            except (TypeError, ValueError):
+                legacy_map_margin = DEFAULT_TRACK_EDGE_MARGIN_FRACTION
+            if 0.0 <= legacy_map_margin < 0.5:
+                self.parameters["trackmaps.edge_margin_fraction"] = legacy_map_margin
+        self._sync_legacy_parameter_controls()
         loaded_gpx_value = str(data.get("gpx_file", "") or "").strip()
         if loaded_gpx_value:
             loaded_gpx_path = Path(loaded_gpx_value).expanduser()
@@ -2467,26 +2610,8 @@ class GPXTrackerController(NSObject):
         self.last_picture_import_directory = (
             Path(last_import_directory).expanduser().resolve(strict=False) if last_import_directory else None
         )
-        try:
-            media_fraction = float(
-                data.get(
-                    "time_lapse_media_min_fraction",
-                    data.get("time_lapse_media_max_fraction", 0.5),
-                )
-            )
-        except (TypeError, ValueError):
-            media_fraction = 0.5
-        self.time_lapse_media_min_fraction = media_fraction if 0 < media_fraction <= 1 else 0.5
-        self.track_maps_for_time_lapse = bool(data.get("track_maps_for_time_lapse", True))
-        try:
-            map_margin = float(data.get("track_map_edge_margin_fraction", DEFAULT_TRACK_EDGE_MARGIN_FRACTION))
-        except (TypeError, ValueError):
-            map_margin = DEFAULT_TRACK_EDGE_MARGIN_FRACTION
-        self.track_map_edge_margin_fraction = map_margin if 0.0 <= map_margin < 0.5 else DEFAULT_TRACK_EDGE_MARGIN_FRACTION
-        if hasattr(self, "gpx_time_lapse_maps_checkbox"):
-            self.gpx_time_lapse_maps_checkbox.setState_(
-                NSControlStateValueOn if self.track_maps_for_time_lapse else NSControlStateValueOff
-            )
+        loaded_resume_position = data.get("slideshow_resume_position")
+        self.slideshow_resume_position = loaded_resume_position if isinstance(loaded_resume_position, dict) else None
 
     def _refresh_loaded_gpx_summary(self):
         self.start_async_project_status_refresh("loaded adventure")
@@ -2715,15 +2840,16 @@ class GPXTrackerController(NSObject):
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Enter the project name and a short description, then save the adventure.\n"
-            "3. Select one GPX file in the adventure folder, or choose external/multiple GPX files and use Add & Edit Tracks to save one final GPX file.\n"
-            "4. In Track Maps, choose whether to work on Standard or for Time-Lapse maps. Create makes the selected kind for every stage; Update refreshes only missing or outdated maps. Rows marked with * need update.\n"
-            "5. Import photos and video clips. They are copied into the adventure folder. Existing files are skipped so they are not duplicated.\n"
-            "6. Press Create in Slide Show Control File. The program reads photo dates and positions, combines them with the tracks and maps, and creates the ordered slide-show list.\n"
-            "7. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again.\n"
-            "8. If tracks or maps changed after the control file was edited, press Sync Track Maps. It shows which map entries should be inserted and can remove old entries; it does not render maps.\n"
-            "9. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
-            "10. If desired, press Add Place Names to add readable place names for photos that have GPS positions.\n"
-            "11. Press Start to launch the slide show.\n\n"
+            "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. Apply keeps the changes in the current adventure until it is saved.\n"
+            "4. Select one GPX file in the adventure folder, or choose external/multiple GPX files and use Add & Edit Tracks to save one final GPX file.\n"
+            "5. In Track Maps, choose whether to work on Standard or for Time-Lapse maps. Create makes the selected kind for every stage; Update refreshes only missing or outdated maps. Rows marked with * need update.\n"
+            "6. Import photos and video clips. They are copied into the adventure folder. Existing files are skipped so they are not duplicated.\n"
+            "7. Press Create in Slide Show Control File. The program reads photo dates and positions, combines them with the tracks and maps, and creates the ordered slide-show list.\n"
+            "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again.\n"
+            "9. If tracks or maps changed after the control file was edited, press Sync Track Maps. It shows which map entries should be inserted and can remove old entries; it does not render maps.\n"
+            "10. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
+            "11. If desired, press Add Place Names to add readable place names for photos that have GPS positions.\n"
+            "12. Press Start to launch the slide show. When a previous show stopped early, press y to resume there or n to begin again. The new stop position is saved automatically.\n\n"
             "Files and folders you will see:\n"
             "- The adventure file stores the project name, folder, selected track file, and other settings.\n"
             "- The GPX track file contains the travel route.\n"
@@ -2968,6 +3094,394 @@ class GPXTrackerController(NSObject):
         button.setAction_(action)
         button.setToolTip_(fallback_title)
         return apply_liquid_glass_button_style(button, compact=True)
+
+    def _ensure_parameter_window(self):
+        if self.parameter_window is not None:
+            return
+        rect = NSMakeRect(180.0, 100.0, 900.0, 680.0)
+        style = (
+            NSWindowStyleMaskTitled
+            | NSWindowStyleMaskClosable
+            | NSWindowStyleMaskMiniaturizable
+            | NSWindowStyleMaskResizable
+        )
+        self.parameter_window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            style,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.parameter_window.setTitle_("Adventure Settings")
+        self.parameter_window.setMinSize_((760.0, 540.0))
+        self.parameter_window_delegate = GPSTrackShowGUIParameterWindowDelegate.alloc().initWithController_(self)
+        self.parameter_window.setDelegate_(self.parameter_window_delegate)
+        content = self.parameter_window.contentView()
+
+        self.parameter_section_buttons = []
+        for index, section in enumerate(SECTION_ORDER):
+            button = self._make_button(section, "selectParameterSection:")
+            button.setTag_(7000 + index)
+            button.setToolTip_(f"Show {section} settings.")
+            content.addSubview_(button)
+            self.parameter_section_buttons.append(button)
+
+        self.parameter_form_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 100))
+        self.parameter_form_scroll.setHasVerticalScroller_(True)
+        self.parameter_form_scroll.setHasHorizontalScroller_(False)
+        self.parameter_form_scroll.setBorderType_(1)
+        content.addSubview_(self.parameter_form_scroll)
+
+        self.parameter_advanced_checkbox = self._make_checkbox("Show Advanced Settings", "toggleAdvancedParameters:")
+        content.addSubview_(self.parameter_advanced_checkbox)
+        self.parameter_error_label = self._make_label("", size=11.0)
+        self.parameter_error_label.setTextColor_(NSColor.systemRedColor())
+        content.addSubview_(self.parameter_error_label)
+        self.parameter_reset_all_button = self._make_button("Reset All", "resetAllParameters:")
+        self.parameter_cancel_button = self._make_button("Cancel", "cancelParameterEditor:")
+        self.parameter_apply_button = self._make_button("Apply", "applyParameterEditor:")
+        content.addSubview_(self.parameter_reset_all_button)
+        content.addSubview_(self.parameter_cancel_button)
+        content.addSubview_(self.parameter_apply_button)
+        self.layoutParameterWindow()
+
+    def layoutParameterWindow(self):
+        if self.parameter_window is None:
+            return
+        bounds = self.parameter_window.contentView().bounds()
+        width, height = float(bounds.size.width), float(bounds.size.height)
+        sidebar_width = 178.0
+        footer_height = 70.0
+        top_padding = 16.0
+        section_height = 34.0
+        for index, button in enumerate(self.parameter_section_buttons):
+            button.setFrame_(
+                NSMakeRect(
+                    14.0,
+                    height - top_padding - (index + 1) * section_height,
+                    sidebar_width - 28.0,
+                    28.0,
+                )
+            )
+        form_x = sidebar_width
+        self.parameter_form_scroll.setFrame_(
+            NSMakeRect(form_x, footer_height, max(420.0, width - form_x - 14.0), max(300.0, height - footer_height - 14.0))
+        )
+        self.parameter_advanced_checkbox.setFrame_(NSMakeRect(18.0, 40.0, sidebar_width - 24.0, 24.0))
+        self.parameter_reset_all_button.setFrame_(NSMakeRect(18.0, 8.0, 110.0, 28.0))
+        self.parameter_apply_button.setFrame_(NSMakeRect(width - 116.0, 18.0, 100.0, 30.0))
+        self.parameter_cancel_button.setFrame_(NSMakeRect(width - 226.0, 18.0, 100.0, 30.0))
+        self.parameter_error_label.setFrame_(NSMakeRect(form_x + 12.0, 20.0, max(220.0, width - form_x - 250.0), 24.0))
+        if self.parameter_form_view is not None:
+            self._capture_parameter_controls(update_error=False)
+            self._render_parameter_section()
+
+    def _parameter_color(self, value):
+        text = str(value).strip().lower()
+        named = {
+            "black": NSColor.blackColor(),
+            "white": NSColor.whiteColor(),
+            "red": NSColor.redColor(),
+            "blue": NSColor.blueColor(),
+            "green": NSColor.greenColor(),
+            "yellow": NSColor.yellowColor(),
+            "gray": NSColor.grayColor(),
+            "grey": NSColor.grayColor(),
+            "orange": NSColor.orangeColor(),
+            "cyan": NSColor.cyanColor(),
+            "magenta": NSColor.magentaColor(),
+        }
+        if text in named:
+            return named[text]
+        if re.fullmatch(r"#[0-9a-f]{6}", text):
+            return NSColor.colorWithSRGBRed_green_blue_alpha_(
+                int(text[1:3], 16) / 255.0,
+                int(text[3:5], 16) / 255.0,
+                int(text[5:7], 16) / 255.0,
+                1.0,
+            )
+        return NSColor.blackColor()
+
+    def _parameter_color_text(self, color):
+        converted = color.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace()) if color is not None else None
+        if converted is None:
+            return "#000000"
+        return "#{:02X}{:02X}{:02X}".format(
+            round(float(converted.redComponent()) * 255.0),
+            round(float(converted.greenComponent()) * 255.0),
+            round(float(converted.blueComponent()) * 255.0),
+        )
+
+    def _display_parameter_value(self, spec, value):
+        if spec.value_type == "fraction":
+            return f"{float(value) * 100.0:g}"
+        return str(value)
+
+    def _parameter_stepper_values(self, spec, value):
+        scale = 100.0 if spec.value_type == "fraction" else 1.0
+        displayed = float(value) * scale
+        minimum = float(spec.minimum) * scale if spec.minimum is not None else -1.0e9
+        maximum = float(spec.maximum) * scale if spec.maximum is not None else 1.0e9
+        if spec.value_type in {"int", "fraction"}:
+            increment = 1.0
+        else:
+            increment = 0.1 if max(abs(displayed), 1.0) < 10.0 else 1.0
+        return displayed, minimum, maximum, increment
+
+    def _render_parameter_section(self):
+        if self.parameter_form_scroll is None:
+            return
+        specs = visible_specs_for_section(
+            self.parameter_current_section,
+            self.parameter_draft,
+            self.parameter_show_advanced,
+        )
+        visible_height = max(300.0, float(self.parameter_form_scroll.contentSize().height))
+        row_height = 64.0
+        document_height = max(visible_height, 24.0 + row_height * len(specs))
+        document_width = max(520.0, float(self.parameter_form_scroll.contentSize().width))
+        form_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, document_width, document_height))
+        self.parameter_controls = {}
+        self.parameter_steppers = {}
+        self.parameter_tag_to_key = {}
+        for row, spec in enumerate(specs):
+            y = document_height - 18.0 - (row + 1) * row_height
+            label = self._make_label(spec.label, size=13.0, bold=True)
+            label.setFrame_(NSMakeRect(16.0, y + 34.0, 215.0, 20.0))
+            label.setToolTip_(spec.help_text)
+            form_view.addSubview_(label)
+            help_label = self._make_label(spec.help_text, size=10.5)
+            help_label.setTextColor_(NSColor.secondaryLabelColor())
+            help_label.setFrame_(NSMakeRect(16.0, y + 6.0, max(220.0, document_width - 72.0), 28.0))
+            help_label.setToolTip_(spec.help_text)
+            form_view.addSubview_(help_label)
+
+            tag = 8000 + row
+            value = self.parameter_draft.get(spec.key, spec.default)
+            control_x = min(245.0, max(220.0, document_width * 0.42))
+            is_numeric = spec.value_type in {"int", "float", "fraction"}
+            reset_x = document_width - 36.0
+            stepper_x = reset_x - 26.0 if is_numeric else reset_x
+            unit_width = 42.0 if spec.unit else 0.0
+            unit_x = stepper_x - unit_width - (6.0 if spec.unit else 0.0)
+            control_right = (unit_x if spec.unit else stepper_x) - 8.0
+            control_width = max(110.0, control_right - control_x)
+            if spec.value_type == "bool":
+                control = self._make_checkbox("", "parameterValueChanged:")
+                control.setState_(NSControlStateValueOn if bool(value) else NSControlStateValueOff)
+            elif spec.value_type == "choice":
+                control = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(0, 0, control_width, 26.0))
+                control.addItemsWithTitles_([label_text for _stored, label_text in spec.choices])
+                selected_index = next((index for index, item in enumerate(spec.choices) if item[0] == value), 0)
+                control.selectItemAtIndex_(selected_index)
+                control.setTarget_(self)
+                control.setAction_("parameterValueChanged:")
+            elif spec.value_type == "color":
+                control = NSColorWell.alloc().initWithFrame_(NSMakeRect(0, 0, min(90.0, control_width), 26.0))
+                control.setColor_(self._parameter_color(value))
+                control.setTarget_(self)
+                control.setAction_("parameterValueChanged:")
+            else:
+                control = self._make_text_field("")
+                control.setStringValue_(self._display_parameter_value(spec, value))
+                control.setDelegate_(self)
+                control.setTarget_(self)
+                control.setAction_("parameterValueChanged:")
+            control.setTag_(tag)
+            control.setFrame_(NSMakeRect(control_x, y + 31.0, control_width, 27.0))
+            control.setToolTip_(spec.help_text)
+            form_view.addSubview_(control)
+            self.parameter_controls[spec.key] = control
+            self.parameter_tag_to_key[tag] = spec.key
+
+            if spec.unit:
+                unit = self._make_label(spec.unit, size=11.0)
+                unit.setFrame_(NSMakeRect(unit_x, y + 35.0, unit_width, 18.0))
+                form_view.addSubview_(unit)
+            if is_numeric:
+                displayed, minimum, maximum, increment = self._parameter_stepper_values(spec, value)
+                stepper = NSStepper.alloc().initWithFrame_(NSMakeRect(stepper_x, y + 31.0, 20.0, 27.0))
+                stepper.setMinValue_(minimum)
+                stepper.setMaxValue_(maximum)
+                stepper.setIncrement_(increment)
+                stepper.setDoubleValue_(displayed)
+                stepper.setValueWraps_(False)
+                stepper.setAutorepeat_(True)
+                stepper.setTarget_(self)
+                stepper.setAction_("parameterStepperChanged:")
+                stepper.setTag_(tag)
+                stepper.setToolTip_(f"Increase or decrease {spec.label}.")
+                form_view.addSubview_(stepper)
+                self.parameter_steppers[spec.key] = stepper
+            reset = self._make_icon_button(["sf:arrow.counterclockwise", "NSRefreshTemplate"], "Reset", "resetParameter:")
+            reset.setTag_(tag)
+            reset.setFrame_(NSMakeRect(reset_x, y + 31.0, 26.0, 26.0))
+            reset.setToolTip_(f"Reset {spec.label} to {spec.default}.")
+            form_view.addSubview_(reset)
+
+        self.parameter_form_view = form_view
+        self.parameter_form_scroll.setDocumentView_(form_view)
+        key_views = list(self.parameter_controls.values())
+        for current, following in zip(key_views, key_views[1:]):
+            current.setNextKeyView_(following)
+        if key_views:
+            key_views[-1].setNextKeyView_(self.parameter_advanced_checkbox)
+            self.parameter_advanced_checkbox.setNextKeyView_(self.parameter_cancel_button)
+            self.parameter_cancel_button.setNextKeyView_(self.parameter_apply_button)
+            self.parameter_apply_button.setNextKeyView_(key_views[0])
+        for index, button in enumerate(self.parameter_section_buttons):
+            button.setEnabled_(SECTION_ORDER[index] != self.parameter_current_section)
+        self._validate_parameter_draft()
+
+    def _control_parameter_value(self, spec, control):
+        if spec.value_type == "bool":
+            raw = control.state() == NSControlStateValueOn
+        elif spec.value_type == "choice":
+            index = int(control.indexOfSelectedItem())
+            raw = spec.choices[index][0]
+        elif spec.value_type == "color":
+            raw = self._parameter_color_text(control.color())
+        else:
+            raw = str(control.stringValue())
+        return normalize_parameter_value(spec, raw)
+
+    def _capture_parameter_controls(self, update_error=True):
+        field_errors = {}
+        for key, control in self.parameter_controls.items():
+            spec = SPECS_BY_KEY[key]
+            try:
+                self.parameter_draft[key] = self._control_parameter_value(spec, control)
+                stepper = self.parameter_steppers.get(key)
+                if stepper is not None:
+                    displayed, _minimum, _maximum, _increment = self._parameter_stepper_values(
+                        spec, self.parameter_draft[key]
+                    )
+                    stepper.setDoubleValue_(displayed)
+            except (TypeError, ValueError) as exc:
+                field_errors[key] = str(exc)
+        if update_error:
+            self._validate_parameter_draft(field_errors)
+        return field_errors
+
+    def _validate_parameter_draft(self, field_errors=None):
+        errors = dict(field_errors or {})
+        if not errors:
+            errors.update(validate_parameters(self.parameter_draft))
+        if self.parameter_apply_button is not None:
+            self.parameter_apply_button.setEnabled_(not errors)
+        if self.parameter_error_label is not None:
+            if errors:
+                key, message = next(iter(errors.items()))
+                label = SPECS_BY_KEY[key].label if key in SPECS_BY_KEY else key
+                self.parameter_error_label.setStringValue_(f"{label}: {message}")
+            else:
+                self.parameter_error_label.setStringValue_("")
+        return errors
+
+    @objc.IBAction
+    def showParameterEditor_(self, _sender):
+        self._ensure_parameter_window()
+        self.parameter_draft = dict(self.parameters)
+        self.parameter_advanced_checkbox.setState_(
+            NSControlStateValueOn if self.parameter_show_advanced else NSControlStateValueOff
+        )
+        self._render_parameter_section()
+        self.parameter_window.makeKeyAndOrderFront_(None)
+        NSApp().activateIgnoringOtherApps_(True)
+
+    @objc.IBAction
+    def selectParameterSection_(self, sender):
+        self._capture_parameter_controls()
+        index = int(sender.tag()) - 7000
+        if 0 <= index < len(SECTION_ORDER):
+            self.parameter_current_section = SECTION_ORDER[index]
+            self._render_parameter_section()
+
+    @objc.IBAction
+    def toggleAdvancedParameters_(self, sender):
+        self._capture_parameter_controls()
+        self.parameter_show_advanced = sender.state() == NSControlStateValueOn
+        self._render_parameter_section()
+
+    @objc.IBAction
+    def parameterValueChanged_(self, _sender):
+        key = self.parameter_tag_to_key.get(int(_sender.tag()))
+        self._capture_parameter_controls()
+        if key == "maps.provider":
+            self.performSelector_withObject_afterDelay_("refreshParameterSection:", None, 0.0)
+
+    def refreshParameterSection_(self, _payload):
+        self._render_parameter_section()
+
+    @objc.IBAction
+    def parameterStepperChanged_(self, sender):
+        key = self.parameter_tag_to_key.get(int(sender.tag()))
+        if key is None or key not in self.parameter_controls:
+            return
+        spec = SPECS_BY_KEY[key]
+        value = float(sender.doubleValue())
+        if spec.value_type == "int":
+            text = str(int(round(value)))
+        else:
+            text = f"{value:g}"
+        self.parameter_controls[key].setStringValue_(text)
+        self._capture_parameter_controls()
+
+    @objc.IBAction
+    def resetParameter_(self, sender):
+        key = self.parameter_tag_to_key.get(int(sender.tag()))
+        if key is None:
+            return
+        self.parameter_draft[key] = SPECS_BY_KEY[key].default
+        self._render_parameter_section()
+
+    @objc.IBAction
+    def resetAllParameters_(self, _sender):
+        self.parameter_draft = default_parameters()
+        self._render_parameter_section()
+
+    @objc.IBAction
+    def cancelParameterEditor_(self, _sender):
+        self.parameter_draft = dict(self.parameters)
+        if self.parameter_window is not None:
+            self.parameter_window.orderOut_(None)
+
+    def _sync_legacy_parameter_controls(self):
+        self.time_lapse_media_min_fraction = float(self.parameters["timelapse.media_min_fraction"])
+        self.track_maps_for_time_lapse = self.parameters["trackmaps.variant"] == "time_lapse"
+        self.track_map_edge_margin_fraction = float(self.parameters["trackmaps.edge_margin_fraction"])
+        self._set_track_order_mode(self.parameters["trackmaps.ordering"] == "track_number")
+        if hasattr(self, "gpx_time_lapse_maps_checkbox"):
+            self.gpx_time_lapse_maps_checkbox.setState_(
+                NSControlStateValueOn if self.track_maps_for_time_lapse else NSControlStateValueOff
+            )
+
+    @objc.IBAction
+    def applyParameterEditor_(self, _sender):
+        field_errors = self._capture_parameter_controls()
+        errors = self._validate_parameter_draft(field_errors)
+        if errors:
+            return
+        old_parameters = dict(self.parameters)
+        self.parameters = normalize_parameters(self.parameter_draft)
+        changed = changed_parameter_keys(old_parameters, self.parameters)
+        self._sync_legacy_parameter_controls()
+        if changed & map_affecting_parameter_keys():
+            self.track_maps_status_cache = None
+            self.track_maps_summary_label.setStringValue_("Track-map settings changed; use Update to refresh affected maps.")
+            self._set_section_status_checkbox(
+                self.track_maps_status_checkbox,
+                False,
+                "Track-map settings changed; update the maps before the slide show.",
+            )
+        editor_controller = getattr(self, "gpx_editor_controller", None)
+        if editor_controller is not None:
+            editor_controller.apply_project_parameters(self.parameters)
+        if changed:
+            self.mark_dirty()
+            self.set_status(f"Applied {len(changed)} adventure setting(s). Save the adventure to keep them.")
+        else:
+            self.set_status("Adventure settings unchanged.")
+        self.parameter_window.orderOut_(None)
 
     def _ensure_control_table_window(self):
         if self.control_table_window is not None:
@@ -4507,6 +5021,14 @@ class GPXTrackerController(NSObject):
             NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(str(project_dir)))
             self.set_status("Opened project directory. No GPX files found yet.")
 
+    def _geolocation_options(self):
+        return {
+            "distance": self.parameters["locations.reuse_radius_m"],
+            "geocode_timeout_seconds": self.parameters["locations.timeout_seconds"],
+            "geocode_pacing_min_seconds": self.parameters["locations.pacing_min_seconds"],
+            "geocode_pacing_max_seconds": self.parameters["locations.pacing_max_seconds"],
+        }
+
     @objc.IBAction
     def createControlFile_(self, _sender):
         if self.geolocations_thread is not None and self.geolocations_thread.is_alive():
@@ -4589,6 +5111,7 @@ class GPXTrackerController(NSObject):
                     stdout=output_writer,
                     stderr=output_writer,
                     cancel_event=cancel_event,
+                    **self._geolocation_options(),
                 )
             except GeoLocationsCancelled:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("geoLocationsRunFinished:", "cancelled", True)
@@ -4677,6 +5200,7 @@ class GPXTrackerController(NSObject):
                     stdout=output_writer,
                     stderr=output_writer,
                     cancel_event=cancel_event,
+                    **self._geolocation_options(),
                 )
             except GeoLocationsCancelled:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("geoLocationsRunFinished:", "cancelled", True)
@@ -4750,6 +5274,7 @@ class GPXTrackerController(NSObject):
                     stdout=output_writer,
                     stderr=output_writer,
                     cancel_event=cancel_event,
+                    **self._geolocation_options(),
                 )
             except GeoLocationsCancelled:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("geoLocationsRunFinished:", "cancelled", True)
@@ -4821,6 +5346,7 @@ class GPXTrackerController(NSObject):
                     stdout=output_writer,
                     stderr=output_writer,
                     cancel_event=cancel_event,
+                    **self._geolocation_options(),
                 )
             except GeoLocationsCancelled:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("geoLocationsRunFinished:", "cancelled", True)
@@ -5035,6 +5561,40 @@ class GPXTrackerController(NSObject):
     def startTimeLapseShow_(self, _sender):
         self._start_slide_show(time_lapse=True)
 
+    def _validated_slideshow_resume_position(self, control_file_path):
+        position = self.slideshow_resume_position
+        if not isinstance(position, dict) or position.get("completed"):
+            return None
+        try:
+            stored_control = Path(str(position.get("control_file", ""))).expanduser().resolve(strict=False)
+            current_control = Path(control_file_path).expanduser().resolve(strict=False)
+            playlist_index = int(position["playlist_index"])
+            lines = [line.strip() for line in current_control.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (KeyError, OSError, TypeError, ValueError):
+            return None
+        if stored_control != current_control or not 0 <= playlist_index < len(lines):
+            return None
+        stored_line = position.get("line_text")
+        if isinstance(stored_line, str) and stored_line != lines[playlist_index]:
+            return None
+        return dict(position)
+
+    def _ask_to_resume_slideshow(self, position):
+        playlist_index = int(position.get("playlist_index", 0))
+        mode = "Time-Lapse" if position.get("mode") == "time-lapse" else "Standard Slide Show"
+        saved_at = str(position.get("saved_at", "") or "")
+        detail = f"Continue {mode} near control-file row {playlist_index + 1}?"
+        if saved_at:
+            detail += f"\nLast stopped: {saved_at}"
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Resume Slide Show?")
+        alert.setInformativeText_(detail + "\n\nPress y for Yes or n for No.")
+        yes_button = alert.addButtonWithTitle_("Yes")
+        no_button = alert.addButtonWithTitle_("No - Start at Beginning")
+        yes_button.setKeyEquivalent_("y")
+        no_button.setKeyEquivalent_("n")
+        return int(alert.runModal()) == 1000
+
     def _start_slide_show(self, time_lapse: bool):
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
@@ -5060,25 +5620,25 @@ class GPXTrackerController(NSObject):
             self.set_status("Slide show is already running.")
             return
 
+        resume_position = self._validated_slideshow_resume_position(control_file_path)
+        if resume_position is not None and not self._ask_to_resume_slideshow(resume_position):
+            resume_position = None
+        state_file = project_dir / ".mycamino-slideshow-state.json"
         try:
-            if time_lapse:
-                gpx_path = self._current_single_gpx_path()
-                if gpx_path is not None and gpx_path.exists():
-                    report = upgrade_timed_track_sidecars(
-                        gpx_path,
-                        trackimages_dir,
-                        output_base=self._current_project_name() or project_dir.name,
-                        sort_original=self._use_track_order(),
-                        sort_date=not self._use_track_order(),
-                    )
-                    if report["updated"]:
-                        self.set_status(f"Upgraded timing metadata for {len(report['updated'])} track map(s).")
-                    elif report["skipped"]:
-                        self.set_status(
-                            f"Time-lapse timing unavailable for {len(report['skipped'])} track map(s); "
-                            "they will use distance-based motion."
-                        )
-            command = self._slideshow_command(project_dir, control_file_path, trackimages_dir, time_lapse=time_lapse)
+            state_file.unlink(missing_ok=True)
+        except OSError as exc:
+            show_alert("Could not prepare slide-show state file.", str(exc))
+            return
+
+        try:
+            command = self._slideshow_command(
+                project_dir,
+                control_file_path,
+                trackimages_dir,
+                time_lapse=time_lapse,
+                resume_position=resume_position,
+                state_file=state_file,
+            )
             self.slideshow_process = subprocess.Popen(
                 command,
                 cwd=str(self.base_dir),
@@ -5087,7 +5647,11 @@ class GPXTrackerController(NSObject):
             show_alert("Could not start slide show.", str(exc))
             self.set_status("Slide show failed to start.")
             return
-        watcher = threading.Thread(target=self._watch_slideshow_process, args=(self.slideshow_process,), daemon=True)
+        watcher = threading.Thread(
+            target=self._watch_slideshow_process,
+            args=(self.slideshow_process, state_file),
+            daemon=True,
+        )
         watcher.start()
         mode = "time-lapse slide show" if time_lapse else "slide show"
         self.set_status(f"Started {mode} with {control_file_path.name} and trackdir {trackimages_dir}.")
@@ -5111,30 +5675,125 @@ class GPXTrackerController(NSObject):
         if controller is not None:
             self.set_status("Opened GPXEditor and PDF Summary options.")
 
-    def _watch_slideshow_process(self, process):
+    def _watch_slideshow_process(self, process, state_file):
         return_code = process.wait()
-        if process is self.slideshow_process:
-            self.slideshow_process = None
+        resume_state = None
+        try:
+            if state_file.is_file():
+                with state_file.open("r", encoding="utf-8") as handle:
+                    loaded_state = json.load(handle)
+                if isinstance(loaded_state, dict):
+                    resume_state = loaded_state
+        except (OSError, json.JSONDecodeError):
+            resume_state = None
+        finally:
+            try:
+                state_file.unlink(missing_ok=True)
+            except OSError:
+                pass
         if return_code == 0:
             message = "Slide show closed."
         else:
             message = f"Slide show exited with code {return_code}."
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
-            "setStatusFromWorker:",
-            message,
+            "slideShowProcessFinished:",
+            {
+                "pid": process.pid,
+                "message": message,
+                "resume_state": resume_state,
+            },
             False,
         )
 
-    def _slideshow_command(self, project_dir, control_file_path, trackimages_dir, time_lapse=False):
+    def slideShowProcessFinished_(self, result):
+        active_process = self.slideshow_process
+        if active_process is not None and active_process.pid == int(result.get("pid", -1)):
+            self.slideshow_process = None
+        resume_state = result.get("resume_state")
+        if isinstance(resume_state, dict):
+            new_position = None if resume_state.get("completed") else resume_state
+            if new_position != self.slideshow_resume_position:
+                self.slideshow_resume_position = new_position
+                if self.save_project_configuration():
+                    suffix = " Resume position saved automatically." if new_position is not None else " Resume position cleared."
+                    self.set_status(str(result.get("message", "Slide show closed.")) + suffix)
+                    return
+        self.set_status(str(result.get("message", "Slide show closed.")))
+
+    def _slideshow_command(
+        self,
+        project_dir,
+        control_file_path,
+        trackimages_dir,
+        time_lapse=False,
+        resume_position=None,
+        state_file=None,
+    ):
+        settings = self.parameters
         args = [
             str(project_dir),
             "--inputlist",
             str(control_file_path),
             "--trackdir",
             str(trackimages_dir.resolve(strict=False)),
+            "--duration",
+            str(settings["slideshow.media_duration_seconds"]),
+            "--transition-duration-ms",
+            str(settings["slideshow.transition_duration_ms"]),
+            "--transition",
+            str(settings["slideshow.transition"]),
+            "--background-color",
+            str(settings["slideshow.background_color"]),
+            "--font-color",
+            str(settings["slideshow.font_color"]),
+            "--font-size",
+            str(settings["slideshow.font_size"]),
+            "--dot-color",
+            str(settings["slideshow.marker_color"]),
+            "--dot-size",
+            str(settings["slideshow.marker_radius"]),
+            "--arrow-length",
+            str(settings["slideshow.arrow_scale"]),
+            "--clock",
+            "on" if settings["slideshow.clock"] else "off",
+            "--placenames",
+            "on" if settings["slideshow.place_names"] else "off",
+            "--collage-size-range",
+            str(settings["slideshow.collage_size_range"]),
+            "--collage-max-images",
+            str(settings["slideshow.collage_max_images"]),
+            "--time-lapse-duration",
+            str(settings["timelapse.stage_duration_seconds"]),
             "--time-lapse-media-min-fraction",
-            str(self.time_lapse_media_min_fraction),
+            str(settings["timelapse.media_min_fraction"]),
         ]
+        if settings["slideshow.map_window"]:
+            args.append("--mapwindow")
+        else:
+            args.append("--no-mapwindow")
+        if settings["slideshow.join_windows"] and settings["slideshow.map_window"]:
+            args.append("--join-windows")
+        if settings["slideshow.display_swap"]:
+            args.append("--switch-display")
+        if settings["slideshow.repeat"]:
+            args.append("--repeat")
+        if settings["slideshow.manual_start"]:
+            args.append("--keypressed")
+        fullscreen_mode = settings["slideshow.fullscreen"]
+        if fullscreen_mode == "on":
+            args.append("--fullscreen")
+        elif fullscreen_mode == "off":
+            args.append("--no-fullscreen")
+        if state_file is not None:
+            args.extend(["--state-file", str(state_file)])
+        if isinstance(resume_position, dict):
+            args.extend(["--resume-index", str(int(resume_position["playlist_index"]))])
+            progress = resume_position.get("time_lapse_progress")
+            if isinstance(progress, (int, float)):
+                args.extend(["--resume-progress", str(max(0.0, min(1.0, float(progress))))])
+            media_index = resume_position.get("media_index")
+            if isinstance(media_index, int) and media_index >= 0:
+                args.extend(["--resume-media-index", str(media_index)])
         if time_lapse:
             args.append("--time-lapse-stages")
         if getattr(sys, "frozen", False):
@@ -5593,17 +6252,55 @@ class GPXTrackerController(NSObject):
         self.plot_selection_result = None
         NSApp().stopModal()
 
+    def _track_map_image_size(self):
+        width_text, height_text = str(self.parameters["trackmaps.image_size"]).lower().split("x", 1)
+        return int(width_text), int(height_text)
+
+    def _track_summary_parameter_signature(self, values=None):
+        source = self.parameters if values is None else values
+        keys = (
+            "trackmaps.ordering",
+            "trackmaps.remove_name_prefix",
+            "gpx.fallback_walking_speed_kmh",
+            "gpx.minimum_point_spacing_m",
+            "gpx.maximum_accuracy_m",
+        )
+        return parameter_subset(source, keys)
+
+    def _track_map_parameter_signature(self, variant, values=None):
+        source = self.parameters if values is None else values
+        keys = tuple(map_affecting_parameter_keys())
+        signature = parameter_subset(source, keys)
+        if variant != "time-lapse":
+            signature.pop("trackmaps.edge_margin_fraction", None)
+        signature["trackmaps.rendered_layout"] = str(variant)
+        return signature
+
+    def _metadata_parameters_are_current(self, metadata, expected, variant):
+        if not isinstance(metadata, dict):
+            return False
+        saved = metadata.get("adventure_render_parameters")
+        if isinstance(saved, dict):
+            return saved == expected
+        defaults = default_parameters()
+        return expected == self._track_map_parameter_signature(variant, defaults)
+
     def _plot_common_options(self, project_name, trackimages_dir):
         use_track_order = self._use_track_order()
+        variant = "time-lapse" if self.track_maps_for_time_lapse else "standard"
+        labels = "none" if self.parameters["trackmaps.overview_labels"] == "none" else None
+        maximum_zoom = int(self.parameters["maps.maximum_zoom"])
         return {
-            "print_labels": "none",
-            "line_width": 4.0,
-            "line_color": "blue",
-            "dot_color": "white",
-            "dot_size": 0.0,
-            "size": (1920, 1080),
-            "fontsize": 2.2,
-            "zoom": 15,
+            "print_labels": labels,
+            "line_width": self.parameters["trackmaps.route_width"],
+            "line_color": self.parameters["trackmaps.route_color"],
+            "dot_color": self.parameters["trackmaps.endpoint_color"],
+            "dot_size": self.parameters["trackmaps.endpoint_size"],
+            "background_color": self.parameters["trackmaps.background_color"],
+            "title_color": self.parameters["trackmaps.title_color"],
+            "size": self._track_map_image_size(),
+            "fontsize": self.parameters["trackmaps.font_factor"],
+            "zoom": min(int(self.parameters["trackmaps.zoom"]), maximum_zoom),
             "header": project_name,
             "output_dir": str(trackimages_dir),
             "output_base": project_name,
@@ -5611,8 +6308,20 @@ class GPXTrackerController(NSObject):
             "verbose": False,
             "sort_original": use_track_order,
             "sort_date": not use_track_order,
-            "map_layout": "time-lapse" if self.track_maps_for_time_lapse else "standard",
-            "track_edge_margin_fraction": self.track_map_edge_margin_fraction,
+            "remove_prefix": self.parameters["trackmaps.remove_name_prefix"],
+            "gpx_threshold_distance": self.parameters["gpx.minimum_point_spacing_m"],
+            "gpx_threshold_accuracy": self.parameters["gpx.maximum_accuracy_m"],
+            "fallback_walking_speed_kmh": self.parameters["gpx.fallback_walking_speed_kmh"],
+            "map_layout": variant,
+            "track_edge_margin_fraction": self.parameters["trackmaps.edge_margin_fraction"],
+            "map_provider": self.parameters["maps.provider"],
+            "custom_map_url": self.parameters["maps.custom_url"],
+            "custom_map_attribution": self.parameters["maps.custom_attribution"],
+            "maximum_map_zoom": maximum_zoom,
+            "map_request_timeout_seconds": self.parameters["maps.request_timeout_seconds"],
+            "adventure_render_parameters": self._track_map_parameter_signature(variant),
+            "adventure_overview_render_parameters": self._track_map_parameter_signature("overview"),
+            "adventure_processing_parameters": self._track_summary_parameter_signature(),
         }
 
     def _existing_expected_track_map_count(self, selection_context):
@@ -5892,6 +6601,7 @@ class GPXTrackerController(NSObject):
         existing_controller = self.gpx_editor_controller
         existing_window = getattr(existing_controller, "window", None) if existing_controller is not None else None
         if existing_window is not None and existing_window.isVisible():
+            existing_controller.apply_project_parameters(self.parameters)
             existing_window.makeKeyAndOrderFront_(None)
             existing_window.orderFrontRegardless()
             NSApp().activateIgnoringOtherApps_(True)
@@ -5969,6 +6679,7 @@ class GPXTrackerController(NSObject):
                 cli_args,
                 on_close=handle_editor_close,
                 on_save=handle_editor_save,
+                settings=self.parameters,
             )
         except Exception as exc:
             show_alert("Could not open GPXEditor.", str(exc))
@@ -6113,18 +6824,25 @@ class GPXTrackerController(NSObject):
         if field is self.title_field:
             self.mark_dirty()
 
+    def controlTextDidChange_(self, notification):
+        field = notification.object()
+        if field in self.parameter_controls.values():
+            self._capture_parameter_controls()
+
     @objc.IBAction
     def fieldChanged_(self, _sender):
         if _sender is self.title_field:
             self.refresh_current_gpx_summary()
             self.refresh_control_file_display()
         if _sender is self.gpx_track_order_popup:
+            self.parameters["trackmaps.ordering"] = "track_number" if self._use_track_order() else "date"
             self.refresh_track_maps_summary()
         self.mark_dirty()
 
     @objc.IBAction
     def trackMapVariantChanged_(self, _sender):
         self.track_maps_for_time_lapse = _sender.state() == NSControlStateValueOn
+        self.parameters["trackmaps.variant"] = "time_lapse" if self.track_maps_for_time_lapse else "standard"
         self.refresh_track_maps_summary()
         self.mark_dirty()
 
@@ -6132,6 +6850,15 @@ class GPXTrackerController(NSObject):
         self.mark_dirty()
 
     def shutdown(self):
+        if self.parameter_window is not None:
+            try:
+                self.parameter_window.setDelegate_(None)
+                self.parameter_window.orderOut_(None)
+                self.parameter_window.close()
+            except Exception:
+                pass
+            self.parameter_window = None
+            self.parameter_window_delegate = None
         if self.slideshow_process is not None and self.slideshow_process.poll() is None:
             try:
                 self.slideshow_process.terminate()

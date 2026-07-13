@@ -88,6 +88,8 @@ from Foundation import (
 
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
 from basemap_tile_utils import tolerate_missing_tiles
+from adventure_parameters import default_parameters, normalize_parameters
+from map_provider_utils import contextily_provider, contextily_request_timeout, provider_display_name
 from track_timing_utils import timestamps_from_start
 
 try:
@@ -157,13 +159,7 @@ FIELD_HEIGHT = 26.0
 BUTTON_HEIGHT = 28.0
 STATUS_HEIGHT = 24.0
 ROW_HEIGHT = 24.0
-AUTOSAVE_SECONDS = 300.0
 DRAG_TYPE = "myCaminoGPXEditorRows"
-MAX_BASEMAP_TILES = 48
-PDF_MAX_BASEMAP_TILES = 24
-PDF_EXPORT_DPI = 200
-PDF_MAP_PIXEL_DPI = 600.0
-OSM_REQUEST_TIMEOUT_SECONDS = 12.0
 APP_CACHE_DIR = Path.home() / "Library" / "Caches" / "myCamino-GPXEditor"
 TILE_CACHE_DIR = APP_CACHE_DIR / "tiles"
 MPL_CACHE_DIR = APP_CACHE_DIR / "matplotlib"
@@ -1311,8 +1307,10 @@ class PlotView(NSView):
             if not tracks:
                 tracks = self.controller.visible_tracks()
             tracks = [track for track in tracks if not track.hidden]
-            extent = self.controller.extent_for_track_records(tracks, padding_fraction=0.10)
-            requested_zoom = self.controller.overview_zoom_for_tracks(tracks, int(self.plot_info.get("zoom_level", 14)))
+            extent = self.controller.extent_for_track_records(tracks)
+            requested_zoom = self.controller.overview_zoom_for_tracks(
+                tracks, int(self.plot_info.get("zoom_level", self.controller.overview_zoom))
+            )
             self.render_extent(extent, requested_zoom, "Zoomed overview to selected tracks.")
             return
         tracks = self.display_tracks()
@@ -1478,16 +1476,16 @@ class PlotView(NSView):
         self.last_viewport_signature = None
         if self.mode == "overview":
             tracks = self.controller.tracks
-            extent = self.controller.extent_for_track_records(tracks, padding_fraction=0.08)
+            extent = self.controller.extent_for_track_records(tracks)
             if extent is not None:
-                requested_zoom = self.controller.overview_zoom_for_tracks(tracks, 14)
+                requested_zoom = self.controller.overview_zoom_for_tracks(tracks, self.controller.overview_zoom)
                 self.render_extent(extent, requested_zoom, "Reset overview to all tracks.")
                 return
         else:
             tracks = self.display_tracks()
-            extent = self.controller.extent_for_track_records(tracks, padding_fraction=0.08)
+            extent = self.controller.extent_for_track_records(tracks)
             if extent is not None:
-                self.render_extent(extent, 14, "Reset track map to the full track extent.")
+                self.render_extent(extent, self.controller.track_zoom, "Reset track map to the full track extent.")
                 if any(track is selected_track for track in tracks) and selected_point_index is not None:
                     self.move_cursor_to_track_point(selected_track, selected_point_index, self.inspector, sync_table=False)
                 return
@@ -1698,7 +1696,7 @@ class ElevationProfileView(NSView):
     def fixed_elevation_range(self, elevations):
         max_elevation = max(elevations)
         y_min = 0.0
-        needed = max_elevation + 80.0
+        needed = max_elevation + max(1.0, max_elevation * self.controller.elevation_headroom_fraction)
         for candidate in (500.0, 1000.0, 1500.0, 2000.0, 3000.0, 4000.0):
             if candidate >= needed:
                 return y_min, candidate
@@ -3102,11 +3100,13 @@ class GPXEditorController(NSObject):
         self.plot_window_refs = []
         self.auxiliary_windows = []
         self.closing_auxiliary_windows = False
+        self.project_parameters = default_parameters()
+        self._apply_parameter_attributes()
         self.tile_cache_dir = TILE_CACHE_DIR
         self.tile_cache_dir.mkdir(parents=True, exist_ok=True)
         self.cached_osm_tile_urls: set[str] | None = None
         MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self.prune_tile_cache(max_age_seconds=24 * 3600)
+        self.prune_tile_cache(max_age_seconds=self.map_cache_retention_hours * 3600.0)
         self.columns = [
             ("row", "Row\n", 56, False),
             ("nr", "Nr.\n", 56, False),
@@ -3124,9 +3124,42 @@ class GPXEditorController(NSObject):
         ]
         self._build_window()
         self.autosave_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            AUTOSAVE_SECONDS, self, "autosave:", None, True
+            self.editor_autosave_seconds, self, "autosave:", None, True
         )
         return self
+
+    def _apply_parameter_attributes(self):
+        values = self.project_parameters
+        self.editor_autosave_seconds = float(values["gpx.editor_autosave_seconds"])
+        self.map_padding_fraction = float(values["gpx.map_padding_fraction"])
+        self.overview_zoom = int(values["gpx.overview_zoom"])
+        self.track_zoom = int(values["gpx.track_zoom"])
+        self.elevation_headroom_fraction = float(values["gpx.elevation_headroom_fraction"])
+        self.maximum_map_tiles = int(values["gpx.maximum_map_tiles"])
+        self.pdf_document_dpi = int(values["pdf.document_dpi"])
+        self.pdf_map_dpi = float(values["pdf.map_dpi"])
+        self.pdf_overview_zoom = int(values["pdf.overview_zoom"])
+        self.pdf_track_zoom = int(values["pdf.track_zoom"])
+        self.pdf_maximum_map_tiles = int(values["pdf.maximum_map_tiles"])
+        self.map_provider = str(values["maps.provider"])
+        self.custom_map_url = str(values["maps.custom_url"])
+        self.custom_map_attribution = str(values["maps.custom_attribution"])
+        self.maximum_map_zoom = int(values["maps.maximum_zoom"])
+        self.map_request_timeout_seconds = float(values["maps.request_timeout_seconds"])
+        self.map_cache_retention_hours = float(values["maps.cache_retention_hours"])
+
+    def apply_project_parameters(self, settings=None):
+        """Apply project-scoped settings to an embedded editor instance."""
+        self.project_parameters = normalize_parameters(settings)
+        self._apply_parameter_attributes()
+        timer = getattr(self, "autosave_timer", None)
+        if timer is not None:
+            timer.invalidate()
+            self.autosave_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                self.editor_autosave_seconds, self, "autosave:", None, True
+            )
+        self.cached_osm_tile_urls = None
+        self.prune_tile_cache(max_age_seconds=self.map_cache_retention_hours * 3600.0)
 
     def _build_window(self):
         style = (
@@ -3600,10 +3633,10 @@ class GPXEditorController(NSObject):
         }
 
     def effective_tile_zoom(self, extent: dict, requested_zoom: int) -> tuple[int, dict]:
-        return self.effective_tile_zoom_for_limit(extent, requested_zoom, MAX_BASEMAP_TILES)
+        return self.effective_tile_zoom_for_limit(extent, requested_zoom, self.maximum_map_tiles)
 
     def effective_tile_zoom_for_limit(self, extent: dict, requested_zoom: int, max_tiles: int) -> tuple[int, dict]:
-        effective_zoom = max(0, min(19, int(requested_zoom)))
+        effective_zoom = max(0, min(self.maximum_map_zoom, int(requested_zoom)))
         diagnostics = self.tile_diagnostics(extent, effective_zoom)
         while effective_zoom > 0 and diagnostics["count"] > max_tiles:
             effective_zoom -= 1
@@ -4302,7 +4335,7 @@ class GPXEditorController(NSObject):
             [{"lat": point.lat, "lon": point.lon} for point in points],
             start_time,
             end_time,
-            self.average_speed() or 3.5,
+            self.average_speed() or self.project_parameters["gpx.fallback_walking_speed_kmh"],
         )
         for point, point_time in zip(points, repaired_times):
             get_or_create_point_time(point.element).text = format_gpx_time(point_time)
@@ -4946,7 +4979,7 @@ class GPXEditorController(NSObject):
             for page_index, start in enumerate(range(0, len(rows), rows_per_page), start=1):
                 page_rows = rows[start : start + rows_per_page]
                 table_height = (len(page_rows) + 1) * row_height_fraction
-                fig, ax = plt.subplots(figsize=page_size, dpi=PDF_EXPORT_DPI)
+                fig, ax = plt.subplots(figsize=page_size, dpi=self.pdf_document_dpi)
                 fig.patch.set_facecolor("white")
                 ax.axis("off")
                 ax.text(
@@ -5001,7 +5034,7 @@ class GPXEditorController(NSObject):
                         elif row_index % 2 == 0:
                             cell.set_facecolor("#f7f9fb")
                 fig.tight_layout(pad=0.3)
-                pdf.savefig(fig, dpi=PDF_EXPORT_DPI)
+                pdf.savefig(fig, dpi=self.pdf_document_dpi)
                 plt.close(fig)
             self.write_pdf_map_pages(pdf, page_size, orientation, pdf_options or {}, plt)
 
@@ -5024,7 +5057,7 @@ class GPXEditorController(NSObject):
             )
             if fig is not None:
                 save_start = time.perf_counter()
-                pdf.savefig(fig, dpi=PDF_EXPORT_DPI)
+                pdf.savefig(fig, dpi=self.pdf_document_dpi)
                 save_done = time.perf_counter()
                 if self.debug:
                     print(f"GPXEditor PDF benchmark: save overview page={save_done - save_start:.3f}s", flush=True)
@@ -5053,7 +5086,7 @@ class GPXEditorController(NSObject):
             )
             if fig is not None:
                 save_start = time.perf_counter()
-                pdf.savefig(fig, dpi=PDF_EXPORT_DPI)
+                pdf.savefig(fig, dpi=self.pdf_document_dpi)
                 save_done = time.perf_counter()
                 if self.debug:
                     print(
@@ -5071,7 +5104,7 @@ class GPXEditorController(NSObject):
         if hasattr(cx, "tile") and hasattr(cx.tile, "set_cache_dir"):
             cx.tile.set_cache_dir(str(self.tile_cache_dir))
         import_done = time.perf_counter()
-        fig = plt.figure(figsize=page_size, dpi=PDF_EXPORT_DPI)
+        fig = plt.figure(figsize=page_size, dpi=self.pdf_document_dpi)
         fig.patch.set_facecolor("white")
         page_w, page_h = page_size
         left_inches = 0.72 if options.get("elevation_profile") else 0.42
@@ -5104,13 +5137,15 @@ class GPXEditorController(NSObject):
         ax.set_xlim(extent["min_x"], extent["max_x"])
         ax.set_ylim(extent["min_y"], extent["max_y"])
         ax.set_aspect("equal", adjustable="box")
-        requested_zoom = 8 if mode == "overview" else 14
+        requested_zoom = self.pdf_overview_zoom if mode == "overview" else self.pdf_track_zoom
         if mode == "overview":
             requested_zoom = self.overview_zoom_for_tracks(tracks, requested_zoom)
-        tile_zoom, diagnostics = self.effective_tile_zoom_for_limit(extent, requested_zoom, PDF_MAX_BASEMAP_TILES)
+        tile_zoom, diagnostics = self.effective_tile_zoom_for_limit(
+            extent, requested_zoom, self.pdf_maximum_map_tiles
+        )
         missing_tiles = self.missing_osm_tile_count(diagnostics, tile_zoom)
-        pixel_width = int(max(map_rect[2] * page_w * PDF_MAP_PIXEL_DPI, 1.0))
-        pixel_height = int(max(map_rect[3] * page_h * PDF_MAP_PIXEL_DPI, 1.0))
+        pixel_width = int(max(map_rect[2] * page_w * self.pdf_map_dpi, 1.0))
+        pixel_height = int(max(map_rect[3] * page_h * self.pdf_map_dpi, 1.0))
         map_label = "overview" if mode == "overview" else f"track #{tracks[0].nr}"
         self.set_status(
             f"PDF export: plotting {map_label} at {pixel_width}x{pixel_height}px, "
@@ -5120,15 +5155,15 @@ class GPXEditorController(NSObject):
         try:
             if missing_tiles:
                 self.set_status(
-                    f"PDF export: connecting to OSM server for {missing_tiles} missing tile(s) "
+                    f"PDF export: connecting to map server for {missing_tiles} missing tile(s) "
                     f"for {map_label} at zoom {tile_zoom}."
                 )
             else:
                 self.set_status(f"PDF export: using cached OSM tiles for {map_label} at zoom {tile_zoom}.")
             missing_basemap_tiles = self.add_osm_basemap_with_timeout(cx, ax, tile_zoom)
         except Exception as exc:
-            self.set_status(f"PDF export: OSM map unavailable for {map_label}: {exc}")
-            ax.text(0.5, 0.5, f"OSM map unavailable\n{exc}", transform=ax.transAxes, ha="center", va="center", color="white", fontsize=10)
+            self.set_status(f"PDF export: map unavailable for {map_label}: {exc}")
+            ax.text(0.5, 0.5, f"Map unavailable\n{exc}", transform=ax.transAxes, ha="center", va="center", color="white", fontsize=10)
         map_done = time.perf_counter()
         if missing_basemap_tiles:
             self.set_status(
@@ -5220,7 +5255,12 @@ class GPXEditorController(NSObject):
         xs = [row[0] for row in rows]
         ys = [row[1] for row in rows]
         y_min = 0
-        y_max = max(500, math.ceil((max(ys) + 80) / 500.0) * 500.0)
+        y_max = max(
+            500,
+            math.ceil(
+                (max(ys) + max(1.0, max(ys) * self.elevation_headroom_fraction)) / 500.0
+            ) * 500.0,
+        )
         ax.plot(xs, ys, color="blue", linewidth=1.4)
         if mode == "overview":
             selected = {track.nr for track in self.selected_tracks()}
@@ -5956,7 +5996,7 @@ class GPXEditorController(NSObject):
         try:
             if mode == "overview":
                 timing_start = time.perf_counter()
-                effective_requested_zoom = 14 if zoom_level is None else zoom_level
+                effective_requested_zoom = self.overview_zoom if zoom_level is None else zoom_level
                 if tracks_override:
                     tracks_override = [track for track in tracks_override if not track.hidden]
                     selected_extent = self.extent_for_track_records(tracks_override)
@@ -5992,7 +6032,7 @@ class GPXEditorController(NSObject):
                 return rendered
 
             selected = self.selected_tracks() or self.tracks[:1]
-            effective_requested_zoom = 14 if zoom_level is None else zoom_level
+            effective_requested_zoom = self.track_zoom if zoom_level is None else zoom_level
             per_track = {}
             for track in selected:
                 table_number = self.tracks.index(track) + 1
@@ -6017,10 +6057,12 @@ class GPXEditorController(NSObject):
             first_info["base_extent_mercator"] = first_info.get("metadata", {}).get("extent_mercator")
             return first_info
         except RuntimeError as exc:
-            show_alert("Could not render the OSM map.", str(exc))
+            show_alert("Could not render the map.", str(exc))
             return None
 
-    def extent_for_track_records(self, tracks: list[TrackRecord], padding_fraction: float = 0.08) -> dict:
+    def extent_for_track_records(self, tracks: list[TrackRecord], padding_fraction: float | None = None) -> dict:
+        if padding_fraction is None:
+            padding_fraction = self.map_padding_fraction
         projected = [
             lonlat_to_web_mercator(point.lon, point.lat)
             for track in tracks
@@ -6041,7 +6083,9 @@ class GPXEditorController(NSObject):
             "max_y": max(ys) + padding_y,
         }
 
-    def overview_zoom_for_tracks(self, selected_tracks: list[TrackRecord], base_zoom: int = 14) -> int:
+    def overview_zoom_for_tracks(self, selected_tracks: list[TrackRecord], base_zoom: int | None = None) -> int:
+        if base_zoom is None:
+            base_zoom = self.overview_zoom
         if not selected_tracks or len(selected_tracks) == len(self.tracks):
             return base_zoom
         full_extent = self.extent_for_track_records(self.tracks)
@@ -6074,32 +6118,30 @@ class GPXEditorController(NSObject):
         }
 
     def add_osm_basemap_with_timeout(self, cx, ax, tile_zoom: int):
-        """Call contextily with a bounded HTTP timeout for OSM tile requests."""
+        """Call Contextily with the configured provider and bounded timeout."""
         try:
             import requests
         except ImportError:
             requests = None
-        tile_module = getattr(cx, "tile", None)
-        request_module = getattr(tile_module, "requests", None) if tile_module is not None else None
-        original_get = getattr(request_module, "get", None) if request_module is not None else None
-
-        def get_with_timeout(*args, **kwargs):
-            kwargs.setdefault("timeout", OSM_REQUEST_TIMEOUT_SECONDS)
-            return original_get(*args, **kwargs)
-
         try:
-            if original_get is not None:
-                request_module.get = get_with_timeout
-            with tolerate_missing_tiles(cx) as missing_tile_report:
-                cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik, zoom=tile_zoom)
+            with contextily_request_timeout(cx, self.map_request_timeout_seconds):
+                with tolerate_missing_tiles(cx) as missing_tile_report:
+                    cx.add_basemap(
+                        ax,
+                        source=contextily_provider(
+                            cx,
+                            self.map_provider,
+                            self.custom_map_url,
+                            self.custom_map_attribution,
+                            self.maximum_map_zoom,
+                        ),
+                        zoom=min(tile_zoom, self.maximum_map_zoom),
+                    )
             return missing_tile_report.count
         except Exception as exc:
             if requests is not None and isinstance(exc, (requests.Timeout, requests.ConnectionError)):
-                raise TimeoutError(f"OSM tile request timed out after {OSM_REQUEST_TIMEOUT_SECONDS:.0f}s.") from exc
+                raise TimeoutError(f"Map tile request timed out after {self.map_request_timeout_seconds:.0f}s.") from exc
             raise
-        finally:
-            if original_get is not None:
-                request_module.get = original_get
 
     def render_viewport_plot(self, mode: str, tracks: list[TrackRecord], extent: dict, tile_zoom: int) -> dict | None:
         timing_start = time.perf_counter()
@@ -6113,7 +6155,7 @@ class GPXEditorController(NSObject):
                 cx.tile.set_cache_dir(str(self.tile_cache_dir))
             import_done = time.perf_counter()
         except ImportError as exc:
-            show_alert("Could not render the OSM viewport.", f"Missing plotting dependency: {exc}")
+            show_alert("Could not render the map viewport.", f"Missing plotting dependency: {exc}")
             return None
 
         requested_tile_zoom = tile_zoom
@@ -6140,18 +6182,18 @@ class GPXEditorController(NSObject):
         try:
             if missing_tiles:
                 self.set_status(
-                    f"Connecting to OSM server for {missing_tiles} tile(s) at zoom {tile_zoom} "
+                    f"Connecting to map server for {missing_tiles} tile(s) at zoom {tile_zoom} "
                     f"(timeout {OSM_REQUEST_TIMEOUT_SECONDS:.0f}s per request)..."
                 )
             missing_basemap_tiles = self.add_osm_basemap_with_timeout(cx, ax, tile_zoom)
         except Exception as exc:
             plt.close(fig)
             message = (
-                "Could not download the OSM map. The OSM server may be unavailable, "
+                "Could not download the map. The configured map server may be unavailable, "
                 "the network connection may be offline, or the request timed out."
             )
             self.set_status(f"{message} {exc}")
-            show_alert("Could not download the OSM map.", f"{message}\n\n{exc}")
+            show_alert("Could not download the map.", f"{message}\n\n{exc}")
             return None
         basemap_done = time.perf_counter()
         cache_after = self.count_tile_cache_files()
@@ -6214,7 +6256,7 @@ class GPXEditorController(NSObject):
             "image_size_px": {"width": width_px, "height": height_px},
             "axes_box_fraction": {"left": 0.0, "bottom": 0.0, "width": 1.0, "height": 1.0},
             "extent_mercator": dict(extent),
-            "basemap": "OpenStreetMap.Mapnik",
+            "basemap": provider_display_name(self.map_provider),
             "effective_zoom": tile_zoom,
             "missing_basemap_tiles": missing_basemap_tiles,
         }
@@ -6598,8 +6640,11 @@ def show_gpx_editor(
     debug: bool = False,
     on_close=None,
     on_save=None,
+    settings=None,
 ):
     controller = GPXEditorController.alloc().initStandalone_(standalone)
+    if settings is not None:
+        controller.apply_project_parameters(settings)
     controller.debug = bool(debug)
     controller.on_close_callback = on_close
     controller.on_save_callback = on_save
@@ -6619,6 +6664,7 @@ def show_gpx_editor_from_cli_args(
     standalone: bool = False,
     on_close=None,
     on_save=None,
+    settings=None,
 ):
     """Open the editor from another Python program using CLI-style arguments.
 
@@ -6651,6 +6697,7 @@ def show_gpx_editor_from_cli_args(
         debug=debug,
         on_close=on_close,
         on_save=on_save,
+        settings=settings,
     )
 
 
@@ -6659,6 +6706,7 @@ def export_pdf_summary_from_paths(
     output_file: str | os.PathLike | None = None,
     project_name: str | None = None,
     debug: bool = False,
+    settings=None,
 ) -> Path | None:
     """Open the standard GPXEditor PDF export panel for GPX paths."""
     paths = [Path(path).expanduser().resolve() for path in gpx_paths or []]
@@ -6666,6 +6714,8 @@ def export_pdf_summary_from_paths(
         show_alert("No GPX file selected.", "Select a GPX file before exporting a PDF summary.")
         return None
     controller = GPXEditorController.alloc().initStandalone_(False)
+    if settings is not None:
+        controller.apply_project_parameters(settings)
     controller.debug = bool(debug)
     if output_file is not None:
         controller.set_output_path(Path(output_file).expanduser().resolve())

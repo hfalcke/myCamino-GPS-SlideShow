@@ -16,6 +16,10 @@ The active source files are:
 - `gpx_tracks_table.py`: GPX parsing, table summaries, track sorting, map plot
   generation, and track summary JSON generation.
 - `plot_metadata_utils.py`: shared JSON and coordinate/plot metadata helpers.
+- `adventure_parameters.py`: typed project parameter registry, defaults,
+  normalization, validation, and versioned `.adv` payload support.
+- `map_provider_utils.py`: shared Contextily provider construction and bounded
+  tile-request handling.
 - `gpxjoin.py`, `gpxlist.py`, `editGPXTrack.py`: older or supporting GPX tools.
 
 ## Runtime Model
@@ -107,6 +111,34 @@ Stored values include:
 - `time_lapse_media_min_fraction` (currently stored with a default of `0.5`;
   the legacy `time_lapse_media_max_fraction` key is accepted while loading)
 - description and other GUI state that belongs to the adventure
+- `parameters`: a versioned object containing normalized values from the
+  central registry
+
+Older adventures without `parameters` load registry defaults and mirror the
+legacy ordering, map-variant, edge-margin, and time-lapse media-size fields.
+Unknown future keys are ignored safely. Top-level compatibility fields continue
+to be written for older releases.
+
+## Adventure Parameter Editor
+
+`adventure_parameters.py` is the only source of parameter defaults. Each
+`ParameterSpec` defines its key, section, label, type, range or choices, inline
+help, unit, and whether it is advanced. `GPSTrackShowGUI.py` generates the
+native Cocoa controls from this registry and edits a draft until Apply.
+
+The registry currently propagates settings to:
+
+- `GPSTrackShow.py` through explicit CLI options for both playback modes.
+- `gpx_tracks_table.py` for filtering, sorting, rendering, provider choice,
+  timeout, dimensions, and styling.
+- embedded `GPXEditor.py` instances for autosave, map behavior, PDF rendering,
+  provider choice, cache retention, and timestamp fallback.
+- `GetGeoLocations.py` for known-place radius, timeout, and request pacing.
+
+Track-map sidecars store `adventure_render_parameters`; the track summary stores
+`adventure_processing_parameters`. Freshness checks compare these normalized
+signatures. Legacy outputs remain current only while the corresponding settings
+still equal their old defaults.
 
 When a project directory is selected, the GUI creates it if needed and tries to
 load an `.adv` file from that directory. The default GPX file is derived from
@@ -355,13 +387,42 @@ is retained as a red dot with a white outline. Backward navigation stores playli
 numbers rather than rendered `NSImage` objects. Normal mode reloads the prior
 map or medium from its source, and time-lapse mode first walks back through the
 media events of the active stage. This permits navigation beyond four items
-without restoring the former full-resolution image retention.
+without restoring the former full-resolution image retention. Arrow-key steps
+never modify `manual_mode`; `_continue_time_lapse_after_navigation()` restarts
+the 20 ms timer only when playback was already automatic and unpaused.
 
 `TimeLapseMapView` owns a retained clock `NSImageView` above its optional
 AVPlayer child. Clock content is rebuilt only when time, date, or view height
 changes, not on each 20 ms tick. `create_clock_overlay_image(...)` applies a
 50%-opaque black shadow offset down/right by one stroke width before drawing
-the white clock and date.
+the white clock and date. The clock time comes from the interpolated current
+track-point time. Once progress reaches the track endpoint,
+`time_lapse_clock_datetime(...)` advances it to the current medium's later
+capture timestamp while leaving the marker at the endpoint. The view draws the
+current medium's reverse-geocoded place in
+one line across the bottom 5% of the aspect-fit map and draws total distance,
+stage distance, and elevation as three right-aligned header lines. These text
+layers are drawn directly by the retained view and do not allocate per-frame
+overlay images.
+
+### Slide-Show Resume Protocol
+
+The GUI launches the separate player with a project-local `--state-file`.
+During orderly quit, the player atomically writes the active zero-based control-
+file row, its exact line text, mode, Time-Lapse progress, optional visible-media
+row, control-file path, and timestamp. Natural completion writes
+`completed: true`. The GUI watcher reads and removes this transient file on the
+main thread, stores or clears `slideshow_resume_position` in the `.adv` payload,
+and saves the adventure automatically.
+
+Before a later launch, the GUI validates the stored control-file path, row
+range, and line text. Its modal Yes/No buttons have `y` and `n` key equivalents.
+When accepted, it passes `--resume-index`, `--resume-progress`, and
+`--resume-media-index` as applicable. The same optional values are available to
+`config_from_options(...)` and `run_with_options(...)`. Standard playback
+reopens the exact media/map row; Time-Lapse reconstructs the containing stage,
+marker progress, and visible medium. Edited or replaced control files invalidate
+the stored position safely.
 
 `track_timing_utils.py` is the single timestamp-repair policy shared by the
 GPX editor, `gpx_tracks_table.py`, and the player. It preserves usable GPX
@@ -370,17 +431,21 @@ times, interpolates missing intervals by cumulative distance, and falls back to
 values only. GPX files are changed only by an explicit GPX Editor save.
 
 Track-map sidecars include `timed_track_points`, an ordered list of latitude,
-longitude, ISO timestamp, and estimated-time flag. Use
+longitude, ISO timestamp, estimated-time flag, elevation in metres, and
+cumulative stage distance in kilometres. Use
 `gpx_tracks_table.upgrade_timed_track_sidecars(...)` to add that payload to
 matching current sidecars without rerendering a PNG. It verifies the existing
-track fingerprint first and reports unsafe matches instead of guessing.
+track fingerprint first and reports unsafe matches instead of guessing. This is
+an explicit one-time migration or maintenance API; it is not called when the
+slide show starts. Track Maps Create and Update write the complete payload as
+part of normal map generation, while the player remains read-only and falls
+back to in-memory distance-based timing for legacy or foreign sidecars.
 
-The future Adventure settings UI should persist these global slide-show
-parameters in `.adv` files: media pause duration, stage time-lapse duration,
-time-lapse media minimum size, transition, background/marker/arrow styling, font
-and clock/place overlays, fullscreen/display swap/map-window/joined-window/
-repeat options, and collage size and maximum. The media minimum size is already
-persisted but is not editable until that settings UI is implemented.
+The Adventure settings window now persists the global slide-show parameters in
+`.adv` files: media and stage durations, time-lapse media minimum size,
+transition, background/marker/arrow styling, font and clock/place overlays,
+fullscreen/display swap/map-window/joined-window/repeat options, and collage
+size and maximum. Playback key changes remain session-only by design.
 
 ## GPXEditor Architecture
 
@@ -453,6 +518,20 @@ debug/status fields.
 Use `./build_dmg.sh` to build the distribution from the CLI. It performs syntax
 checks, builds the slide-show player, builds the standalone GPX editor app,
 builds the main GUI app, creates the DMG root, writes the DMG, and verifies it.
+
+For a complete tested release, use:
+
+```bash
+./release.sh -m "Describe the stable release"
+```
+
+`release.sh` shows the current branch and worktree, asks for confirmation, runs
+`git diff --check` and the complete unit-test suite, calls `build_dmg.sh`, then
+stages all repository changes, commits them, and pushes the current branch to
+its configured upstream. Use `--yes` for a non-interactive invocation. The DMG
+remains at `dist/myCamino-GPS-Track-Show.dmg`; `dist/` is ignored and therefore
+the binary is not pushed to GitHub. A failed test or DMG build occurs before
+Git staging and prevents the commit.
 
 Relevant specs:
 

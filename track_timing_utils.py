@@ -35,8 +35,20 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
             lat, lon = float(point["lat"]), float(point["lon"])
         except (KeyError, TypeError, ValueError):
             continue
+        try:
+            elevation_m = float(point.get("elevation_m", point.get("elevation")))
+        except (TypeError, ValueError):
+            elevation_m = None
         point_time = point.get("time")
-        result.append({"lat": lat, "lon": lon, "time": point_time if isinstance(point_time, datetime) else None, "estimated": False})
+        result.append(
+            {
+                "lat": lat,
+                "lon": lon,
+                "time": point_time if isinstance(point_time, datetime) else None,
+                "estimated": False,
+                "elevation_m": elevation_m,
+            }
+        )
     if not result:
         return result
 
@@ -55,6 +67,8 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
     distances = [0.0]
     for previous, current in zip(result, result[1:]):
         distances.append(distances[-1] + haversine_km(previous["lat"], previous["lon"], current["lat"], current["lon"]))
+    for point, cumulative_distance_km in zip(result, distances):
+        point["cumulative_distance_km"] = cumulative_distance_km
     anchors = [index for index, point in enumerate(result) if point["time"] is not None]
     if len(anchors) >= 2:
         first, last = anchors[0], anchors[-1]
@@ -96,11 +110,21 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
 
 def timed_points_payload(points: Iterable[dict], fallback_speed_kmh: float = DEFAULT_WALKING_SPEED_KMH) -> list[dict]:
     """Serialize repaired points for plot sidecars without changing GPX data."""
-    return [
-        {"lat": point["lat"], "lon": point["lon"], "time_iso": point["time"].isoformat(), "estimated": point["estimated"]}
-        for point in repair_timed_points(points, fallback_speed_kmh)
-        if point.get("time") is not None
-    ]
+    payload = []
+    for point in repair_timed_points(points, fallback_speed_kmh):
+        if point.get("time") is None:
+            continue
+        payload.append(
+            {
+                "lat": point["lat"],
+                "lon": point["lon"],
+                "time_iso": point["time"].isoformat(),
+                "estimated": point["estimated"],
+                "elevation_m": point.get("elevation_m"),
+                "cumulative_distance_km": round(float(point.get("cumulative_distance_km", 0.0)), 6),
+            }
+        )
+    return payload
 
 
 def timestamps_from_start(points: Iterable[dict], start_time: datetime, end_time: datetime | None = None, fallback_speed_kmh: float = DEFAULT_WALKING_SPEED_KMH) -> list[datetime]:

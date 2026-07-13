@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from GPSTrackShow import (
+    GPSTrackShowApp,
     advance_time_lapse_progress,
     best_media_corner_layout,
     clear_corner_rect_options,
@@ -22,6 +23,23 @@ from GPSTrackShow import (
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_arrow_navigation_resumes_only_in_previous_automatic_mode(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.manual_mode = False
+        app.paused = False
+        app.time_lapse_stage = object()
+        app.time_lapse_last_tick = None
+        ticks = []
+        app._time_lapse_tick = lambda: ticks.append("tick")
+        app._continue_time_lapse_after_navigation()
+        self.assertEqual(ticks, ["tick"])
+        self.assertFalse(app.manual_mode)
+
+        app.manual_mode = True
+        app._continue_time_lapse_after_navigation()
+        self.assertEqual(ticks, ["tick"])
+        self.assertTrue(app.manual_mode)
+
     def test_axes_metadata_excludes_header_from_map_placement(self):
         image_rect = (100.0, 50.0, 800.0, 400.0)
         metadata = {

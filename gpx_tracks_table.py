@@ -19,6 +19,11 @@ from plot_metadata_utils import (
     read_plot_metadata,
 )
 from basemap_tile_utils import tolerate_missing_tiles
+from map_provider_utils import (
+    contextily_provider,
+    contextily_request_timeout,
+    provider_display_name,
+)
 from track_timing_utils import timed_points_payload
 from track_map_layout_utils import (
     DEFAULT_GRID_LONG_AXIS,
@@ -187,7 +192,7 @@ def extract_point_accuracy(point_element):
 # AI prompt: "Write a parser that extracts valid trackpoint coordinates and
 # timestamps from a GPX <trk> element while preserving point order."
 def extract_track_points(track_element):
-    """Return ordered trackpoints as dicts with lat, lon, time, and accuracy."""
+    """Return ordered trackpoints with coordinates, time, elevation, and accuracy."""
     points = []
     for segment in track_element.findall("gpx:trkseg", GPX_NS):
         for point_element in segment.findall("gpx:trkpt", GPX_NS):
@@ -201,12 +206,18 @@ def extract_track_points(track_element):
             except ValueError:
                 continue
             point_time = parse_time(point_element.findtext("gpx:time", default="", namespaces=GPX_NS))
+            elevation_text = point_element.findtext("gpx:ele", default="", namespaces=GPX_NS)
+            try:
+                elevation_m = float(elevation_text) if elevation_text.strip() else None
+            except ValueError:
+                elevation_m = None
             accuracy_value, accuracy_field = extract_point_accuracy(point_element)
             points.append(
                 {
                     "lat": lat_value,
                     "lon": lon_value,
                     "time": point_time,
+                    "elevation_m": elevation_m,
                     "accuracy": accuracy_value,
                     "accuracy_field": accuracy_field,
                 }
@@ -941,12 +952,22 @@ def projected_track_data(tracks):
 
 # AI prompt: "Write a helper that selects the configured basemap provider from
 # contextily based on whether ESRI mode is enabled."
-def basemap_provider(contextily_module, use_esri):
+def basemap_provider(
+    contextily_module,
+    use_esri=False,
+    provider="osm",
+    custom_url="",
+    custom_attribution="",
+    maximum_zoom=19,
+):
     """Return the selected basemap provider."""
-    return (
-        contextily_module.providers.Esri.WorldStreetMap
-        if use_esri
-        else contextily_module.providers.OpenStreetMap.Mapnik
+    selected = "esri" if use_esri else provider
+    return contextily_provider(
+        contextily_module,
+        selected,
+        custom_url,
+        custom_attribution,
+        maximum_zoom,
     )
 
 
@@ -1117,6 +1138,11 @@ def render_track_plot(
     overview_mode,
     map_layout="standard",
     track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+    map_provider="osm",
+    custom_map_url="",
+    custom_map_attribution="",
+    maximum_map_zoom=19,
+    map_request_timeout_seconds=12.0,
 ):
     """Render one overview or one single-track plot."""
     try:
@@ -1196,7 +1222,11 @@ def render_track_plot(
     else:
         selected_extent = standard_extent
     min_x, max_x, min_y, max_y = selected_extent
-    effective_zoom = fitted_zoom_level(zoom_level, (min_x, max_x, min_y, max_y), plot_area_size)
+    effective_zoom = fitted_zoom_level(
+        min(int(zoom_level), int(maximum_map_zoom)),
+        (min_x, max_x, min_y, max_y),
+        plot_area_size,
+    )
     span = max(max_x - min_x, max_y - min_y)
 
     ax = fig.add_axes(axes_box)
@@ -1252,10 +1282,22 @@ def render_track_plot(
     ax.set_ylim(min_y, max_y)
     ax.set_aspect("equal", adjustable="box")
     try:
-        with tolerate_missing_tiles(cx) as missing_tile_report:
-            cx.add_basemap(ax, source=basemap_provider(cx, use_esri), zoom=effective_zoom)
+        with contextily_request_timeout(cx, map_request_timeout_seconds):
+            with tolerate_missing_tiles(cx) as missing_tile_report:
+                cx.add_basemap(
+                    ax,
+                    source=basemap_provider(
+                        cx,
+                        use_esri,
+                        map_provider,
+                        custom_map_url,
+                        custom_map_attribution,
+                        maximum_map_zoom,
+                    ),
+                    zoom=effective_zoom,
+                )
     except Exception as exc:
-        provider_name = "ESRI" if use_esri else "OSM"
+        provider_name = provider_display_name("esri" if use_esri else map_provider)
         raise RuntimeError(
             f"Could not download the {provider_name} basemap. "
             "Please check the internet connection or try again later; the map server may have timed out."
@@ -1295,7 +1337,7 @@ def render_track_plot(
             "min_y": min_y,
             "max_y": max_y,
         },
-        "basemap": "Esri.WorldStreetMap" if use_esri else "OpenStreetMap.Mapnik",
+        "basemap": provider_display_name("esri" if use_esri else map_provider),
         "effective_zoom": effective_zoom,
         "missing_basemap_tiles": missing_tile_report.count,
     }
@@ -1384,6 +1426,16 @@ def build_argument_parser():
         action="store_true",
         help="Use ESRI World Street basemap for plotting instead of the default OpenStreetMap style.",
     )
+    parser.add_argument(
+        "--map-provider",
+        choices=("osm", "esri", "custom"),
+        default="osm",
+        help="Basemap provider for plots (default: osm). --esri remains a compatibility alias.",
+    )
+    parser.add_argument("--custom-map-url", default="", help="Custom tile URL containing {z}, {x}, and {y}.")
+    parser.add_argument("--custom-map-attribution", default="", help="Attribution for a custom tile provider.")
+    parser.add_argument("--maximum-map-zoom", type=int, default=19, help="Maximum zoom supported by the provider.")
+    parser.add_argument("--map-request-timeout-seconds", type=float, default=12.0, help="Timeout for one tile request.")
     parser.add_argument(
         "--Zoom",
         "--zoom",
@@ -1476,7 +1528,7 @@ def build_argument_parser():
     )
     parser.add_argument(
         "--gpx-threshold-distance",
-        type=parse_positive_float,
+        type=parse_non_negative_float,
         default=10.0,
         help="Minimum spacing in meters between kept GPX points after filtering (default: 10).",
     )
@@ -1485,6 +1537,12 @@ def build_argument_parser():
         type=parse_positive_float,
         default=10.0,
         help="Maximum allowed point accuracy in meters when present (default: 10).",
+    )
+    parser.add_argument(
+        "--fallback-walking-speed-kmh",
+        type=parse_positive_float,
+        default=3.5,
+        help="Fallback speed for repairing missing point timestamps (default: 3.5 km/h).",
     )
     parser.add_argument(
         "--map-layout",
@@ -1510,6 +1568,24 @@ def normalize_runtime_args(args):
 
     if args.zoom < 0:
         raise ValueError("Zoom level must be a non-negative integer.")
+    if float(args.gpx_threshold_distance) < 0:
+        raise ValueError("gpx_threshold_distance must be non-negative.")
+    if float(args.gpx_threshold_accuracy) <= 0:
+        raise ValueError("gpx_threshold_accuracy must be positive.")
+    if float(getattr(args, "fallback_walking_speed_kmh", 3.5)) <= 0:
+        raise ValueError("fallback_walking_speed_kmh must be positive.")
+    if getattr(args, "maximum_map_zoom", 19) < 0:
+        raise ValueError("maximum_map_zoom must be non-negative.")
+    if getattr(args, "map_request_timeout_seconds", 12.0) <= 0:
+        raise ValueError("map_request_timeout_seconds must be positive.")
+    if getattr(args, "map_provider", "osm") == "custom":
+        custom_url = str(getattr(args, "custom_map_url", ""))
+        if not custom_url.startswith(("http://", "https://")) or not all(
+            token in custom_url for token in ("{z}", "{x}", "{y}")
+        ):
+            raise ValueError("custom_map_url must use HTTP(S) and contain {z}, {x}, and {y}.")
+        if not str(getattr(args, "custom_map_attribution", "")).strip():
+            raise ValueError("custom_map_attribution is required for a custom provider.")
     if getattr(args, "map_layout", "standard") not in {"standard", "time-lapse"}:
         raise ValueError("map_layout must be 'standard' or 'time-lapse'.")
     margin = float(getattr(args, "track_edge_margin_fraction", DEFAULT_TRACK_EDGE_MARGIN_FRACTION))
@@ -1707,7 +1783,11 @@ def execute_run_context(context, print_table_output=True):
         if args.verbose:
             print(f"PDF gespeichert: {context['pdf_output_path']}")
     if not args.nojson:
-        write_table_data(build_table_summary_data(gpx_path, tracks), context["table_json_path"])
+        table_summary = build_table_summary_data(gpx_path, tracks)
+        processing_parameters = getattr(args, "adventure_processing_parameters", None)
+        if isinstance(processing_parameters, dict):
+            table_summary["adventure_processing_parameters"] = processing_parameters
+        write_table_data(table_summary, context["table_json_path"])
         if args.verbose:
             print(f"Tabellen-JSON gespeichert: {context['table_json_path']}")
 
@@ -1732,7 +1812,17 @@ def execute_run_context(context, print_table_output=True):
             args.print_labels,
             args.header,
             True,
+            map_provider=args.map_provider,
+            custom_map_url=args.custom_map_url,
+            custom_map_attribution=args.custom_map_attribution,
+            maximum_map_zoom=args.maximum_map_zoom,
+            map_request_timeout_seconds=args.map_request_timeout_seconds,
         )
+        render_parameters = getattr(args, "adventure_overview_render_parameters", None)
+        if not isinstance(render_parameters, dict):
+            render_parameters = getattr(args, "adventure_render_parameters", None)
+        if isinstance(render_parameters, dict):
+            overview_metadata["adventure_render_parameters"] = render_parameters
         overview_metadata.update(
             {
                 "source_gpx": os.path.abspath(gpx_path),
@@ -1816,7 +1906,15 @@ def execute_run_context(context, print_table_output=True):
                 False,
                 args.map_layout,
                 args.track_edge_margin_fraction,
+                args.map_provider,
+                args.custom_map_url,
+                args.custom_map_attribution,
+                args.maximum_map_zoom,
+                args.map_request_timeout_seconds,
             )
+            render_parameters = getattr(args, "adventure_render_parameters", None)
+            if isinstance(render_parameters, dict):
+                plot_metadata["adventure_render_parameters"] = render_parameters
             media_clear_options = plot_metadata.pop("media_clear_box_options", None)
             plot_metadata.update(
                 {
@@ -1846,7 +1944,10 @@ def execute_run_context(context, print_table_output=True):
                         track["last_point"][1] if track["last_point"] is not None else None,
                     ),
                     "track_points": [(point[0], point[1]) for point in track["points"]],
-                    "timed_track_points": timed_points_payload(track.get("point_records", [])),
+                    "timed_track_points": timed_points_payload(
+                        track.get("point_records", []),
+                        args.fallback_walking_speed_kmh,
+                    ),
                 }
             )
             if media_clear_options is not None:
@@ -1902,6 +2003,11 @@ def namespace_from_options(gpx_file, **overrides):
         print_labels=[["LENGTH"], ["TRACKNAME"], ["DATE"]],
         header="",
         esri=False,
+        map_provider="osm",
+        custom_map_url="",
+        custom_map_attribution="",
+        maximum_map_zoom=19,
+        map_request_timeout_seconds=12.0,
         zoom=8,
         size=DEFAULT_IMAGE_SIZE,
         fontsize=1.0,
@@ -1919,9 +2025,13 @@ def namespace_from_options(gpx_file, **overrides):
         verbose=False,
         gpx_threshold_distance=10.0,
         gpx_threshold_accuracy=10.0,
+        fallback_walking_speed_kmh=3.5,
         map_layout="standard",
         track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
         create_output_dir=True,
+        adventure_render_parameters=None,
+        adventure_overview_render_parameters=None,
+        adventure_processing_parameters=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1940,8 +2050,38 @@ def run_with_options(gpx_file, print_table_output=True, **overrides):
     return execute_run_context(context, print_table_output=print_table_output)
 
 
+def _legacy_sidecar_matches_track(metadata, track):
+    """Return True only when legacy identity fields unambiguously match a track."""
+    try:
+        if int(metadata.get("track_number")) != int(track["table_number"]):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    if metadata.get("track_name") != track.get("name"):
+        return False
+    if metadata.get("track_start_time") != format_datetime_local_seconds(track.get("start_time")):
+        return False
+
+    for metadata_key, track_key in (("start_point", "first_point"), ("end_point", "last_point")):
+        stored_point = metadata.get(metadata_key)
+        current_point = track.get(track_key)
+        if not isinstance(stored_point, dict) or current_point is None:
+            return False
+        try:
+            stored_lat = float(stored_point["lat"])
+            stored_lon = float(stored_point["lon"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if abs(stored_lat - float(current_point[0])) > 1e-7:
+            return False
+        if abs(stored_lon - float(current_point[1])) > 1e-7:
+            return False
+    return True
+
+
 def upgrade_timed_track_sidecars(gpx_file, output_dir, **overrides):
     """Add timing payloads to existing sidecars matched by track fingerprint."""
+    fallback_walking_speed_kmh = float(overrides.get("fallback_walking_speed_kmh", 3.5))
     context = prepare_with_options(gpx_file, output_dir=str(output_dir), **overrides)
     tracks_by_fingerprint = {
         track.get("track_fingerprint"): track
@@ -1958,17 +2098,35 @@ def upgrade_timed_track_sidecars(gpx_file, output_dir, **overrides):
             report["skipped"].append((metadata_path.name, f"unreadable metadata: {exc}"))
             continue
         fingerprint = metadata.get("track_fingerprint")
-        if not fingerprint:
-            continue
-        track = tracks_by_fingerprint.get(fingerprint)
-        if track is None:
-            report["skipped"].append((metadata_path.name, "GPX track no longer matches plot metadata"))
-            continue
+        if fingerprint:
+            track = tracks_by_fingerprint.get(fingerprint)
+            if track is None:
+                report["skipped"].append((metadata_path.name, "GPX track no longer matches plot metadata"))
+                continue
+        else:
+            legacy_matches = [
+                candidate
+                for candidate in context["tracks"]
+                if _legacy_sidecar_matches_track(metadata, candidate)
+            ]
+            if not legacy_matches:
+                if metadata.get("track_number") is not None:
+                    report["skipped"].append((metadata_path.name, "legacy track identity does not match current GPX"))
+                continue
+            if len(legacy_matches) != 1:
+                report["skipped"].append((metadata_path.name, "legacy track identity is ambiguous"))
+                continue
+            track = legacy_matches[0]
+            fingerprint = track.get("track_fingerprint")
         matched_fingerprints.add(fingerprint)
-        payload = timed_points_payload(track.get("point_records", []))
-        if metadata.get("timed_track_points") == payload:
+        payload = timed_points_payload(
+            track.get("point_records", []),
+            fallback_walking_speed_kmh,
+        )
+        if metadata.get("timed_track_points") == payload and metadata.get("track_fingerprint") == fingerprint:
             report["current"].append(track["table_number"])
             continue
+        metadata["track_fingerprint"] = fingerprint
         metadata["timed_track_points"] = payload
         write_plot_metadata(metadata, metadata_path)
         report["updated"].append(track["table_number"])

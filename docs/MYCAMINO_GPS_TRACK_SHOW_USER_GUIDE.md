@@ -56,11 +56,38 @@ Files created:
   `.adv` extension.
 
 The `.adv` file stores the project name, project directory, selected GPX file,
-last picture import directory, preferred time-lapse media minimum size, selected
-track-map variant, track edge margin, and
-other saved GUI settings. When you load an adventure, the GUI restores these
-fields. The media minimum defaults to half the slide-show window and will become editable in
-the planned global slide-show settings.
+last picture import directory, the project settings described below, and the
+last stopped slide-show position. Loading an adventure restores them together.
+
+### Adventure Settings
+
+Press the gear immediately left of the myCamino logo to open **Adventure
+Settings**. Choose a section in the left sidebar. The right side shows each
+setting together with a short explanation.
+
+- Common settings are visible initially. Enable **Show Advanced Settings** for
+  technical GPX, PDF, request, cache, and custom map-server controls.
+- The reset arrow beside one row restores only that setting. **Reset All**
+  restores all parameter defaults without changing project files or names.
+- **Apply** validates and applies the draft to this adventure. Save the
+  adventure afterward to retain it. **Cancel** discards the draft.
+- Invalid entries are explained at the bottom and disable Apply.
+
+Settings cover Standard and Time-Lapse playback, Track Map appearance and
+ordering, GPX processing, PDF output resolution, place-name lookup, and map
+providers. OpenStreetMap and Esri are presets. A custom provider requires an
+HTTP(S) tile address containing `{z}`, `{x}`, and `{y}`, plus attribution.
+Selecting Custom reveals both required fields immediately. Numerical settings
+can be typed or adjusted with the adjacent up/down stepper.
+
+The Locations radius groups nearby GPS positions under an already determined
+place name. A larger radius reduces the number of lookups and can speed up
+**Add Place Names**, while a smaller radius gives more locally specific names.
+
+Changing a map-rendering or GPX-filtering setting marks affected Track Maps or
+the track summary as needing Update. Slide-show and place-name settings do not
+force map recreation. Keyboard changes made while a slide show is running are
+temporary and do not overwrite the saved project settings.
 
 Bottom buttons:
 
@@ -320,10 +347,14 @@ The Start Slide Show section contains:
   remains below the map header and keeps a 5% margin inside the actual map
   area. The moving arrow keeps one fixed orientation, perpendicular to the line
   from the stage start to its end. While media is visible, a red dot with a
-  white edge marks the route position where it first appeared. When the clock
-  option is enabled, the active medium's analog clock and date appear in the
-  upper-left corner over the stage map. A half-transparent black shadow keeps
-  them readable over bright map areas; `c` toggles the clock in both modes.
+  white edge marks the route position where it first appeared. Its reverse-
+  geocoded place appears as one shadowed line in the free 5% strip at the
+  bottom of the map. When the clock option is enabled, the analog clock in the
+  upper-left follows the moving GPX marker time throughout the stage rather
+  than showing a fixed media time. The upper-right map header shows total
+  travelled distance, distance within the current stage, and current height.
+  Half-transparent black shadows keep all overlay text readable; `c` and `p`
+  toggle the clock and place name respectively.
 - PDF Summary: opens the same PDF export panel used by `myCamino GPX Editor`.
   It exports the current GPX track table and can optionally include overview,
   track maps, elevation profiles, and page orientation choices.
@@ -338,12 +369,20 @@ The GUI passes these values to the slide-show player:
 The slide show reads the control file, media files, map images, and sidecar
 metadata.
 
+When a slide show is stopped before reaching its end, the player returns its
+current control-file row and, for Time-Lapse, its stage progress and visible
+medium. The main GUI stores this position automatically in the adventure file.
+At the next Start or Start Time-Lapse, a **Resume Slide Show?** dialog appears.
+Press `y` to continue there or `n` to start at the beginning. A show that runs
+normally to its end clears the saved resume position.
+
 Common slide-show keys:
 
 - Space: pause or resume automatic playback.
 - `m`: switch between automatic and manual stepping.
 - Right or Down: advance to the next item; in manual time-lapse mode, advance
-  to the next scheduled media pause or the end of the stage.
+  to the next scheduled media pause or the end of the stage. Arrow-key
+  navigation retains the current automatic or manual playback mode.
 - Left or Up: previous item. In Time-Lapse this first walks backward through
   media in the current stage, then to the previous stage. Previous items are
   reloaded from the control list instead of being retained as large images.
@@ -367,12 +406,19 @@ the main GUI.
 The time-lapse uses the recorded GPX point times where available. Missing times
 are estimated along the travelled distance; when a track has no usable duration,
 it uses a walking speed of 3.5 km/h. Creating or playing a time-lapse does not
-change the GPX file.
+change the GPX file or its map information. Track maps created or updated with
+the current version include cumulative distance, elevation, and timing data.
+Older projects can be migrated once without recreating their map PNG files. If
+that information is unavailable, the player uses its safe distance-based
+fallback instead of changing project files while it starts.
 
 The position marker normally continues moving while a photo or video is shown.
 If it reaches the scheduled position of another medium before the current one
 has received its full display time, the marker waits at that position. The next
-medium then starts there after the previous one has finished.
+medium then starts there after the previous one has finished. If the marker has
+already reached the final track time but later-dated media remain in the stage,
+the marker stays at the endpoint while the analog clock advances to the capture
+time and date of each displayed medium.
 
 ## Standalone GPX Editor App
 

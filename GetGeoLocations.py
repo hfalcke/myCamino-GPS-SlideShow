@@ -167,6 +167,9 @@ class Params:
     photolist: Path
     tracks: Optional[Path]
     distance: float
+    geocode_timeout_seconds: float
+    geocode_pacing_min_seconds: float
+    geocode_pacing_max_seconds: float
     file_filter: str
     getclearnames: bool
     redo_reverse_geolocation: bool
@@ -273,6 +276,9 @@ def collect_input_parameters(argv: list[str]) -> Params:
         default=150.0,
         help="Reuse a known successful place within this distance in meters (default: 150).",
     )
+    parser.add_argument("--geocode-timeout-seconds", type=float, default=10.0, help="Timeout for one reverse-geocoding request.")
+    parser.add_argument("--geocode-pacing-min-seconds", type=float, default=1.0, help="Minimum delay between reverse-geocoding requests.")
+    parser.add_argument("--geocode-pacing-max-seconds", type=float, default=5.0, help="Maximum delay between reverse-geocoding requests.")
     parser.add_argument(
         "--file-filter",
         dest="file_filter",
@@ -375,12 +381,19 @@ def collect_input_parameters(argv: list[str]) -> Params:
             parser.error(f"merge media file is not a file: {media_path}")
     if args.distance < 0:
         parser.error(f"distance must be non-negative: {args.distance}")
+    if args.geocode_timeout_seconds <= 0:
+        parser.error("geocode timeout must be positive")
+    if args.geocode_pacing_min_seconds < 0 or args.geocode_pacing_max_seconds < args.geocode_pacing_min_seconds:
+        parser.error("geocode pacing must satisfy 0 <= minimum <= maximum")
     return Params(
         photodir=photodir,
         gps_dir=photodir,
         photolist=photolist,
         tracks=tracks,
         distance=float(args.distance),
+        geocode_timeout_seconds=float(args.geocode_timeout_seconds),
+        geocode_pacing_min_seconds=float(args.geocode_pacing_min_seconds),
+        geocode_pacing_max_seconds=float(args.geocode_pacing_max_seconds),
         file_filter=args.file_filter,
         getclearnames=bool(args.getclearnames),
         redo_reverse_geolocation=bool(args.redo_reverse_geolocation),
@@ -402,6 +415,9 @@ def params_from_options(
     photolist: Path | str | None = None,
     tracks: Path | str | None = None,
     distance: float = 150.0,
+    geocode_timeout_seconds: float = 10.0,
+    geocode_pacing_min_seconds: float = 1.0,
+    geocode_pacing_max_seconds: float = 5.0,
     file_filter: str = "ALL",
     getclearnames: bool = False,
     redo_reverse_geolocation: bool = False,
@@ -478,6 +494,10 @@ def params_from_options(
         raise ValueError(f"file_filter must be one of {sorted(FILE_FILTERS)}: {normalized_filter}")
     if float(distance) < 0:
         raise ValueError(f"distance must be non-negative: {distance}")
+    if float(geocode_timeout_seconds) <= 0:
+        raise ValueError("geocode_timeout_seconds must be positive")
+    if float(geocode_pacing_min_seconds) < 0 or float(geocode_pacing_max_seconds) < float(geocode_pacing_min_seconds):
+        raise ValueError("geocode pacing must satisfy 0 <= minimum <= maximum")
 
     return Params(
         photodir=photo_dir_path,
@@ -485,6 +505,9 @@ def params_from_options(
         photolist=photo_list_path,
         tracks=tracks_path,
         distance=float(distance),
+        geocode_timeout_seconds=float(geocode_timeout_seconds),
+        geocode_pacing_min_seconds=float(geocode_pacing_min_seconds),
+        geocode_pacing_max_seconds=float(geocode_pacing_max_seconds),
         file_filter=normalized_filter,
         getclearnames=bool(getclearnames),
         redo_reverse_geolocation=bool(redo_reverse_geolocation),
@@ -1125,9 +1148,9 @@ def reverse_geocode_location_name(latitude: float, longitude: float, timeout_sec
     return place
 
 
-def sleep_between_geocode_requests() -> None:
+def sleep_between_geocode_requests(minimum_seconds=GEOCODE_PACING_MIN_SECONDS, maximum_seconds=GEOCODE_PACING_MAX_SECONDS) -> None:
     """Wait a randomized interval between geocode requests."""
-    sleep_with_cancel(random.uniform(GEOCODE_PACING_MIN_SECONDS, GEOCODE_PACING_MAX_SECONDS))
+    sleep_with_cancel(random.uniform(float(minimum_seconds), float(maximum_seconds)))
 
 
 def format_german_date(value: datetime) -> str:
@@ -1579,6 +1602,9 @@ def build_record_from_photo(
     known_places: list[KnownPlace],
     place_distance_m: float,
     debug: bool,
+    geocode_timeout_seconds: float = 10.0,
+    geocode_pacing_min_seconds: float = GEOCODE_PACING_MIN_SECONDS,
+    geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
 ) -> PhotoRecord:
     """Extract metadata from a photo and create a normalized record."""
     check_cancelled()
@@ -1637,12 +1663,16 @@ def build_record_from_photo(
                     }
             else:
                 if debug:
-                    place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(latitude, longitude)
+                    place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(
+                        latitude, longitude, timeout_seconds=geocode_timeout_seconds
+                    )
                     geocode_cache[cache_key] = (place, place_details)
                     debug_info["geocode"] = {"cache_key": cache_key, "requested": True, **geocode_debug}
                 else:
-                    geocode_cache[cache_key] = reverse_geocode_location_details(latitude, longitude)
-                sleep_between_geocode_requests()
+                    geocode_cache[cache_key] = reverse_geocode_location_details(
+                        latitude, longitude, timeout_seconds=geocode_timeout_seconds
+                    )
+                sleep_between_geocode_requests(geocode_pacing_min_seconds, geocode_pacing_max_seconds)
         elif debug:
             debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key][0]}
         place, place_details = geocode_cache[cache_key]
@@ -1672,6 +1702,9 @@ def resolve_place_for_record(
     known_places: list[KnownPlace],
     place_distance_m: float,
     debug: bool,
+    geocode_timeout_seconds: float = 10.0,
+    geocode_pacing_min_seconds: float = GEOCODE_PACING_MIN_SECONDS,
+    geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
 ) -> PhotoRecord:
     """Resolve a missing place for an existing record without changing other metadata."""
     check_cancelled()
@@ -1704,12 +1737,16 @@ def resolve_place_for_record(
                 }
         else:
             if debug:
-                place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(record.latitude, record.longitude)
+                place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(
+                    record.latitude, record.longitude, timeout_seconds=geocode_timeout_seconds
+                )
                 geocode_cache[cache_key] = (place, place_details)
                 debug_info["geocode"] = {"cache_key": cache_key, "requested": True, **geocode_debug}
             else:
-                geocode_cache[cache_key] = reverse_geocode_location_details(record.latitude, record.longitude)
-            sleep_between_geocode_requests()
+                geocode_cache[cache_key] = reverse_geocode_location_details(
+                    record.latitude, record.longitude, timeout_seconds=geocode_timeout_seconds
+                )
+            sleep_between_geocode_requests(geocode_pacing_min_seconds, geocode_pacing_max_seconds)
     elif debug:
         debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key][0]}
 
@@ -2246,6 +2283,9 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
                     known_places,
                     params.distance,
                     params.debug,
+                    params.geocode_timeout_seconds,
+                    params.geocode_pacing_min_seconds,
+                    params.geocode_pacing_max_seconds,
                 )
                 if (params.redo_reverse_geolocation or params.overwrite_reverse_geolocation) and is_resolved_place_name(record.place):
                     record.place_updated = True
@@ -2261,6 +2301,9 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
                     known_places,
                     params.distance,
                     params.debug,
+                    params.geocode_timeout_seconds,
+                    params.geocode_pacing_min_seconds,
+                    params.geocode_pacing_max_seconds,
                 )
                 if record.place_updated:
                     write_record_json(record, protected_json_paths)
@@ -2271,6 +2314,9 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
                     known_places,
                     params.distance,
                     params.debug,
+                    params.geocode_timeout_seconds,
+                    params.geocode_pacing_min_seconds,
+                    params.geocode_pacing_max_seconds,
                 )
                 if record.place_updated:
                     write_record_json(record, protected_json_paths)
