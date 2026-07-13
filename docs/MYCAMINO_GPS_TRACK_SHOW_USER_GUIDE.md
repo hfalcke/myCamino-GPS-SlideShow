@@ -46,7 +46,8 @@ Controls:
 
 - Project directory field: type or choose the adventure folder.
 - Folder icon: opens a directory chooser. A missing selected directory is
-  created.
+  created after confirmation. If the folder has no Adventure file, the program
+  asks whether a new Adventure should be created there.
 - Title: adventure name used for default file names.
 - Description: optional two-line description.
 
@@ -58,6 +59,8 @@ Files created:
 The `.adv` file stores the project name, project directory, selected GPX file,
 last picture import directory, the project settings described below, and the
 last stopped slide-show position. Loading an adventure restores them together.
+After creation or loading, every relevant change is saved automatically. The
+filename remains unchanged when the displayed project title is edited.
 
 ### Adventure Settings
 
@@ -69,8 +72,8 @@ setting together with a short explanation.
   technical GPX, PDF, request, cache, and custom map-server controls.
 - The reset arrow beside one row restores only that setting. **Reset All**
   restores all parameter defaults without changing project files or names.
-- **Apply** validates and applies the draft to this adventure. Save the
-  adventure afterward to retain it. **Cancel** discards the draft.
+- **Apply** validates, applies, and auto-saves the draft to this adventure.
+  **Cancel** discards the draft.
 - Invalid entries are explained at the bottom and disable Apply.
 
 Settings cover Standard and Time-Lapse playback, Track Map appearance and
@@ -79,6 +82,14 @@ providers. OpenStreetMap and Esri are presets. A custom provider requires an
 HTTP(S) tile address containing `{z}`, `{x}`, and `{y}`, plus attribution.
 Selecting Custom reveals both required fields immediately. Numerical settings
 can be typed or adjusted with the adjacent up/down stepper.
+
+The Time-Lapse **Moving marker** setting chooses between the animated walking
+pilgrim and the traditional arrow. The pilgrim is the default. It uses a
+standing pose while the GPS marker remains within the screen-scaled motion
+tolerance, then resumes its walking cycle from frame 3. At the start of each
+stage it adopts the fixed arrow angle and is mirrored when necessary so that it
+faces from the stage start toward its end. This setting affects only the stage
+map; the overview map continues to show the traditional arrow.
 
 The Locations radius groups nearby GPS positions under an already determined
 place name. A larger radius reduces the number of lookups and can speed up
@@ -91,10 +102,10 @@ temporary and do not overwrite the saved project settings.
 
 Bottom buttons:
 
-- Save: save the `.adv` file.
 - Load: load an existing `.adv` file.
-- Save & Exit: save and quit.
-- Quit: quit, asking whether to save if needed.
+- Help: show the workflow and files used by the program.
+- Quit: flush any pending auto-save and quit. If writing fails, the program
+  offers Retry, Quit Without Saving, or Cancel.
 
 ## GPX Files Section
 
@@ -424,7 +435,10 @@ time and date of each displayed medium.
 
 The DMG also contains `myCamino GPX Editor.app`. This is the same GPX editor
 that opens from Add & Edit Tracks, but it can also be launched directly for GPX
-work that is not part of a slide-show project.
+work that is not part of a slide-show project. Its gear button edits GPX
+processing, PDF export, and map-service settings. Standalone settings are kept
+for future sessions; when opened from an Adventure, they are auto-saved in that
+Adventure instead.
 
 ## What Files Are in a Finished Project Directory
 

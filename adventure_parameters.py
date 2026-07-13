@@ -53,6 +53,7 @@ PARAMETER_SPECS = (
 
     ParameterSpec("timelapse.stage_duration_seconds", "Time-Lapse", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s"),
     ParameterSpec("timelapse.media_min_fraction", "Time-Lapse", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%"),
+    ParameterSpec("timelapse.marker_style", "Time-Lapse", "Moving marker", "pilgrim", "choice", "Show a walking pilgrim or the traditional arrow at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("arrow", "Arrow"))),
 
     ParameterSpec("trackmaps.ordering", "Track Maps", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
     ParameterSpec("trackmaps.variant", "Track Maps", "Map variant", "time_lapse", "choice", "Variant preferred by Create, Update, and View.", choices=_choice(("standard", "Standard"), ("time_lapse", "Time-Lapse"))),
@@ -101,6 +102,10 @@ PARAMETER_SPECS = (
 
 SPECS_BY_KEY = {spec.key: spec for spec in PARAMETER_SPECS}
 SECTION_ORDER = tuple(dict.fromkeys(spec.section for spec in PARAMETER_SPECS))
+EDITOR_PARAMETER_SECTIONS = ("GPX Processing", "PDF Export", "Map Service")
+EDITOR_PARAMETER_KEYS = tuple(
+    spec.key for spec in PARAMETER_SPECS if spec.section in EDITOR_PARAMETER_SECTIONS
+)
 COLOR_NAMES = {"black", "white", "red", "blue", "green", "yellow", "gray", "grey", "orange", "cyan", "magenta"}
 
 

@@ -8,16 +8,22 @@ from tempfile import TemporaryDirectory
 
 from GPSTrackShow import (
     GPSTrackShowApp,
+    PilgrimWalkState,
     advance_time_lapse_progress,
     best_media_corner_layout,
     clear_corner_rect_options,
     config_from_options,
     derive_clock_date_text,
     endpoint_tangent,
+    fixed_arrow_normal,
     inset_rect,
     largest_clear_corner_rects,
     map_plot_rect,
+    normalize_transition,
     previous_displayable_playlist_index,
+    pilgrim_orientation_for_tangent,
+    pilgrim_motion_threshold,
+    time_lapse_marker_style,
     time_lapse_media_minimum_pending,
 )
 
@@ -142,6 +148,19 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         tangent = endpoint_tangent([(10.0, 20.0), (50.0, 60.0), (110.0, 20.0)])
         self.assertEqual(tangent, (1.0, 0.0))
 
+    def test_pilgrim_uses_arrow_orientation_and_faces_track_direction(self):
+        self.assertEqual(fixed_arrow_normal((1.0, 0.0)), (0.0, -1.0))
+        self.assertEqual(pilgrim_orientation_for_tangent((1.0, 0.0)), (0.0, False))
+        self.assertEqual(pilgrim_orientation_for_tangent((-1.0, 0.0)), (0.0, True))
+        rotation, mirrored = pilgrim_orientation_for_tangent((0.0, 1.0))
+        self.assertAlmostEqual(rotation, 90.0)
+        self.assertTrue(mirrored)
+
+    def test_overview_always_uses_arrow_marker(self):
+        self.assertEqual(time_lapse_marker_style("pilgrim", overview=False), "pilgrim")
+        self.assertEqual(time_lapse_marker_style("pilgrim", overview=True), "arrow")
+        self.assertEqual(time_lapse_marker_style("arrow", overview=True), "arrow")
+
     def test_default_and_validation_for_media_fraction(self):
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
@@ -150,12 +169,54 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             config = config_from_options(project_dir, inputlist=control_file)
             self.assertEqual(config.time_lapse_media_min_fraction, 0.5)
             self.assertEqual(config.time_lapse_media_max_fraction, 0.5)
+            self.assertEqual(config.time_lapse_marker, "pilgrim")
+            self.assertEqual(
+                config_from_options(project_dir, inputlist=control_file, transition="blend").transition.value,
+                "BLEND",
+            )
+            self.assertEqual(normalize_transition(" blend "), "BLEND")
+            arrow_config = config_from_options(
+                project_dir,
+                inputlist=control_file,
+                time_lapse_marker="arrow",
+            )
+            self.assertEqual(arrow_config.time_lapse_marker, "arrow")
             with self.assertRaises(ValueError):
                 config_from_options(
                     project_dir,
                     inputlist=control_file,
                     time_lapse_media_min_fraction=1.1,
                 )
+            with self.assertRaises(ValueError):
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    time_lapse_marker="unknown",
+                )
+
+    def test_pilgrim_stands_and_resumes_with_frame_three(self):
+        state = PilgrimWalkState()
+        self.assertEqual(state.update((100.0, 100.0), 0.0, 2.0), 0)
+        self.assertEqual(state.update((103.0, 100.0), 0.02, 2.0), 3)
+        self.assertEqual(state.update((107.0, 100.0), 0.12, 2.0), 4)
+        self.assertEqual(state.update((107.0, 100.0), 0.23, 2.0), 0)
+        self.assertEqual(state.update((110.0, 100.0), 0.24, 2.0), 3)
+
+    def test_pilgrim_walk_cycle_wraps_from_frame_eight_to_one(self):
+        state = PilgrimWalkState()
+        state.update((0.0, 0.0), 0.0, 1.0)
+        self.assertEqual(state.update((2.0, 0.0), 0.01, 1.0), 3)
+        self.assertEqual(state.update((4.0, 0.0), 0.51, 1.0), 8)
+        self.assertEqual(state.update((6.0, 0.0), 0.61, 1.0), 1)
+
+    def test_pilgrim_motion_tolerance_scales_with_resolution(self):
+        small = pilgrim_motion_threshold(640.0, 480.0)
+        large = pilgrim_motion_threshold(3840.0, 2160.0)
+        self.assertGreaterEqual(small, 1.0)
+        self.assertGreater(large, small)
+        state = PilgrimWalkState()
+        state.update((10.0, 10.0), 0.0, large)
+        self.assertEqual(state.update((10.0 + large / 2.0, 10.0), 0.11, large), 0)
 
     def test_time_lapse_clock_accepts_plain_date_context(self):
         self.assertEqual(derive_clock_date_text({}, "23.05.2020"), "23.05.2020")

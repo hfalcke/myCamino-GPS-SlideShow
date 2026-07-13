@@ -13,7 +13,7 @@ design decisions and verification scope.
 
 Add a standard macOS `gearshape` button immediately left of the myCamino logo. It opens a resizable parameter window with a section sidebar, scrollable forms, an optional **Show Advanced Settings** switch, and inline help.
 
-Parameter changes are edited as a draft. **Apply** validates them, updates the current project, and marks the adventure as modified; the existing Save actions write them to the `.adv` file. **Cancel** discards the draft. Every row gets a reset-arrow button, while **Reset All** restores only parameter defaults, never project names or files.
+Parameter changes are edited as a draft. **Apply** validates them, updates the current project, and triggers Adventure auto-save. **Cancel** discards the draft. Every row gets a reset-arrow button, while **Reset All** restores only parameter defaults, never project names or files.
 
 ## Editable Parameters
 
@@ -35,7 +35,7 @@ Internal safety and implementation values remain hidden: memory-watchdog limits,
 - Store normalized values under a versioned `parameters` object in `.adv`. Continue reading and mirroring existing top-level Time-Lapse/map fields for compatibility. Missing, malformed, and future unknown fields are handled safely.
 - Build controls from the registry: checkboxes, numeric/text fields, popups, color wells, and reset buttons. Invalid fields show an inline explanation and disable Apply.
 - Pass Slide Show settings through its Python API and CLI. Add a tri-state fullscreen option while retaining existing CLI compatibility. Keyboard changes remain temporary for that running show.
-- Pass project settings into embedded GPX Editor calls. Standalone GPX Editor uses factory defaults. An already-open embedded editor receives applied settings for subsequent operations and rearms its autosave timer when needed.
+- Pass project settings into embedded GPX Editor calls. Standalone GPX Editor stores its GPX/PDF/map-service subset in macOS Application Support. An already-open embedded editor receives applied settings for subsequent operations and rearms its autosave timer when needed.
 - Extend `gpx_tracks_table.run_with_options()` and `GetGeoLocations.run_with_options()` with the relevant map, timing, filtering, provider, and geolocation parameters.
 - Centralize Contextily/xyzservices provider creation and tile URL generation so map rendering, cache diagnostics, missing-tile handling, and GPX Editor all use the same configured service.
 - Include map-affecting parameters in track-map metadata and freshness checks. Legacy maps remain current under legacy defaults; changed rendering parameters mark them stale. GPX filtering or timing changes regenerate the summary asynchronously and mark affected maps for Update.

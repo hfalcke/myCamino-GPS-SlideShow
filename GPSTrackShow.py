@@ -137,6 +137,9 @@ MEMORY_WATCHDOG_INTERVAL_SECONDS = 5.0
 GIBIBYTE = 1024**3
 DEFAULT_DOT_COLOR_NAME = "red"
 DEFAULT_DOT_SIZE = 6
+PILGRIM_FRAME_INTERVAL_SECONDS = 0.1
+PILGRIM_MOTION_TOLERANCE_FRACTION = 0.0015
+PILGRIM_VISIBLE_SOURCE_RECT = (143.0, 34.0, 230.0, 447.0)
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 KEY_HELP_LINES = [
     "Keys:",
@@ -178,6 +181,81 @@ COLOR_NAMES = {
 }
 
 
+def bundled_resource_path(filename: str) -> Path:
+    """Resolve a development or PyInstaller-bundled data file."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / filename
+
+
+def pilgrim_motion_threshold(width: float, height: float) -> float:
+    """Return a resolution-scaled view-space tolerance for visible motion."""
+    return max(1.0, math.hypot(max(0.0, width), max(0.0, height)) * PILGRIM_MOTION_TOLERANCE_FRACTION)
+
+
+def time_lapse_marker_style(configured_style: str, *, overview: bool) -> str:
+    """Keep the overview arrow while allowing a pilgrim on the stage map."""
+    return "arrow" if overview else configured_style
+
+
+@dataclass
+class PilgrimWalkState:
+    """Select retained walk-cycle frames from marker movement over time."""
+
+    frame_index: int = 0
+    motion_anchor: Optional[tuple[float, float]] = None
+    last_motion_time: Optional[float] = None
+    last_frame_time: Optional[float] = None
+    stationary: bool = True
+
+    def reset(self) -> None:
+        self.frame_index = 0
+        self.motion_anchor = None
+        self.last_motion_time = None
+        self.last_frame_time = None
+        self.stationary = True
+
+    def update(
+        self,
+        position: tuple[float, float],
+        now: float,
+        motion_threshold: float,
+        frame_interval: float = PILGRIM_FRAME_INTERVAL_SECONDS,
+    ) -> int:
+        if self.motion_anchor is None:
+            self.motion_anchor = position
+            self.last_motion_time = now
+            self.last_frame_time = now
+            self.frame_index = 0
+            self.stationary = True
+            return self.frame_index
+
+        moved = math.hypot(
+            position[0] - self.motion_anchor[0],
+            position[1] - self.motion_anchor[1],
+        ) >= max(0.0, motion_threshold)
+        if moved:
+            self.motion_anchor = position
+            self.last_motion_time = now
+            if self.stationary:
+                self.stationary = False
+                self.frame_index = 3
+                self.last_frame_time = now
+                return self.frame_index
+            elapsed = max(0.0, now - (self.last_frame_time if self.last_frame_time is not None else now))
+            interval = max(frame_interval, 1.0e-6)
+            # Treat an interval reached within floating-point precision as due.
+            steps = math.floor((elapsed + interval * 1.0e-9) / interval)
+            if steps:
+                self.frame_index = ((max(1, self.frame_index) - 1 + steps) % 8) + 1
+                self.last_frame_time = (self.last_frame_time or now) + steps * interval
+            return self.frame_index
+
+        if self.last_motion_time is not None and now - self.last_motion_time >= frame_interval:
+            self.stationary = True
+            self.frame_index = 0
+        return self.frame_index
+
+
 class Transition(str, Enum):
     """Supported slide transition names."""
 
@@ -189,6 +267,11 @@ class Transition(str, Enum):
     COLLAGE = "COLLAGE"
     QUAD = "QUAD"
     RANDOM = "RANDOM"
+
+
+def normalize_transition(value: object) -> str:
+    """Return the case-insensitive CLI/settings form of a transition name."""
+    return str(value).strip().upper()
 
 
 ENABLED_TRANSITIONS = (
@@ -245,6 +328,7 @@ class Config:
     time_lapse_stages: bool = False
     time_lapse_duration: float = 30.0
     time_lapse_media_min_fraction: float = 0.5
+    time_lapse_marker: str = "pilgrim"
     resume_index: Optional[int] = None
     resume_progress: Optional[float] = None
     resume_media_index: Optional[int] = None
@@ -361,11 +445,18 @@ def parse_args(argv: list[str]) -> Config:
         help="Preferred minimum framed-media size relative to the window; media grows to the largest track-free corner (default: 0.5).",
     )
     parser.add_argument(
+        "--time-lapse-marker",
+        choices=("pilgrim", "arrow"),
+        default="pilgrim",
+        help="Moving Time-Lapse marker: walking pilgrim or traditional arrow (default: pilgrim).",
+    )
+    parser.add_argument(
         "--transition",
         "-t",
+        type=normalize_transition,
         choices=[item.value for item in ENABLED_TRANSITIONS],
         default=Transition.BLEND.value,
-        help="Transition type between slides.",
+        help="Transition type between slides (case-insensitive).",
     )
     parser.add_argument("--background-color", default="black", help="Background color.")
     parser.add_argument("--dot-color", default=DEFAULT_DOT_COLOR_NAME, help="GPS marker color.")
@@ -481,6 +572,7 @@ def parse_args(argv: list[str]) -> Config:
         time_lapse_stages=bool(args.time_lapse_stages),
         time_lapse_duration=float(args.time_lapse_duration),
         time_lapse_media_min_fraction=float(args.time_lapse_media_min_fraction),
+        time_lapse_marker=str(args.time_lapse_marker),
         resume_index=args.resume_index,
         resume_progress=args.resume_progress,
         resume_media_index=args.resume_media_index,
@@ -604,6 +696,7 @@ def config_from_options(
     time_lapse_duration: float = 30.0,
     time_lapse_media_min_fraction: float = 0.5,
     time_lapse_media_max_fraction: Optional[float] = None,
+    time_lapse_marker: str = "pilgrim",
     resume_index: Optional[int] = None,
     resume_progress: Optional[float] = None,
     resume_media_index: Optional[int] = None,
@@ -638,6 +731,8 @@ def config_from_options(
         time_lapse_media_min_fraction = time_lapse_media_max_fraction
     if not 0 < time_lapse_media_min_fraction <= 1:
         raise ValueError("time_lapse_media_min_fraction must be greater than 0 and at most 1")
+    if time_lapse_marker not in {"pilgrim", "arrow"}:
+        raise ValueError("time_lapse_marker must be 'pilgrim' or 'arrow'")
     if dot_size < 1:
         raise ValueError("dot_size must be at least 1")
     if arrow_length < 0:
@@ -647,7 +742,7 @@ def config_from_options(
     if collage_max_images < 1:
         raise ValueError("collage_max_images must be at least 1")
 
-    transition_value = transition if isinstance(transition, Transition) else Transition(str(transition))
+    transition_value = transition if isinstance(transition, Transition) else Transition(normalize_transition(transition))
     if transition_value not in ENABLED_TRANSITIONS:
         raise ValueError(f"transition is not enabled: {transition_value.value}")
     collage_size_min, collage_size_max = parse_percentage_range_option(collage_size_range)
@@ -687,6 +782,7 @@ def config_from_options(
         time_lapse_stages=bool(time_lapse_stages),
         time_lapse_duration=float(time_lapse_duration),
         time_lapse_media_min_fraction=float(time_lapse_media_min_fraction),
+        time_lapse_marker=str(time_lapse_marker),
         resume_index=resume_index,
         resume_progress=resume_progress,
         resume_media_index=resume_media_index,
@@ -980,6 +1076,25 @@ def track_length_from_metadata(metadata: Optional[dict]) -> float:
 
 
 if APPKIT_AVAILABLE:
+    _PILGRIM_FRAME_IMAGES = None
+
+    def load_pilgrim_frame_images():
+        """Load the standing frame and eight walking frames once per process."""
+        global _PILGRIM_FRAME_IMAGES
+        if _PILGRIM_FRAME_IMAGES is not None:
+            return _PILGRIM_FRAME_IMAGES
+        frames = []
+        for index in range(9):
+            path = bundled_resource_path(f"pilgrim-frame{index:02d}-rigged-512.png")
+            image = NSImage.alloc().initWithContentsOfFile_(str(path)) if path.exists() else None
+            if image is None:
+                frames = []
+                break
+            frames.append(image)
+        _PILGRIM_FRAME_IMAGES = tuple(frames)
+        return _PILGRIM_FRAME_IMAGES
+
+
     class TimeLapseMapView(NSView):
         """Draw retained maps plus a changing arrow/media layer without image churn."""
 
@@ -997,6 +1112,12 @@ if APPKIT_AVAILABLE:
             self.marker_color = COLOR_NAMES[DEFAULT_DOT_COLOR_NAME]
             self.marker_radius = DEFAULT_DOT_SIZE
             self.arrow_factor = 1.0
+            self.marker_style = "pilgrim"
+            self.pilgrim_frames = load_pilgrim_frame_images()
+            self.pilgrim_walk_state = PilgrimWalkState()
+            self.stage_tangent = None
+            self.pilgrim_rotation_degrees = 0.0
+            self.pilgrim_mirrored = False
             self.media_min_fraction = 0.5
             self.media_placement_cache_key = None
             self.media_clear_rects = None
@@ -1027,6 +1148,11 @@ if APPKIT_AVAILABLE:
                 self.media_placement_cache_key = None
                 self.media_clear_rects = None
                 self.current_media_corner = None
+                self.pilgrim_walk_state.reset()
+                self.stage_tangent = self.fixedStageTangent()
+                self.pilgrim_rotation_degrees, self.pilgrim_mirrored = pilgrim_orientation_for_tangent(
+                    self.stage_tangent
+                )
             self.setNeedsDisplay_(True)
 
         def _update_clock_overlay(self, clock_time, date_text, enabled):
@@ -1118,21 +1244,45 @@ if APPKIT_AVAILABLE:
             if pixel is None:
                 return None
             _image_w, image_h = image_size_tuple(self.map_image)
+            view_point = (
+                image_rect.origin.x + pixel[0] * scale,
+                image_rect.origin.y + (image_h - pixel[1]) * scale,
+            )
             NSGraphicsContext.saveGraphicsState()
             try:
                 transform = NSAffineTransform.transform()
                 transform.translateXBy_yBy_(image_rect.origin.x, image_rect.origin.y)
                 transform.scaleXBy_yBy_(scale, scale)
                 transform.concat()
-                tangent = self.fixedStageTangent()
-                if tangent is not None and self.arrow_factor > 0:
-                    draw_open_arrow_at_marker(
-                        pixel[0], pixel[1], image_h, tangent, self.marker_color, self.marker_radius, self.arrow_factor
+                use_pilgrim = self.marker_style == "pilgrim" and len(self.pilgrim_frames) == 9
+                if use_pilgrim:
+                    frame_index = self.pilgrim_walk_state.update(
+                        view_point,
+                        time.monotonic(),
+                        pilgrim_motion_threshold(self.bounds().size.width, self.bounds().size.height),
                     )
-                draw_marker_at(pixel[0], pixel[1], image_h, self.marker_color, self.marker_radius)
+                    if self.arrow_factor > 0:
+                        draw_pilgrim_at_marker(
+                            pixel[0],
+                            pixel[1],
+                            image_h,
+                            self.pilgrim_frames[frame_index],
+                            self.marker_radius,
+                            self.arrow_factor,
+                            self.pilgrim_rotation_degrees,
+                            self.pilgrim_mirrored,
+                        )
+                    draw_marker_at(pixel[0], pixel[1], image_h, self.marker_color, self.marker_radius)
+                else:
+                    tangent = self.stage_tangent
+                    if tangent is not None and self.arrow_factor > 0:
+                        draw_open_arrow_at_marker(
+                            pixel[0], pixel[1], image_h, tangent, self.marker_color, self.marker_radius, self.arrow_factor
+                        )
+                    draw_marker_at(pixel[0], pixel[1], image_h, self.marker_color, self.marker_radius)
             finally:
                 NSGraphicsContext.restoreGraphicsState()
-            return image_rect.origin.x + pixel[0] * scale, image_rect.origin.y + (image_h - pixel[1]) * scale
+            return view_point
 
         def mediaPlacementGeometry(self):
             """Return cached corner envelopes within the actual map plotting area."""
@@ -1596,6 +1746,35 @@ def endpoint_tangent(points: list[tuple[float, float]]) -> Optional[tuple[float,
     return tangent_x / length, tangent_y / length
 
 
+def fixed_arrow_normal(tangent: Optional[tuple[float, float]]) -> Optional[tuple[float, float]]:
+    """Return the fixed map-space normal used by the stage arrow."""
+    if tangent is None:
+        return None
+    tangent_x, tangent_y = tangent
+    normal_x, normal_y = -tangent_y, tangent_x
+    if normal_y > 0:
+        normal_x, normal_y = -normal_x, -normal_y
+    normal_length = math.hypot(normal_x, normal_y)
+    if normal_length <= 0:
+        return None
+    return normal_x / normal_length, normal_y / normal_length
+
+
+def pilgrim_orientation_for_tangent(tangent: Optional[tuple[float, float]]) -> tuple[float, bool]:
+    """Align a right-facing upright pilgrim with the fixed stage arrow and route."""
+    normal = fixed_arrow_normal(tangent)
+    if normal is None or tangent is None:
+        return 0.0, False
+
+    # Map pixels use a top-left origin, while AppKit drawing uses bottom-left.
+    body_x, body_y = normal[0], -normal[1]
+    rotation_degrees = math.degrees(math.atan2(-body_x, body_y))
+    native_facing_x, native_facing_y = body_y, -body_x
+    track_x, track_y = tangent[0], -tangent[1]
+    mirrored = native_facing_x * track_x + native_facing_y * track_y < 0.0
+    return rotation_degrees, mirrored
+
+
 def draw_open_arrow_at_marker(
     pixel_x: float,
     pixel_y: float,
@@ -1606,15 +1785,10 @@ def draw_open_arrow_at_marker(
     arrow_factor: float,
 ) -> None:
     """Draw one outlined arrow normal to the local track tangent."""
-    tangent_x, tangent_y = tangent
-    normal_x, normal_y = -tangent_y, tangent_x
-    if normal_y > 0:
-        normal_x, normal_y = -normal_x, -normal_y
-    normal_length = math.hypot(normal_x, normal_y)
-    if normal_length <= 0:
+    normal = fixed_arrow_normal(tangent)
+    if normal is None:
         return
-    normal_x /= normal_length
-    normal_y /= normal_length
+    normal_x, normal_y = normal
     arrow_length = image_height * 0.07 * arrow_factor
     head_width = arrow_length / 3.0
     head_length = head_width
@@ -1662,6 +1836,42 @@ def draw_open_arrow_at_marker(
     ns_color(color).setStroke()
     path.setLineWidth_(max(2.0, head_width * 0.12))
     path.stroke()
+
+
+def draw_pilgrim_at_marker(
+    pixel_x: float,
+    pixel_y: float,
+    image_height: float,
+    frame_image,
+    radius: int,
+    size_factor: float,
+    rotation_degrees: float,
+    mirrored: bool,
+) -> None:
+    """Draw one stage-oriented pilgrim with its feet at the GPS marker."""
+    if frame_image is None or size_factor <= 0:
+        return
+    source_x, source_y, source_width, source_height = PILGRIM_VISIBLE_SOURCE_RECT
+    visible_height = image_height * 0.07 * size_factor
+    visible_width = visible_height * source_width / source_height
+    destination = NSMakeRect(-visible_width / 2.0, radius * 1.5, visible_width, visible_height)
+    source = NSMakeRect(source_x, source_y, source_width, source_height)
+    NSGraphicsContext.saveGraphicsState()
+    try:
+        transform = NSAffineTransform.transform()
+        transform.translateXBy_yBy_(pixel_x, image_height - pixel_y)
+        transform.rotateByDegrees_(rotation_degrees)
+        if mirrored:
+            transform.scaleXBy_yBy_(-1.0, 1.0)
+        transform.concat()
+        frame_image.drawInRect_fromRect_operation_fraction_(
+            destination,
+            source,
+            NSCompositingOperationSourceOver,
+            1.0,
+        )
+    finally:
+        NSGraphicsContext.restoreGraphicsState()
 
 
 def draw_marker_at(
@@ -4602,6 +4812,10 @@ class GPSTrackShowApp:
             stage_view.marker_color = self.config.dot_color
             stage_view.marker_radius = self.config.dot_size
             stage_view.arrow_factor = self.config.arrow_length
+            stage_view.marker_style = time_lapse_marker_style(
+                self.config.time_lapse_marker,
+                overview=False,
+            )
             stage_view.media_min_fraction = self.config.time_lapse_media_min_fraction
             stage_view.media_marker_latlon = self.time_lapse_media_marker_latlon
             stage_view.place_text = self.time_lapse_place_text if self.config.placenames else None
@@ -4631,6 +4845,12 @@ class GPSTrackShowApp:
             overview_view.marker_color = self.config.dot_color
             overview_view.marker_radius = self.config.dot_size
             overview_view.arrow_factor = self.config.arrow_length
+            # The overview remains a conventional navigation map even when
+            # the stage map uses the animated pilgrim.
+            overview_view.marker_style = time_lapse_marker_style(
+                self.config.time_lapse_marker,
+                overview=True,
+            )
             overview_view.media_marker_latlon = self.time_lapse_media_marker_latlon
             overview_view.place_text = None
             overview_view.metrics_lines = ()

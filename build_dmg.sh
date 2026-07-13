@@ -63,6 +63,9 @@ echo "==> Checking Python syntax"
 "$PYTHON" -m py_compile \
   GPSTrackShowGUI.py \
   GPXEditor.py \
+  adventure_parameters.py \
+  cocoa_parameter_editor.py \
+  json_storage.py \
   GetGeoLocations.py \
   gpx_tracks_table.py \
   GPSTrackShow.py

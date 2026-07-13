@@ -31,11 +31,31 @@ The main window contains:
 - Selection field.
 - Action buttons.
 - Status line.
+- A gear button beside the logo for editor settings.
 
 The output field shows where Save and Save & Exit will write the GPX file.
 Edit the field, press Enter, or use the folder button to choose an output file.
 
 The project name is stored in GPX metadata when saved.
+
+## Settings
+
+The gear button opens **GPX Editor Settings** with three sections:
+
+- GPX Processing: timestamp fallback, filtering, recovery interval, and
+  interactive map behavior.
+- PDF Export: document/map resolution, zoom, and tile limits.
+- Map Service: OpenStreetMap, Esri, or a custom tile service.
+
+Numerical values can be typed or changed with the adjacent up/down stepper.
+Each row has a reset arrow, and Reset All resets only these editor sections.
+Custom map services require an HTTP(S) URL containing `{z}`, `{x}`, and `{y}`
+plus attribution.
+
+When the editor runs standalone, Apply stores these settings in macOS
+Application Support for the next session. When opened from myCamino GPS Track
+Show, Apply updates and auto-saves the active Adventure instead. Parameter
+changes do not mark the GPX track data as edited.
 
 ## Loading Tracks
 
@@ -311,3 +331,5 @@ Embedded use from GPS Track Show:
 - If a track has no time information, date edits may estimate point timestamps.
 - If the main GUI opened the editor, use Save or Save & Exit so the saved GPX
   path is returned to the main GUI.
+- If settings cannot be stored, check write access to the Adventure directory
+  or to `~/Library/Application Support/myCamino GPX Editor` in standalone mode.

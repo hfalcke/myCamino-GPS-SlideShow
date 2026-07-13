@@ -88,7 +88,15 @@ from Foundation import (
 
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
 from basemap_tile_utils import tolerate_missing_tiles
-from adventure_parameters import default_parameters, normalize_parameters
+from adventure_parameters import (
+    EDITOR_PARAMETER_KEYS,
+    EDITOR_PARAMETER_SECTIONS,
+    default_parameters,
+    normalize_parameters,
+    parameter_subset,
+)
+from cocoa_parameter_editor import CocoaParameterEditor
+from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
 from map_provider_utils import contextily_provider, contextily_request_timeout, provider_display_name
 from track_timing_utils import timestamps_from_start
 
@@ -145,6 +153,9 @@ GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
 NS = {"gpx": GPX_NAMESPACE}
 ET.register_namespace("", GPX_NAMESPACE)
 MYCAMINO_EXT_TAG = "mycamino_gpx_editor"
+STANDALONE_SETTINGS_PATH = (
+    Path.home() / "Library" / "Application Support" / "myCamino GPX Editor" / "settings.json"
+)
 
 
 def bundled_resource_path(filename: str) -> Path:
@@ -3083,6 +3094,9 @@ class GPXEditorController(NSObject):
         self.pdf_summary_delegate = None
         self.on_close_callback = None
         self.on_save_callback = None
+        self.on_settings_change_callback = None
+        self.settings_controller = None
+        self.parameter_load_warnings = []
         self.help_window = None
         self.did_auto_size_track_columns = False
         self.dirty = False
@@ -3100,7 +3114,13 @@ class GPXEditorController(NSObject):
         self.plot_window_refs = []
         self.auxiliary_windows = []
         self.closing_auxiliary_windows = False
-        self.project_parameters = default_parameters()
+        if self.standalone:
+            self.project_parameters, self.parameter_load_warnings = load_parameter_subset(
+                STANDALONE_SETTINGS_PATH,
+                EDITOR_PARAMETER_KEYS,
+            )
+        else:
+            self.project_parameters = default_parameters()
         self._apply_parameter_attributes()
         self.tile_cache_dir = TILE_CACHE_DIR
         self.tile_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -3160,6 +3180,59 @@ class GPXEditorController(NSObject):
             )
         self.cached_osm_tile_urls = None
         self.prune_tile_cache(max_age_seconds=self.map_cache_retention_hours * 3600.0)
+        if self.settings_controller is not None:
+            self.settings_controller.update_values(self.project_parameters)
+
+    def _apply_editor_settings(self, values, changed):
+        changed_editor_keys = set(changed) & set(EDITOR_PARAMETER_KEYS)
+        if not changed_editor_keys:
+            self.set_status("GPX Editor settings unchanged.")
+            return True
+        previous_parameters = dict(self.project_parameters)
+        updated = dict(self.project_parameters)
+        for key in EDITOR_PARAMETER_KEYS:
+            if key in values:
+                updated[key] = values[key]
+        self.apply_project_parameters(updated)
+        if self.standalone:
+            try:
+                atomic_write_json(
+                    STANDALONE_SETTINGS_PATH,
+                    parameter_subset_payload(self.project_parameters, EDITOR_PARAMETER_KEYS),
+                )
+            except OSError as exc:
+                self.apply_project_parameters(previous_parameters)
+                show_alert("Could not save GPX Editor settings.", str(exc))
+                self.set_status("GPX Editor settings could not be saved.")
+                return False
+            self.set_status(f"Saved {len(changed_editor_keys)} GPX Editor setting(s).")
+            return True
+        if self.on_settings_change_callback is not None:
+            try:
+                self.on_settings_change_callback(
+                    parameter_subset(self.project_parameters, EDITOR_PARAMETER_KEYS)
+                )
+            except Exception as exc:
+                self.apply_project_parameters(previous_parameters)
+                show_alert("Could not update Adventure settings.", str(exc))
+                self.set_status("Adventure settings could not be updated.")
+                return False
+        self.set_status(f"Applied {len(changed_editor_keys)} Adventure setting(s).")
+        return True
+
+    @objc.IBAction
+    def showSettings_(self, _sender):
+        if self.settings_controller is None:
+            self.settings_controller = CocoaParameterEditor.alloc().init()
+            self.settings_controller.configure(
+                title="GPX Editor Settings",
+                sections=EDITOR_PARAMETER_SECTIONS,
+                values=self.project_parameters,
+                apply_callback=self._apply_editor_settings,
+            )
+        else:
+            self.settings_controller.update_values(self.project_parameters)
+        self.settings_controller.show()
 
     def _build_window(self):
         style = (
@@ -3187,6 +3260,19 @@ class GPXEditorController(NSObject):
         if logo_path.exists():
             self.header_logo_view.setImage_(NSImage.alloc().initWithContentsOfFile_(str(logo_path)))
         self.root.addSubview_(self.header_logo_view)
+        self.settings_button = make_liquid_glass_button(NSMakeRect(0, 0, 34, 34))
+        self.configure_symbol_button(
+            self.settings_button,
+            "gearshape",
+            "GPX Editor Settings",
+            "NSActionTemplate",
+            "Settings",
+        )
+        self.settings_button.setTarget_(self)
+        self.settings_button.setAction_("showSettings:")
+        self.settings_button.setToolTip_("Edit GPX processing, PDF export, and map-service settings.")
+        apply_liquid_glass_button_style(self.settings_button, compact=True)
+        self.root.addSubview_(self.settings_button)
         self.output_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 360, FIELD_HEIGHT))
         self.output_field.setFont_(NSFont.systemFontOfSize_(12))
         self.output_field.setPlaceholderString_("Choose output .gpx file")
@@ -3356,8 +3442,11 @@ class GPXEditorController(NSObject):
         self.buttons["Help"].setFrame_(NSMakeRect(PADDING, top - 30, 64, BUTTON_HEIGHT))
         logo_size = 44.0
         logo_x = width - PADDING - logo_size
+        settings_size = 34.0
+        settings_x = logo_x - gap - settings_size
         title_x = PADDING + 64 + gap
-        self.title_label.setFrame_(NSMakeRect(title_x, top - 34, max(220.0, logo_x - title_x - gap), 32))
+        self.title_label.setFrame_(NSMakeRect(title_x, top - 34, max(220.0, settings_x - title_x - gap), 32))
+        self.settings_button.setFrame_(NSMakeRect(settings_x, top - settings_size + 1.0, settings_size, settings_size))
         self.header_logo_view.setFrame_(NSMakeRect(logo_x, top - logo_size + 4, logo_size, logo_size))
         top -= 52
         project_y = top - FIELD_HEIGHT
@@ -3419,6 +3508,7 @@ class GPXEditorController(NSObject):
     def configure_key_loop(self):
         order = [
             self.buttons["Help"],
+            self.settings_button,
             self.buttons["Add Tracks"],
             self.project_field,
             self.buttons["Undo"],
@@ -3449,6 +3539,12 @@ class GPXEditorController(NSObject):
         self.window.center()
         self.window.makeKeyAndOrderFront_(None)
         self.window.makeFirstResponder_(self.project_field)
+        if self.parameter_load_warnings:
+            show_alert(
+                "Some GPX Editor settings could not be loaded.",
+                "\n".join(self.parameter_load_warnings),
+            )
+            self.parameter_load_warnings = []
 
     def set_status(self, message: str):
         self.status_label.setStringValue_(message)
@@ -3491,6 +3587,9 @@ class GPXEditorController(NSObject):
         if self.editor_close_finalized:
             return
         self.editor_close_finalized = True
+        if self.settings_controller is not None:
+            self.settings_controller.close()
+            self.settings_controller = None
         self.close_auxiliary_windows()
         self.notify_close_callback()
         if delete_recovery:
@@ -6506,7 +6605,7 @@ class GPXEditorController(NSObject):
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
             "Plot Overview opens an OpenStreetMap overview. If tracks are selected, the overview zooms to those tracks and highlights them in red; selecting different tracks in the table updates the red highlight. Click a track in the overview to select it in the table. Double-click a point in the overview to open that track in the inspector and track map at the same point.\n\n"
             "Plot Track(s) opens a detailed map for the selected track. View File opens the original GPX source file of the selected track in TextEdit and asks whether unsaved edits should be saved first. Click or drag on a map to move the white cursor dot and arrow to the nearest waypoint. Double-click a track point to open its waypoint inspector. Press i to show or hide point information; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; r zooms out to the full map extent; q closes the plot window. In the track map, m or Shift-click sets a marker, Delete removes the marker-to-cursor point range after confirmation, and x cuts the track at the cursor after confirmation.\n\n"
-            "Inspect Track opens all waypoints of one track. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
+            "Inspect Track opens all waypoints of one track. The gear button edits GPX processing, PDF, and map-service settings. A standalone editor keeps these settings for future sessions; an editor opened from an Adventure stores them with that Adventure. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
         )
         self.show_scrollable_help("myCamino GPX Editor Help", text)
 
@@ -6640,6 +6739,7 @@ def show_gpx_editor(
     debug: bool = False,
     on_close=None,
     on_save=None,
+    on_settings_change=None,
     settings=None,
 ):
     controller = GPXEditorController.alloc().initStandalone_(standalone)
@@ -6648,6 +6748,7 @@ def show_gpx_editor(
     controller.debug = bool(debug)
     controller.on_close_callback = on_close
     controller.on_save_callback = on_save
+    controller.on_settings_change_callback = on_settings_change
     if output_file is not None:
         controller.set_output_path(Path(output_file).expanduser().resolve())
     loaded_recovery = controller.offer_recovery_load()
@@ -6664,6 +6765,7 @@ def show_gpx_editor_from_cli_args(
     standalone: bool = False,
     on_close=None,
     on_save=None,
+    on_settings_change=None,
     settings=None,
 ):
     """Open the editor from another Python program using CLI-style arguments.
@@ -6697,6 +6799,7 @@ def show_gpx_editor_from_cli_args(
         debug=debug,
         on_close=on_close,
         on_save=on_save,
+        on_settings_change=on_settings_change,
         settings=settings,
     )
 

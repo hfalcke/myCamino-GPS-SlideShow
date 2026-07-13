@@ -5,7 +5,10 @@ a = Analysis(
     ['GPSTrackShow.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        (f'pilgrim-frame{index:02d}-rigged-512.png', '.')
+        for index in range(9)
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

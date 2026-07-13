@@ -73,8 +73,10 @@ from AppKit import (
     NSBoldFontMask,
     NSPasteboardTypeString,
     NSTableViewDropAbove,
+    NSTerminateCancel,
+    NSTerminateNow,
 )
-from Foundation import NSDate, NSIndexSet, NSObject, NSAttributedString, NSMakeSize, NSNotificationCenter, NSRunLoop, NSString, NSURL, NSPredicate
+from Foundation import NSDate, NSIndexSet, NSObject, NSAttributedString, NSMakeSize, NSNotificationCenter, NSRunLoop, NSString, NSURL, NSPredicate, NSTimer
 
 from GetGeoLocations import (
     GPS_NOT_AVAILABLE,
@@ -117,6 +119,8 @@ from adventure_parameters import (
     validate_parameters,
     visible_specs_for_section,
 )
+from cocoa_parameter_editor import CocoaParameterEditor
+from json_storage import atomic_write_json
 
 
 PHOTOS_FRAMEWORK_AVAILABLE = True
@@ -889,6 +893,10 @@ class GPXTrackerController(NSObject):
         self.slideshow_resume_position = None
         self.project_dirty = False
         self.skip_next_project_dir_dirty = False
+        self.adventure_autosave_timer = None
+        self.adventure_autosave_suspended = 0
+        self.adventure_autosave_error = None
+        self.directory_activation_in_progress = False
         self.gpx_field_manually_changed = False
         self.progress_total = 0
         self.skipped_media_windows = []
@@ -973,6 +981,7 @@ class GPXTrackerController(NSObject):
         self.parameter_advanced_checkbox = None
         self.parameter_error_label = None
         self.parameter_apply_button = None
+        self.parameter_editor_controller = None
         self.gpx_editor_controller = None
         self.plot_creation_thread = None
         self.plot_cancel_event = None
@@ -1082,14 +1091,10 @@ class GPXTrackerController(NSObject):
         self.description_scroll.setDocumentView_(self.description_text)
         self.root_view.addSubview_(self.description_scroll)
 
-        self.edit_button = self._make_button("Save", "editAdventure:")
         self.load_button = self._make_button("Load", "loadAdventure:")
-        self.save_exit_button = self._make_button("Save & Exit", "saveAndExit:")
         self.help_button = self._make_button("Help", "showMainHelp:")
         self.quit_button = self._make_button("Quit", "quit:")
-        self.root_view.addSubview_(self.edit_button)
         self.root_view.addSubview_(self.load_button)
-        self.root_view.addSubview_(self.save_exit_button)
         self.root_view.addSubview_(self.help_button)
         self.root_view.addSubview_(self.quit_button)
 
@@ -1439,11 +1444,9 @@ class GPXTrackerController(NSObject):
         self.slideshow_time_lapse_button.setToolTip_("Launch the stage-map GPS time-lapse slide show using the current track-map metadata.")
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
 
-        self.edit_button.setToolTip_("Save the current adventure settings to the .adv file.")
         self.load_button.setToolTip_("Load an existing .adv adventure file.")
-        self.save_exit_button.setToolTip_("Save the current adventure and exit the program.")
         self.help_button.setToolTip_("Show a simple overview of the program and the recommended workflow.")
-        self.quit_button.setToolTip_("Quit the program, asking to save if there are unsaved changes.")
+        self.quit_button.setToolTip_("Auto-save pending Adventure changes and quit the program.")
         self.status_label.setToolTip_("Current operation status.")
         self.progress_bar.setToolTip_("Progress for longer-running operations.")
 
@@ -1475,10 +1478,8 @@ class GPXTrackerController(NSObject):
         self.control_file_merge_media_button.setNextKeyView_(self.slideshow_start_button)
         self.slideshow_start_button.setNextKeyView_(self.slideshow_time_lapse_button)
         self.slideshow_time_lapse_button.setNextKeyView_(self.pdf_summary_button)
-        self.pdf_summary_button.setNextKeyView_(self.edit_button)
-        self.edit_button.setNextKeyView_(self.load_button)
-        self.load_button.setNextKeyView_(self.save_exit_button)
-        self.save_exit_button.setNextKeyView_(self.help_button)
+        self.pdf_summary_button.setNextKeyView_(self.load_button)
+        self.load_button.setNextKeyView_(self.help_button)
         self.help_button.setNextKeyView_(self.quit_button)
         self.quit_button.setNextKeyView_(self.project_dir_field)
 
@@ -1656,13 +1657,11 @@ class GPXTrackerController(NSObject):
         self.pdf_summary_button.setFrame_(NSMakeRect(field_x + SMALL_BUTTON_WIDTH + 132.0 + 2 * INNER_GAP, row_y, 124.0, FIELD_HEIGHT))
 
         button_row_y = row_y - FIELD_HEIGHT - 8.0
-        total_button_width = BUTTON_WIDTH * 5 + INNER_GAP * 4
+        total_button_width = BUTTON_WIDTH * 3 + INNER_GAP * 2
         button_start = field_x + (description_width - total_button_width) / 2.0
-        self.edit_button.setFrame_(NSMakeRect(button_start, button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        self.load_button.setFrame_(NSMakeRect(button_start + BUTTON_WIDTH + INNER_GAP, button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        self.save_exit_button.setFrame_(NSMakeRect(button_start + 2 * (BUTTON_WIDTH + INNER_GAP), button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        self.help_button.setFrame_(NSMakeRect(button_start + 3 * (BUTTON_WIDTH + INNER_GAP), button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        self.quit_button.setFrame_(NSMakeRect(button_start + 4 * (BUTTON_WIDTH + INNER_GAP), button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
+        self.load_button.setFrame_(NSMakeRect(button_start, button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
+        self.help_button.setFrame_(NSMakeRect(button_start + BUTTON_WIDTH + INNER_GAP, button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
+        self.quit_button.setFrame_(NSMakeRect(button_start + 2 * (BUTTON_WIDTH + INNER_GAP), button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
         status_bottom = button_row_y - STATUS_HEIGHT - 6.0
         progress_bottom = status_bottom - PROGRESS_HEIGHT - 6.0
         self.status_label.setFrame_(NSMakeRect(field_x, status_bottom, description_width, STATUS_HEIGHT))
@@ -1696,12 +1695,44 @@ class GPXTrackerController(NSObject):
     def setStatusFromWorker_(self, message):
         self.set_status(str(message))
 
-    def mark_dirty(self):
+    def mark_dirty(self, immediate=False):
         self.project_dirty = True
+        if self.adventure_autosave_suspended == 0 and self.current_project_file is not None:
+            self.schedule_adventure_autosave(immediate=immediate)
 
     def mark_clean(self):
         self.project_dirty = False
+        self.adventure_autosave_error = None
         self.saved_project_payload = self._collect_project_payload()
+
+    def cancel_adventure_autosave(self):
+        timer = self.adventure_autosave_timer
+        self.adventure_autosave_timer = None
+        if timer is not None:
+            timer.invalidate()
+
+    def schedule_adventure_autosave(self, immediate=False):
+        if self.adventure_autosave_suspended or self.current_project_file is None:
+            return
+        self.cancel_adventure_autosave()
+        delay = 0.0 if immediate else 0.5
+        self.adventure_autosave_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            delay,
+            self,
+            "performAdventureAutosave:",
+            None,
+            False,
+        )
+
+    def performAdventureAutosave_(self, _timer):
+        self.adventure_autosave_timer = None
+        self._write_project_configuration(status_prefix="Auto-saved adventure")
+
+    def flush_adventure_autosave(self):
+        self.cancel_adventure_autosave()
+        if self.current_project_file is None or not self.project_payload_changed():
+            return True
+        return self._write_project_configuration(status_prefix="Auto-saved adventure")
 
     def project_payload_changed(self):
         if self.saved_project_payload is None:
@@ -1709,6 +1740,8 @@ class GPXTrackerController(NSObject):
         return self._collect_project_payload() != self.saved_project_payload
 
     def _project_adv_path(self):
+        if self.current_project_file is not None:
+            return Path(self.current_project_file).expanduser().resolve(strict=False)
         if self.current_project_dir is None:
             return None
         base_name = project_filename_base(str(self.title_field.stringValue()).strip() or self.current_project_dir.name)
@@ -2549,7 +2582,97 @@ class GPXTrackerController(NSObject):
             self.skip_next_project_dir_dirty = True
         return loaded
 
+    def _restore_project_directory_field(self, previous_directory):
+        if previous_directory is None:
+            self.project_dir_field.setStringValue_("")
+        else:
+            self.project_dir_field.setStringValue_(str(previous_directory))
+
+    def _activate_project_directory(self, project_dir, allow_create=True):
+        candidate = Path(project_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = (self.current_project_dir or self.base_dir) / candidate
+        candidate = candidate.resolve(strict=False)
+        previous_directory = self.current_project_dir
+        if (
+            previous_directory is not None
+            and previous_directory.resolve(strict=False) == candidate
+            and self.current_project_file is not None
+        ):
+            self.project_dir_field.setStringValue_(str(candidate))
+            return True
+        if candidate.exists() and not candidate.is_dir():
+            show_alert("The selected path is not a directory.", str(candidate))
+            self._restore_project_directory_field(previous_directory)
+            return False
+        if not candidate.exists() and not allow_create:
+            show_alert("Directory does not exist!", str(candidate))
+            self._restore_project_directory_field(previous_directory)
+            return False
+
+        adventure_file = self._find_adventure_file_in_directory(candidate) if candidate.exists() else None
+        if adventure_file is None and not confirm_alert(
+            "Create a new Adventure?",
+            f"No Adventure file exists in:\n{candidate}\n\nCreate a new Adventure here?",
+            "Create Adventure",
+            "Cancel",
+        ):
+            self._restore_project_directory_field(previous_directory)
+            self.set_status("Adventure creation cancelled.")
+            return False
+
+        if not self.flush_adventure_autosave():
+            self._restore_project_directory_field(previous_directory)
+            return False
+
+        self.project_dir_field.setStringValue_(str(candidate))
+        self.directory_activation_in_progress = True
+        try:
+            resolved = self._resolve_project_directory(allow_create=allow_create)
+        finally:
+            self.directory_activation_in_progress = False
+        if resolved is None:
+            self._restore_project_directory_field(previous_directory)
+            return False
+        if adventure_file is not None:
+            loaded = self.load_project_configuration(adventure_file, flush_current=False)
+            if not loaded:
+                self.current_project_dir = previous_directory
+                self._restore_project_directory_field(previous_directory)
+                if previous_directory is not None:
+                    try:
+                        os.chdir(previous_directory)
+                    except OSError:
+                        pass
+            return loaded
+
+        self.current_project_file = None
+        if not str(self.title_field.stringValue()).strip():
+            self.title_field.setStringValue_(resolved.name)
+        self.current_project_file = resolved / f"{project_filename_base(str(self.title_field.stringValue()).strip() or resolved.name)}.adv"
+        self.project_dirty = True
+        if not self._write_project_configuration(status_prefix="Created adventure"):
+            self.current_project_file = None
+            self.current_project_dir = previous_directory
+            self._restore_project_directory_field(previous_directory)
+            if previous_directory is not None:
+                try:
+                    os.chdir(previous_directory)
+                except OSError:
+                    pass
+            return False
+        self._remember_recent_adventure(resolved)
+        self.refresh_section_status_indicators()
+        return True
+
     def _update_loaded_project_fields(self, data):
+        self.adventure_autosave_suspended += 1
+        try:
+            self._update_loaded_project_fields_without_autosave(data)
+        finally:
+            self.adventure_autosave_suspended = max(0, self.adventure_autosave_suspended - 1)
+
+    def _update_loaded_project_fields_without_autosave(self, data):
         project_directory = str(data.get("project_directory", "") or "")
         self.project_dir_field.setStringValue_(project_directory)
         self.current_project_dir = Path(project_directory).expanduser().resolve(strict=False) if project_directory else None
@@ -2612,6 +2735,8 @@ class GPXTrackerController(NSObject):
         )
         loaded_resume_position = data.get("slideshow_resume_position")
         self.slideshow_resume_position = loaded_resume_position if isinstance(loaded_resume_position, dict) else None
+        if self.parameter_editor_controller is not None:
+            self.parameter_editor_controller.update_values(self.parameters)
 
     def _refresh_loaded_gpx_summary(self):
         self.start_async_project_status_refresh("loaded adventure")
@@ -2778,9 +2903,9 @@ class GPXTrackerController(NSObject):
                 pass
         self.clear_gpx_summary()
 
-    def save_project_configuration(self):
-        project_dir = self._resolve_project_directory(allow_create=True, update_gpx_field=False)
-        if project_dir is None:
+    def _write_project_configuration(self, status_prefix="Saved adventure"):
+        project_dir = self.current_project_dir
+        if project_dir is None or self.current_project_file is None:
             return False
         adv_path = self._project_adv_path()
         if adv_path is None:
@@ -2788,18 +2913,33 @@ class GPXTrackerController(NSObject):
         payload = self._collect_project_payload()
         if adv_path.exists() and self.saved_project_payload == payload:
             self.mark_clean()
-            self.set_status(f"Adventure settings unchanged: {adv_path}")
             return True
-        with adv_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
+        try:
+            atomic_write_json(adv_path, payload)
+        except OSError as exc:
+            self.project_dirty = True
+            self.adventure_autosave_error = str(exc)
+            show_alert("Could not auto-save the Adventure.", str(exc))
+            self.set_status(f"Auto-save failed: {exc}")
+            return False
         self.current_project_file = adv_path
         self._remember_recent_adventure(project_dir)
         self.mark_clean()
-        self.set_status(f"Saved adventure to {adv_path}")
+        self.set_status(f"{status_prefix}: {adv_path.name}")
         return True
 
-    def load_project_configuration(self, adv_path):
+    def save_project_configuration(self):
+        """Compatibility wrapper for operations that require an immediate flush."""
+        if self.current_project_file is None:
+            project_dir = self._project_dir_path()
+            if project_dir is None:
+                return False
+            return self._activate_project_directory(project_dir, allow_create=True)
+        return self.flush_adventure_autosave()
+
+    def load_project_configuration(self, adv_path, flush_current=True):
+        if flush_current and self.current_project_file is not None and not self.flush_adventure_autosave():
+            return False
         try:
             with Path(adv_path).expanduser().open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -2817,21 +2957,56 @@ class GPXTrackerController(NSObject):
         return True
 
     def confirm_close(self):
-        if not self.project_payload_changed():
-            self.mark_clean()
+        if self.flush_adventure_autosave():
             return True
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Save project before quitting?")
-        alert.setInformativeText_("The project has unsaved changes.")
-        alert.addButtonWithTitle_("Save")
-        alert.addButtonWithTitle_("Don't Save")
-        alert.addButtonWithTitle_("Cancel")
-        response = int(alert.runModal())
-        if response == 1000:
-            return self.save_project_configuration()
-        if response == 1001:
-            return True
-        return False
+        while True:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Adventure auto-save failed")
+            alert.setInformativeText_(
+                "The latest Adventure changes could not be saved. Retry, quit without those changes, or cancel quitting."
+            )
+            alert.addButtonWithTitle_("Retry")
+            alert.addButtonWithTitle_("Quit Without Saving")
+            alert.addButtonWithTitle_("Cancel")
+            response = int(alert.runModal())
+            if response == 1000:
+                if self.flush_adventure_autosave():
+                    return True
+                continue
+            if response == 1001:
+                return True
+            return False
+
+    def _apply_parameter_values(self, values, propagate_to_editor=True):
+        old_parameters = dict(self.parameters)
+        self.parameters = normalize_parameters(values)
+        changed = changed_parameter_keys(old_parameters, self.parameters)
+        self._sync_legacy_parameter_controls()
+        if changed & map_affecting_parameter_keys():
+            self.track_maps_status_cache = None
+            self.track_maps_summary_label.setStringValue_("Track-map settings changed; use Update to refresh affected maps.")
+            self._set_section_status_checkbox(
+                self.track_maps_status_checkbox,
+                False,
+                "Track-map settings changed; update the maps before the slide show.",
+            )
+        editor_controller = getattr(self, "gpx_editor_controller", None)
+        if propagate_to_editor and editor_controller is not None:
+            editor_controller.apply_project_parameters(self.parameters)
+        if changed:
+            self.mark_dirty(immediate=True)
+            self.set_status(f"Applied {len(changed)} Adventure setting(s); auto-save scheduled.")
+        else:
+            self.set_status("Adventure settings unchanged.")
+        return True
+
+    def _apply_parameters_from_shared_editor(self, values, _changed):
+        return self._apply_parameter_values(values, propagate_to_editor=True)
+
+    def _apply_embedded_editor_parameters(self, editor_values):
+        merged = dict(self.parameters)
+        merged.update(editor_values)
+        return self._apply_parameter_values(merged, propagate_to_editor=False)
 
     @objc.IBAction
     def showMainHelp_(self, _sender):
@@ -2839,8 +3014,8 @@ class GPXTrackerController(NSObject):
             "myCamino GPS Track Show helps you build one travel slide show from tracks, photos, videos, and maps.\n\n"
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
-            "2. Enter the project name and a short description, then save the adventure.\n"
-            "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. Apply keeps the changes in the current adventure until it is saved.\n"
+            "2. Enter the project name and a short description. The Adventure file is updated automatically after every change.\n"
+            "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. Applied changes are auto-saved with the Adventure.\n"
             "4. Select one GPX file in the adventure folder, or choose external/multiple GPX files and use Add & Edit Tracks to save one final GPX file.\n"
             "5. In Track Maps, choose whether to work on Standard or for Time-Lapse maps. Create makes the selected kind for every stage; Update refreshes only missing or outdated maps. Rows marked with * need update.\n"
             "6. Import photos and video clips. They are copied into the adventure folder. Existing files are skipped so they are not duplicated.\n"
@@ -3379,14 +3554,17 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def showParameterEditor_(self, _sender):
-        self._ensure_parameter_window()
-        self.parameter_draft = dict(self.parameters)
-        self.parameter_advanced_checkbox.setState_(
-            NSControlStateValueOn if self.parameter_show_advanced else NSControlStateValueOff
-        )
-        self._render_parameter_section()
-        self.parameter_window.makeKeyAndOrderFront_(None)
-        NSApp().activateIgnoringOtherApps_(True)
+        if self.parameter_editor_controller is None:
+            self.parameter_editor_controller = CocoaParameterEditor.alloc().init()
+            self.parameter_editor_controller.configure(
+                title="Adventure Settings",
+                sections=SECTION_ORDER,
+                values=self.parameters,
+                apply_callback=self._apply_parameters_from_shared_editor,
+            )
+        else:
+            self.parameter_editor_controller.update_values(self.parameters)
+        self.parameter_editor_controller.show()
 
     @objc.IBAction
     def selectParameterSection_(self, sender):
@@ -3461,26 +3639,7 @@ class GPXTrackerController(NSObject):
         errors = self._validate_parameter_draft(field_errors)
         if errors:
             return
-        old_parameters = dict(self.parameters)
-        self.parameters = normalize_parameters(self.parameter_draft)
-        changed = changed_parameter_keys(old_parameters, self.parameters)
-        self._sync_legacy_parameter_controls()
-        if changed & map_affecting_parameter_keys():
-            self.track_maps_status_cache = None
-            self.track_maps_summary_label.setStringValue_("Track-map settings changed; use Update to refresh affected maps.")
-            self._set_section_status_checkbox(
-                self.track_maps_status_checkbox,
-                False,
-                "Track-map settings changed; update the maps before the slide show.",
-            )
-        editor_controller = getattr(self, "gpx_editor_controller", None)
-        if editor_controller is not None:
-            editor_controller.apply_project_parameters(self.parameters)
-        if changed:
-            self.mark_dirty()
-            self.set_status(f"Applied {len(changed)} adventure setting(s). Save the adventure to keep them.")
-        else:
-            self.set_status("Adventure settings unchanged.")
+        self._apply_parameter_values(self.parameter_draft, propagate_to_editor=True)
         self.parameter_window.orderOut_(None)
 
     def _ensure_control_table_window(self):
@@ -4746,6 +4905,14 @@ class GPXTrackerController(NSObject):
             show_alert("Please select a project directory first.")
             self.window.makeFirstResponder_(self.project_dir_field)
             return None
+        candidate = project_dir.expanduser().resolve(strict=False)
+        current = self.current_project_dir.resolve(strict=False) if self.current_project_dir is not None else None
+        if not self.directory_activation_in_progress and (
+            current != candidate or self.current_project_file is None
+        ):
+            if self._activate_project_directory(candidate, allow_create=allow_create):
+                return self.current_project_dir
+            return None
         if project_dir.exists():
             if not project_dir.is_dir():
                 show_alert("The selected path is not a directory.")
@@ -4797,9 +4964,7 @@ class GPXTrackerController(NSObject):
     @objc.IBAction
     def projectDirectoryCommitted_(self, _sender):
         text = str(self.project_dir_field.stringValue()).strip()
-        project_dir = self._resolve_project_directory(allow_create=True)
-        if project_dir is not None:
-            self._auto_load_adventure_from_directory(project_dir)
+        if text and self._activate_project_directory(Path(text), allow_create=True):
             next_view = self.project_dir_field.nextKeyView()
             if next_view is not None:
                 self.window.makeFirstResponder_(next_view)
@@ -4825,12 +4990,9 @@ class GPXTrackerController(NSObject):
         project_dir = Path(text).expanduser()
         if not project_dir.is_absolute():
             project_dir = (self.current_project_dir or self.base_dir) / project_dir
-        self.project_dir_field.setStringValue_(str(project_dir))
-        resolved = self._resolve_project_directory(allow_create=True)
-        if resolved is None:
+        if not self._activate_project_directory(project_dir, allow_create=True):
             return False
-        self._auto_load_adventure_from_directory(resolved)
-        self.set_status(f"Selected project directory: {resolved}")
+        self.set_status(f"Selected project directory: {self.current_project_dir}")
         return True
 
     def comboBoxSelectionDidChange_(self, notification):
@@ -4858,23 +5020,14 @@ class GPXTrackerController(NSObject):
             if url is None:
                 return
             project_dir = Path(str(url.path())).expanduser().resolve()
-            self.project_dir_field.setStringValue_(str(project_dir))
-            resolved = self._resolve_project_directory(allow_create=True)
-            if resolved is None:
-                return
-            if self._auto_load_adventure_from_directory(resolved):
-                return
-            self.mark_dirty()
-            self.set_status(f"Selected project directory: {resolved}")
+            if self._activate_project_directory(project_dir, allow_create=True):
+                self.set_status(f"Selected project directory: {self.current_project_dir}")
 
     @objc.IBAction
     def createAdventure_(self, _sender):
-        project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
-        if project_dir is None:
-            return
-        if not str(self.title_field.stringValue()).strip():
-            self.title_field.setStringValue_(project_dir.name)
-        self.save_project_configuration()
+        project_dir = self._project_dir_path()
+        if project_dir is not None:
+            self._activate_project_directory(project_dir, allow_create=True)
 
     @objc.IBAction
     def editAdventure_(self, _sender):
@@ -4882,7 +5035,7 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def saveAndExit_(self, _sender):
-        if self.save_project_configuration():
+        if self.confirm_close():
             NSApp().terminate_(None)
 
     @objc.IBAction
@@ -4892,6 +5045,8 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def loadAdventure_(self, _sender):
+        if not self.flush_adventure_autosave():
+            return
         initial_dir = self.current_project_dir or self.base_dir
         panel = NSOpenPanel.openPanel()
         panel.setCanChooseFiles_(True)
@@ -5741,7 +5896,7 @@ class GPXTrackerController(NSObject):
             "--transition-duration-ms",
             str(settings["slideshow.transition_duration_ms"]),
             "--transition",
-            str(settings["slideshow.transition"]),
+            str(settings["slideshow.transition"]).upper(),
             "--background-color",
             str(settings["slideshow.background_color"]),
             "--font-color",
@@ -5766,6 +5921,8 @@ class GPXTrackerController(NSObject):
             str(settings["timelapse.stage_duration_seconds"]),
             "--time-lapse-media-min-fraction",
             str(settings["timelapse.media_min_fraction"]),
+            "--time-lapse-marker",
+            str(settings["timelapse.marker_style"]),
         ]
         if settings["slideshow.map_window"]:
             args.append("--mapwindow")
@@ -6679,6 +6836,7 @@ class GPXTrackerController(NSObject):
                 cli_args,
                 on_close=handle_editor_close,
                 on_save=handle_editor_save,
+                on_settings_change=self._apply_embedded_editor_parameters,
                 settings=self.parameters,
             )
         except Exception as exc:
@@ -6850,6 +7008,13 @@ class GPXTrackerController(NSObject):
         self.mark_dirty()
 
     def shutdown(self):
+        self.cancel_adventure_autosave()
+        if self.parameter_editor_controller is not None:
+            try:
+                self.parameter_editor_controller.close()
+            except Exception:
+                pass
+            self.parameter_editor_controller = None
         if self.parameter_window is not None:
             try:
                 self.parameter_window.setDelegate_(None)
@@ -6910,10 +7075,7 @@ class GPXTrackerController(NSObject):
                 self.window.makeFirstResponder_(self.title_field)
                 return
         if self.startup_project_directory is not None:
-            self.project_dir_field.setStringValue_(str(self.startup_project_directory))
-            if self._resolve_project_directory(allow_create=True) is not None:
-                if not self._auto_load_adventure_from_directory(self.current_project_dir):
-                    self.set_status(f"Selected project directory: {self.current_project_dir}")
+            if self._activate_project_directory(self.startup_project_directory, allow_create=True):
                 self.window.makeFirstResponder_(self.title_field)
                 return
         self.window.makeFirstResponder_(self.project_dir_field)
@@ -6938,6 +7100,12 @@ class GPSTrackShowGUIAppDelegate(NSObject):
     def applicationWillTerminate_(self, _notification):
         if getattr(self, "controller", None) is not None:
             self.controller.shutdown()
+
+    def applicationShouldTerminate_(self, _sender):
+        controller = getattr(self, "controller", None)
+        if controller is None or controller.confirm_close():
+            return NSTerminateNow
+        return NSTerminateCancel
 
 
 def build_argument_parser():

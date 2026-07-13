@@ -18,6 +18,9 @@ The active source files are:
 - `plot_metadata_utils.py`: shared JSON and coordinate/plot metadata helpers.
 - `adventure_parameters.py`: typed project parameter registry, defaults,
   normalization, validation, and versioned `.adv` payload support.
+- `cocoa_parameter_editor.py`: reusable section-filtered native parameter UI.
+- `json_storage.py`: atomic Adventure/preference writing and standalone
+  parameter-subset loading.
 - `map_provider_utils.py`: shared Contextily provider construction and bounded
   tile-request handling.
 - `gpxjoin.py`, `gpxlist.py`, `editGPXTrack.py`: older or supporting GPX tools.
@@ -81,7 +84,7 @@ The sections are:
 - Photos and Video Clips
 - Slide Show Control File
 - Start Slide Show
-- Save/Load/Quit controls, status line, and progress bar
+- Load/Help/Quit controls, status line, and progress bar
 
 Each section has a non-editable status checkbox. It is used as a visual
 completion indicator:
@@ -100,7 +103,14 @@ The GUI saves and loads them with:
 
 - `save_project_configuration()`
 - `load_project_configuration(...)`
-- `_auto_load_adventure_from_directory(...)`
+- `_activate_project_directory(...)`
+
+The first use of a directory without an Adventure requires confirmation.
+Afterward `mark_dirty()` schedules a 500 ms coalesced auto-save. Discrete
+operations use the same path, while callers that need durability immediately
+flush it. `atomic_write_json(...)` writes and fsyncs a temporary sibling before
+`os.replace(...)`. Once set, `current_project_file` is authoritative, so a
+project-title edit does not rename or duplicate the `.adv` file.
 
 Stored values include:
 
@@ -123,8 +133,10 @@ to be written for older releases.
 
 `adventure_parameters.py` is the only source of parameter defaults. Each
 `ParameterSpec` defines its key, section, label, type, range or choices, inline
-help, unit, and whether it is advanced. `GPSTrackShowGUI.py` generates the
-native Cocoa controls from this registry and edits a draft until Apply.
+help, unit, and whether it is advanced. `CocoaParameterEditor` generates the
+native controls from this registry and edits a draft until Apply. The main GUI
+shows every section; GPX Editor filters it to GPX Processing, PDF Export, and
+Map Service.
 
 The registry currently propagates settings to:
 
@@ -447,6 +459,18 @@ transition, background/marker/arrow styling, font and clock/place overlays,
 fullscreen/display swap/map-window/joined-window/repeat options, and collage
 size and maximum. Playback key changes remain session-only by design.
 
+`timelapse.marker_style` selects `pilgrim` (default) or `arrow`. The player
+loads `pilgrim-frame00-rigged-512.png` through
+`pilgrim-frame08-rigged-512.png` once and draws retained images in
+`TimeLapseMapView`. Frame 0 is the standing pose; movement after a stationary
+interval resumes at frame 3. Motion tolerance scales with the map view
+diagonal, and the 0.1-second sprite cadence is independent of the 50 Hz GPS
+position updates. The view calculates and caches one orientation per stage
+from the same fixed normal used by the arrow. It mirrors the right-facing
+source frames when their transformed facing direction opposes the route.
+Only the stage-map view uses this setting; the overview view always retains the
+arrow. Missing animation assets fall back to the arrow.
+
 ## GPXEditor Architecture
 
 `GPXEditor.py` is both standalone and embeddable.
@@ -457,6 +481,13 @@ Main entry points:
 - `show_gpx_editor_from_cli_args(...)`
 - `export_pdf_summary_from_paths(...)`
 - `run_gpx_editor_from_cli_args(...)`
+
+`show_gpx_editor(...)` and `show_gpx_editor_from_cli_args(...)` accept an
+`on_settings_change` callback. Embedded settings are returned as the
+editor-owned subset and merged into the active Adventure, which auto-saves
+them. Standalone mode instead reads and atomically writes:
+
+`~/Library/Application Support/myCamino GPX Editor/settings.json`
 
 Core classes:
 

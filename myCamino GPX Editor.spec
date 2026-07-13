@@ -6,9 +6,19 @@ hiddenimports += collect_submodules('objc')
 hiddenimports += collect_submodules('AppKit')
 hiddenimports += collect_submodules('Foundation')
 hiddenimports += collect_submodules('Quartz')
-hiddenimports += collect_submodules('matplotlib')
+hiddenimports += collect_submodules(
+    'matplotlib',
+    filter=lambda name: not (
+        name == 'matplotlib.tests' or name.startswith('matplotlib.tests.')
+    ),
+)
 hiddenimports += collect_submodules('contextily')
-hiddenimports += collect_submodules('rasterio')
+hiddenimports += collect_submodules(
+    'rasterio',
+    filter=lambda name: not (
+        name == 'rasterio.rio' or name.startswith('rasterio.rio.')
+    ),
+)
 
 a = Analysis(
     ['GPXEditor.py'],
