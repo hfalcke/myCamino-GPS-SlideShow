@@ -32,7 +32,6 @@ from AppKit import (
     NSApplicationActivationPolicyRegular,
     NSBackingStoreBuffered,
     NSBezierPath,
-    NSBezelStyleRounded,
     NSBitmapImageFileTypePNG,
     NSBitmapImageRep,
     NSButton,
@@ -86,6 +85,10 @@ from Foundation import (
     NSTimer,
     NSURL,
 )
+
+from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
+from basemap_tile_utils import tolerate_missing_tiles
+from track_timing_utils import timestamps_from_start
 
 try:
     from gpx_tracks_table import (
@@ -2301,11 +2304,11 @@ class TrackInspectorController(NSObject):
             ("Help", "help:"),
             ("Quit", "quit:"),
         ]:
-            button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 110, BUTTON_HEIGHT))
+            button = make_liquid_glass_button(NSMakeRect(0, 0, 110, BUTTON_HEIGHT))
             button.setTitle_(title)
-            button.setBezelStyle_(NSBezelStyleRounded)
             button.setTarget_(self)
             button.setAction_(action)
+            apply_liquid_glass_button_style(button)
             self.buttons[title] = button
             root.addSubview_(button)
 
@@ -3246,9 +3249,8 @@ class GPXEditorController(NSObject):
         ]
         self.buttons = {}
         for title, action, tip in button_specs:
-            button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 98, BUTTON_HEIGHT))
+            button = make_liquid_glass_button(NSMakeRect(0, 0, 98, BUTTON_HEIGHT))
             button.setTitle_(title)
-            button.setBezelStyle_(NSBezelStyleRounded)
             button.setTarget_(self)
             button.setAction_(action)
             button.setToolTip_(tip)
@@ -3256,6 +3258,7 @@ class GPXEditorController(NSObject):
                 self.configure_symbol_button(button, "arrow.uturn.backward", "Undo", "NSGoBackTemplate", "↶")
             elif title == "Redo":
                 self.configure_symbol_button(button, "arrow.uturn.forward", "Redo", "NSGoForwardTemplate", "↷")
+            apply_liquid_glass_button_style(button, compact=title in {"Undo", "Redo"})
             self.buttons[title] = button
             self.root.addSubview_(button)
 
@@ -4295,19 +4298,14 @@ class GPXEditorController(NSObject):
         points = track.points()
         if not points:
             return
-        distances = [0.0]
-        total = 0.0
-        for previous, current in zip(points, points[1:]):
-            total += haversine_km(previous.lat, previous.lon, current.lat, current.lon)
-            distances.append(total)
-        if end_time is not None and end_time > start_time:
-            total_seconds = (end_time - start_time).total_seconds()
-        else:
-            average_speed = self.average_speed() or 3.5
-            total_seconds = (total / average_speed) * 3600.0 if total > 0 else max(0, len(points) - 1)
-        for point, distance in zip(points, distances):
-            fraction = 0.0 if total <= 0 else distance / total
-            get_or_create_point_time(point.element).text = format_gpx_time(start_time + timedelta(seconds=total_seconds * fraction))
+        repaired_times = timestamps_from_start(
+            [{"lat": point.lat, "lon": point.lon} for point in points],
+            start_time,
+            end_time,
+            self.average_speed() or 3.5,
+        )
+        for point, point_time in zip(points, repaired_times):
+            get_or_create_point_time(point.element).text = format_gpx_time(point_time)
         get_or_create_track_time(track.element).text = format_gpx_time(start_time)
         self.invalidate_track_metrics(track)
 
@@ -4663,13 +4661,13 @@ class GPXEditorController(NSObject):
         self.pdf_summary_path_field.setToolTip_("Full path of the PDF file to write.")
         self.pdf_summary_path_field.setAutoresizingMask_(NSViewWidthSizable)
         root.addSubview_(self.pdf_summary_path_field)
-        browse_button = NSButton.alloc().initWithFrame_(NSMakeRect(650, 354, 84, BUTTON_HEIGHT))
+        browse_button = make_liquid_glass_button(NSMakeRect(650, 354, 84, BUTTON_HEIGHT))
         browse_button.setTitle_("Browse")
-        browse_button.setBezelStyle_(NSBezelStyleRounded)
         browse_button.setTarget_(self)
         browse_button.setAction_("choosePdfSummaryOutput:")
         browse_button.setToolTip_("Choose the PDF output file.")
         browse_button.setAutoresizingMask_(0)
+        apply_liquid_glass_button_style(browse_button)
         root.addSubview_(browse_button)
         self.pdf_summary_browse_button = browse_button
 
@@ -4729,20 +4727,20 @@ class GPXEditorController(NSObject):
         self.pdf_summary_orientation_menu.selectItemAtIndex_(0)
         self.pdf_summary_orientation_menu.setToolTip_("Choose the PDF page orientation.")
         root.addSubview_(self.pdf_summary_orientation_menu)
-        export_button = NSButton.alloc().initWithFrame_(NSMakeRect(570, 20, 82, BUTTON_HEIGHT))
+        export_button = make_liquid_glass_button(NSMakeRect(570, 20, 82, BUTTON_HEIGHT))
         export_button.setTitle_("Export")
-        export_button.setBezelStyle_(NSBezelStyleRounded)
         export_button.setTarget_(self)
         export_button.setAction_("exportPdfSummaryNow:")
         export_button.setAutoresizingMask_(0)
+        apply_liquid_glass_button_style(export_button)
         root.addSubview_(export_button)
         self.pdf_summary_export_button = export_button
-        close_button = NSButton.alloc().initWithFrame_(NSMakeRect(660, 20, 74, BUTTON_HEIGHT))
+        close_button = make_liquid_glass_button(NSMakeRect(660, 20, 74, BUTTON_HEIGHT))
         close_button.setTitle_("Close")
-        close_button.setBezelStyle_(NSBezelStyleRounded)
         close_button.setTarget_(self)
         close_button.setAction_("closePdfSummary:")
         close_button.setAutoresizingMask_(0)
+        apply_liquid_glass_button_style(close_button)
         root.addSubview_(close_button)
         self.pdf_summary_close_button = close_button
 
@@ -5118,6 +5116,7 @@ class GPXEditorController(NSObject):
             f"PDF export: plotting {map_label} at {pixel_width}x{pixel_height}px, "
             f"tile zoom {tile_zoom}, tiles {diagnostics['nx']}x{diagnostics['ny']}={diagnostics['count']}."
         )
+        missing_basemap_tiles = 0
         try:
             if missing_tiles:
                 self.set_status(
@@ -5126,11 +5125,16 @@ class GPXEditorController(NSObject):
                 )
             else:
                 self.set_status(f"PDF export: using cached OSM tiles for {map_label} at zoom {tile_zoom}.")
-            self.add_osm_basemap_with_timeout(cx, ax, tile_zoom)
+            missing_basemap_tiles = self.add_osm_basemap_with_timeout(cx, ax, tile_zoom)
         except Exception as exc:
             self.set_status(f"PDF export: OSM map unavailable for {map_label}: {exc}")
             ax.text(0.5, 0.5, f"OSM map unavailable\n{exc}", transform=ax.transAxes, ha="center", va="center", color="white", fontsize=10)
         map_done = time.perf_counter()
+        if missing_basemap_tiles:
+            self.set_status(
+                f"PDF export: {map_label} created with {missing_basemap_tiles} unavailable "
+                f"map tile{'s' if missing_basemap_tiles != 1 else ''} skipped."
+            )
         selected = {track.nr for track in self.selected_tracks()}
         for track in tracks:
             points = track.points()
@@ -6086,7 +6090,9 @@ class GPXEditorController(NSObject):
         try:
             if original_get is not None:
                 request_module.get = get_with_timeout
-            cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik, zoom=tile_zoom)
+            with tolerate_missing_tiles(cx) as missing_tile_report:
+                cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik, zoom=tile_zoom)
+            return missing_tile_report.count
         except Exception as exc:
             if requests is not None and isinstance(exc, (requests.Timeout, requests.ConnectionError)):
                 raise TimeoutError(f"OSM tile request timed out after {OSM_REQUEST_TIMEOUT_SECONDS:.0f}s.") from exc
@@ -6130,13 +6136,14 @@ class GPXEditorController(NSObject):
             self.set_status(f"Checking OSM cache for {total_tiles} tile(s) at zoom {tile_zoom}...")
         else:
             self.set_status(f"Loading {total_tiles} cached OSM tile(s) at zoom {tile_zoom}...")
+        missing_basemap_tiles = 0
         try:
             if missing_tiles:
                 self.set_status(
                     f"Connecting to OSM server for {missing_tiles} tile(s) at zoom {tile_zoom} "
                     f"(timeout {OSM_REQUEST_TIMEOUT_SECONDS:.0f}s per request)..."
                 )
-            self.add_osm_basemap_with_timeout(cx, ax, tile_zoom)
+            missing_basemap_tiles = self.add_osm_basemap_with_timeout(cx, ax, tile_zoom)
         except Exception as exc:
             plt.close(fig)
             message = (
@@ -6178,6 +6185,11 @@ class GPXEditorController(NSObject):
                 f"Loaded {total_tiles} cached OSM tile(s) in {map_seconds:.2f}s; "
                 f"map rendered in {total_seconds:.2f}s."
             )
+        if missing_basemap_tiles:
+            status_message = (
+                f"{status_message} {missing_basemap_tiles} unavailable map "
+                f"tile{'s' if missing_basemap_tiles != 1 else ''} skipped."
+            )
         self.set_status(status_message)
         if self.debug:
             print(
@@ -6204,6 +6216,7 @@ class GPXEditorController(NSObject):
             "extent_mercator": dict(extent),
             "basemap": "OpenStreetMap.Mapnik",
             "effective_zoom": tile_zoom,
+            "missing_basemap_tiles": missing_basemap_tiles,
         }
         return {
             "image": image,

@@ -9,12 +9,24 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from math import asin, atan2, cos, degrees, floor, log, pi, radians, sin, sqrt, tan
+from pathlib import Path
 
 from plot_metadata_utils import (
     build_coordinate_point,
     image_origin_metadata,
     write_plot_metadata,
     write_table_data,
+    read_plot_metadata,
+)
+from basemap_tile_utils import tolerate_missing_tiles
+from track_timing_utils import timed_points_payload
+from track_map_layout_utils import (
+    DEFAULT_GRID_LONG_AXIS,
+    DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+    build_media_clear_boxes_metadata,
+    clear_box_options_for_extent,
+    optimized_track_extent,
+    time_lapse_track_map_name,
 )
 
 
@@ -309,6 +321,7 @@ def summarize_track(track_element, remove_prefix, threshold_distance_m, threshol
         "first_point": first_point,
         "last_point": last_point,
         "points": [(point["lat"], point["lon"]) for point in points],
+        "point_records": points,
         "distance_km": None,
         "raw_points": [(point["lat"], point["lon"]) for point in raw_points],
         "filtered_point_count": len(points),
@@ -691,6 +704,7 @@ def build_table_summary_data(gpx_path, tracks):
                 "track_name": track["name"],
                 "track_fingerprint": track.get("track_fingerprint"),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
+                "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                 "erstellungsdatum": format_datetime_local(track["time"]),
                 "dauer": format_duration(track["duration"]),
                 "laenge_km": round(track["length_km"], 1),
@@ -1101,6 +1115,8 @@ def render_track_plot(
     overview_label_items,
     overview_header,
     overview_mode,
+    map_layout="standard",
+    track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
 ):
     """Render one overview or one single-track plot."""
     try:
@@ -1164,7 +1180,22 @@ def render_track_plot(
         max(1.0, width_px * axes_box[2]),
         max(1.0, height_px * axes_box[3]),
     )
-    min_x, max_x, min_y, max_y = extent_for_image(all_x, all_y, plot_area_size)
+    standard_extent = extent_for_image(all_x, all_y, plot_area_size)
+    selected_optimized_corner = None
+    extent_shift = (0.0, 0.0)
+    media_clear_options = None
+    if not overview_mode and map_layout == "time-lapse":
+        selected_extent, selected_optimized_corner, extent_shift, media_clear_options = optimized_track_extent(
+            standard_extent,
+            projected_tracks[0],
+            (width_px, height_px),
+            axes_box,
+            track_edge_margin_fraction,
+            DEFAULT_GRID_LONG_AXIS,
+        )
+    else:
+        selected_extent = standard_extent
+    min_x, max_x, min_y, max_y = selected_extent
     effective_zoom = fitted_zoom_level(zoom_level, (min_x, max_x, min_y, max_y), plot_area_size)
     span = max(max_x - min_x, max_y - min_y)
 
@@ -1221,7 +1252,8 @@ def render_track_plot(
     ax.set_ylim(min_y, max_y)
     ax.set_aspect("equal", adjustable="box")
     try:
-        cx.add_basemap(ax, source=basemap_provider(cx, use_esri), zoom=effective_zoom)
+        with tolerate_missing_tiles(cx) as missing_tile_report:
+            cx.add_basemap(ax, source=basemap_provider(cx, use_esri), zoom=effective_zoom)
     except Exception as exc:
         provider_name = "ESRI" if use_esri else "OSM"
         raise RuntimeError(
@@ -1265,7 +1297,27 @@ def render_track_plot(
         },
         "basemap": "Esri.WorldStreetMap" if use_esri else "OpenStreetMap.Mapnik",
         "effective_zoom": effective_zoom,
+        "missing_basemap_tiles": missing_tile_report.count,
     }
+    if not overview_mode:
+        if media_clear_options is None:
+            media_clear_options = clear_box_options_for_extent(
+                projected_tracks[0],
+                selected_extent,
+                (width_px, height_px),
+                axes_box,
+                track_edge_margin_fraction,
+                DEFAULT_GRID_LONG_AXIS,
+            )
+        metadata.update(
+            {
+                "map_layout": map_layout,
+                "track_edge_margin_fraction": track_edge_margin_fraction,
+                "selected_optimized_corner": selected_optimized_corner,
+                "extent_shift_mercator": {"x": extent_shift[0], "y": extent_shift[1]},
+                "media_clear_box_options": media_clear_options,
+            }
+        )
     return effective_zoom, actual_font_size, metadata
 
 
@@ -1434,6 +1486,18 @@ def build_argument_parser():
         default=10.0,
         help="Maximum allowed point accuracy in meters when present (default: 10).",
     )
+    parser.add_argument(
+        "--map-layout",
+        choices=("standard", "time-lapse"),
+        default="standard",
+        help="Per-track map layout variant (default: standard).",
+    )
+    parser.add_argument(
+        "--track-edge-margin-fraction",
+        type=float,
+        default=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+        help="Minimum track margin inside the map axes for time-lapse layouts (default: 0.05).",
+    )
     return parser
 
 
@@ -1446,6 +1510,12 @@ def normalize_runtime_args(args):
 
     if args.zoom < 0:
         raise ValueError("Zoom level must be a non-negative integer.")
+    if getattr(args, "map_layout", "standard") not in {"standard", "time-lapse"}:
+        raise ValueError("map_layout must be 'standard' or 'time-lapse'.")
+    margin = float(getattr(args, "track_edge_margin_fraction", DEFAULT_TRACK_EDGE_MARGIN_FRACTION))
+    if not 0.0 <= margin < 0.5:
+        raise ValueError("track_edge_margin_fraction must be at least 0 and below 0.5.")
+    args.track_edge_margin_fraction = margin
 
     if args.output_base:
         normalized_output_base = os.path.normpath(os.path.expanduser(args.output_base))
@@ -1543,6 +1613,9 @@ def prepare_run_context(args):
             f"{sanitize_filename_component(track['name'])}_"
             f"{safe_base}.png"
         )
+        track["track_plot_time_lapse_image_filename"] = time_lapse_track_map_name(
+            track["track_plot_image_filename"]
+        )
 
     selected_numbers = []
     if args.plot_tracks:
@@ -1550,7 +1623,11 @@ def prepare_run_context(args):
     track_plot_paths = []
     for number in selected_numbers:
         track = next(track for track in tracks if track["table_number"] == number)
-        filename = track["track_plot_image_filename"]
+        filename = (
+            track["track_plot_time_lapse_image_filename"]
+            if args.map_layout == "time-lapse"
+            else track["track_plot_image_filename"]
+        )
         track_output_path = os.path.join(output_dir, filename)
         metadata_output_path = os.path.splitext(track_output_path)[0] + ".json"
         track_plot_paths.append(
@@ -1681,6 +1758,7 @@ def execute_run_context(context, print_table_output=True):
                         "track_name": track["name"],
                         "track_fingerprint": track.get("track_fingerprint"),
                         "track_plot_image_filename": track.get("track_plot_image_filename"),
+                        "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                         "start_time": format_datetime_local_seconds(track["start_time"]),
                         "end_time": format_datetime_local_seconds(track["end_time"]),
                         "start_point": build_coordinate_point(
@@ -1736,7 +1814,10 @@ def execute_run_context(context, print_table_output=True):
                 args.print_labels,
                 args.header,
                 False,
+                args.map_layout,
+                args.track_edge_margin_fraction,
             )
+            media_clear_options = plot_metadata.pop("media_clear_box_options", None)
             plot_metadata.update(
                 {
                     "source_gpx": os.path.abspath(gpx_path),
@@ -1765,8 +1846,17 @@ def execute_run_context(context, print_table_output=True):
                         track["last_point"][1] if track["last_point"] is not None else None,
                     ),
                     "track_points": [(point[0], point[1]) for point in track["points"]],
+                    "timed_track_points": timed_points_payload(track.get("point_records", [])),
                 }
-                    )
+            )
+            if media_clear_options is not None:
+                plot_metadata["media_clear_boxes"] = build_media_clear_boxes_metadata(
+                    media_clear_options,
+                    args.size,
+                    args.track_edge_margin_fraction,
+                    track.get("track_fingerprint"),
+                    DEFAULT_GRID_LONG_AXIS,
+                )
             if not args.nojson:
                 plot_metadata.update(image_origin_metadata(plot_metadata))
                 write_plot_metadata(plot_metadata, metadata_output_path)
@@ -1829,6 +1919,8 @@ def namespace_from_options(gpx_file, **overrides):
         verbose=False,
         gpx_threshold_distance=10.0,
         gpx_threshold_accuracy=10.0,
+        map_layout="standard",
+        track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
         create_output_dir=True,
     )
     for key, value in overrides.items():
@@ -1846,6 +1938,44 @@ def run_with_options(gpx_file, print_table_output=True, **overrides):
     """Execute the GPX processing pipeline directly from Python."""
     context = prepare_with_options(gpx_file, **overrides)
     return execute_run_context(context, print_table_output=print_table_output)
+
+
+def upgrade_timed_track_sidecars(gpx_file, output_dir, **overrides):
+    """Add timing payloads to existing sidecars matched by track fingerprint."""
+    context = prepare_with_options(gpx_file, output_dir=str(output_dir), **overrides)
+    tracks_by_fingerprint = {
+        track.get("track_fingerprint"): track
+        for track in context["tracks"]
+        if track.get("track_fingerprint")
+    }
+    report = {"updated": [], "current": [], "skipped": []}
+    matched_fingerprints = set()
+    output_path = Path(output_dir)
+    for metadata_path in sorted(output_path.glob("*.json")):
+        try:
+            metadata = read_plot_metadata(metadata_path)
+        except Exception as exc:
+            report["skipped"].append((metadata_path.name, f"unreadable metadata: {exc}"))
+            continue
+        fingerprint = metadata.get("track_fingerprint")
+        if not fingerprint:
+            continue
+        track = tracks_by_fingerprint.get(fingerprint)
+        if track is None:
+            report["skipped"].append((metadata_path.name, "GPX track no longer matches plot metadata"))
+            continue
+        matched_fingerprints.add(fingerprint)
+        payload = timed_points_payload(track.get("point_records", []))
+        if metadata.get("timed_track_points") == payload:
+            report["current"].append(track["table_number"])
+            continue
+        metadata["timed_track_points"] = payload
+        write_plot_metadata(metadata, metadata_path)
+        report["updated"].append(track["table_number"])
+    for fingerprint, track in tracks_by_fingerprint.items():
+        if fingerprint not in matched_fingerprints:
+            report["skipped"].append((track["table_number"], "matching track-map metadata missing"))
+    return report
 
 
 # AI prompt: "Write the main entrypoint that validates CLI inputs, parses the GPX

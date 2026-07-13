@@ -104,6 +104,8 @@ Stored values include:
 - project directory
 - GPX file basename/path as shown by the GUI
 - last picture import directory
+- `time_lapse_media_min_fraction` (currently stored with a default of `0.5`;
+  the legacy `time_lapse_media_max_fraction` key is accepted while loading)
 - description and other GUI state that belongs to the adventure
 
 When a project directory is selected, the GUI creates it if needed and tries to
@@ -152,16 +154,20 @@ are not counted as missing duplicates.
 
 Track Maps buttons:
 
-- `Create`: render overview plus every track map directly. It confirms before
-  overwriting existing current map images.
+- `Create`: render the shared overview plus every map of the variant selected
+  by `for Time-Lapse`. It confirms before overwriting existing images.
 - `Update`: open the selection window with missing/stale maps marked by `*`,
   preselected, and copied into the range field.
-- `View`: open existing map images.
+- `for Time-Lapse`: selects `map_layout="time-lapse"`; unchecked selects
+  `map_layout="standard"`. It is persisted as `track_maps_for_time_lapse`.
+- `View`: open the preferred variant for every track, with the other variant as
+  fallback.
 - folder icon: open `trackimages/` in Finder.
 
 Before rendering, obsolete numbered track-map `.png` and `.json` files are
-removed if they no longer match any current GPX track. The cleanup intentionally
-does not remove the overview image, summary JSON, or unrelated files.
+removed if they no longer match any current GPX track. Both valid variants are
+retained. The cleanup intentionally does not remove the overview image, summary
+JSON, or unrelated files.
 
 Plot creation runs on a background thread. The GUI shows a Cancel button that
 sets an event. Cancellation is cooperative and stops after the current image.
@@ -197,7 +203,14 @@ Created files in the project directory:
 
 - `<projectname>.lst`: unsorted/intermediate list
 - `<projectname>-sorted.lst`: slide-show control file used by the slide show
-- `<mediafile>.json`: per-media sidecar metadata
+- `<mediafile>.json`: per-media sidecar metadata, where `<mediafile>` includes
+  the original extension (`IMG_4104.mov.json`, not `IMG_4104.json`)
+
+Use `migrate_media_sidecars(project_dir)` or the
+`--migrate-media-sidecars` CLI flag to upgrade old stem-only media sidecars.
+Migration accepts a legacy sidecar only when its `source_filename` and
+`photo_path` identify exactly one current media file; ambiguous metadata is
+preserved under a `.legacy-sidecar` filename instead of being overwritten.
 
 Merge actions use:
 
@@ -215,7 +228,7 @@ The GUI also performs a preflight sync check for the slide-show control file:
 - map entries whose files no longer exist
 
 The Slide Show Control File status line reports these problems. The
-`Update Tracks` button shows the exact maps to insert and old entries to remove,
+`Sync Track Maps` button shows the exact canonical maps to insert and old entries to remove,
 and can remove obsolete entries before calling the GetGeoLocations merge path.
 
 Reverse geocoding uses a temporary list so the user-edited sorted list is not
@@ -287,6 +300,88 @@ It supports keyboard navigation, media overlays, clock/place overlays, and map
 windows. Since it is a separate process, quitting it must not affect the main
 GUI.
 
+### Stage Time-Lapse Mode
+
+`--time-lapse-stages` starts the player in stage-map mode. A stage consists of
+one `#Map:` row and its following media rows until the next `#Map:`. The stage
+map is rendered by a retained `TimeLapseMapView`; the overview is drawn in the
+map role with the complete active route and current position. This avoids
+allocating a new full-screen image for every 20 ms animation tick.
+
+`--time-lapse-duration SECONDS` controls active route motion and defaults to
+30 seconds. In time-lapse mode, the existing `--duration` setting is the
+minimum display time for media. Timed media is
+scheduled from its extension-aware media sidecar; untimed media remains in list
+order at the end of its stage. `T` switches between normal and time-lapse mode
+without intentionally skipping a media row. Entering time-lapse cancels the
+standard continuation timer and presenter transitions, then hides every
+standard content layer so both modes cannot animate concurrently.
+
+`--time-lapse-media-min-fraction FRACTION` sets the preferred minimum size of
+the complete white-framed medium and defaults to `0.5`. It is not an upper
+limit: each medium grows to the largest route-free rectangle available. Track
+safety remains authoritative, so a congested map can still require a smaller
+medium. The old `--time-lapse-media-max-fraction` spelling remains a compatible
+alias. Per-track plotting supports `map_layout="standard"|"time-lapse"` and
+`track_edge_margin_fraction`. Standard maps retain the canonical centered
+extent and filename. Time-Lapse maps retain the same scale but evaluate legal
+extreme extent shifts and use the `-timelapse` filename suffix. The shared
+overview is never variant-specific.
+
+`track_map_layout_utils.py` owns variant naming, obstruction rasterization,
+corner frontiers, extent optimization, cache validation, and normalized/view
+coordinate conversion. Plot sidecars store `media_clear_boxes` version 1 in
+`image_fraction_bottom_left` coordinates. Each corner contains a largest-area
+`maximum` and a Pareto `frontier`, together with image size, margin, grid size,
+and track fingerprint. The player validates those fields and converts the
+normalized rectangles into the current aspect-fit image rectangle. Legacy,
+malformed, stale, or wrong-size caches fall back to the same shared runtime
+calculation. Every medium is aspect-fitted against the frontier member that
+produces the largest display area.
+
+Canonical `#Map:` control rows continue to name the Standard file. Standard
+playback resolves Standard then Time-Lapse; Time-Lapse playback resolves the
+reverse order and loads the sidecar belonging to the selected image. Thus `T`
+switching reloads the appropriate variant without duplicate control rows.
+
+Media display deadlines run alongside the 20 ms motion tick. The arrow keeps
+moving while one item is visible. Once its minimum duration has elapsed, the
+item remains visible until the next medium replaces it or the stage ends. If
+the next media fraction is reached too early, progress is held exactly there
+until the minimum duration is complete. The arrow orientation is fixed for the
+stage from its start/end line, and the established renderer keeps it
+perpendicular to that line. While media is visible, its initial route location
+is retained as a red dot with a white outline. Backward navigation stores playlist row
+numbers rather than rendered `NSImage` objects. Normal mode reloads the prior
+map or medium from its source, and time-lapse mode first walks back through the
+media events of the active stage. This permits navigation beyond four items
+without restoring the former full-resolution image retention.
+
+`TimeLapseMapView` owns a retained clock `NSImageView` above its optional
+AVPlayer child. Clock content is rebuilt only when time, date, or view height
+changes, not on each 20 ms tick. `create_clock_overlay_image(...)` applies a
+50%-opaque black shadow offset down/right by one stroke width before drawing
+the white clock and date.
+
+`track_timing_utils.py` is the single timestamp-repair policy shared by the
+GPX editor, `gpx_tracks_table.py`, and the player. It preserves usable GPX
+times, interpolates missing intervals by cumulative distance, and falls back to
+3.5 km/h when a duration cannot be derived. It returns repaired in-memory
+values only. GPX files are changed only by an explicit GPX Editor save.
+
+Track-map sidecars include `timed_track_points`, an ordered list of latitude,
+longitude, ISO timestamp, and estimated-time flag. Use
+`gpx_tracks_table.upgrade_timed_track_sidecars(...)` to add that payload to
+matching current sidecars without rerendering a PNG. It verifies the existing
+track fingerprint first and reports unsafe matches instead of guessing.
+
+The future Adventure settings UI should persist these global slide-show
+parameters in `.adv` files: media pause duration, stage time-lapse duration,
+time-lapse media minimum size, transition, background/marker/arrow styling, font
+and clock/place overlays, fullscreen/display swap/map-window/joined-window/
+repeat options, and collage size and maximum. The media minimum size is already
+persisted but is not editable until that settings UI is implemented.
+
 ## GPXEditor Architecture
 
 `GPXEditor.py` is both standalone and embeddable.
@@ -329,7 +424,8 @@ by plots, media, and the slide show.
 
 Common sidecar patterns:
 
-- `<image-or-video>.json`: media metadata from `GetGeoLocations.py`
+- `<image-or-video>.json`: media metadata from `GetGeoLocations.py`; retain
+  the media extension in this name to avoid JPEG/video stem collisions
 - `<plot>.json`: plot metadata from `gpx_tracks_table.py`
 - `<projectname>-summary.json`: track summary used by control-file creation
 

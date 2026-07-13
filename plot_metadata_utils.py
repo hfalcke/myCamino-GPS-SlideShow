@@ -4,6 +4,7 @@
 import json
 from datetime import datetime
 from math import atan, degrees, exp, log, pi, radians, tan
+from pathlib import Path
 
 
 # AI prompt: "Write a converter from WGS84 longitude/latitude to Web Mercator
@@ -104,6 +105,37 @@ def write_photo_metadata(payload, output_path):
 def read_photo_metadata(input_path):
     """Read one photo sidecar JSON file."""
     return read_json_data(input_path)
+
+
+def media_sidecar_path(media_path):
+    """Return the collision-safe JSON sidecar path for one media file.
+
+    The extension remains part of the filename: ``IMG_4104.mov.json`` is
+    distinct from ``IMG_4104.jpeg.json``.
+    """
+    path = Path(media_path)
+    return path.with_name(f"{path.name}.json")
+
+
+def legacy_media_sidecar_path(media_path):
+    """Return the pre-migration, stem-only media sidecar path."""
+    return Path(media_path).with_suffix(".json")
+
+
+def media_sidecar_matches_media(metadata, media_path) -> bool:
+    """Return whether a sidecar explicitly identifies the supplied media file."""
+    if not isinstance(metadata, dict):
+        return False
+    path = Path(media_path)
+    expected_name = path.name.casefold()
+    declared_names = []
+    source_filename = metadata.get("source_filename")
+    if isinstance(source_filename, str) and source_filename.strip():
+        declared_names.append(Path(source_filename).name.casefold())
+    photo_path = metadata.get("photo_path")
+    if isinstance(photo_path, str) and photo_path.strip():
+        declared_names.append(Path(photo_path).name.casefold())
+    return bool(declared_names) and all(name == expected_name for name in declared_names)
 
 
 def format_german_date(value):

@@ -26,6 +26,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from plot_metadata_utils import (
     build_photo_metadata_payload,
+    legacy_media_sidecar_path,
+    media_sidecar_matches_media,
+    media_sidecar_path,
     parse_photo_datetime,
     read_json_data,
     read_photo_metadata,
@@ -175,6 +178,7 @@ class Params:
     sort_date_sections_by_tracks: bool
     merge_tracks: Optional[Path]
     merge_media: tuple[Path, ...]
+    migrate_media_sidecars: bool = False
     progress_callback: Optional[Callable[[int, int, str], None]] = None
 
 
@@ -195,6 +199,17 @@ class PhotoRecord:
     geocode_requested: bool
     place_updated: bool
     debug_info: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class MediaSidecarMigrationReport:
+    """Result of a media-sidecar migration for one project directory."""
+
+    project_dir: Path
+    migrated: list[tuple[Path, Path]]
+    regenerated: list[Path]
+    preserved: list[tuple[Path, Path]]
+    conflicts: list[tuple[Path, Path]]
 
 
 @dataclass(frozen=True)
@@ -332,6 +347,11 @@ def collect_input_parameters(argv: list[str]) -> Params:
         default="",
         help="Comma-separated image/video files to merge into the existing sorted photolist.",
     )
+    parser.add_argument(
+        "--migrate-media-sidecars",
+        action="store_true",
+        help="Move legacy <stem>.json media sidecars to collision-safe <mediafile>.json names and create missing sidecars.",
+    )
 
     args = parser.parse_args(argv)
     photodir = args.photodir.expanduser().resolve()
@@ -372,6 +392,7 @@ def collect_input_parameters(argv: list[str]) -> Params:
         sort_date_sections_by_tracks=bool(args.sort_date_sections_by_tracks),
         merge_tracks=merge_tracks,
         merge_media=merge_media,
+        migrate_media_sidecars=bool(args.migrate_media_sidecars),
     )
 
 
@@ -392,6 +413,7 @@ def params_from_options(
     sort_date_sections_by_tracks: bool = False,
     merge_tracks: Path | str | None = None,
     merge_media: list[Path | str] | tuple[Path | str, ...] | str | None = None,
+    migrate_media_sidecars: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Params:
     """Build validated parameters for direct in-process execution."""
@@ -474,6 +496,7 @@ def params_from_options(
         sort_date_sections_by_tracks=bool(sort_date_sections_by_tracks),
         merge_tracks=merge_tracks_path,
         merge_media=merge_media_paths,
+        migrate_media_sidecars=bool(migrate_media_sidecars),
         progress_callback=progress_callback,
     )
 
@@ -1310,6 +1333,100 @@ def list_photo_files(photodir: Path, file_filter: str = "ALL") -> list[Path]:
     )
 
 
+def _migration_backup_path(path: Path) -> Path:
+    """Return an unused, clearly named preservation path for a legacy sidecar."""
+    candidate = path.with_name(f"{path.stem}.legacy-sidecar.json")
+    index = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}.legacy-sidecar-{index}.json")
+        index += 1
+    return candidate
+
+
+def _read_sidecar_or_none(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        payload = read_photo_metadata(path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def migrate_media_sidecars(
+    photodir: Path | str,
+    *,
+    getclearnames: bool = False,
+    distance: float = 150.0,
+    debug: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> MediaSidecarMigrationReport:
+    """Migrate media JSON sidecars without losing valid cached place data.
+
+    Legacy sidecars were named from the stem only, which lets ``photo.jpeg``
+    and ``photo.mov`` collide.  This routine moves an unambiguous sidecar to
+    the extension-aware name, preserves ambiguous files under a backup name,
+    and creates sidecars for media that still have none.
+    """
+    project_dir = Path(photodir).expanduser().resolve()
+    if not project_dir.is_dir():
+        raise ValueError(f"photodir is not a directory: {project_dir}")
+
+    media_files = list_photo_files(project_dir)
+    report = MediaSidecarMigrationReport(project_dir, [], [], [], [])
+    legacy_groups: dict[Path, list[Path]] = {}
+    for media_path in media_files:
+        legacy_groups.setdefault(legacy_media_sidecar_path(media_path), []).append(media_path)
+
+    # A malformed canonical sidecar must never block migration or be reused.
+    for media_path in media_files:
+        canonical_path = media_sidecar_path(media_path)
+        if canonical_path.exists() and not media_sidecar_matches_media(_read_sidecar_or_none(canonical_path), media_path):
+            backup_path = _migration_backup_path(canonical_path)
+            canonical_path.rename(backup_path)
+            report.conflicts.append((canonical_path, backup_path))
+
+    for legacy_path, candidates in legacy_groups.items():
+        if not legacy_path.exists():
+            continue
+        payload = _read_sidecar_or_none(legacy_path)
+        owners = [media_path for media_path in candidates if media_sidecar_matches_media(payload, media_path)]
+        if len(owners) == 1:
+            canonical_path = media_sidecar_path(owners[0])
+            if canonical_path.exists():
+                backup_path = _migration_backup_path(legacy_path)
+                legacy_path.rename(backup_path)
+                report.preserved.append((legacy_path, backup_path))
+            else:
+                legacy_path.rename(canonical_path)
+                report.migrated.append((legacy_path, canonical_path))
+            continue
+
+        # Do not guess ownership when the sidecar is missing, malformed, or
+        # identifies a media file not present in this project directory.
+        backup_path = _migration_backup_path(legacy_path)
+        legacy_path.rename(backup_path)
+        report.conflicts.append((legacy_path, backup_path))
+
+    geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]] = {}
+    known_places: list[KnownPlace] = []
+    total_media = len(media_files)
+    for index, media_path in enumerate(media_files, start=1):
+        canonical_path = media_sidecar_path(media_path)
+        if not canonical_path.exists():
+            record = build_record_from_photo(
+                media_path,
+                getclearnames,
+                geocode_cache,
+                known_places,
+                distance,
+                debug,
+            )
+            write_record_json(record, set())
+            report.regenerated.append(canonical_path)
+        if progress_callback is not None:
+            progress_callback(index, total_media, media_path.name)
+    return report
+
+
 def exclude_tracks_images(photo_files: list[Path], tracks_summary: Optional[TracksSummary]) -> list[Path]:
     """Exclude overview and track plot images referenced by the tracks summary."""
     if tracks_summary is None or not tracks_summary.ignored_photo_names:
@@ -1399,7 +1516,7 @@ def filter_photo_files_by_name(photo_files: list[Path], photo_name_list: Optiona
 
 def get_json_path_for_photo(photo_path: Path) -> Path:
     """Return the sidecar JSON path for one photo."""
-    return photo_path.with_suffix(".json")
+    return media_sidecar_path(photo_path)
 
 
 def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRecord]:
@@ -1407,6 +1524,8 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
     try:
         data = read_photo_metadata(json_path)
     except (OSError, ValueError, TypeError):
+        return None
+    if not media_sidecar_matches_media(data, photo_path):
         return None
 
     try:
@@ -2067,12 +2186,28 @@ def merge_sorted_control_file(params: Params) -> Path:
     return sorted_output_path
 
 
-def collect_photo_location_and_dates(params: Params) -> None:
+def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMigrationReport]:
     """Process photos, emit live output, cache JSON, and write a sorted list."""
     check_cancelled()
+    if params.migrate_media_sidecars:
+        report = migrate_media_sidecars(
+            params.photodir,
+            getclearnames=params.getclearnames,
+            distance=params.distance,
+            debug=params.debug,
+            progress_callback=params.progress_callback,
+        )
+        print(
+            f"Migrated {len(report.migrated)} sidecars, regenerated {len(report.regenerated)}, "
+            f"preserved {len(report.preserved)}, conflicts {len(report.conflicts)}.",
+            flush=True,
+        )
+        for source_path, backup_path in [*report.preserved, *report.conflicts]:
+            print(f"Preserved legacy sidecar: {source_path.name} -> {backup_path.name}", flush=True)
+        return report
     if params.merge_tracks is not None or params.merge_media:
         merge_sorted_control_file(params)
-        return
+        return None
     tracks_summary = load_tracks_summary(params.tracks, params.photolist)
     photo_files = list_photo_files(params.photodir, params.file_filter)
     photo_files = exclude_tracks_images(photo_files, tracks_summary)
@@ -2170,6 +2305,7 @@ def collect_photo_location_and_dates(params: Params) -> None:
         tracks_summary,
         params.sort_date_sections_by_tracks,
     )
+    return None
 
 
 def run_with_options(
@@ -2185,19 +2321,21 @@ def run_with_options(
     params = params_from_options(photodir, **overrides)
     previous_cancel_event = RUNTIME_CANCEL_EVENT
     RUNTIME_CANCEL_EVENT = cancel_event
+    result: Optional[MediaSidecarMigrationReport] = None
     try:
         if stdout is None and stderr is None:
-            collect_photo_location_and_dates(params)
+            result = collect_photo_location_and_dates(params)
         else:
             output_stream = stdout or sys.stdout
             error_stream = stderr or output_stream
             with redirect_stdout(output_stream), redirect_stderr(error_stream):
-                collect_photo_location_and_dates(params)
+                result = collect_photo_location_and_dates(params)
     finally:
         RUNTIME_CANCEL_EVENT = previous_cancel_event
     return {
         "params": params,
         "sorted_output_path": build_sorted_output_path(params.photolist),
+        "migration_report": result,
     }
 
 

@@ -22,7 +22,6 @@ from AppKit import (
     NSApplicationActivationPolicyRegular,
     NSBackingStoreBuffered,
     NSBezierPath,
-    NSBezelStyleRounded,
     NSButton,
     NSButtonTypeSwitch,
     NSColor,
@@ -92,8 +91,16 @@ from gpx_tracks_table import (
     prepare_with_options,
     run_with_options as run_gpx_tracks_table_with_options,
     selected_track_numbers,
+    upgrade_timed_track_sidecars,
 )
-from plot_metadata_utils import read_photo_metadata, read_plot_metadata, read_table_data
+from plot_metadata_utils import media_sidecar_matches_media, media_sidecar_path, read_photo_metadata, read_plot_metadata, read_table_data
+from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
+from track_map_layout_utils import (
+    DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+    canonical_track_map_name,
+    resolve_track_map_variant,
+    track_map_variant_names,
+)
 
 
 PHOTOS_FRAMEWORK_AVAILABLE = True
@@ -841,6 +848,9 @@ class GPXTrackerController(NSObject):
         self.current_project_file = None
         self.recent_adventures = self._load_recent_adventures()
         self.last_picture_import_directory = None
+        self.time_lapse_media_min_fraction = 0.5
+        self.track_maps_for_time_lapse = True
+        self.track_map_edge_margin_fraction = DEFAULT_TRACK_EDGE_MARGIN_FRACTION
         self.project_dirty = False
         self.skip_next_project_dir_dirty = False
         self.gpx_field_manually_changed = False
@@ -1052,6 +1062,8 @@ class GPXTrackerController(NSObject):
         self.gpx_track_order_popup = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(0, 0, 140, FIELD_HEIGHT))
         self.gpx_make_plots_button = self._make_button("Create", "makePlots:")
         self.gpx_update_plots_button = self._make_button("Update", "updatePlots:")
+        self.gpx_time_lapse_maps_checkbox = self._make_checkbox("for Time-Lapse", "trackMapVariantChanged:")
+        self.gpx_time_lapse_maps_checkbox.setState_(NSControlStateValueOn)
         self.gpx_view_plots_button = self._make_button("View", "viewPlots:")
         self.gpx_edit_plots_button = self._make_file_icon_button("editPlots:")
         self.gpx_cancel_plots_button = self._make_button("Cancel", "cancelMakePlots:")
@@ -1065,6 +1077,7 @@ class GPXTrackerController(NSObject):
         self.root_view.addSubview_(self.gpx_track_images_label)
         self.root_view.addSubview_(self.gpx_make_plots_button)
         self.root_view.addSubview_(self.gpx_update_plots_button)
+        self.root_view.addSubview_(self.gpx_time_lapse_maps_checkbox)
         self.root_view.addSubview_(self.gpx_view_plots_button)
         self.root_view.addSubview_(self.gpx_edit_plots_button)
         self.root_view.addSubview_(self.gpx_cancel_plots_button)
@@ -1106,7 +1119,7 @@ class GPXTrackerController(NSObject):
         self.control_file_places_overwrite_checkbox.setState_(NSControlStateValueOff)
         self.control_file_places_overwrite_checkbox.setTarget_(self)
         self.control_file_places_overwrite_checkbox.setAction_("fieldChanged:")
-        self.control_file_merge_tracks_button = self._make_button("Update Tracks", "mergeTracksIntoControlFile:")
+        self.control_file_merge_tracks_button = self._make_button("Sync Track Maps", "mergeTracksIntoControlFile:")
         self.control_file_merge_media_button = self._make_button("Merge New Media", "mergeMediaIntoControlFile:")
         self.root_view.addSubview_(self.control_file_create_button)
         self.root_view.addSubview_(self.control_file_edit_button)
@@ -1122,8 +1135,10 @@ class GPXTrackerController(NSObject):
         self.slideshow_label = self._make_label("Start Slide Show:")
         self.root_view.addSubview_(self.slideshow_label)
         self.slideshow_start_button = self._make_button("Start", "startSlideShow:")
+        self.slideshow_time_lapse_button = self._make_button("Start Time-Lapse", "startTimeLapseShow:")
         self.pdf_summary_button = self._make_button("PDF Summary", "exportPdfSummary:")
         self.root_view.addSubview_(self.slideshow_start_button)
+        self.root_view.addSubview_(self.slideshow_time_lapse_button)
         self.root_view.addSubview_(self.pdf_summary_button)
 
         self.status_label = self._make_status_label("Choose or create an adventure directory to begin.")
@@ -1265,9 +1280,8 @@ class GPXTrackerController(NSObject):
         self._refresh_recent_adventure_menu()
 
     def _make_button(self, title, action):
-        button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, BUTTON_WIDTH, FIELD_HEIGHT))
+        button = make_liquid_glass_button(NSMakeRect(0, 0, BUTTON_WIDTH, FIELD_HEIGHT))
         button.setTitle_(title)
-        button.setBezelStyle_(NSBezelStyleRounded)
         button.setTarget_(self)
         button.setAction_(action)
         return button
@@ -1331,12 +1345,13 @@ class GPXTrackerController(NSObject):
         self.gpx_button.setToolTip_("Choose one or more GPX files.")
         self.gpx_folder_button.setToolTip_("Open Finder with GPX files in the project directory so they can be renamed or deleted.")
         self.gpx_edit_button.setToolTip_("Open GPXEditor to add or edit tracks and save the active GPX file.")
-        self.track_maps_box.setToolTip_("Create and manage the overview map and one map image for each GPX track.")
+        self.track_maps_box.setToolTip_("Create and manage the shared overview plus Standard and Time-Lapse maps for each GPX track.")
         self.gpx_track_images_label.setToolTip_("Track-map image actions.")
         self.gpx_track_order_label.setToolTip_("Choose whether generated track maps use chronological dates or GPX track numbers.")
         self.gpx_track_order_popup.setToolTip_("Date sorts by timestamps. Track number preserves the GPX track sequence.")
         self.gpx_make_plots_button.setToolTip_("Recreate the overview and all per-track map images.")
         self.gpx_update_plots_button.setToolTip_("Select and update only missing or stale track map images.")
+        self.gpx_time_lapse_maps_checkbox.setToolTip_("Create, update, and prefer maps shifted to leave more room for media during Time-Lapse playback.")
         self.gpx_view_plots_button.setToolTip_("Open the track image viewer for existing overview and track plots.")
         self.gpx_edit_plots_button.setToolTip_("Open the trackimages folder in Finder.")
         self.gpx_cancel_plots_button.setToolTip_("Cancel plot generation after the current image finishes.")
@@ -1356,13 +1371,14 @@ class GPXTrackerController(NSObject):
         self.control_file_edit_button.setToolTip_("Open the editable control-file table.")
         self.control_file_places_button.setToolTip_("Reverse-geocode media with GPS coordinates and add missing place names to the editable control-file table without regenerating its order.")
         self.control_file_places_overwrite_checkbox.setToolTip_("Overwrite existing place names in media sidecar files and in the slide-show control table.")
-        self.control_file_merge_tracks_button.setToolTip_("Update track map entries in the existing user-edited control file.")
+        self.control_file_merge_tracks_button.setToolTip_("Synchronize canonical #Map entries in the existing user-edited control file; this does not render map images.")
         self.control_file_merge_media_button.setToolTip_("Choose additional photos or videos and merge them into the existing user-edited control file at their sorted positions.")
         self.control_file_summary_label.setToolTip_("Shows whether a control file exists and counts images, videos, track maps, dates, and overview map.")
 
         self.slideshow_box.setToolTip_("Launch the final slide show or export a GPX track PDF summary.")
         self.slideshow_label.setToolTip_("Start the slide show after tracks, media, and the control file are ready.")
         self.slideshow_start_button.setToolTip_("Launch GPSTrackShow with the project directory, slide-show control file, and trackimages directory.")
+        self.slideshow_time_lapse_button.setToolTip_("Launch the stage-map GPS time-lapse slide show. Track-map timing metadata is upgraded first when possible.")
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
 
         self.edit_button.setToolTip_("Save the current adventure settings to the .adv file.")
@@ -1384,7 +1400,8 @@ class GPXTrackerController(NSObject):
         self.gpx_folder_button.setNextKeyView_(self.gpx_edit_button)
         self.gpx_edit_button.setNextKeyView_(self.gpx_make_plots_button)
         self.gpx_make_plots_button.setNextKeyView_(self.gpx_update_plots_button)
-        self.gpx_update_plots_button.setNextKeyView_(self.gpx_view_plots_button)
+        self.gpx_update_plots_button.setNextKeyView_(self.gpx_time_lapse_maps_checkbox)
+        self.gpx_time_lapse_maps_checkbox.setNextKeyView_(self.gpx_view_plots_button)
         self.gpx_view_plots_button.setNextKeyView_(self.gpx_edit_plots_button)
         self.gpx_edit_plots_button.setNextKeyView_(self.gpx_cancel_plots_button)
         self.gpx_cancel_plots_button.setNextKeyView_(self.gpx_track_order_popup)
@@ -1398,7 +1415,8 @@ class GPXTrackerController(NSObject):
         self.control_file_places_overwrite_checkbox.setNextKeyView_(self.control_file_merge_tracks_button)
         self.control_file_merge_tracks_button.setNextKeyView_(self.control_file_merge_media_button)
         self.control_file_merge_media_button.setNextKeyView_(self.slideshow_start_button)
-        self.slideshow_start_button.setNextKeyView_(self.pdf_summary_button)
+        self.slideshow_start_button.setNextKeyView_(self.slideshow_time_lapse_button)
+        self.slideshow_time_lapse_button.setNextKeyView_(self.pdf_summary_button)
         self.pdf_summary_button.setNextKeyView_(self.edit_button)
         self.edit_button.setNextKeyView_(self.load_button)
         self.load_button.setNextKeyView_(self.save_exit_button)
@@ -1493,12 +1511,17 @@ class GPXTrackerController(NSObject):
         track_button_x = field_x
         self.gpx_make_plots_button.setFrame_(NSMakeRect(track_button_x, row_y, 82.0, FIELD_HEIGHT))
         self.gpx_update_plots_button.setFrame_(NSMakeRect(track_button_x + 82.0 + INNER_GAP, row_y, 82.0, FIELD_HEIGHT))
-        self.gpx_view_plots_button.setFrame_(NSMakeRect(track_button_x + 164.0 + 2 * INNER_GAP, row_y, 72.0, FIELD_HEIGHT))
-        self.gpx_edit_plots_button.setFrame_(NSMakeRect(track_button_x + 164.0 + 72.0 + 3 * INNER_GAP, row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH))
-        self.gpx_cancel_plots_button.setFrame_(NSMakeRect(track_button_x + 164.0 + 72.0 + FILE_BUTTON_WIDTH + 4 * INNER_GAP, row_y, 82.0, FIELD_HEIGHT))
-        order_label_x = track_button_x + 164.0 + 72.0 + FILE_BUTTON_WIDTH + 4 * INNER_GAP + 92.0
-        self.gpx_track_order_label.setFrame_(NSMakeRect(order_label_x, row_y + 4.0, 118.0, 18.0))
-        self.gpx_track_order_popup.setFrame_(NSMakeRect(order_label_x + 122.0, row_y, 128.0, FIELD_HEIGHT))
+        variant_x = track_button_x + 164.0 + 2 * INNER_GAP
+        self.gpx_time_lapse_maps_checkbox.setFrame_(NSMakeRect(variant_x, row_y, 118.0, FIELD_HEIGHT))
+        view_x = variant_x + 118.0 + INNER_GAP
+        self.gpx_view_plots_button.setFrame_(NSMakeRect(view_x, row_y, 64.0, FIELD_HEIGHT))
+        folder_x = view_x + 64.0 + INNER_GAP
+        self.gpx_edit_plots_button.setFrame_(NSMakeRect(folder_x, row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH))
+        cancel_x = folder_x + FILE_BUTTON_WIDTH + INNER_GAP
+        self.gpx_cancel_plots_button.setFrame_(NSMakeRect(cancel_x, row_y, 72.0, FIELD_HEIGHT))
+        order_label_x = cancel_x + 72.0 + INNER_GAP
+        self.gpx_track_order_label.setFrame_(NSMakeRect(order_label_x, row_y + 4.0, 112.0, 18.0))
+        self.gpx_track_order_popup.setFrame_(NSMakeRect(order_label_x + 112.0, row_y, 106.0, FIELD_HEIGHT))
         row_y -= 20.0
         self.track_maps_summary_label.setFrame_(
             NSMakeRect(
@@ -1566,7 +1589,8 @@ class GPXTrackerController(NSObject):
         row_y = current_top - FIELD_HEIGHT
         self.slideshow_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         self.slideshow_start_button.setFrame_(NSMakeRect(field_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        self.pdf_summary_button.setFrame_(NSMakeRect(field_x + SMALL_BUTTON_WIDTH + INNER_GAP, row_y, 124.0, FIELD_HEIGHT))
+        self.slideshow_time_lapse_button.setFrame_(NSMakeRect(field_x + SMALL_BUTTON_WIDTH + INNER_GAP, row_y, 132.0, FIELD_HEIGHT))
+        self.pdf_summary_button.setFrame_(NSMakeRect(field_x + SMALL_BUTTON_WIDTH + 132.0 + 2 * INNER_GAP, row_y, 124.0, FIELD_HEIGHT))
 
         button_row_y = row_y - FIELD_HEIGHT - 8.0
         total_button_width = BUTTON_WIDTH * 5 + INNER_GAP * 4
@@ -1722,11 +1746,20 @@ class GPXTrackerController(NSObject):
         if self.current_project_dir is None:
             return False
         name = Path(str(filename)).name
-        candidates = [
-            self.current_project_dir / name,
-            self.current_project_dir / "trackimages" / name,
-        ]
+        names = track_map_variant_names(name, prefer_time_lapse=False) if re.match(r"^\d+_", name) else [name]
+        candidates = []
+        for candidate_name in names:
+            candidates.extend(
+                [
+                    self.current_project_dir / candidate_name,
+                    self.current_project_dir / "trackimages" / candidate_name,
+                ]
+            )
         return any(path.exists() and path.is_file() for path in candidates)
+
+    def _canonical_track_map_match_name(self, filename):
+        canonical_name = canonical_track_map_name(Path(str(filename)).name)
+        return normalize_track_plot_filename_for_match(canonical_name)
 
     def _control_track_map_sync_status(self, control_file_path=None, tracks_summary_path=None):
         control_file_path = control_file_path or self._control_file_path()
@@ -1757,12 +1790,12 @@ class GPXTrackerController(NSObject):
             if entry.get("name")
         }
         existing_map_names = {
-            normalize_track_plot_filename_for_match(str(entry.get("name", "")))
+            self._canonical_track_map_match_name(str(entry.get("name", "")))
             for entry in entries
             if entry.get("type") == "map" and entry.get("name")
         }
         expected_map_names = {
-            normalize_track_plot_filename_for_match(track.track_plot_image_filename)
+            self._canonical_track_map_match_name(track.track_plot_image_filename)
             for track in tracks_summary.tracks
             if track.track_plot_image_filename
         }
@@ -1777,7 +1810,7 @@ class GPXTrackerController(NSObject):
             image_name = track.track_plot_image_filename
             if not image_name or not self._track_map_file_exists_for_control(image_name):
                 continue
-            normalized_name = normalize_track_plot_filename_for_match(image_name)
+            normalized_name = self._canonical_track_map_match_name(image_name)
             if normalized_name not in existing_map_names:
                 missing_tracks.append(image_name)
 
@@ -1798,7 +1831,7 @@ class GPXTrackerController(NSObject):
                 if normalized != expected_overview_name or not self._track_map_file_exists_for_control(name):
                     obsolete_overview.append(name)
             elif entry_type == "map":
-                normalized = normalize_track_plot_filename_for_match(name)
+                normalized = self._canonical_track_map_match_name(name)
                 if normalized not in expected_map_names or not self._track_map_file_exists_for_control(name):
                     obsolete_tracks.append(name)
         return {
@@ -1967,11 +2000,13 @@ class GPXTrackerController(NSObject):
         """Delete numbered track-map files that no longer belong to current GPX tracks."""
         output_dir = Path(context["output_dir"]).resolve(strict=False)
         expected_names = set()
-        for item in context.get("track_plot_paths", []):
-            image_path = Path(item["output_image"]).resolve(strict=False)
-            metadata_path = Path(item["output_metadata"]).resolve(strict=False)
-            expected_names.add(image_path.name)
-            expected_names.add(metadata_path.name)
+        for track in context.get("tracks", []):
+            for key in ("track_plot_image_filename", "track_plot_time_lapse_image_filename"):
+                filename = track.get(key)
+                if not filename:
+                    continue
+                expected_names.add(Path(filename).name)
+                expected_names.add(Path(filename).with_suffix(".json").name)
         removed = []
         try:
             candidates = list(output_dir.iterdir())
@@ -2049,10 +2084,12 @@ class GPXTrackerController(NSObject):
             return ""
         if context is None:
             return ""
-        overview_exists = Path(context["overview_path"]).exists()
-        track_total = len(context["track_plot_paths"])
-        track_count = sum(1 for item in context["track_plot_paths"] if self._track_plot_exists(item["output_image"]))
-        return f" | Plots: {track_count}/{track_total} | Overview: {'yes' if overview_exists else 'no'}"
+        status = self._track_maps_status_from_context(gpx_path, context, self._existing_track_plot_path)
+        return (
+            f" | Maps: Standard {status['standard_count']}/{status['track_total']}, "
+            f"Time-Lapse {status['time_lapse_count']}/{status['track_total']} | "
+            f"Overview: {'yes' if status['overview_exists'] else 'no'}"
+        )
 
     def _summary_fingerprints_by_track_number(self, table_json_path):
         try:
@@ -2102,9 +2139,13 @@ class GPXTrackerController(NSObject):
         summary_has_fingerprints = bool(summary_fingerprints)
         summary_path = Path(context["table_json_path"])
         summary_exists = summary_path.exists()
-        track_total = len(context["track_plot_paths"])
-        track_count = 0
-        stale_track_count = 0
+        tracks = context.get("tracks", [])
+        track_total = len(tracks)
+        standard_count = 0
+        time_lapse_count = 0
+        standard_stale_count = 0
+        time_lapse_stale_count = 0
+        current_any_count = 0
         missing_metadata_count = 0
         try:
             gpx_mtime = Path(gpx_path).stat().st_mtime
@@ -2121,31 +2162,47 @@ class GPXTrackerController(NSObject):
             except OSError:
                 summary_out_of_date = True
 
-        for item in context["track_plot_paths"]:
-            existing = existing_plot_path_callback(item["output_image"])
-            if existing is None:
-                continue
-            track_count += 1
+        output_dir = Path(context["output_dir"])
+        for track in tracks:
             try:
-                track_number = int(item["track_number"])
+                track_number = int(track["table_number"])
             except (TypeError, ValueError):
                 continue
             current_fingerprint = current_fingerprints.get(track_number)
-            plot_metadata = self._plot_metadata_for_image(existing)
-            saved_fingerprint = None
-            if isinstance(plot_metadata, dict):
-                saved_fingerprint = plot_metadata.get("track_fingerprint")
-            if saved_fingerprint:
-                if current_fingerprint and str(saved_fingerprint) != current_fingerprint:
-                    stale_track_count += 1
-                continue
-            missing_metadata_count += 1
-            if gpx_mtime is not None:
-                try:
-                    if Path(existing).stat().st_mtime < gpx_mtime:
-                        stale_track_count += 1
-                except OSError:
-                    stale_track_count += 1
+            variant_current = False
+            for variant_key, count_key in (
+                ("track_plot_image_filename", "standard"),
+                ("track_plot_time_lapse_image_filename", "time_lapse"),
+            ):
+                filename = track.get(variant_key)
+                existing = existing_plot_path_callback(output_dir / filename) if filename else None
+                if existing is None:
+                    continue
+                if count_key == "standard":
+                    standard_count += 1
+                else:
+                    time_lapse_count += 1
+                plot_metadata = self._plot_metadata_for_image(existing)
+                saved_fingerprint = plot_metadata.get("track_fingerprint") if isinstance(plot_metadata, dict) else None
+                stale = False
+                if saved_fingerprint:
+                    stale = bool(current_fingerprint and str(saved_fingerprint) != current_fingerprint)
+                else:
+                    missing_metadata_count += 1
+                    if gpx_mtime is not None:
+                        try:
+                            stale = Path(existing).stat().st_mtime < gpx_mtime
+                        except OSError:
+                            stale = True
+                if stale:
+                    if count_key == "standard":
+                        standard_stale_count += 1
+                    else:
+                        time_lapse_stale_count += 1
+                else:
+                    variant_current = True
+            if variant_current:
+                current_any_count += 1
 
         overview_out_of_date = False
         if overview_exists:
@@ -2167,12 +2224,21 @@ class GPXTrackerController(NSObject):
             "overview_exists": overview_exists,
             "overview_out_of_date": overview_out_of_date,
             "track_total": track_total,
-            "track_count": track_count,
-            "stale_track_count": stale_track_count,
+            "track_count": current_any_count,
+            "standard_count": standard_count,
+            "time_lapse_count": time_lapse_count,
+            "standard_stale_count": standard_stale_count,
+            "time_lapse_stale_count": time_lapse_stale_count,
+            "stale_track_count": standard_stale_count + time_lapse_stale_count,
             "missing_metadata_count": missing_metadata_count,
             "summary_exists": summary_exists,
             "summary_out_of_date": summary_out_of_date,
-            "out_of_date": bool(stale_track_count or overview_out_of_date or summary_out_of_date),
+            "out_of_date": bool(
+                current_any_count < track_total
+                or not summary_exists
+                or overview_out_of_date
+                or summary_out_of_date
+            ),
         }
 
     def _track_maps_status(self):
@@ -2194,13 +2260,19 @@ class GPXTrackerController(NSObject):
         stale_count = int(status.get("stale_track_count") or 0)
         freshness_parts = []
         if stale_count:
-            freshness_parts.append(f"{stale_count} track map{'s' if stale_count != 1 else ''} not up-to-date")
+            freshness_parts.append(f"{stale_count} map variant{'s' if stale_count != 1 else ''} not up-to-date")
         if status.get("overview_out_of_date"):
             freshness_parts.append("overview not up-to-date")
-        if status.get("summary_out_of_date"):
+        if not status.get("summary_exists"):
+            freshness_parts.append("track summary missing")
+        elif status.get("summary_out_of_date"):
             freshness_parts.append("track summary not up-to-date")
         freshness_text = f" | {', '.join(freshness_parts)}" if freshness_parts else ""
-        return f"{status['track_count']}/{status['track_total']} track maps, overview: {overview_text}{freshness_text}"
+        return (
+            f"Standard: {status.get('standard_count', 0)}/{status['track_total']} | "
+            f"Time-Lapse: {status.get('time_lapse_count', 0)}/{status['track_total']} | "
+            f"overview: {overview_text}{freshness_text}"
+        )
 
     def refresh_track_maps_summary(self):
         if not hasattr(self, "track_maps_summary_label"):
@@ -2300,6 +2372,7 @@ class GPXTrackerController(NSObject):
         track_maps_ready = bool(
             track_maps_status
             and track_maps_status["overview_exists"]
+            and track_maps_status.get("summary_exists")
             and track_maps_status["track_total"] > 0
             and track_maps_status["track_count"] == track_maps_status["track_total"]
             and not track_maps_status.get("out_of_date")
@@ -2344,6 +2417,9 @@ class GPXTrackerController(NSObject):
             "control_file": str(self._control_file_path()) if self._control_file_path() is not None else "",
             "control_file_track_order": self._use_track_order(),
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
+            "time_lapse_media_min_fraction": self.time_lapse_media_min_fraction,
+            "track_maps_for_time_lapse": self.track_maps_for_time_lapse,
+            "track_map_edge_margin_fraction": self.track_map_edge_margin_fraction,
         }
 
     def _find_adventure_file_in_directory(self, project_dir):
@@ -2391,6 +2467,26 @@ class GPXTrackerController(NSObject):
         self.last_picture_import_directory = (
             Path(last_import_directory).expanduser().resolve(strict=False) if last_import_directory else None
         )
+        try:
+            media_fraction = float(
+                data.get(
+                    "time_lapse_media_min_fraction",
+                    data.get("time_lapse_media_max_fraction", 0.5),
+                )
+            )
+        except (TypeError, ValueError):
+            media_fraction = 0.5
+        self.time_lapse_media_min_fraction = media_fraction if 0 < media_fraction <= 1 else 0.5
+        self.track_maps_for_time_lapse = bool(data.get("track_maps_for_time_lapse", True))
+        try:
+            map_margin = float(data.get("track_map_edge_margin_fraction", DEFAULT_TRACK_EDGE_MARGIN_FRACTION))
+        except (TypeError, ValueError):
+            map_margin = DEFAULT_TRACK_EDGE_MARGIN_FRACTION
+        self.track_map_edge_margin_fraction = map_margin if 0.0 <= map_margin < 0.5 else DEFAULT_TRACK_EDGE_MARGIN_FRACTION
+        if hasattr(self, "gpx_time_lapse_maps_checkbox"):
+            self.gpx_time_lapse_maps_checkbox.setState_(
+                NSControlStateValueOn if self.track_maps_for_time_lapse else NSControlStateValueOff
+            )
 
     def _refresh_loaded_gpx_summary(self):
         self.start_async_project_status_refresh("loaded adventure")
@@ -2620,11 +2716,11 @@ class GPXTrackerController(NSObject):
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Enter the project name and a short description, then save the adventure.\n"
             "3. Select one GPX file in the adventure folder, or choose external/multiple GPX files and use Add & Edit Tracks to save one final GPX file.\n"
-            "4. In Track Maps, press Create to make all maps. Later, after editing tracks, press Update to refresh only missing or outdated maps. Rows marked with * need update.\n"
+            "4. In Track Maps, choose whether to work on Standard or for Time-Lapse maps. Create makes the selected kind for every stage; Update refreshes only missing or outdated maps. Rows marked with * need update.\n"
             "5. Import photos and video clips. They are copied into the adventure folder. Existing files are skipped so they are not duplicated.\n"
             "6. Press Create in Slide Show Control File. The program reads photo dates and positions, combines them with the tracks and maps, and creates the ordered slide-show list.\n"
             "7. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again.\n"
-            "8. If tracks or maps changed after the control file was edited, press Update Tracks. It shows which maps should be inserted and can remove old map entries.\n"
+            "8. If tracks or maps changed after the control file was edited, press Sync Track Maps. It shows which map entries should be inserted and can remove old entries; it does not render maps.\n"
             "9. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
             "10. If desired, press Add Place Names to add readable place names for photos that have GPS positions.\n"
             "11. Press Start to launch the slide show.\n\n"
@@ -2849,7 +2945,7 @@ class GPXTrackerController(NSObject):
             self.geolocations_window.orderOut_(None)
 
     def _make_icon_button(self, image_name, fallback_title, action):
-        button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, FIELD_HEIGHT, FIELD_HEIGHT))
+        button = make_liquid_glass_button(NSMakeRect(0, 0, FIELD_HEIGHT, FIELD_HEIGHT))
         image_names = image_name if isinstance(image_name, (list, tuple)) else [image_name]
         image = None
         for candidate in image_names:
@@ -2868,11 +2964,10 @@ class GPXTrackerController(NSObject):
             button.setTitle_("")
         else:
             button.setTitle_(fallback_title)
-        button.setBezelStyle_(NSBezelStyleRounded)
         button.setTarget_(self)
         button.setAction_(action)
         button.setToolTip_(fallback_title)
-        return button
+        return apply_liquid_glass_button_style(button, compact=True)
 
     def _ensure_control_table_window(self):
         if self.control_table_window is not None:
@@ -3272,11 +3367,12 @@ class GPXTrackerController(NSObject):
 
     def metadata_for_project_media_path(self, path):
         metadata = {}
-        sidecar_path = Path(path).with_suffix(".json")
+        media_path = Path(path)
+        sidecar_path = media_sidecar_path(media_path)
         if sidecar_path.exists():
             try:
                 loaded = read_photo_metadata(sidecar_path)
-                if isinstance(loaded, dict):
+                if isinstance(loaded, dict) and media_sidecar_matches_media(loaded, media_path):
                     metadata = loaded
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 metadata = {}
@@ -3550,14 +3646,14 @@ class GPXTrackerController(NSObject):
         media_path = self.resolve_control_row_path(row)
         if media_path is None:
             return None
-        sidecar_path = Path(media_path).with_suffix(".json")
+        sidecar_path = media_sidecar_path(media_path)
         if not sidecar_path.exists():
             return None
         try:
             metadata = read_photo_metadata(sidecar_path)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
-        if isinstance(metadata, dict):
+        if isinstance(metadata, dict) and media_sidecar_matches_media(metadata, media_path):
             details = metadata.get("place_details")
             if isinstance(details, dict):
                 place_from_details = self.format_place_details_for_display(details)
@@ -4912,7 +5008,7 @@ class GPXTrackerController(NSObject):
         else:
             show_alert("No track map updates needed.", "The slide show control file already contains the current track maps.")
             return
-        self._start_control_file_merge("Update Tracks In Slide Show Control File", merge_tracks_path=tracks_summary_path)
+        self._start_control_file_merge("Sync Track Maps In Slide Show Control File", merge_tracks_path=tracks_summary_path)
 
     @objc.IBAction
     def mergeMediaIntoControlFile_(self, _sender):
@@ -4933,6 +5029,13 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def startSlideShow_(self, _sender):
+        self._start_slide_show(time_lapse=False)
+
+    @objc.IBAction
+    def startTimeLapseShow_(self, _sender):
+        self._start_slide_show(time_lapse=True)
+
+    def _start_slide_show(self, time_lapse: bool):
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
             show_alert("Please choose a project directory first.")
@@ -4958,7 +5061,24 @@ class GPXTrackerController(NSObject):
             return
 
         try:
-            command = self._slideshow_command(project_dir, control_file_path, trackimages_dir)
+            if time_lapse:
+                gpx_path = self._current_single_gpx_path()
+                if gpx_path is not None and gpx_path.exists():
+                    report = upgrade_timed_track_sidecars(
+                        gpx_path,
+                        trackimages_dir,
+                        output_base=self._current_project_name() or project_dir.name,
+                        sort_original=self._use_track_order(),
+                        sort_date=not self._use_track_order(),
+                    )
+                    if report["updated"]:
+                        self.set_status(f"Upgraded timing metadata for {len(report['updated'])} track map(s).")
+                    elif report["skipped"]:
+                        self.set_status(
+                            f"Time-lapse timing unavailable for {len(report['skipped'])} track map(s); "
+                            "they will use distance-based motion."
+                        )
+            command = self._slideshow_command(project_dir, control_file_path, trackimages_dir, time_lapse=time_lapse)
             self.slideshow_process = subprocess.Popen(
                 command,
                 cwd=str(self.base_dir),
@@ -4969,7 +5089,8 @@ class GPXTrackerController(NSObject):
             return
         watcher = threading.Thread(target=self._watch_slideshow_process, args=(self.slideshow_process,), daemon=True)
         watcher.start()
-        self.set_status(f"Started slide show with {control_file_path.name} and trackdir {trackimages_dir}.")
+        mode = "time-lapse slide show" if time_lapse else "slide show"
+        self.set_status(f"Started {mode} with {control_file_path.name} and trackdir {trackimages_dir}.")
 
     @objc.IBAction
     def exportPdfSummary_(self, _sender):
@@ -5004,14 +5125,18 @@ class GPXTrackerController(NSObject):
             False,
         )
 
-    def _slideshow_command(self, project_dir, control_file_path, trackimages_dir):
+    def _slideshow_command(self, project_dir, control_file_path, trackimages_dir, time_lapse=False):
         args = [
             str(project_dir),
             "--inputlist",
             str(control_file_path),
             "--trackdir",
             str(trackimages_dir.resolve(strict=False)),
+            "--time-lapse-media-min-fraction",
+            str(self.time_lapse_media_min_fraction),
         ]
+        if time_lapse:
+            args.append("--time-lapse-stages")
         if getattr(sys, "frozen", False):
             executable = self._bundled_slideshow_executable()
             if executable is None:
@@ -5486,6 +5611,8 @@ class GPXTrackerController(NSObject):
             "verbose": False,
             "sort_original": use_track_order,
             "sort_date": not use_track_order,
+            "map_layout": "time-lapse" if self.track_maps_for_time_lapse else "standard",
+            "track_edge_margin_fraction": self.track_map_edge_margin_fraction,
         }
 
     def _existing_expected_track_map_count(self, selection_context):
@@ -5700,10 +5827,17 @@ class GPXTrackerController(NSObject):
         overview_path = Path(context["overview_path"]).resolve(strict=False)
         if overview_path.exists():
             image_paths.append(overview_path)
-        for item in context["track_plot_paths"]:
-            existing_path = self._existing_track_plot_path(item["output_image"])
+        output_dir = Path(context["output_dir"])
+        for track in context.get("tracks", []):
+            canonical_name = track.get("track_plot_image_filename")
+            if not canonical_name:
+                continue
+            existing_path = resolve_track_map_variant(
+                output_dir / canonical_name,
+                prefer_time_lapse=self.track_maps_for_time_lapse,
+            )
             if existing_path is not None:
-                image_paths.append(existing_path)
+                image_paths.append(existing_path.resolve(strict=False))
         if not image_paths:
             show_alert("No track plot images found.", f"Expected images in:\n{context['output_dir']}")
             return
@@ -5986,6 +6120,12 @@ class GPXTrackerController(NSObject):
             self.refresh_control_file_display()
         if _sender is self.gpx_track_order_popup:
             self.refresh_track_maps_summary()
+        self.mark_dirty()
+
+    @objc.IBAction
+    def trackMapVariantChanged_(self, _sender):
+        self.track_maps_for_time_lapse = _sender.state() == NSControlStateValueOn
+        self.refresh_track_maps_summary()
         self.mark_dirty()
 
     def textDidChange_(self, _notification):
