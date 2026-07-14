@@ -23,6 +23,10 @@ class AdventureParameterTests(unittest.TestCase):
         payload = parameter_payload(defaults)
         self.assertEqual(payload["version"], PARAMETER_SCHEMA_VERSION)
         self.assertEqual(payload["values"], defaults)
+        self.assertEqual(defaults["slideshow.start_mode"], "time_lapse")
+        self.assertEqual(defaults["slideshow.window_mode"], "auto")
+        self.assertFalse(defaults["slideshow.track_map_before_media"])
+        self.assertTrue(defaults["timelapse.overview_as_media"])
 
     def test_invalid_loaded_values_fall_back_individually(self):
         normalized = normalize_parameters(

@@ -17,8 +17,8 @@ Parameter changes are edited as a draft. **Apply** validates them, updates the c
 
 ## Editable Parameters
 
-- **Slide Show:** media duration `3 s`, transition, transition duration, background/font/marker colors, font size `30`, marker radius `6 px`, arrow scale `1.0`, clock, place names, fullscreen mode `Auto/On/Off`, map window, joined windows, display swap, repeat, manual start, collage range `33-66%`, and maximum collage images `9`.
-- **Time-Lapse:** stage duration `30 s` and preferred minimum media size `50%`.
+- **Slide Show:** default Time-Lapse/Standard show, media duration `3 s`, transition, transition duration, background/font/marker colors, font size `30`, marker radius `6 px`, arrow scale `1.0`, clock, place names, fullscreen mode `Auto/On/Off`, automatic/single/separate overview window mode, optional marked track map before each Standard medium, joined windows, display swap, repeat, manual start, collage range `33-66%`, and maximum collage images `9`.
+- **Time-Lapse:** stage duration `30 s`, preferred minimum media size `50%`, framed/full-screen single-window overview, and walking-pilgrim/arrow marker style.
 - **Track Maps:** ordering by date/track number, Standard/Time-Lapse map preference, image size `1920x1080`, zoom `15`, route width `4`, route/endpoint/background/title colors, endpoint size `0`, font factor `2.2`, overview labels, removable track-name prefix, and Time-Lapse edge margin `5%`.
 - **GPX Processing:** fallback walking speed `3.5 km/h`, minimum retained-point spacing `10 m`, maximum accepted GPS accuracy `10 m`, GPX Editor autosave interval `300 s`, map padding `8%`, default map zooms, elevation-profile headroom, and maximum interactive map tiles `48`.
 - **PDF Export:** document DPI `200`, embedded-map DPI `600`, overview/track zooms `8/14`, and maximum PDF map tiles `24`.

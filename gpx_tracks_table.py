@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from math import asin, atan2, cos, degrees, floor, log, pi, radians, sin, sqrt, tan
 from pathlib import Path
 
@@ -909,6 +909,34 @@ def extent_for_image(all_x, all_y, image_size):
     )
 
 
+MINIMUM_MAP_SHORT_DIMENSION_M = 10_000.0
+
+
+def extent_with_minimum_short_dimension(
+    extent,
+    minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
+):
+    """Expand a centered extent until its smaller dimension reaches the minimum."""
+    min_x, max_x, min_y, max_y = extent
+    width = max_x - min_x
+    height = max_y - min_y
+    short_dimension = min(width, height)
+    minimum = max(0.0, float(minimum_short_dimension_m))
+    if short_dimension <= 0.0 or short_dimension >= minimum:
+        return extent
+    scale = minimum / short_dimension
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    half_width = width * scale / 2.0
+    half_height = height * scale / 2.0
+    return (
+        center_x - half_width,
+        center_x + half_width,
+        center_y - half_height,
+        center_y + half_height,
+    )
+
+
 # AI prompt: "Write a helper that limits the OSM zoom level so the requested map
 # extent fits into the requested plot-area pixel size while preserving coverage."
 def fitted_zoom_level(requested_zoom, extent, image_size):
@@ -1143,6 +1171,8 @@ def render_track_plot(
     custom_map_attribution="",
     maximum_map_zoom=19,
     map_request_timeout_seconds=12.0,
+    minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
+    media_map_date=None,
 ):
     """Render one overview or one single-track plot."""
     try:
@@ -1178,6 +1208,19 @@ def render_track_plot(
             1.0 - (2.0 * side_margin_px / width_px),
             max(0.60, (header_bottom_px - bottom_margin_px) / height_px),
         ]
+    elif media_map_date is not None:
+        title_font_size = max(label_font_size(1) * font_factor + 2.0, 10.0)
+        title_height_px = title_font_size * dpi / 72.0
+        top_margin_px = 0.05 * title_height_px
+        side_margin_px = 2.0
+        bottom_margin_px = 2.0
+        heading_bottom_px = height_px - top_margin_px - title_height_px
+        axes_box = [
+            side_margin_px / width_px,
+            bottom_margin_px / height_px,
+            1.0 - (2.0 * side_margin_px / width_px),
+            max(0.60, (heading_bottom_px - bottom_margin_px) / height_px),
+        ]
     else:
         title_font_size = max(label_font_size(len(tracks)) * font_factor + 2.0, 10.0)
         subtitle_font_size = max(label_font_size(len(tracks)) * font_factor, 9.0)
@@ -1207,6 +1250,11 @@ def render_track_plot(
         max(1.0, height_px * axes_box[3]),
     )
     standard_extent = extent_for_image(all_x, all_y, plot_area_size)
+    if not overview_mode:
+        standard_extent = extent_with_minimum_short_dimension(
+            standard_extent,
+            minimum_short_dimension_m,
+        )
     selected_optimized_corner = None
     extent_shift = (0.0, 0.0)
     media_clear_options = None
@@ -1246,6 +1294,21 @@ def render_track_plot(
             ha="center",
             va="top",
             fontsize=header_font_size,
+            fontweight="bold",
+            color=title_color,
+        )
+    elif media_map_date is not None:
+        title_font_size = max(actual_font_size + 2.0, 10.0)
+        title_height_frac = (title_font_size * dpi / 72.0) / height_px
+        title_y = 1.0 - (0.05 * title_height_frac)
+        date_label = media_map_date.strftime("%d.%m.%Y") if hasattr(media_map_date, "strftime") else str(media_map_date)
+        fig.text(
+            0.5,
+            title_y,
+            date_label,
+            ha="center",
+            va="top",
+            fontsize=title_font_size,
             fontweight="bold",
             color=title_color,
         )
@@ -1302,10 +1365,11 @@ def render_track_plot(
             f"Could not download the {provider_name} basemap. "
             "Please check the internet connection or try again later; the map server may have timed out."
         ) from exc
-    for track, projected_points in zip(tracks, projected_tracks):
-        if not projected_points:
-            continue
-        draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size)
+    if media_map_date is None:
+        for track, projected_points in zip(tracks, projected_tracks):
+            if not projected_points:
+                continue
+            draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size)
     if overview_mode:
         add_overview_markers(ax, projected_tracks, height_px, dpi, line_color)
         add_overview_labels(
@@ -1317,7 +1381,7 @@ def render_track_plot(
             line_color,
             overview_label_items,
         )
-    if not overview_mode and projected_tracks and projected_tracks[0]:
+    if not overview_mode and media_map_date is None and projected_tracks and projected_tracks[0]:
         add_single_track_markers(ax, projected_tracks[0], height_px, dpi, line_color)
     ax.axis("off")
     fig.savefig(output_path, dpi=dpi, facecolor=background_color, bbox_inches=None, pad_inches=0)
@@ -1340,6 +1404,9 @@ def render_track_plot(
         "basemap": provider_display_name("esri" if use_esri else map_provider),
         "effective_zoom": effective_zoom,
         "missing_basemap_tiles": missing_tile_report.count,
+        "minimum_short_dimension_m": (
+            float(minimum_short_dimension_m) if not overview_mode else None
+        ),
     }
     if not overview_mode:
         if media_clear_options is None:
@@ -1360,7 +1427,122 @@ def render_track_plot(
                 "media_clear_box_options": media_clear_options,
             }
         )
+    if media_map_date is not None:
+        metadata.update(
+            {
+                "map_kind": "media",
+                "media_map_date": media_map_date.isoformat() if hasattr(media_map_date, "isoformat") else str(media_map_date),
+                "media_points": [
+                    build_coordinate_point(point[0], point[1])
+                    for track in tracks
+                    for point in track.get("points", [])
+                    if len(point) >= 2
+                ],
+            }
+        )
     return effective_zoom, actual_font_size, metadata
+
+
+def render_media_location_map(
+    coordinates,
+    media_date: date,
+    output_path,
+    *,
+    zoom_level=15,
+    image_size=DEFAULT_IMAGE_SIZE,
+    font_factor=1.0,
+    use_esri=False,
+    background_color="black",
+    title_color="white",
+    map_provider="osm",
+    custom_map_url="",
+    custom_map_attribution="",
+    maximum_map_zoom=19,
+    map_request_timeout_seconds=12.0,
+    minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
+    map_layout="standard",
+    track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+    adventure_render_parameters=None,
+):
+    """Render a date-only map containing all supplied media coordinates."""
+    points = [
+        (float(latitude), float(longitude))
+        for latitude, longitude in coordinates
+        if latitude is not None and longitude is not None
+    ]
+    if not points:
+        raise ValueError("A media location map requires at least one GPS coordinate.")
+    output = Path(output_path).expanduser().resolve(strict=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pseudo_track = {
+        "name": "",
+        "time": datetime.combine(media_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+        "points": points,
+    }
+    effective_zoom, actual_font_size, metadata = render_track_plot(
+        [pseudo_track],
+        zoom_level,
+        image_size,
+        font_factor,
+        use_esri,
+        str(output),
+        "blue",
+        0.0,
+        "white",
+        0.0,
+        background_color,
+        title_color,
+        [],
+        "",
+        False,
+        map_layout=map_layout,
+        track_edge_margin_fraction=track_edge_margin_fraction,
+        map_provider=map_provider,
+        custom_map_url=custom_map_url,
+        custom_map_attribution=custom_map_attribution,
+        maximum_map_zoom=maximum_map_zoom,
+        map_request_timeout_seconds=map_request_timeout_seconds,
+        minimum_short_dimension_m=minimum_short_dimension_m,
+        media_map_date=media_date,
+    )
+    media_clear_options = metadata.pop("media_clear_box_options", None)
+    media_fingerprint = media_coordinates_fingerprint(media_date, points)
+    metadata.update(
+        {
+            "output_image": str(output),
+            "output_metadata": str(output.with_suffix(".json")),
+            "media_fingerprint": media_fingerprint,
+            "track_fingerprint": media_fingerprint,
+        }
+    )
+    if isinstance(adventure_render_parameters, dict):
+        metadata["adventure_render_parameters"] = dict(adventure_render_parameters)
+    if media_clear_options is not None:
+        metadata["media_clear_boxes"] = build_media_clear_boxes_metadata(
+            media_clear_options,
+            image_size,
+            track_edge_margin_fraction,
+            media_fingerprint,
+            DEFAULT_GRID_LONG_AXIS,
+        )
+    metadata.update(image_origin_metadata(metadata))
+    write_plot_metadata(metadata, output.with_suffix(".json"))
+    return {
+        "output_image": output,
+        "output_metadata": output.with_suffix(".json"),
+        "effective_zoom": effective_zoom,
+        "font_size": actual_font_size,
+        "metadata": metadata,
+    }
+
+
+def media_coordinates_fingerprint(media_date: date, coordinates) -> str:
+    """Return the stable fingerprint shared by media-map creation and status checks."""
+    payload = media_date.isoformat() + "|" + "|".join(
+        f"{float(latitude):.8f},{float(longitude):.8f}"
+        for latitude, longitude in coordinates
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # AI prompt: "Write argparse setup for a standalone GPX track CLI with positional

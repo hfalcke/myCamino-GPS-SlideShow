@@ -42,8 +42,10 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.arrow_scale", "Slide Show", "Arrow scale", 1.0, "float", "Scale factor for the direction arrow; zero hides it.", 0.0, 10.0),
     ParameterSpec("slideshow.clock", "Slide Show", "Show clock", True, "bool", "Show the analog clock when timing is available."),
     ParameterSpec("slideshow.place_names", "Slide Show", "Show place names", True, "bool", "Show reverse-geocoded place names."),
+    ParameterSpec("slideshow.start_mode", "Slide Show", "Default show", "time_lapse", "choice", "Slide-show type selected by default in the main window.", choices=_choice(("time_lapse", "Time-Lapse"), ("standard", "Standard"))),
     ParameterSpec("slideshow.fullscreen", "Slide Show", "Fullscreen", "auto", "choice", "Choose automatic, always-on, or windowed startup.", choices=_choice(("auto", "Auto"), ("on", "On"), ("off", "Off"))),
-    ParameterSpec("slideshow.map_window", "Slide Show", "Separate map window", True, "bool", "Open a second window for the map role."),
+    ParameterSpec("slideshow.window_mode", "Slide Show", "Window mode", "auto", "choice", "Automatic uses one window on one screen and a separate overview window when multiple screens are available.", choices=_choice(("auto", "Automatic"), ("single", "Single window"), ("multiple", "Separate overview window"))),
+    ParameterSpec("slideshow.track_map_before_media", "Slide Show", "Track map before each medium", False, "bool", "In single-window Standard playback, briefly show the marked track map before every photo or video. The stage map is always shown once at the beginning of its stage."),
     ParameterSpec("slideshow.join_windows", "Slide Show", "Join windows", False, "bool", "Place photo and map roles side-by-side in one window."),
     ParameterSpec("slideshow.display_swap", "Slide Show", "Swap displays", False, "bool", "Swap the initial photo and map display assignment."),
     ParameterSpec("slideshow.repeat", "Slide Show", "Repeat", False, "bool", "Restart after the final control-file row."),
@@ -53,6 +55,7 @@ PARAMETER_SPECS = (
 
     ParameterSpec("timelapse.stage_duration_seconds", "Time-Lapse", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s"),
     ParameterSpec("timelapse.media_min_fraction", "Time-Lapse", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%"),
+    ParameterSpec("timelapse.overview_as_media", "Time-Lapse", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage."),
     ParameterSpec("timelapse.marker_style", "Time-Lapse", "Moving marker", "pilgrim", "choice", "Show a walking pilgrim or the traditional arrow at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("arrow", "Arrow"))),
 
     ParameterSpec("trackmaps.ordering", "Track Maps", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),

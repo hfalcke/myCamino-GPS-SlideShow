@@ -10,9 +10,10 @@ import shutil
 import subprocess
 import sys
 import re
+import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import objc
@@ -40,12 +41,15 @@ from AppKit import (
     NSImageNameFolder,
     NSMakePoint,
     NSMakeRect,
+    NSMenu,
+    NSMenuItem,
     NSInsetRect,
     NSOpenPanel,
     NSPasteboard,
     NSPopUpButton,
     NSProgressIndicator,
     NSScrollView,
+    NSSearchField,
     NSSortDescriptor,
     NSStepper,
     NSTableColumn,
@@ -55,6 +59,9 @@ from AppKit import (
     NSTextView,
     NSView,
     NSViewHeightSizable,
+    NSViewMaxXMargin,
+    NSViewMinXMargin,
+    NSViewMinYMargin,
     NSViewWidthSizable,
     NSWindow,
     NSWindowStyleMaskClosable,
@@ -78,6 +85,19 @@ from AppKit import (
 )
 from Foundation import NSDate, NSIndexSet, NSObject, NSAttributedString, NSMakeSize, NSNotificationCenter, NSRunLoop, NSString, NSURL, NSPredicate, NSTimer
 
+try:
+    from AVFoundation import AVPlayer
+    from AVKit import AVPlayerView, AVPlayerViewControlsStyleInline
+    from CoreMedia import CMTimeMake
+
+    AVKIT_MEDIA_VIEWER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    AVKIT_MEDIA_VIEWER_AVAILABLE = False
+    AVPlayer = None
+    AVPlayerView = None
+    AVPlayerViewControlsStyleInline = 1
+    CMTimeMake = None
+
 from GetGeoLocations import (
     GPS_NOT_AVAILABLE,
     PLACE_NOT_AVAILABLE,
@@ -88,9 +108,16 @@ from GetGeoLocations import (
     normalize_filename_for_match,
     normalize_track_plot_filename_for_match,
     parse_control_file_entries,
+    media_map_specs_from_control_entries,
+    media_map_output_filename,
+    render_media_map_specs,
+    remove_control_track_map_entries,
+    update_control_special_map_entries,
     run_with_options as run_geolocations_with_options,
 )
 from gpx_tracks_table import (
+    MINIMUM_MAP_SHORT_DIMENSION_M,
+    media_coordinates_fingerprint,
     parse_track_selection,
     parse_gpx_file,
     prepare_with_options,
@@ -103,6 +130,7 @@ from track_map_layout_utils import (
     DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
     canonical_track_map_name,
     resolve_track_map_variant,
+    time_lapse_track_map_name,
     track_map_variant_names,
 )
 from adventure_parameters import (
@@ -121,6 +149,17 @@ from adventure_parameters import (
 )
 from cocoa_parameter_editor import CocoaParameterEditor
 from json_storage import atomic_write_json
+from adventure_files import (
+    ADVENTURE_FORMAT_VERSION,
+    AdventureFormatError,
+    discover_adventures,
+    filename_base as adventure_filename_base,
+    load_adventure,
+    project_file_names,
+    rename_or_copy_adventure,
+    shared_references,
+    validate_adventure_payload,
+)
 
 
 PHOTOS_FRAMEWORK_AVAILABLE = True
@@ -180,6 +219,14 @@ CONTROL_TABLE_TITLES = {
     "gps": "GPS coordinates",
     "place": "Place",
 }
+CONTROL_ROW_TYPE_KEYWORDS = {
+    "MAP": "Overviewmap",
+    "TRK": "Map",
+    "BEF": "MapBefore",
+    "AFT": "MapAfter",
+    "LOC": "MediaMap",
+    "DAT": "Datum",
+}
 CONTROL_TABLE_DRAG_TYPE = NSPasteboardTypeString
 PH_AUTH_NOT_DETERMINED = 0
 PH_AUTH_RESTRICTED = 1
@@ -209,6 +256,38 @@ def confirm_alert(message: str, informative: str = "", confirm_title: str = "Pro
     alert.addButtonWithTitle_(confirm_title)
     alert.addButtonWithTitle_(cancel_title)
     return int(alert.runModal()) == 1000
+
+
+def control_table_backup_directory(control_path: Path) -> Path:
+    """Return the private recovery directory beside a control file."""
+    return control_path.parent / ".mycamino-control-backups"
+
+
+def control_table_recovery_path(control_path: Path) -> Path:
+    """Return the stable crash-recovery path for an editable control file."""
+    return control_table_backup_directory(control_path) / f"{control_path.name}.recovery.lst"
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write UTF-8 text atomically in the destination directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        delete=False,
+    ) as handle:
+        temporary_path = Path(handle.name)
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def nsstring(value: str) -> NSString:
@@ -275,6 +354,12 @@ def parse_slideshow_control_line(line: str) -> dict:
             row_type = "MAP"
         elif normalized == "map":
             row_type = "TRK"
+        elif normalized == "mapbefore":
+            row_type = "BEF"
+        elif normalized == "mapafter":
+            row_type = "AFT"
+        elif normalized == "mediamap":
+            row_type = "LOC"
         elif normalized in {"date", "datum"}:
             row_type = "DAT"
         else:
@@ -309,10 +394,10 @@ def serialize_slideshow_control_row(row: dict) -> str:
     """Serialize one editable slideshow row back to the sorted-list format."""
     row_type = str(row.get("type", "")).strip().upper()
     name = str(row.get("name", "")).strip()
-    if row.get("is_keyword") or row_type in {"MAP", "TRK", "DAT"}:
+    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT"}:
         keyword = str(row.get("keyword", "")).strip()
         if not keyword:
-            keyword = {"MAP": "Overviewmap", "TRK": "Map", "DAT": "Datum"}.get(row_type, row_type)
+            keyword = CONTROL_ROW_TYPE_KEYWORDS.get(row_type, row_type)
         return f"#{keyword}: {name}"
 
     time_text = str(row.get("time", "")).strip()
@@ -326,8 +411,77 @@ def clone_slideshow_row(row: dict) -> dict:
     return dict(row)
 
 
+def control_table_search_indexes(rows, query):
+    """Return rows whose serialized control-file text contains ``query``."""
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return []
+    return [
+        index
+        for index, row in enumerate(rows)
+        if needle in serialize_slideshow_control_row(row).casefold()
+    ]
+
+
+def next_control_table_search_position(current, count, direction):
+    """Return the wrapped next/previous result position."""
+    if count <= 0:
+        return -1
+    if current < 0:
+        return 0 if direction >= 0 else count - 1
+    return (current + direction) % count
+
+
+def media_viewer_control_row_index(source, items, index):
+    """Return the originating control-table row for the visible viewer item."""
+    if source != "control" or not items or index < 0 or index >= len(items):
+        return None
+    try:
+        return int(items[index]["index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def update_slideshow_control_row_cell(row: dict, column_id: str, value: str) -> None:
+    """Apply one table edit while keeping type and directive keyword consistent."""
+    text = str(value or "")
+    if column_id != "type":
+        row[column_id] = text
+        return
+    row_type = text.strip().upper()
+    row["type"] = row_type
+    if row_type in CONTROL_ROW_TYPE_KEYWORDS:
+        row["keyword"] = CONTROL_ROW_TYPE_KEYWORDS[row_type]
+        row["is_keyword"] = True
+    elif row_type in {"IMG", "VID"}:
+        row["keyword"] = ""
+        row["is_keyword"] = False
+    elif row.get("is_keyword"):
+        row["keyword"] = row_type
+
+
+def disable_field_editor_text_checking(editor) -> None:
+    """Disable macOS writing aids that can deadlock short table-cell edits."""
+    if editor is None:
+        return
+    for selector in (
+        "setContinuousSpellCheckingEnabled_",
+        "setGrammarCheckingEnabled_",
+        "setAutomaticSpellingCorrectionEnabled_",
+        "setAutomaticTextReplacementEnabled_",
+        "setAutomaticQuoteSubstitutionEnabled_",
+        "setAutomaticDashSubstitutionEnabled_",
+    ):
+        method = getattr(editor, selector, None)
+        if method is not None:
+            try:
+                method(False)
+            except Exception:
+                pass
+
+
 def is_media_row_type(row_type: str) -> bool:
-    return str(row_type).upper() in {"IMG", "VID", "MAP", "TRK"}
+    return str(row_type).upper() in {"IMG", "VID", "MAP", "TRK", "BEF", "AFT", "LOC"}
 
 
 class GPSTrackShowGUITableDataSource(NSObject):
@@ -415,9 +569,14 @@ class SlideShowControlTableDataSource(NSObject):
             return
         self.controller.update_control_table_cell(row_index, identifier, str(value or ""))
 
-    def tableView_shouldEditTableColumn_row_(self, _table_view, _table_column, _row_index):
+    def tableView_shouldEditTableColumn_row_(self, table_view, _table_column, _row_index):
         if str(_table_column.identifier()) in {"preview", "file_datetime"}:
             return False
+        window = table_view.window()
+        if window is not None:
+            disable_field_editor_text_checking(
+                window.fieldEditor_forObject_(True, table_view)
+            )
         return True
 
     def tableView_willDisplayCell_forTableColumn_row_(self, _table_view, cell, _table_column, row_index):
@@ -427,7 +586,7 @@ class SlideShowControlTableDataSource(NSObject):
         base_font = NSFont.systemFontOfSize_(13.0)
         if row_type == "DAT":
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSBoldFontMask)
-        elif row_type in {"MAP", "TRK"}:
+        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSItalicFontMask)
         else:
             font = base_font
@@ -478,6 +637,37 @@ class SlideShowControlTableView(NSTableView):
         path.moveToPoint_(NSMakePoint(x, bounds.origin.y))
         path.lineToPoint_(NSMakePoint(x, bounds.origin.y + bounds.size.height))
         path.stroke()
+
+    def menuForEvent_(self, event):
+        """Select the right-clicked row and return its editing context menu."""
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        row_index = int(self.rowAtPoint_(point))
+        if row_index < 0:
+            return None
+        selected = self.selectedRowIndexes()
+        if not selected.containsIndex_(row_index):
+            self.selectRowIndexes_byExtendingSelection_(
+                NSIndexSet.indexSetWithIndex_(row_index),
+                False,
+            )
+
+        menu = NSMenu.alloc().initWithTitle_("Control File Row")
+
+        def add_item(title, action, enabled=True):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+            item.setTarget_(self.controller)
+            item.setEnabled_(bool(enabled))
+            menu.addItem_(item)
+
+        add_item("Delete", "deleteControlRows:")
+        add_item("Cut", "cutControlRows:")
+        add_item("Copy", "copyControlRowsToPasteboard:")
+        add_item("Paste", "pasteControlRows:")
+        menu.addItem_(NSMenuItem.separatorItem())
+        has_viewable_file = self.controller.selectedControlRowsHaveViewableFiles()
+        add_item("Preview", "openSelectedControlMedia:", has_viewable_file)
+        add_item("Open in Finder", "openSelectedControlRowsInFinder:", has_viewable_file)
+        return menu
 
     def keyDown_(self, event):
         if self.currentEditor() is not None:
@@ -553,6 +743,21 @@ class SlideShowControlTableView(NSTableView):
         if self._send_to_field_editor("redo:", sender):
             return
         self.controller.redoControlTable_(sender)
+
+
+class SlideShowControlTableWindow(NSWindow):
+    """Control-table window with window-wide search shortcuts."""
+
+    def performKeyEquivalent_(self, event):
+        key = str(event.charactersIgnoringModifiers() or "").lower()
+        modifiers = int(event.modifierFlags())
+        if modifiers & int(NSEventModifierFlagCommand) and key == "f":
+            if modifiers & int(NSEventModifierFlagShift):
+                self.controller.findPreviousControlTableMatch_(self)
+            else:
+                self.controller.findNextControlTableMatch_(self)
+            return True
+        return objc.super(SlideShowControlTableWindow, self).performKeyEquivalent_(event)
 
 
 class GPSTrackShowGUIWindowDelegate(NSObject):
@@ -641,6 +846,21 @@ class GPSTrackShowGUIGeoLocationsWindowDelegate(NSObject):
         return False
 
 
+class GPSTrackShowGUIControlTableWindowDelegate(NSObject):
+    """Hide the reusable control-table window instead of releasing it."""
+
+    def initWithController_(self, controller):
+        self = objc.super(GPSTrackShowGUIControlTableWindowDelegate, self).init()
+        if self is None:
+            return None
+        self.controller = controller
+        return self
+
+    def windowShouldClose_(self, _sender):
+        self.controller.closeControlTable_(None)
+        return False
+
+
 class GPSTrackShowGUIPlotViewerView(NSView):
     """Key-aware plot viewer content view."""
 
@@ -683,6 +903,7 @@ class SlideShowMediaViewerDelegate(NSObject):
         return self
 
     def windowWillClose_(self, _notification):
+        self.controller.stop_media_viewer_video()
         self.controller.media_viewer_window = None
         self.controller.media_viewer_view = None
         self.controller.media_viewer_delegate = None
@@ -724,10 +945,10 @@ class SlideShowMediaViewerView(NSView):
         if key in {"s", "S"}:
             self.controller.toggle_media_viewer_sort()
             return
-        if key_code == 36:
+        if key_code in {36, 49}:
             item = self.controller.current_media_viewer_item()
             if item is not None and item.get("kind") == "video":
-                NSWorkspace.sharedWorkspace().openFile_(str(item.get("path", "")))
+                self.controller.toggle_media_viewer_video_playback()
             return
         if key_code in {123, 126}:
             self.controller.show_previous_control_media()
@@ -782,6 +1003,7 @@ class SlideShowMediaViewerView(NSView):
                     "Keys",
                     "Left/Up: previous media",
                     "Right/Down: next media",
+                    "Space/Return: play or pause video",
                     "i: show/hide info overlay",
                     "s: sort by filename/date",
                     "h: show/hide this help",
@@ -795,7 +1017,7 @@ class SlideShowMediaViewerView(NSView):
         if int(event.clickCount()) >= 2:
             item = self.controller.current_media_viewer_item()
             if item is not None and item.get("kind") == "video":
-                NSWorkspace.sharedWorkspace().openFile_(str(item.get("path", "")))
+                self.controller.toggle_media_viewer_video_playback()
 
     def _image_rect(self, image, bounds):
         image_size = image.size()
@@ -884,6 +1106,14 @@ class GPXTrackerController(NSObject):
         self.rows = []
         self.columns = []
         self.current_project_file = None
+        self.current_control_file = None
+        self.track_map_base = ""
+        self.adventure_records = []
+        self.adventure_combo_paths = []
+        self.project_file_menu_refreshing = False
+        self.committed_adventure_name = ""
+        self.adventure_name_commit_in_progress = False
+        self.shared_asset_warning_accepted = set()
         self.recent_adventures = self._load_recent_adventures()
         self.last_picture_import_directory = None
         self.parameters = default_parameters()
@@ -927,6 +1157,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_result_path = None
         self.geolocations_mode = None
         self.geolocations_temp_paths = []
+        self.geolocations_merge_work_path = None
         self.geolocations_places_overwrite = False
         self.status_refresh_generation = 0
         self.media_counts_cache = None
@@ -934,6 +1165,7 @@ class GPXTrackerController(NSObject):
         self.track_maps_status_cache = None
         self.gpx_ready_cache = None
         self.control_table_window = None
+        self.control_table_window_delegate = None
         self.control_table_view = None
         self.control_table_data_source = None
         self.control_table_rows = []
@@ -946,6 +1178,14 @@ class GPXTrackerController(NSObject):
         self.control_table_file_datetime_cache = {}
         self.control_table_show_previews = False
         self.control_table_preview_checkbox = None
+        self.control_table_search_field = None
+        self.control_table_search_status = None
+        self.control_table_search_matches = []
+        self.control_table_search_position = -1
+        self.control_table_search_query = ""
+        self.control_table_recovery_timer = None
+        self.control_table_dirty = False
+        self.control_table_last_snapshot_time = 0.0
         self.saved_project_payload = None
         self.media_viewer_window = None
         self.media_viewer_view = None
@@ -956,6 +1196,10 @@ class GPXTrackerController(NSObject):
         self.media_viewer_sort_mode = "filename"
         self.media_viewer_image_cache = {}
         self.media_viewer_hint_timer = None
+        self.media_viewer_video_player = None
+        self.media_viewer_video_view = None
+        self.media_viewer_video_path = None
+        self.media_viewer_video_preroll = None
         self.media_browser_window = None
         self.media_browser_table = None
         self.media_browser_data_source = None
@@ -1063,12 +1307,17 @@ class GPXTrackerController(NSObject):
         self.project_dir_button = self._make_file_icon_button("chooseProjectDirectory:", "Choose or create the project directory.")
         self.root_view.addSubview_(self.project_dir_button)
 
-        self.title_field_label = self._make_label("Project name")
+        self.title_field_label = self._make_label("Adventure name")
         self.root_view.addSubview_(self.title_field_label)
-        self.title_field = self._make_text_field("")
+        self.title_field = NSComboBox.alloc().initWithFrame_(NSMakeRect(0, 0, 100, FIELD_HEIGHT))
+        self.title_field.setFont_(NSFont.systemFontOfSize_(13.0))
+        self.title_field.setPlaceholderString_("Select or enter an Adventure name")
+        self.title_field.setCompletes_(True)
+        self.title_field.setUsesDataSource_(False)
+        self.title_field.setDelegate_(self)
         self.title_field.setTag_(102)
         self.title_field.setTarget_(self)
-        self.title_field.setAction_("fieldChanged:")
+        self.title_field.setAction_("adventureNameCommitted:")
         self.root_view.addSubview_(self.title_field)
 
         self.description_label = self._make_label("Description")
@@ -1091,10 +1340,8 @@ class GPXTrackerController(NSObject):
         self.description_scroll.setDocumentView_(self.description_text)
         self.root_view.addSubview_(self.description_scroll)
 
-        self.load_button = self._make_button("Load", "loadAdventure:")
         self.help_button = self._make_button("Help", "showMainHelp:")
         self.quit_button = self._make_button("Quit", "quit:")
-        self.root_view.addSubview_(self.load_button)
         self.root_view.addSubview_(self.help_button)
         self.root_view.addSubview_(self.quit_button)
 
@@ -1105,7 +1352,12 @@ class GPXTrackerController(NSObject):
 
         self.gpx_label = self._make_label("Selected GPX file(s)")
         self.root_view.addSubview_(self.gpx_label)
-        self.gpx_field = self._make_text_field("Choose one or more .gpx files")
+        self.gpx_field = NSComboBox.alloc().initWithFrame_(NSMakeRect(0, 0, 100, FIELD_HEIGHT))
+        self.gpx_field.setFont_(NSFont.systemFontOfSize_(13.0))
+        self.gpx_field.setPlaceholderString_("Choose one or more .gpx files")
+        self.gpx_field.setCompletes_(True)
+        self.gpx_field.setUsesDataSource_(False)
+        self.gpx_field.setDelegate_(self)
         self.gpx_field.setTag_(103)
         self.gpx_field.setTarget_(self)
         self.gpx_field.setAction_("gpxSelectionCommitted:")
@@ -1171,8 +1423,18 @@ class GPXTrackerController(NSObject):
         self.root_view.addSubview_(self.control_file_status_checkbox)
         self.control_box = self._make_box_label("Slide Show Control File")
         self.root_view.addSubview_(self.control_box)
-        self.control_file_label = self._make_label("Slide Show Control file:")
+        self.control_file_label = self._make_label("Control file")
         self.root_view.addSubview_(self.control_file_label)
+        self.control_file_field = NSComboBox.alloc().initWithFrame_(NSMakeRect(0, 0, 100, FIELD_HEIGHT))
+        self.control_file_field.setFont_(NSFont.systemFontOfSize_(13.0))
+        self.control_file_field.setPlaceholderString_("Select or enter a .lst filename")
+        self.control_file_field.setCompletes_(True)
+        self.control_file_field.setUsesDataSource_(False)
+        self.control_file_field.setDelegate_(self)
+        self.control_file_field.setTag_(104)
+        self.control_file_field.setTarget_(self)
+        self.control_file_field.setAction_("controlFileCommitted:")
+        self.root_view.addSubview_(self.control_file_field)
         self.control_file_create_button = self._make_button("Create", "createControlFile:")
         self.control_file_edit_button = self._make_button("Edit", "editControlFile:")
         self.control_file_places_button = self._make_button("Add Place Names", "getPlaceNames:")
@@ -1195,13 +1457,20 @@ class GPXTrackerController(NSObject):
 
         self.slideshow_box = self._make_box_label("Start Slide Show")
         self.root_view.addSubview_(self.slideshow_box)
-        self.slideshow_label = self._make_label("Start Slide Show:")
+        self.slideshow_label = self._make_label("Show type")
         self.root_view.addSubview_(self.slideshow_label)
-        self.slideshow_start_button = self._make_button("Start", "startSlideShow:")
-        self.slideshow_time_lapse_button = self._make_button("Start Time-Lapse", "startTimeLapseShow:")
+        self.slideshow_mode_popup = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(0, 0, 132, FIELD_HEIGHT))
+        self.slideshow_mode_popup.addItemsWithTitles_(["Time-Lapse", "Standard"])
+        self.slideshow_mode_popup.selectItemAtIndex_(0)
+        self.slideshow_mode_popup.setTarget_(self)
+        self.slideshow_mode_popup.setAction_("fieldChanged:")
+        self.slideshow_start_button = self._make_button("Start", "startSelectedSlideShow:")
+        self.slideshow_continue_button = self._make_button("Continue", "continueSelectedSlideShow:")
+        self.slideshow_continue_button.setEnabled_(False)
         self.pdf_summary_button = self._make_button("PDF Summary", "exportPdfSummary:")
+        self.root_view.addSubview_(self.slideshow_mode_popup)
         self.root_view.addSubview_(self.slideshow_start_button)
-        self.root_view.addSubview_(self.slideshow_time_lapse_button)
+        self.root_view.addSubview_(self.slideshow_continue_button)
         self.root_view.addSubview_(self.pdf_summary_button)
 
         self.status_label = self._make_status_label("Choose or create an adventure directory to begin.")
@@ -1236,6 +1505,13 @@ class GPXTrackerController(NSObject):
             "NSComboBoxSelectionDidChangeNotification",
             self.project_dir_field,
         )
+        for combo in (self.title_field, self.gpx_field, self.control_file_field):
+            self.notification_center.addObserver_selector_name_object_(
+                self,
+                "projectFileComboSelectionChanged:",
+                "NSComboBoxSelectionDidChangeNotification",
+                combo,
+            )
 
         self.layout_window()
         self._configure_tooltips()
@@ -1397,8 +1673,8 @@ class GPXTrackerController(NSObject):
         self.project_dir_label.setToolTip_("Working directory where the adventure data, plots, media, and control files are stored.")
         self.project_dir_field.setToolTip_("Type or choose the project directory. The dropdown offers the last ten adventure folders. Missing directories are created when selected.")
         self.project_dir_button.setToolTip_("Choose or create the project directory.")
-        self.title_field_label.setToolTip_("Adventure title used for saved files, plots, and display names.")
-        self.title_field.setToolTip_("Edit the adventure title.")
+        self.title_field_label.setToolTip_("Select, create, rename, or copy an Adventure in the current project directory.")
+        self.title_field.setToolTip_("The dropdown lists Adventures in this directory. Commit an edited name to rename or copy the active Adventure.")
         self.description_label.setToolTip_("Optional short description of this adventure.")
         self.description_text.setToolTip_("Enter a short free-text adventure description.")
 
@@ -1429,22 +1705,23 @@ class GPXTrackerController(NSObject):
         self.media_summary_label.setToolTip_("Current count of imported photos and video clips.")
 
         self.control_box.setToolTip_("Create and edit the slide-show control file used to merge media, dates, maps, and geolocations.")
-        self.control_file_label.setToolTip_("Slide-show control file generation and editing.")
-        self.control_file_create_button.setToolTip_("Run GetGeoLocations to create the sorted slide-show control file.")
+        self.control_file_label.setToolTip_("Select an existing .lst file or enter the filename that Create should produce.")
+        self.control_file_field.setToolTip_("The active slide-show control file. The dropdown lists .lst files in this project directory.")
+        self.control_file_create_button.setToolTip_("Create the sorted slide-show control file. Adjacent media is associated with a nearby stage; remaining GPS media receives a date-only location map.")
         self.control_file_edit_button.setToolTip_("Open the editable control-file table.")
         self.control_file_places_button.setToolTip_("Reverse-geocode media with GPS coordinates and add missing place names to the editable control-file table without regenerating its order.")
         self.control_file_places_overwrite_checkbox.setToolTip_("Overwrite existing place names in media sidecar files and in the slide-show control table.")
-        self.control_file_merge_tracks_button.setToolTip_("Synchronize canonical #Map entries in the existing user-edited control file; this does not render map images.")
-        self.control_file_merge_media_button.setToolTip_("Choose additional photos or videos and merge them into the existing user-edited control file at their sorted positions.")
-        self.control_file_summary_label.setToolTip_("Shows whether a control file exists and counts images, videos, track maps, dates, and overview map.")
+        self.control_file_merge_tracks_button.setToolTip_("Synchronize canonical track maps and update adjacent-day map references in the existing user-edited control file; this does not render map images.")
+        self.control_file_merge_media_button.setToolTip_("Choose additional photos or videos and merge them into the existing user-edited control file, including suitable Day before, Day after, or media-location map sections.")
+        self.control_file_summary_label.setToolTip_("Shows whether a control file exists and counts images, videos, track maps, media-location maps, dates, and the overview map.")
 
         self.slideshow_box.setToolTip_("Launch the final slide show or export a GPX track PDF summary.")
-        self.slideshow_label.setToolTip_("Start the slide show after tracks, media, and the control file are ready.")
-        self.slideshow_start_button.setToolTip_("Launch GPSTrackShow with the project directory, slide-show control file, and trackimages directory.")
-        self.slideshow_time_lapse_button.setToolTip_("Launch the stage-map GPS time-lapse slide show using the current track-map metadata.")
+        self.slideshow_label.setToolTip_("Choose Standard or Time-Lapse playback before starting.")
+        self.slideshow_mode_popup.setToolTip_("Time-Lapse animates each stage route; Standard shows maps and media sequentially.")
+        self.slideshow_start_button.setToolTip_("Launch the selected slide-show type from the beginning.")
+        self.slideshow_continue_button.setToolTip_("Continue the selected slide-show type from its last automatically saved position.")
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
 
-        self.load_button.setToolTip_("Load an existing .adv adventure file.")
         self.help_button.setToolTip_("Show a simple overview of the program and the recommended workflow.")
         self.quit_button.setToolTip_("Auto-save pending Adventure changes and quit the program.")
         self.status_label.setToolTip_("Current operation status.")
@@ -1469,19 +1746,21 @@ class GPXTrackerController(NSObject):
         self.gpx_track_order_popup.setNextKeyView_(self.media_import_button)
         self.media_import_button.setNextKeyView_(self.media_view_button)
         self.media_view_button.setNextKeyView_(self.media_edit_button)
-        self.media_edit_button.setNextKeyView_(self.control_file_create_button)
+        self.media_edit_button.setNextKeyView_(self.control_file_field)
+        self.control_file_field.setNextKeyView_(self.control_file_create_button)
         self.control_file_create_button.setNextKeyView_(self.control_file_edit_button)
         self.control_file_edit_button.setNextKeyView_(self.control_file_places_button)
         self.control_file_places_button.setNextKeyView_(self.control_file_places_overwrite_checkbox)
         self.control_file_places_overwrite_checkbox.setNextKeyView_(self.control_file_merge_tracks_button)
         self.control_file_merge_tracks_button.setNextKeyView_(self.control_file_merge_media_button)
-        self.control_file_merge_media_button.setNextKeyView_(self.slideshow_start_button)
-        self.slideshow_start_button.setNextKeyView_(self.slideshow_time_lapse_button)
-        self.slideshow_time_lapse_button.setNextKeyView_(self.pdf_summary_button)
-        self.pdf_summary_button.setNextKeyView_(self.load_button)
-        self.load_button.setNextKeyView_(self.help_button)
-        self.help_button.setNextKeyView_(self.quit_button)
-        self.quit_button.setNextKeyView_(self.project_dir_field)
+        self.control_file_merge_media_button.setNextKeyView_(self.slideshow_mode_popup)
+        self.slideshow_mode_popup.setNextKeyView_(self.slideshow_start_button)
+        self.slideshow_start_button.setNextKeyView_(self.slideshow_continue_button)
+        self.slideshow_continue_button.setNextKeyView_(self.pdf_summary_button)
+        self.pdf_summary_button.setNextKeyView_(self.quit_button)
+        self.quit_button.setNextKeyView_(self.help_button)
+        self.help_button.setNextKeyView_(self.parameter_button)
+        self.parameter_button.setNextKeyView_(self.project_dir_field)
 
     def layout_window(self):
         bounds = self.root_view.bounds()
@@ -1503,12 +1782,17 @@ class GPXTrackerController(NSObject):
         logo_x = field_x + description_width - logo_size
         parameter_button_size = 34.0
         parameter_button_x = logo_x - parameter_button_size - INNER_GAP
-        text_width = max(180.0, parameter_button_x - left_x - INNER_GAP)
+        help_button_width = 62.0
+        help_button_x = parameter_button_x - help_button_width - INNER_GAP
+        text_width = max(180.0, help_button_x - left_x - INNER_GAP)
         self.header_text_label.setFrame_(
             NSMakeRect(left_x, current_top - title_height + 13.0, text_width, 34.0)
         )
         self.parameter_button.setFrame_(
             NSMakeRect(parameter_button_x, current_top - title_height + 12.0, parameter_button_size, parameter_button_size)
+        )
+        self.help_button.setFrame_(
+            NSMakeRect(help_button_x, current_top - title_height + 12.0, help_button_width, parameter_button_size)
         )
         self.header_logo_view.setFrame_(
             NSMakeRect(logo_x, current_top - logo_size + 26.0, logo_size, logo_size)
@@ -1622,6 +1906,8 @@ class GPXTrackerController(NSObject):
         current_top -= 24.0
         row_y = current_top - FIELD_HEIGHT
         self.control_file_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
+        self.control_file_field.setFrame_(NSMakeRect(field_x, row_y, description_width, FIELD_HEIGHT))
+        row_y -= FIELD_HEIGHT + 4.0
         self.control_file_create_button.setFrame_(NSMakeRect(field_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
         edit_x = field_x + SMALL_BUTTON_WIDTH + INNER_GAP
         self.control_file_edit_button.setFrame_(NSMakeRect(edit_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
@@ -1652,17 +1938,16 @@ class GPXTrackerController(NSObject):
         current_top -= 24.0
         row_y = current_top - FIELD_HEIGHT
         self.slideshow_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        self.slideshow_start_button.setFrame_(NSMakeRect(field_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        self.slideshow_time_lapse_button.setFrame_(NSMakeRect(field_x + SMALL_BUTTON_WIDTH + INNER_GAP, row_y, 132.0, FIELD_HEIGHT))
-        self.pdf_summary_button.setFrame_(NSMakeRect(field_x + SMALL_BUTTON_WIDTH + 132.0 + 2 * INNER_GAP, row_y, 124.0, FIELD_HEIGHT))
-
-        button_row_y = row_y - FIELD_HEIGHT - 8.0
-        total_button_width = BUTTON_WIDTH * 3 + INNER_GAP * 2
-        button_start = field_x + (description_width - total_button_width) / 2.0
-        self.load_button.setFrame_(NSMakeRect(button_start, button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        self.help_button.setFrame_(NSMakeRect(button_start + BUTTON_WIDTH + INNER_GAP, button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        self.quit_button.setFrame_(NSMakeRect(button_start + 2 * (BUTTON_WIDTH + INNER_GAP), button_row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        status_bottom = button_row_y - STATUS_HEIGHT - 6.0
+        self.slideshow_mode_popup.setFrame_(NSMakeRect(field_x, row_y, 132.0, FIELD_HEIGHT))
+        start_x = field_x + 132.0 + INNER_GAP
+        self.slideshow_start_button.setFrame_(NSMakeRect(start_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
+        continue_x = start_x + SMALL_BUTTON_WIDTH + INNER_GAP
+        self.slideshow_continue_button.setFrame_(NSMakeRect(continue_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
+        pdf_x = continue_x + SMALL_BUTTON_WIDTH + INNER_GAP
+        self.pdf_summary_button.setFrame_(NSMakeRect(pdf_x, row_y, 124.0, FIELD_HEIGHT))
+        quit_x = field_x + description_width - BUTTON_WIDTH
+        self.quit_button.setFrame_(NSMakeRect(quit_x, row_y, BUTTON_WIDTH, FIELD_HEIGHT))
+        status_bottom = row_y - STATUS_HEIGHT - 6.0
         progress_bottom = status_bottom - PROGRESS_HEIGHT - 6.0
         self.status_label.setFrame_(NSMakeRect(field_x, status_bottom, description_width, STATUS_HEIGHT))
         self.progress_bar.setFrame_(NSMakeRect(field_x, progress_bottom, description_width, PROGRESS_HEIGHT))
@@ -1748,14 +2033,25 @@ class GPXTrackerController(NSObject):
         return self.current_project_dir / f"{base_name}.adv"
 
     def _control_file_base_name(self):
-        if self.current_project_dir is None and not self._current_project_name():
-            return "project"
-        return project_filename_base(self._current_project_name() or self.current_project_dir.name)
+        path = self._control_file_path()
+        if path is not None:
+            stem = path.stem
+            return stem[:-7] if stem.endswith("-sorted") else stem
+        return project_filename_base(self._current_project_name() or "project")
 
     def _control_file_path(self):
         if self.current_project_dir is None:
             return None
-        return self.current_project_dir / f"{self._control_file_base_name()}-sorted.lst"
+        value = str(self.control_file_field.stringValue()).strip() if hasattr(self, "control_file_field") else ""
+        if value:
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = self.current_project_dir / path
+            return path.resolve(strict=False)
+        if self.current_control_file is not None:
+            return Path(self.current_control_file).resolve(strict=False)
+        base = project_filename_base(self._current_project_name() or self.current_project_dir.name)
+        return (self.current_project_dir / f"{base}-sorted.lst").resolve(strict=False)
 
     def _use_track_order(self):
         if not hasattr(self, "gpx_track_order_popup"):
@@ -1807,7 +2103,7 @@ class GPXTrackerController(NSObject):
         self.refresh_section_status_indicators()
 
     def _control_file_summary_text(self, rows, control_file_path=None):
-        counts = {"IMG": 0, "VID": 0, "TRK": 0, "DAT": 0}
+        counts = {"IMG": 0, "VID": 0, "TRK": 0, "BEF": 0, "AFT": 0, "LOC": 0, "DAT": 0}
         overview_present = False
         images_with_places = 0
         for row in rows:
@@ -1828,7 +2124,8 @@ class GPXTrackerController(NSObject):
         return (
             f"{counts['IMG']} images, {counts['VID']} videos, "
             f"{images_with_places} images with places, "
-            f"{counts['TRK']} track maps, {counts['DAT']} dates, "
+            f"{counts['TRK']} track maps, {counts['BEF'] + counts['AFT']} adjacent-day maps, "
+            f"{counts['LOC']} media maps, {counts['DAT']} dates, "
             f"overview: {'yes' if overview_present else 'no'}{changed_text}"
         )
 
@@ -1865,6 +2162,7 @@ class GPXTrackerController(NSObject):
             "missing_tracks": [],
             "obsolete_overview": [],
             "obsolete_tracks": [],
+            "special_updates": [],
         }
         if control_file_path is None or tracks_summary_path is None:
             return empty
@@ -1895,6 +2193,11 @@ class GPXTrackerController(NSObject):
             for track in tracks_summary.tracks
             if track.track_plot_image_filename
         }
+        expected_by_number = {
+            int(track.original_sequence_number): track.track_plot_image_filename
+            for track in tracks_summary.tracks
+            if track.track_plot_image_filename
+        }
         missing_overview = []
         if tracks_summary.overview_image:
             overview_name = normalize_filename_for_match(tracks_summary.overview_image)
@@ -1912,6 +2215,7 @@ class GPXTrackerController(NSObject):
 
         obsolete_overview = []
         obsolete_tracks = []
+        special_updates = []
         expected_overview_name = (
             normalize_filename_for_match(tracks_summary.overview_image)
             if tracks_summary.overview_image
@@ -1930,62 +2234,83 @@ class GPXTrackerController(NSObject):
                 normalized = self._canonical_track_map_match_name(name)
                 if normalized not in expected_map_names or not self._track_map_file_exists_for_control(name):
                     obsolete_tracks.append(name)
+            elif entry_type in {"map_before", "map_after"}:
+                normalized = self._canonical_track_map_match_name(name)
+                match = re.match(r"^0*(\d+)_", Path(name).name)
+                entry_date = entry.get("date")
+                date_candidates = []
+                if entry_date is not None:
+                    target_date = entry_date + timedelta(
+                        days=1 if entry_type == "map_before" else -1
+                    )
+                    date_candidates = [
+                        track
+                        for track in tracks_summary.tracks
+                        if track.start_time.date() == target_date
+                        and track.track_plot_image_filename
+                    ]
+                replacement = None
+                if len(date_candidates) == 1:
+                    replacement = date_candidates[0].track_plot_image_filename
+                elif date_candidates and match:
+                    old_number = int(match.group(1))
+                    replacement = next(
+                        (
+                            track.track_plot_image_filename
+                            for track in date_candidates
+                            if track.original_sequence_number == old_number
+                        ),
+                        None,
+                    )
+                    if replacement is None:
+                        replacement = date_candidates[0].track_plot_image_filename
+                elif date_candidates:
+                    replacement = date_candidates[0].track_plot_image_filename
+                elif entry_date is None and match:
+                    replacement = expected_by_number.get(int(match.group(1)))
+                if (
+                    replacement
+                    and normalized == self._canonical_track_map_match_name(replacement)
+                    and self._track_map_file_exists_for_control(name)
+                ):
+                    continue
+                if replacement and self._track_map_file_exists_for_control(replacement):
+                    special_updates.append((name, replacement, entry_type))
+                else:
+                    obsolete_tracks.append(name)
         return {
             "missing_overview": missing_overview,
             "missing_tracks": missing_tracks,
             "obsolete_overview": obsolete_overview,
             "obsolete_tracks": obsolete_tracks,
+            "special_updates": special_updates,
         }
 
     def _control_track_map_sync_suffix(self, control_file_path=None):
         status = self._control_track_map_sync_status(control_file_path=control_file_path)
         missing_count = len(status["missing_overview"]) + len(status["missing_tracks"])
         obsolete_count = len(status["obsolete_overview"]) + len(status["obsolete_tracks"])
+        update_count = len(status.get("special_updates", []))
         parts = []
         if missing_count:
             parts.append(f"{missing_count} track map {'entries' if missing_count != 1 else 'entry'} missing")
         if obsolete_count:
             parts.append(f"{obsolete_count} old track map {'entries' if obsolete_count != 1 else 'entry'}")
+        if update_count:
+            parts.append(f"{update_count} adjacent-day map {'references' if update_count != 1 else 'reference'} to update")
         return f" | {', '.join(parts)}" if parts else ""
 
-    def _remove_control_track_map_entries(self, control_file_path, names_to_remove):
-        names = {
-            normalize_filename_for_match(name)
-            for name in names_to_remove
-            if str(name).strip()
-        }
-        map_names = {
-            normalize_track_plot_filename_for_match(name)
-            for name in names_to_remove
-            if str(name).strip()
-        }
-        if not names and not map_names:
-            return 0
+    def _remove_control_track_map_entries(self, control_file_path, names_to_remove, refresh=True):
         path = Path(control_file_path)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            removed = remove_control_track_map_entries(path, list(names_to_remove))
         except OSError:
             return 0
-        kept_lines = []
-        removed = 0
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                keyword, _separator, value = stripped[1:].partition(":")
-                normalized = keyword.strip().lower()
-                name = value.strip()
-                if normalized == "overviewmap" and normalize_filename_for_match(name) in names:
-                    removed += 1
-                    continue
-                if normalized == "map" and normalize_track_plot_filename_for_match(name) in map_names:
-                    removed += 1
-                    continue
-            kept_lines.append(line)
         if removed:
-            path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8")
-            self.load_slideshow_control_file(path)
-            self.refresh_control_file_display()
-            self.mark_dirty()
+            if refresh:
+                self.load_slideshow_control_file(path)
+                self.refresh_control_file_display()
+                self.mark_dirty()
         return removed
 
     def _selected_gpx_display_value(self):
@@ -2018,10 +2343,61 @@ class GPXTrackerController(NSObject):
         trackimages_dir = self._track_images_dir()
         if not project_name or gpx_path is None or trackimages_dir is None:
             return None
-        return self._plot_context_for_values(gpx_path, project_name, trackimages_dir, self._use_track_order())
+        context = self._plot_context_for_values(
+            gpx_path,
+            project_name,
+            trackimages_dir,
+            self._use_track_order(),
+            self.track_map_base or project_name,
+        )
+        self._add_media_maps_to_plot_context(context)
+        return context
 
-    def _plot_context_for_values(self, gpx_path, project_name, trackimages_dir, use_track_order):
-        options = self._plot_common_options(project_name, trackimages_dir)
+    def _add_media_maps_to_plot_context(self, context):
+        """Attach control-file media maps to the shared Track Maps selection context."""
+        if not isinstance(context, dict):
+            return
+        control_path = self._control_file_path()
+        if control_path is None or not control_path.exists():
+            context["media_map_items"] = []
+            return
+        try:
+            entries = parse_control_file_entries(control_path.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            context["media_map_items"] = []
+            return
+        specs = media_map_specs_from_control_entries(entries)
+        first_number = len(context.get("tracks", [])) + 1
+        layout = "time-lapse" if self.track_maps_for_time_lapse else "standard"
+        output_dir = Path(context["output_dir"])
+        expected_parameters = self._track_map_parameter_signature(layout)
+        items = []
+        for offset, spec in enumerate(specs):
+            output_name = media_map_output_filename(spec["filename"], layout)
+            output_path = output_dir / output_name
+            metadata = self._plot_metadata_for_image(output_path) if output_path.exists() else None
+            expected_fingerprint = media_coordinates_fingerprint(spec["date"], spec["coordinates"])
+            needs_update = (
+                not output_path.exists()
+                or not self._metadata_parameters_are_current(metadata, expected_parameters, layout)
+                or not isinstance(metadata, dict)
+                or str(metadata.get("media_fingerprint", "")) != expected_fingerprint
+            )
+            items.append(
+                {
+                    "selection_number": first_number + offset,
+                    "date": spec["date"],
+                    "filename": spec["filename"],
+                    "coordinates": spec["coordinates"],
+                    "output_image": str(output_path),
+                    "needs_update": needs_update,
+                    "control_file": str(control_path),
+                }
+            )
+        context["media_map_items"] = items
+
+    def _plot_context_for_values(self, gpx_path, project_name, trackimages_dir, use_track_order, track_map_base=None):
+        options = self._plot_common_options(project_name, trackimages_dir, track_map_base or project_name)
         options.update(
             {
                 "plot_tracks": "all",
@@ -2045,7 +2421,7 @@ class GPXTrackerController(NSObject):
             plot_overview=False,
             plot_tracks=None,
             output_dir=str(trackimages_dir),
-            output_base=project_name,
+            output_base=self.track_map_base or project_name,
             nojson=False,
             pdf=False,
             verbose=False,
@@ -2181,6 +2557,9 @@ class GPXTrackerController(NSObject):
                         update_numbers.add(track_number)
                 except OSError:
                     update_numbers.add(track_number)
+        for item in context.get("media_map_items", []):
+            if item.get("needs_update"):
+                update_numbers.add(int(item["selection_number"]))
         return sorted(update_numbers)
 
     def _plot_status_for_gpx(self, gpx_path):
@@ -2352,6 +2731,42 @@ class GPXTrackerController(NSObject):
                 except OSError:
                     overview_out_of_date = True
 
+        media_items = context.get("media_map_items", [])
+        media_standard_count = 0
+        media_time_lapse_count = 0
+        media_stale_count = 0
+        media_current_any_count = 0
+        for item in media_items:
+            variant_current = False
+            expected_fingerprint = media_coordinates_fingerprint(item["date"], item["coordinates"])
+            for layout, filename in (
+                ("standard", item["filename"]),
+                ("time-lapse", time_lapse_track_map_name(item["filename"])),
+            ):
+                path = output_dir / filename
+                if not path.exists():
+                    continue
+                if layout == "standard":
+                    media_standard_count += 1
+                else:
+                    media_time_lapse_count += 1
+                metadata = self._plot_metadata_for_image(path)
+                stale = (
+                    not self._metadata_parameters_are_current(
+                        metadata,
+                        self._track_map_parameter_signature(layout),
+                        layout,
+                    )
+                    or not isinstance(metadata, dict)
+                    or str(metadata.get("media_fingerprint", "")) != expected_fingerprint
+                )
+                if stale:
+                    media_stale_count += 1
+                else:
+                    variant_current = True
+            if variant_current:
+                media_current_any_count += 1
+
         return {
             "overview_exists": overview_exists,
             "overview_out_of_date": overview_out_of_date,
@@ -2363,6 +2778,11 @@ class GPXTrackerController(NSObject):
             "time_lapse_stale_count": time_lapse_stale_count,
             "stale_track_count": standard_stale_count + time_lapse_stale_count,
             "missing_metadata_count": missing_metadata_count,
+            "media_map_total": len(media_items),
+            "media_map_count": media_current_any_count,
+            "media_standard_count": media_standard_count,
+            "media_time_lapse_count": media_time_lapse_count,
+            "media_stale_count": media_stale_count,
             "summary_exists": summary_exists,
             "summary_out_of_date": summary_out_of_date,
             "out_of_date": bool(
@@ -2370,6 +2790,7 @@ class GPXTrackerController(NSObject):
                 or not summary_exists
                 or overview_out_of_date
                 or summary_out_of_date
+                or media_current_any_count < len(media_items)
             ),
         }
 
@@ -2399,10 +2820,14 @@ class GPXTrackerController(NSObject):
             freshness_parts.append("track summary missing")
         elif status.get("summary_out_of_date"):
             freshness_parts.append("track summary not up-to-date")
+        if status.get("media_stale_count"):
+            freshness_parts.append(f"{status['media_stale_count']} media map variant(s) not up-to-date")
         freshness_text = f" | {', '.join(freshness_parts)}" if freshness_parts else ""
         return (
             f"Standard: {status.get('standard_count', 0)}/{status['track_total']} | "
             f"Time-Lapse: {status.get('time_lapse_count', 0)}/{status['track_total']} | "
+            f"Media maps Standard: {status.get('media_standard_count', 0)}/{status.get('media_map_total', 0)} | "
+            f"Time-Lapse: {status.get('media_time_lapse_count', 0)}/{status.get('media_map_total', 0)} | "
             f"overview: {overview_text}{freshness_text}"
         )
 
@@ -2548,30 +2973,73 @@ class GPXTrackerController(NSObject):
 
     def _collect_project_payload(self):
         return {
+            "adventure_format_version": ADVENTURE_FORMAT_VERSION,
             "project_name": str(self.title_field.stringValue()).strip(),
             "project_directory": str(self.current_project_dir) if self.current_project_dir else "",
             "description": self._description_string(),
-            "gpx_file": self._selected_gpx_display_value(),
-            "control_file": str(self._control_file_path()) if self._control_file_path() is not None else "",
-            "control_file_track_order": self._use_track_order(),
+            "gpx_file": self._gpx_field_basename(),
+            "control_file": self._control_file_path().name if self._control_file_path() is not None else "",
+            "track_map_base": self.track_map_base or project_filename_base(self._current_project_name()),
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
-            "time_lapse_media_min_fraction": self.time_lapse_media_min_fraction,
-            "track_maps_for_time_lapse": self.track_maps_for_time_lapse,
-            "track_map_edge_margin_fraction": self.track_map_edge_margin_fraction,
             "parameters": parameter_payload(self.parameters),
             "slideshow_resume_position": self.slideshow_resume_position,
         }
 
+    def _confirm_shared_asset_change(self, field, value, label):
+        if self.current_project_dir is None or self.current_project_file is None or not value:
+            return True
+        key = (field, str(value))
+        if key in self.shared_asset_warning_accepted:
+            return True
+        others = shared_references(
+            self.current_project_dir,
+            Path(self.current_project_file).resolve(strict=False),
+            field,
+            str(value),
+        )
+        if not others:
+            return True
+        names = "\n".join(f"- {path.name}" for path in others)
+        if not confirm_alert(
+            f"Shared {label}",
+            f"This {label} is also used by:\n{names}\n\nChanges will affect those Adventures too.",
+            "Continue",
+            "Cancel",
+        ):
+            return False
+        self.shared_asset_warning_accepted.add(key)
+        return True
+
+    def _refresh_project_file_menus(self):
+        if self.current_project_dir is None or not self.current_project_dir.is_dir():
+            return
+        self.project_file_menu_refreshing = True
+        try:
+            records, errors = discover_adventures(self.current_project_dir)
+            self.adventure_records = records
+            self.adventure_combo_paths = [record.path for record in records]
+            current_name = str(self.title_field.stringValue()).strip()
+            self.title_field.removeAllItems()
+            self.title_field.addItemsWithObjectValues_([record.project_name for record in records])
+            self.title_field.setStringValue_(current_name)
+
+            gpx_value = str(self.gpx_field.stringValue()).strip()
+            self.gpx_field.removeAllItems()
+            self.gpx_field.addItemsWithObjectValues_(project_file_names(self.current_project_dir, ".gpx"))
+            self.gpx_field.setStringValue_(gpx_value)
+
+            control_value = str(self.control_file_field.stringValue()).strip()
+            self.control_file_field.removeAllItems()
+            self.control_file_field.addItemsWithObjectValues_(project_file_names(self.current_project_dir, ".lst"))
+            self.control_file_field.setStringValue_(control_value)
+        finally:
+            self.project_file_menu_refreshing = False
+        if errors:
+            show_alert("Some Adventure files could not be used.", "\n".join(errors))
+
     def _find_adventure_file_in_directory(self, project_dir):
-        project_dir = Path(project_dir).expanduser().resolve(strict=False)
-        adv_files = sorted(project_dir.glob("*.adv"), key=lambda path: path.name.lower())
-        if not adv_files:
-            return None
-        preferred_name = f"{project_filename_base(project_dir.name)}.adv"
-        for adv_path in adv_files:
-            if adv_path.name == preferred_name:
-                return adv_path.resolve(strict=False)
-        return adv_files[0].resolve(strict=False)
+        records, _errors = discover_adventures(project_dir)
+        return records[0].path if records else None
 
     def _auto_load_adventure_from_directory(self, project_dir):
         adv_path = self._find_adventure_file_in_directory(project_dir)
@@ -2610,17 +3078,6 @@ class GPXTrackerController(NSObject):
             self._restore_project_directory_field(previous_directory)
             return False
 
-        adventure_file = self._find_adventure_file_in_directory(candidate) if candidate.exists() else None
-        if adventure_file is None and not confirm_alert(
-            "Create a new Adventure?",
-            f"No Adventure file exists in:\n{candidate}\n\nCreate a new Adventure here?",
-            "Create Adventure",
-            "Cancel",
-        ):
-            self._restore_project_directory_field(previous_directory)
-            self.set_status("Adventure creation cancelled.")
-            return False
-
         if not self.flush_adventure_autosave():
             self._restore_project_directory_field(previous_directory)
             return False
@@ -2634,7 +3091,9 @@ class GPXTrackerController(NSObject):
         if resolved is None:
             self._restore_project_directory_field(previous_directory)
             return False
-        if adventure_file is not None:
+        records, _errors = discover_adventures(resolved)
+        if records:
+            adventure_file = records[0].path
             loaded = self.load_project_configuration(adventure_file, flush_current=False)
             if not loaded:
                 self.current_project_dir = previous_directory
@@ -2646,23 +3105,25 @@ class GPXTrackerController(NSObject):
                         pass
             return loaded
 
-        self.current_project_file = None
-        if not str(self.title_field.stringValue()).strip():
-            self.title_field.setStringValue_(resolved.name)
-        self.current_project_file = resolved / f"{project_filename_base(str(self.title_field.stringValue()).strip() or resolved.name)}.adv"
-        self.project_dirty = True
-        if not self._write_project_configuration(status_prefix="Created adventure"):
+        self.adventure_autosave_suspended += 1
+        try:
             self.current_project_file = None
-            self.current_project_dir = previous_directory
-            self._restore_project_directory_field(previous_directory)
-            if previous_directory is not None:
-                try:
-                    os.chdir(previous_directory)
-                except OSError:
-                    pass
-            return False
+            suggested = project_filename_base(resolved.name)
+            self.title_field.setStringValue_(suggested)
+            self.committed_adventure_name = ""
+            self.track_map_base = suggested
+            self._set_gpx_field_value(f"{suggested}.gpx", manual=False)
+            self.current_control_file = resolved / f"{suggested}-sorted.lst"
+            self.control_file_field.setStringValue_(self.current_control_file.name)
+            self.description_text.setString_("")
+            self.slideshow_resume_position = None
+        finally:
+            self.adventure_autosave_suspended = max(0, self.adventure_autosave_suspended - 1)
+        self.saved_project_payload = None
+        self._refresh_project_file_menus()
         self._remember_recent_adventure(resolved)
         self.refresh_section_status_indicators()
+        self.set_status("Enter or confirm the Adventure name to create it.")
         return True
 
     def _update_loaded_project_fields(self, data):
@@ -2683,58 +3144,23 @@ class GPXTrackerController(NSObject):
                 show_alert("Could not make the loaded project directory the current working directory.", str(exc))
 
         self.title_field.setStringValue_(str(data.get("project_name", "") or ""))
+        self.committed_adventure_name = str(data.get("project_name", "") or "")
+        self.track_map_base = str(data["track_map_base"])
         self.description_text.setString_(str(data.get("description", "") or ""))
-        raw_parameter_payload = data.get("parameters")
-        self.parameters = normalize_parameters(raw_parameter_payload)
-        raw_parameter_values = (
-            raw_parameter_payload.get("values", {})
-            if isinstance(raw_parameter_payload, dict) and isinstance(raw_parameter_payload.get("values"), dict)
-            else {}
-        )
-        if "trackmaps.ordering" not in raw_parameter_values:
-            self.parameters["trackmaps.ordering"] = (
-                "track_number" if bool(data.get("control_file_track_order", True)) else "date"
-            )
-        if "trackmaps.variant" not in raw_parameter_values:
-            self.parameters["trackmaps.variant"] = (
-                "time_lapse" if bool(data.get("track_maps_for_time_lapse", True)) else "standard"
-            )
-        if "timelapse.media_min_fraction" not in raw_parameter_values:
-            try:
-                legacy_media_fraction = float(
-                    data.get(
-                        "time_lapse_media_min_fraction",
-                        data.get("time_lapse_media_max_fraction", 0.5),
-                    )
-                )
-            except (TypeError, ValueError):
-                legacy_media_fraction = 0.5
-            if 0.0 < legacy_media_fraction <= 1.0:
-                self.parameters["timelapse.media_min_fraction"] = legacy_media_fraction
-        if "trackmaps.edge_margin_fraction" not in raw_parameter_values:
-            try:
-                legacy_map_margin = float(
-                    data.get("track_map_edge_margin_fraction", DEFAULT_TRACK_EDGE_MARGIN_FRACTION)
-                )
-            except (TypeError, ValueError):
-                legacy_map_margin = DEFAULT_TRACK_EDGE_MARGIN_FRACTION
-            if 0.0 <= legacy_map_margin < 0.5:
-                self.parameters["trackmaps.edge_margin_fraction"] = legacy_map_margin
+        self.parameters = normalize_parameters(data["parameters"])
         self._sync_legacy_parameter_controls()
-        loaded_gpx_value = str(data.get("gpx_file", "") or "").strip()
-        if loaded_gpx_value:
-            loaded_gpx_path = Path(loaded_gpx_value).expanduser()
-            if not loaded_gpx_path.is_absolute() and self.current_project_dir is not None:
-                loaded_gpx_path = self.current_project_dir / loaded_gpx_path
-            self._set_gpx_field_value(str(loaded_gpx_value), manual=not self._is_default_gpx_path(loaded_gpx_path))
-        else:
-            self._update_default_gpx_field(force=True)
+        loaded_gpx_value = str(data["gpx_file"]).strip()
+        loaded_gpx_path = self.current_project_dir / loaded_gpx_value
+        self._set_gpx_field_value(loaded_gpx_value, manual=not self._is_default_gpx_path(loaded_gpx_path))
+        self.current_control_file = (self.current_project_dir / str(data["control_file"])).resolve(strict=False)
+        self.control_file_field.setStringValue_(self.current_control_file.name)
         last_import_directory = str(data.get("last_picture_import_directory", "") or "")
         self.last_picture_import_directory = (
             Path(last_import_directory).expanduser().resolve(strict=False) if last_import_directory else None
         )
         loaded_resume_position = data.get("slideshow_resume_position")
         self.slideshow_resume_position = loaded_resume_position if isinstance(loaded_resume_position, dict) else None
+        self._update_slideshow_continue_button()
         if self.parameter_editor_controller is not None:
             self.parameter_editor_controller.update_values(self.parameters)
 
@@ -2824,8 +3250,7 @@ class GPXTrackerController(NSObject):
         result["media_counts"] = (photo_count, video_count)
         result["media_summary"] = f"{photo_count} {'photo' if photo_count == 1 else 'photos'}, {video_count} {'video clip' if video_count == 1 else 'video clips'}"
 
-        control_base = project_filename_base(project_name or project_dir.name)
-        control_file_path = project_dir / f"{control_base}-sorted.lst"
+        control_file_path = snapshot.get("control_file_path")
         if control_file_path.exists():
             try:
                 rows = [
@@ -2846,7 +3271,13 @@ class GPXTrackerController(NSObject):
                 result["gpx_summary"] = default_gpx_summary_text()
             try:
                 trackimages_dir = project_dir / "trackimages"
-                context = self._plot_context_for_values(gpx_path, project_name, trackimages_dir, snapshot["use_track_order"])
+                context = self._plot_context_for_values(
+                    gpx_path,
+                    project_name,
+                    trackimages_dir,
+                    snapshot["use_track_order"],
+                    snapshot["track_map_base"],
+                )
                 result["track_maps_status"] = self._track_maps_status_from_context(
                     gpx_path,
                     context,
@@ -2864,7 +3295,9 @@ class GPXTrackerController(NSObject):
             "generation": generation,
             "project_dir": project_dir.resolve(strict=False) if project_dir is not None else None,
             "project_name": self._current_project_name(),
+            "track_map_base": self.track_map_base or self._current_project_name(),
             "gpx_text": str(self.gpx_field.stringValue()).strip(),
+            "control_file_path": self._control_file_path(),
             "use_track_order": self._use_track_order(),
         }
         self._set_project_status_pending()
@@ -2915,8 +3348,9 @@ class GPXTrackerController(NSObject):
             self.mark_clean()
             return True
         try:
+            validate_adventure_payload(payload, adv_path)
             atomic_write_json(adv_path, payload)
-        except OSError as exc:
+        except (OSError, AdventureFormatError) as exc:
             self.project_dirty = True
             self.adventure_autosave_error = str(exc)
             show_alert("Could not auto-save the Adventure.", str(exc))
@@ -2931,25 +3365,26 @@ class GPXTrackerController(NSObject):
     def save_project_configuration(self):
         """Compatibility wrapper for operations that require an immediate flush."""
         if self.current_project_file is None:
-            project_dir = self._project_dir_path()
-            if project_dir is None:
+            if self._project_dir_path() is None:
                 return False
-            return self._activate_project_directory(project_dir, allow_create=True)
+            self.adventureNameCommitted_(self.title_field)
+            return self.current_project_file is not None
         return self.flush_adventure_autosave()
 
     def load_project_configuration(self, adv_path, flush_current=True):
         if flush_current and self.current_project_file is not None and not self.flush_adventure_autosave():
             return False
         try:
-            with Path(adv_path).expanduser().open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
+            record = load_adventure(adv_path)
+            data = record.payload
+        except AdventureFormatError as exc:
             show_alert("Could not load adventure.", str(exc))
             return False
 
         self._update_loaded_project_fields(data)
-        self.current_project_file = Path(adv_path).expanduser().resolve(strict=False)
+        self.current_project_file = record.path
         self._remember_recent_adventure(self.current_project_file.parent)
+        self._refresh_project_file_menus()
         self.set_status(f"Loaded adventure from {self.current_project_file}")
         self.reset_progress()
         self._refresh_loaded_gpx_summary()
@@ -2957,6 +3392,8 @@ class GPXTrackerController(NSObject):
         return True
 
     def confirm_close(self):
+        if not self._resolve_unsaved_control_table_changes():
+            return False
         if self.flush_adventure_autosave():
             return True
         while True:
@@ -3014,21 +3451,23 @@ class GPXTrackerController(NSObject):
             "myCamino GPS Track Show helps you build one travel slide show from tracks, photos, videos, and maps.\n\n"
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
-            "2. Enter the project name and a short description. The Adventure file is updated automatically after every change.\n"
+            "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Editing an existing name offers Rename or Copy, optionally including its GPX, control file, and Track Maps.\n"
             "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. Applied changes are auto-saved with the Adventure.\n"
             "4. Select one GPX file in the adventure folder, or choose external/multiple GPX files and use Add & Edit Tracks to save one final GPX file.\n"
             "5. In Track Maps, choose whether to work on Standard or for Time-Lapse maps. Create makes the selected kind for every stage; Update refreshes only missing or outdated maps. Rows marked with * need update.\n"
             "6. Import photos and video clips. They are copied into the adventure folder. Existing files are skipped so they are not duplicated.\n"
-            "7. Press Create in Slide Show Control File. The program reads photo dates and positions, combines them with the tracks and maps, and creates the ordered slide-show list.\n"
-            "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again.\n"
+            "7. Select or enter the .lst name in Slide Show Control File, then press Create. The program reads photo dates and positions, combines them with the tracks and maps, and creates the ordered slide-show list. Media from a trackless day immediately before or after a stage can be attached to that stage when its location is close enough. Remaining dated media with positions receives its own date-only location map.\n"
+            "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. If tracks or maps changed after the control file was edited, press Sync Track Maps. It shows which map entries should be inserted and can remove old entries; it does not render maps.\n"
             "10. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
             "11. If desired, press Add Place Names to add readable place names for photos that have GPS positions.\n"
-            "12. Press Start to launch the slide show. When a previous show stopped early, press y to resume there or n to begin again. The new stop position is saved automatically.\n\n"
+            "12. Choose Time-Lapse or Standard. Press Start to begin at the start, or Continue to resume from the last automatically saved position. Time-Lapse is selected by default.\n"
+            "13. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. In one-window Time-Lapse mode the overview is shown by default as a framed image over the track map before each stage and advances automatically in Auto mode. Settings can instead make it full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
+            "14. Standard playback shows the track map once at the beginning of each stage. Settings can optionally show the marked track map again before every photo or video.\n\n"
             "Files and folders you will see:\n"
-            "- The adventure file stores the project name, folder, selected track file, and other settings.\n"
+            "- The Adventure file stores the explicit GPX, slide-show list, Track Map family, folder, and other settings.\n"
             "- The GPX track file contains the travel route.\n"
-            "- The trackimages folder contains the overview map, track map pictures, and the track summary used to keep maps and the slide-show list synchronized.\n"
+            "- The trackimages folder contains the overview map, track map pictures, date-only media location maps, and the track summary used to keep maps and the slide-show list synchronized.\n"
             "- The slide-show list controls the final order of photos, videos, date headings, and maps.\n"
             "- Small companion files next to photos, videos, and maps store dates, positions, and place names used by the program.\n\n"
             "The colored marks at the left of each section show whether the minimum required step is complete. "
@@ -3161,6 +3600,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_cancel_event = None
         self.geolocations_running = False
         self.geolocations_mode = None
+        self.geolocations_merge_work_path = None
 
     def _finish_media_browser_preparation(self):
         self._cleanup_geolocations_temp_paths()
@@ -3186,6 +3626,7 @@ class GPXTrackerController(NSObject):
                 self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run("Aborted.", "Media metadata refresh cancelled.")
             elif mode == "merge":
+                self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run("Aborted.", "Control-file merge cancelled.")
             else:
                 self._finish_geolocations_run("Aborted.", "Control-file creation cancelled.")
@@ -3198,6 +3639,7 @@ class GPXTrackerController(NSObject):
                 self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run(status, "Media metadata refresh failed.")
             elif mode == "merge":
+                self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run(status, "Control-file merge failed.")
             else:
                 self._finish_geolocations_run(status, "Control-file creation failed.")
@@ -3214,9 +3656,29 @@ class GPXTrackerController(NSObject):
         if mode == "media-browser":
             self._finish_media_browser_preparation()
             return
+        if mode == "merge" and self.geolocations_merge_work_path is not None:
+            work_path = Path(self.geolocations_merge_work_path)
+            result_path = Path(self.geolocations_result_path) if self.geolocations_result_path is not None else None
+            try:
+                if result_path is None:
+                    raise OSError("No destination control file is set")
+                os.replace(work_path, result_path)
+            except OSError as exc:
+                self._cleanup_geolocations_temp_paths()
+                self._finish_geolocations_run(
+                    f"error: {exc}",
+                    "Control-file merge could not be committed; the original file was retained.",
+                )
+                return
+            self.geolocations_temp_paths = [
+                path for path in self.geolocations_temp_paths
+                if Path(path) != work_path
+            ]
+            self.geolocations_merge_work_path = None
         if self.geolocations_result_path is not None:
             self.mark_dirty()
             self.load_slideshow_control_file(self.geolocations_result_path)
+            self._refresh_project_file_menus()
         if mode == "merge":
             self._finish_geolocations_run("Finished.", f"Merged updates into slide show control file {self.geolocations_result_path}")
             return
@@ -3632,6 +4094,10 @@ class GPXTrackerController(NSObject):
             self.gpx_time_lapse_maps_checkbox.setState_(
                 NSControlStateValueOn if self.track_maps_for_time_lapse else NSControlStateValueOff
             )
+        if hasattr(self, "slideshow_mode_popup"):
+            self.slideshow_mode_popup.selectItemAtIndex_(
+                0 if self.parameters["slideshow.start_mode"] == "time_lapse" else 1
+            )
 
     @objc.IBAction
     def applyParameterEditor_(self, _sender):
@@ -3645,20 +4111,63 @@ class GPXTrackerController(NSObject):
     def _ensure_control_table_window(self):
         if self.control_table_window is not None:
             return
-        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        window = SlideShowControlTableWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(180.0, 140.0, 980.0, 383.0),
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
             NSBackingStoreBuffered,
             False,
         )
+        window.controller = self
         window.setTitle_("Slide Show Control File")
+        window.setReleasedWhenClosed_(False)
+        delegate = GPSTrackShowGUIControlTableWindowDelegate.alloc().initWithController_(self)
+        window.setDelegate_(delegate)
         content = window.contentView()
 
         preview_checkbox = self._make_checkbox("Previews", "toggleControlTablePreviews:")
         preview_checkbox.setState_(NSControlStateValueOn if self.control_table_show_previews else 0)
         preview_checkbox.setFrame_(NSMakeRect(16.0, 344.0, 110.0, FIELD_HEIGHT))
         preview_checkbox.setToolTip_("Show or hide image preview icons. Keep this off for faster scrolling.")
+        preview_checkbox.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
         content.addSubview_(preview_checkbox)
+
+        search_field = NSSearchField.alloc().initWithFrame_(NSMakeRect(670.0, 344.0, 210.0, FIELD_HEIGHT))
+        search_field.setPlaceholderString_("Search control file")
+        search_field.setFont_(NSFont.systemFontOfSize_(13.0))
+        search_field.setTarget_(self)
+        search_field.setAction_("findNextControlTableMatch:")
+        # NSSearchField may otherwise send its action after each character,
+        # which selects a table row and retires the active field editor.
+        search_field.setSendsSearchStringImmediately_(False)
+        search_field.setSendsWholeSearchString_(True)
+        search_field.setDelegate_(self)
+        search_field.setToolTip_("Search all text and numbers in the control file. Cmd-F finds next; Shift-Cmd-F finds previous.")
+        search_field.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        content.addSubview_(search_field)
+
+        previous_search_button = self._make_icon_button(
+            ["sf:chevron.up", "NSGoUpTemplate"],
+            "Previous search result",
+            "findPreviousControlTableMatch:",
+        )
+        previous_search_button.setFrame_(NSMakeRect(886.0, 344.0, FIELD_HEIGHT, FIELD_HEIGHT))
+        previous_search_button.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        content.addSubview_(previous_search_button)
+
+        next_search_button = self._make_icon_button(
+            ["sf:chevron.down", "NSGoDownTemplate"],
+            "Next search result",
+            "findNextControlTableMatch:",
+        )
+        next_search_button.setFrame_(NSMakeRect(920.0, 344.0, FIELD_HEIGHT, FIELD_HEIGHT))
+        next_search_button.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        content.addSubview_(next_search_button)
+
+        search_status = self._make_label("", size=11.0)
+        search_status.setAlignment_(2)
+        search_status.setFrame_(NSMakeRect(600.0, 344.0, 64.0, FIELD_HEIGHT))
+        search_status.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        content.addSubview_(search_status)
 
         scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(16.0, 72.0, 948.0, 265.0))
         scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -3700,6 +4209,9 @@ class GPXTrackerController(NSObject):
         table.setDelegate_(data_source)
         table.setTarget_(self)
         table.setDoubleAction_("openSelectedControlMedia:")
+        disable_field_editor_text_checking(
+            window.fieldEditor_forObject_(True, table)
+        )
         scroll.setDocumentView_(table)
         content.addSubview_(scroll)
 
@@ -3716,6 +4228,7 @@ class GPXTrackerController(NSObject):
         up_button = self._make_button("Up", "moveControlRowsUp:")
         down_button = self._make_button("Down", "moveControlRowsDown:")
         copy_button = self._make_button("Copy", "copyControlRows:")
+        cut_button = self._make_button("Cut", "cutControlRows:")
         delete_button = self._make_button("Delete", "deleteControlRows:")
         save_button = self._make_button("Save", "saveControlTable:")
         revert_button = self._make_button("Revert", "revertControlTable:")
@@ -3725,11 +4238,12 @@ class GPXTrackerController(NSObject):
             (redo_button, FIELD_HEIGHT),
             (up_button, 86.0),
             (down_button, 86.0),
-            (copy_button, 86.0),
-            (delete_button, 86.0),
-            (save_button, 86.0),
-            (revert_button, 86.0),
-            (close_button, 86.0),
+            (copy_button, 76.0),
+            (cut_button, 70.0),
+            (delete_button, 76.0),
+            (save_button, 76.0),
+            (revert_button, 76.0),
+            (close_button, 76.0),
         ]
         x = 16.0
         for button, width in buttons:
@@ -3739,7 +4253,7 @@ class GPXTrackerController(NSObject):
             x += width + 8.0
 
         hint = self._make_label(
-            "Double-click media rows to view images/videos; edit cells directly, drag rows, or use Delete, Cmd-C/V/X/Z, Save, or Revert.",
+            "Double-click previews media; right-click for actions/Finder. Drag rows. Cmd-F: next match; Shift-Cmd-F: previous; Cmd-C/V/X/Z edit.",
             size=12.0,
         )
         hint.setFrame_(NSMakeRect(16.0, 8.0, 948.0, 16.0))
@@ -3747,10 +4261,87 @@ class GPXTrackerController(NSObject):
         content.addSubview_(hint)
 
         self.control_table_window = window
+        self.control_table_window_delegate = delegate
         self.control_table_view = table
         self.control_table_data_source = data_source
         self.control_table_hint_label = hint
         self.control_table_preview_checkbox = preview_checkbox
+        self.control_table_search_field = search_field
+        self.control_table_search_status = search_status
+
+    def _control_table_search_indexes(self, query):
+        """Return rows containing a case-insensitive control-file substring."""
+        return control_table_search_indexes(self.control_table_rows, query)
+
+    def _refresh_control_table_search(self, select_first=False):
+        if self.control_table_search_field is None:
+            return
+        query = str(self.control_table_search_field.stringValue() or "")
+        changed = query.casefold() != self.control_table_search_query.casefold()
+        self.control_table_search_query = query
+        self.control_table_search_matches = self._control_table_search_indexes(query)
+        if changed:
+            self.control_table_search_position = -1
+        if not self.control_table_search_matches:
+            self.control_table_search_position = -1
+        elif self.control_table_search_position >= len(self.control_table_search_matches):
+            self.control_table_search_position = -1
+        if select_first and self.control_table_search_matches:
+            self.control_table_search_position = 0
+            self._show_control_table_search_match()
+        self._update_control_table_search_status()
+
+    def _update_control_table_search_status(self):
+        if self.control_table_search_status is None:
+            return
+        count = len(self.control_table_search_matches)
+        if not self.control_table_search_query.strip():
+            text = ""
+        elif not count:
+            text = "0/0"
+        elif self.control_table_search_position < 0:
+            text = f"0/{count}"
+        else:
+            text = f"{self.control_table_search_position + 1}/{count}"
+        self.control_table_search_status.setStringValue_(text)
+
+    def _show_control_table_search_match(self):
+        if not self.control_table_search_matches or self.control_table_search_position < 0:
+            return
+        editor = self.control_table_search_field.currentEditor() if self.control_table_search_field is not None else None
+        selected_range = editor.selectedRange() if editor is not None else None
+        row_index = self.control_table_search_matches[self.control_table_search_position]
+        self._select_control_table_indexes([row_index])
+        if self.control_table_view is not None:
+            self.control_table_view.scrollRowToVisible_(row_index)
+        if self.control_table_window is not None and self.control_table_search_field is not None:
+            self.control_table_window.makeFirstResponder_(self.control_table_search_field)
+            restored_editor = self.control_table_search_field.currentEditor()
+            if restored_editor is not None and selected_range is not None:
+                restored_editor.setSelectedRange_(selected_range)
+        self._update_control_table_search_status()
+
+    def _navigate_control_table_search(self, direction):
+        if self.control_table_search_field is None or self.control_table_window is None:
+            return
+        self.control_table_window.makeFirstResponder_(self.control_table_search_field)
+        self._refresh_control_table_search(select_first=False)
+        if not self.control_table_search_matches:
+            return
+        self.control_table_search_position = next_control_table_search_position(
+            self.control_table_search_position,
+            len(self.control_table_search_matches),
+            direction,
+        )
+        self._show_control_table_search_match()
+
+    @objc.IBAction
+    def findNextControlTableMatch_(self, _sender):
+        self._navigate_control_table_search(1)
+
+    @objc.IBAction
+    def findPreviousControlTableMatch_(self, _sender):
+        self._navigate_control_table_search(-1)
 
     def _selected_control_table_indexes(self):
         if self.control_table_view is None:
@@ -3776,17 +4367,71 @@ class GPXTrackerController(NSObject):
     def _push_control_table_undo(self):
         self.control_table_undo_stack.append(self._snapshot_control_table())
         self.control_table_redo_stack.clear()
+        self._schedule_control_table_recovery()
+
+    def _schedule_control_table_recovery(self):
+        """Debounce a crash-recovery write while the table is being edited."""
+        self.control_table_dirty = True
+        if self.control_table_recovery_timer is not None:
+            self.control_table_recovery_timer.invalidate()
+        self.control_table_recovery_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0,
+            self,
+            "autosaveControlTableRecovery:",
+            None,
+            False,
+        )
+
+    def _control_table_text(self):
+        lines = [serialize_slideshow_control_row(row) for row in self.control_table_rows]
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    @objc.IBAction
+    def autosaveControlTableRecovery_(self, _sender):
+        """Persist the current edit state without replacing the user's list."""
+        self.control_table_recovery_timer = None
+        if not self.control_table_dirty or self.control_table_path is None:
+            return
+        try:
+            recovery_path = control_table_recovery_path(self.control_table_path)
+            text = self._control_table_text()
+            write_text_atomic(recovery_path, text)
+            now = time.time()
+            if now - self.control_table_last_snapshot_time >= 60.0:
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                snapshot = recovery_path.parent / f"{self.control_table_path.name}.{stamp}.autosave.lst"
+                write_text_atomic(snapshot, text)
+                self.control_table_last_snapshot_time = now
+                snapshots = sorted(
+                    recovery_path.parent.glob(f"{self.control_table_path.name}.*.autosave.lst"),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+                for obsolete in snapshots[20:]:
+                    obsolete.unlink(missing_ok=True)
+            self.set_status(f"Backed up unsaved control-file edits for {self.control_table_path.name}")
+        except OSError as exc:
+            self.set_status(f"Could not back up control-file edits: {exc}")
 
     def _reload_control_table(self):
         if self.control_table_view is not None:
             self.control_table_view.reloadData()
+        self._refresh_control_table_search(select_first=False)
 
     def resolve_control_row_path(self, row):
         name = str(row.get("name", "")).strip()
         if not name:
             return None
+        row_type = str(row.get("type", "")).upper()
         path = Path(name).expanduser()
         if path.is_absolute():
+            if row_type in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+                variant = resolve_track_map_variant(
+                    path,
+                    prefer_time_lapse=self.track_maps_for_time_lapse,
+                )
+                if variant is not None:
+                    return variant.resolve(strict=False)
             return path
         candidates = []
         if self.control_table_path is not None:
@@ -3798,6 +4443,13 @@ class GPXTrackerController(NSObject):
         for candidate in candidates:
             if candidate.exists():
                 return candidate.resolve(strict=False)
+            if row_type in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+                variant = resolve_track_map_variant(
+                    candidate,
+                    prefer_time_lapse=self.track_maps_for_time_lapse,
+                )
+                if variant is not None:
+                    return variant.resolve(strict=False)
         return candidates[0].resolve(strict=False) if candidates else path.resolve(strict=False)
 
     def preview_image_for_control_row(self, row_index):
@@ -3816,7 +4468,7 @@ class GPXTrackerController(NSObject):
         if cache_key in self.control_table_preview_cache:
             return self.control_table_preview_cache[cache_key]
         image = None
-        if row_type in {"IMG", "MAP", "TRK"} and path.exists():
+        if row_type in {"IMG", "MAP", "TRK", "BEF", "AFT", "LOC"} and path.exists():
             image = NSImage.alloc().initWithContentsOfFile_(str(path))
         if image is None and path.exists():
             image = NSWorkspace.sharedWorkspace().iconForFile_(str(path))
@@ -3849,7 +4501,7 @@ class GPXTrackerController(NSObject):
         cache_key = str(path)
         if cache_key in self.control_table_file_datetime_cache:
             return self.control_table_file_datetime_cache[cache_key]
-        if row_type == "TRK":
+        if row_type in {"TRK", "BEF", "AFT", "LOC"}:
             value = self.track_datetime_from_sidecar(path)
             if value:
                 self.control_table_file_datetime_cache[cache_key] = value
@@ -3871,7 +4523,7 @@ class GPXTrackerController(NSObject):
             return ""
         if not isinstance(metadata, dict):
             return ""
-        for key in ("track_start_time", "start_time", "track_datetime"):
+        for key in ("track_start_time", "start_time", "track_datetime", "media_map_date"):
             value = str(metadata.get(key, "") or "").strip()
             if not value:
                 continue
@@ -4115,6 +4767,112 @@ class GPXTrackerController(NSObject):
         self.load_media_viewer_image(item)
         return item
 
+    def stop_media_viewer_video(self):
+        """Pause and detach the embedded preview player safely."""
+        if self.media_viewer_video_player is not None:
+            try:
+                if hasattr(self.media_viewer_video_player, "cancelPendingPrerolls"):
+                    self.media_viewer_video_player.cancelPendingPrerolls()
+                self.media_viewer_video_player.pause()
+            except Exception:
+                pass
+        if self.media_viewer_video_view is not None:
+            try:
+                self.media_viewer_video_view.setPlayer_(None)
+                self.media_viewer_video_view.removeFromSuperview()
+            except Exception:
+                pass
+        self.media_viewer_video_player = None
+        self.media_viewer_video_view = None
+        self.media_viewer_video_path = None
+        self.media_viewer_video_preroll = None
+
+    def show_media_viewer_video(self, item):
+        """Show one paused video at its first frame with native controls."""
+        path = Path(item["path"]).resolve(strict=False)
+        if self.media_viewer_video_path == path and self.media_viewer_video_view is not None:
+            return
+        self.stop_media_viewer_video()
+        if (
+            not AVKIT_MEDIA_VIEWER_AVAILABLE
+            or AVPlayer is None
+            or AVPlayerView is None
+            or self.media_viewer_view is None
+        ):
+            return
+        player = AVPlayer.playerWithURL_(NSURL.fileURLWithPath_(str(path)))
+        bounds = self.media_viewer_view.bounds()
+        video_frame = NSMakeRect(
+            bounds.origin.x + 18.0,
+            bounds.origin.y + 120.0,
+            max(1.0, bounds.size.width - 36.0),
+            max(1.0, bounds.size.height - 138.0),
+        )
+        player_view = AVPlayerView.alloc().initWithFrame_(video_frame)
+        player_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        if hasattr(player_view, "setControlsStyle_"):
+            player_view.setControlsStyle_(AVPlayerViewControlsStyleInline)
+        if hasattr(player_view, "setShowsFullScreenToggleButton_"):
+            player_view.setShowsFullScreenToggleButton_(True)
+        player_view.setPlayer_(player)
+        self.media_viewer_view.addSubview_(player_view)
+        self.media_viewer_video_player = player
+        self.media_viewer_video_view = player_view
+        self.media_viewer_video_path = path
+        if CMTimeMake is not None:
+            try:
+                player.seekToTime_(CMTimeMake(0, 600))
+            except Exception:
+                pass
+        player.pause()
+        if hasattr(player, "prerollAtRate_completionHandler_"):
+            def preroll_finished(_finished):
+                if self.media_viewer_video_player is player:
+                    player.pause()
+
+            self.media_viewer_video_preroll = preroll_finished
+            try:
+                player.prerollAtRate_completionHandler_(1.0, preroll_finished)
+            except Exception:
+                self.media_viewer_video_preroll = None
+
+    def toggle_media_viewer_video_playback(self):
+        """Toggle the embedded video's play/pause state."""
+        player = self.media_viewer_video_player
+        if player is None:
+            return
+        try:
+            if float(player.rate()) > 0.0:
+                player.pause()
+            else:
+                player.play()
+        except Exception:
+            pass
+
+    def sync_control_table_to_media_viewer_item(self):
+        """Select the control row represented by the visible viewer item."""
+        row_index = media_viewer_control_row_index(
+            self.media_viewer_source,
+            self.media_viewer_items,
+            self.media_viewer_index,
+        )
+        if row_index is None:
+            return
+        self._select_control_table_indexes([row_index])
+        if self.control_table_view is not None:
+            self.control_table_view.scrollRowToVisible_(row_index)
+
+    def update_media_viewer_content(self):
+        """Update image/video presentation and its originating table row."""
+        item = self.current_media_viewer_item()
+        if item is not None and item.get("kind") == "video":
+            self.show_media_viewer_video(item)
+        else:
+            self.stop_media_viewer_video()
+        self.sync_control_table_to_media_viewer_item()
+        if self.media_viewer_view is not None:
+            self.media_viewer_view.setNeedsDisplay_(True)
+
     def update_media_viewer_title(self):
         if self.media_viewer_window is None:
             return
@@ -4211,6 +4969,7 @@ class GPXTrackerController(NSObject):
             self.media_viewer_view = view
             self.media_viewer_delegate = delegate
         self.update_media_viewer_title()
+        self.update_media_viewer_content()
         self.media_viewer_view.hint_until = time.time() + 3.0
         self.media_viewer_view.setNeedsDisplay_(True)
         if self.media_viewer_hint_timer is not None:
@@ -4235,11 +4994,49 @@ class GPXTrackerController(NSObject):
         if not indexes:
             return
         media_indexes = [item["index"] for item in self.control_media_items()]
-        selected_index = indexes[0]
-        if selected_index not in media_indexes:
+        selected_index = next((index for index in indexes if index in media_indexes), None)
+        if selected_index is None:
             show_alert("Selected row has no associated media file.")
             return
         self.show_media_viewer_item(media_indexes.index(selected_index))
+
+    def selectedControlRowsHaveViewableFiles(self):
+        """Return whether the current table selection resolves to a file."""
+        for index in self._selected_control_table_indexes():
+            if index < 0 or index >= len(self.control_table_rows):
+                continue
+            row = self.control_table_rows[index]
+            if not is_media_row_type(str(row.get("type", ""))):
+                continue
+            path = self.resolve_control_row_path(row)
+            if path is not None and path.is_file():
+                return True
+        return False
+
+    @objc.IBAction
+    def openSelectedControlRowsInFinder_(self, _sender):
+        """Reveal selected control-file media or map files in Finder."""
+        paths = []
+        seen = set()
+        for index in self._selected_control_table_indexes():
+            if index < 0 or index >= len(self.control_table_rows):
+                continue
+            row = self.control_table_rows[index]
+            if not is_media_row_type(str(row.get("type", ""))):
+                continue
+            path = self.resolve_control_row_path(row)
+            if path is None or not path.is_file():
+                continue
+            resolved = path.resolve(strict=False)
+            if str(resolved) not in seen:
+                paths.append(resolved)
+                seen.add(str(resolved))
+        if not paths:
+            show_alert("Selected row has no associated file.")
+            return
+        urls = [NSURL.fileURLWithPath_(str(path)) for path in paths]
+        NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_(urls)
+        self.set_status(f"Opened Finder with {len(paths)} selected file(s).")
 
     @objc.IBAction
     def closeMediaViewer_(self, _sender):
@@ -4250,6 +5047,7 @@ class GPXTrackerController(NSObject):
             self.media_viewer_hint_timer.invalidate()
             self.media_viewer_hint_timer = None
         if self.media_viewer_window is not None:
+            self.stop_media_viewer_video()
             self.media_viewer_window.close()
 
     def show_previous_control_media(self):
@@ -4257,14 +5055,14 @@ class GPXTrackerController(NSObject):
             return
         self.media_viewer_index = (self.media_viewer_index - 1) % len(self.media_viewer_items)
         self.update_media_viewer_title()
-        self.media_viewer_view.setNeedsDisplay_(True)
+        self.update_media_viewer_content()
 
     def show_next_control_media(self):
         if not self.media_viewer_items:
             return
         self.media_viewer_index = (self.media_viewer_index + 1) % len(self.media_viewer_items)
         self.update_media_viewer_title()
-        self.media_viewer_view.setNeedsDisplay_(True)
+        self.update_media_viewer_content()
 
     def move_control_rows_by_drag(self, drop_row):
         indexes = sorted(index for index in self.control_table_drag_indexes if 0 <= index < len(self.control_table_rows))
@@ -4292,8 +5090,27 @@ class GPXTrackerController(NSObject):
 
     def load_slideshow_control_file(self, control_file_path):
         path = Path(control_file_path).expanduser().resolve(strict=False)
+        recovery_path = control_table_recovery_path(path)
+        source_path = path
+        if recovery_path.exists():
+            try:
+                recovery_is_newer = not path.exists() or recovery_path.stat().st_mtime > path.stat().st_mtime
+            except OSError:
+                recovery_is_newer = False
+            if recovery_is_newer:
+                alert = NSAlert.alloc().init()
+                alert.setMessageText_("Unsaved control-file edits were found.")
+                alert.setInformativeText_(
+                    "The previous editing session did not save these changes. Restore the autosaved version?"
+                )
+                alert.addButtonWithTitle_("Restore")
+                alert.addButtonWithTitle_("Ignore")
+                if int(alert.runModal()) == 1000:
+                    source_path = recovery_path
+                else:
+                    recovery_path.unlink(missing_ok=True)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = source_path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
             show_alert("Could not load slide show control file.", str(exc))
             return False
@@ -4301,6 +5118,8 @@ class GPXTrackerController(NSObject):
         self.control_table_rows = [parse_slideshow_control_line(line) for line in lines if line.strip()]
         self.control_table_undo_stack = []
         self.control_table_redo_stack = []
+        self.control_table_dirty = source_path == recovery_path
+        self.control_table_last_snapshot_time = time.time() if self.control_table_dirty else 0.0
         self.control_table_preview_cache = {}
         self.control_table_file_datetime_cache = {}
         self._ensure_control_table_window()
@@ -4399,6 +5218,16 @@ class GPXTrackerController(NSObject):
             self.control_table_window.makeKeyAndOrderFront_(None)
         return updated_count
 
+    def reloadControlTableAfterEditing_(self, _sender):
+        """Refresh row styling only after AppKit has retired its field editor."""
+        table = self.control_table_view
+        if table is None:
+            return
+        if table.currentEditor() is None:
+            self._reload_control_table()
+        else:
+            table.setNeedsDisplay_(True)
+
     def update_control_table_cell(self, row_index, column_id, value):
         if row_index < 0 or row_index >= len(self.control_table_rows):
             return
@@ -4406,10 +5235,18 @@ class GPXTrackerController(NSObject):
         if current == value:
             return
         self._push_control_table_undo()
-        self.control_table_rows[row_index][column_id] = value
-        if column_id == "type":
-            self.control_table_rows[row_index][column_id] = value.strip().upper()
-        self._reload_control_table()
+        update_slideshow_control_row_cell(
+            self.control_table_rows[row_index],
+            column_id,
+            value,
+        )
+        if self.control_table_view is not None:
+            self.control_table_view.setNeedsDisplay_(True)
+        self.performSelector_withObject_afterDelay_(
+            "reloadControlTableAfterEditing:",
+            None,
+            0.01,
+        )
 
     @objc.IBAction
     def moveControlRowsUp_(self, _sender):
@@ -4497,6 +5334,7 @@ class GPXTrackerController(NSObject):
             return
         self.control_table_redo_stack.append(self._snapshot_control_table())
         self.control_table_rows = self.control_table_undo_stack.pop()
+        self._schedule_control_table_recovery()
         self._reload_control_table()
 
     @objc.IBAction
@@ -4505,31 +5343,96 @@ class GPXTrackerController(NSObject):
             return
         self.control_table_undo_stack.append(self._snapshot_control_table())
         self.control_table_rows = self.control_table_redo_stack.pop()
+        self._schedule_control_table_recovery()
         self._reload_control_table()
 
     @objc.IBAction
     def saveControlTable_(self, _sender):
+        self._save_control_table_changes()
+
+    def _save_control_table_changes(self):
+        """Save the editable control table and return whether it succeeded."""
         if self.control_table_path is None:
             show_alert("No slide show control file is loaded.")
-            return
-        lines = [serialize_slideshow_control_row(row) for row in self.control_table_rows]
+            return False
         try:
-            self.control_table_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            write_text_atomic(self.control_table_path, self._control_table_text())
+            control_table_recovery_path(self.control_table_path).unlink(missing_ok=True)
         except OSError as exc:
             show_alert("Could not save slide show control file.", str(exc))
-            return
+            return False
+        if self.control_table_recovery_timer is not None:
+            self.control_table_recovery_timer.invalidate()
+            self.control_table_recovery_timer = None
+        self.control_table_dirty = False
         self.refresh_control_file_display()
         self.set_status(f"Saved slide show control file {self.control_table_path}")
+        return True
+
+    def _discard_control_table_changes(self):
+        """Restore the table from disk and remove unsaved recovery state."""
+        if self.control_table_path is None:
+            return False
+        try:
+            lines = self.control_table_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            show_alert("Could not discard slide show control-file changes.", str(exc))
+            return False
+        if self.control_table_recovery_timer is not None:
+            self.control_table_recovery_timer.invalidate()
+            self.control_table_recovery_timer = None
+        try:
+            control_table_recovery_path(self.control_table_path).unlink(missing_ok=True)
+        except OSError as exc:
+            show_alert("Could not discard the recovery copy.", str(exc))
+            return False
+        self.control_table_rows = [parse_slideshow_control_line(line) for line in lines if line.strip()]
+        self.control_table_undo_stack = []
+        self.control_table_redo_stack = []
+        self.control_table_dirty = False
+        self.control_table_last_snapshot_time = 0.0
+        self.control_table_preview_cache = {}
+        self.control_table_file_datetime_cache = {}
+        self._reload_control_table()
+        self.refresh_control_file_display()
+        self.set_status(f"Discarded unsaved changes to {self.control_table_path.name}")
+        return True
+
+    def _resolve_unsaved_control_table_changes(self):
+        """Ask whether dirty control-table edits should be saved."""
+        if self.control_table_window is not None:
+            self.control_table_window.makeFirstResponder_(None)
+        if not self.control_table_dirty:
+            return True
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Save changes to the slide show control file?")
+        filename = self.control_table_path.name if self.control_table_path is not None else "the control file"
+        alert.setInformativeText_(
+            f"There are unsaved changes in {filename}. Save them before closing the editor?"
+        )
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Don't Save")
+        alert.addButtonWithTitle_("Cancel")
+        response = int(alert.runModal())
+        if response == 1000:
+            return self._save_control_table_changes()
+        if response == 1001:
+            return self._discard_control_table_changes()
+        return False
 
     @objc.IBAction
     def revertControlTable_(self, _sender):
         if self.control_table_path is None:
             show_alert("No slide show control file is loaded.")
             return
+        control_table_recovery_path(self.control_table_path).unlink(missing_ok=True)
+        self.control_table_dirty = False
         self.load_slideshow_control_file(self.control_table_path)
 
     @objc.IBAction
     def closeControlTable_(self, _sender):
+        if not self._resolve_unsaved_control_table_changes():
+            return
         if self.control_table_window is not None:
             self.control_table_window.orderOut_(None)
 
@@ -4846,7 +5749,8 @@ class GPXTrackerController(NSObject):
     def _default_gpx_path(self):
         if self.current_project_dir is None:
             return None
-        return self.current_project_dir / f"{self.current_project_dir.name}.gpx"
+        base = project_filename_base(self._current_project_name() or self.current_project_dir.name)
+        return self.current_project_dir / f"{base}.gpx"
 
     def _is_default_gpx_path(self, path):
         default_path = self._default_gpx_path()
@@ -5005,6 +5909,133 @@ class GPXTrackerController(NSObject):
             return
         self._activate_selected_project_directory()
 
+    def projectFileComboSelectionChanged_(self, notification):
+        if self.project_file_menu_refreshing:
+            return
+        field = notification.object()
+        if field is self.title_field:
+            index = int(self.title_field.indexOfSelectedItem())
+            if 0 <= index < len(self.adventure_combo_paths):
+                self.load_project_configuration(self.adventure_combo_paths[index])
+        elif field is self.gpx_field:
+            self.gpxSelectionCommitted_(self.gpx_field)
+        elif field is self.control_file_field:
+            self.controlFileCommitted_(self.control_file_field)
+
+    @objc.IBAction
+    def adventureNameCommitted_(self, _sender):
+        if self.project_file_menu_refreshing or self.adventure_name_commit_in_progress:
+            return
+        self.adventure_name_commit_in_progress = True
+        try:
+            requested_name = project_filename_base(str(self.title_field.stringValue()).strip())
+            if not requested_name or self.current_project_dir is None:
+                self.title_field.setStringValue_(self.committed_adventure_name)
+                return
+
+            for record in self.adventure_records:
+                if record.project_name.casefold() == requested_name.casefold() and record.path != self.current_project_file:
+                    self.load_project_configuration(record.path)
+                    return
+
+            if self.current_project_file is None:
+                target = self.current_project_dir / f"{requested_name}.adv"
+                if target.exists():
+                    self.load_project_configuration(target)
+                    return
+                self.title_field.setStringValue_(requested_name)
+                self.committed_adventure_name = requested_name
+                self.track_map_base = requested_name
+                self._set_gpx_field_value(f"{requested_name}.gpx", manual=False)
+                self.current_control_file = self.current_project_dir / f"{requested_name}-sorted.lst"
+                self.control_file_field.setStringValue_(self.current_control_file.name)
+                self.current_project_file = target
+                self.project_dirty = True
+                if not self._write_project_configuration(status_prefix="Created adventure"):
+                    self.current_project_file = None
+                    return
+                self._refresh_project_file_menus()
+                self.start_async_project_status_refresh("new adventure")
+                return
+
+            if requested_name == self.committed_adventure_name:
+                self.title_field.setStringValue_(self.committed_adventure_name)
+                return
+
+            edited_name = requested_name
+            self.title_field.setStringValue_(self.committed_adventure_name)
+            if not self.flush_adventure_autosave():
+                return
+            try:
+                source_payload = load_adventure(self.current_project_file).payload
+            except AdventureFormatError as exc:
+                show_alert("Could not read the active Adventure.", str(exc))
+                return
+            self.title_field.setStringValue_(edited_name)
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Change Adventure name")
+            alert.setInformativeText_(
+                f"Rename the current Adventure to '{edited_name}', create an independent copy, or cancel?"
+            )
+            alert.addButtonWithTitle_("Rename")
+            alert.addButtonWithTitle_("Copy")
+            alert.addButtonWithTitle_("Cancel")
+            related_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 430, FIELD_HEIGHT))
+            related_checkbox.setButtonType_(NSButtonTypeSwitch)
+            related_checkbox.setTitle_("Also rename/copy GPX, control file, and Track Maps")
+            related_checkbox.setState_(NSControlStateValueOn)
+            alert.setAccessoryView_(related_checkbox)
+            response = int(alert.runModal())
+            if response not in {1000, 1001}:
+                self.title_field.setStringValue_(self.committed_adventure_name)
+                self.set_status("Adventure name change cancelled.")
+                return
+            operation = "rename" if response == 1000 else "copy"
+            include_related = related_checkbox.state() == NSControlStateValueOn
+            try:
+                self.set_status(f"Preparing Adventure {operation}...")
+                target_path, _payload = rename_or_copy_adventure(
+                    self.current_project_file,
+                    source_payload,
+                    edited_name,
+                    operation,
+                    include_related=include_related,
+                    progress=lambda current, total: self.set_progress(current, total),
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self.reset_progress()
+                self.title_field.setStringValue_(self.committed_adventure_name)
+                show_alert(f"Could not {operation} the Adventure.", str(exc))
+                self.set_status(f"Adventure {operation} failed.")
+                return
+            self.reset_progress()
+            self.load_project_configuration(target_path, flush_current=False)
+            self.set_status(f"Adventure {operation} completed: {target_path.name}")
+        finally:
+            self.adventure_name_commit_in_progress = False
+
+    @objc.IBAction
+    def controlFileCommitted_(self, _sender):
+        if self.project_file_menu_refreshing or self.current_project_dir is None:
+            return
+        value = str(self.control_file_field.stringValue()).strip()
+        if not value:
+            value = f"{project_filename_base(self._current_project_name())}-sorted.lst"
+        name = Path(value).name
+        if Path(name).suffix.lower() != ".lst":
+            show_alert("Control file must use the .lst extension.", name)
+            if self.current_control_file is not None:
+                self.control_file_field.setStringValue_(self.current_control_file.name)
+            return
+        self.current_control_file = (self.current_project_dir / name).resolve(strict=False)
+        self.control_file_field.setStringValue_(name)
+        self.control_table_rows = []
+        self.control_table_path = None
+        self.mark_dirty(immediate=True)
+        self.refresh_control_file_display()
+        self._update_slideshow_continue_button()
+
     @objc.IBAction
     def chooseProjectDirectory_(self, _sender):
         panel = NSOpenPanel.openPanel()
@@ -5042,22 +6073,6 @@ class GPXTrackerController(NSObject):
     def quit_(self, _sender):
         if self.confirm_close():
             NSApp().terminate_(None)
-
-    @objc.IBAction
-    def loadAdventure_(self, _sender):
-        if not self.flush_adventure_autosave():
-            return
-        initial_dir = self.current_project_dir or self.base_dir
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseFiles_(True)
-        panel.setCanChooseDirectories_(False)
-        panel.setAllowsMultipleSelection_(False)
-        panel.setAllowedFileTypes_(["adv"])
-        panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(initial_dir)))
-        if panel.runModal():
-            url = panel.URL()
-            if url is not None:
-                self.load_project_configuration(Path(str(url.path())).resolve())
 
     @objc.IBAction
     def gpxSelectionCommitted_(self, _sender):
@@ -5159,6 +6174,7 @@ class GPXTrackerController(NSObject):
                 self.mark_dirty()
                 return
             self.mark_dirty()
+            self._refresh_project_file_menus()
             self.handle_gpx_file_selection(show_errors=True)
 
     @objc.IBAction
@@ -5184,6 +6200,29 @@ class GPXTrackerController(NSObject):
             "geocode_pacing_max_seconds": self.parameters["locations.pacing_max_seconds"],
         }
 
+    def _media_map_options(self):
+        """Return map-rendering settings used for control-file media maps."""
+        trackimages_dir = self._track_images_dir()
+        maximum_zoom = int(self.parameters["maps.maximum_zoom"])
+        variant = "time-lapse" if self.track_maps_for_time_lapse else "standard"
+        return {
+            "output_dir": str(trackimages_dir) if trackimages_dir is not None else "",
+            "filename_base": self._control_file_base_name(),
+            "zoom_level": min(int(self.parameters["trackmaps.zoom"]), maximum_zoom),
+            "image_size": self._track_map_image_size(),
+            "font_factor": self.parameters["trackmaps.font_factor"],
+            "background_color": self.parameters["trackmaps.background_color"],
+            "title_color": self.parameters["trackmaps.title_color"],
+            "map_provider": self.parameters["maps.provider"],
+            "custom_map_url": self.parameters["maps.custom_url"],
+            "custom_map_attribution": self.parameters["maps.custom_attribution"],
+            "maximum_map_zoom": maximum_zoom,
+            "map_request_timeout_seconds": self.parameters["maps.request_timeout_seconds"],
+            "map_layout": variant,
+            "track_edge_margin_fraction": self.parameters["trackmaps.edge_margin_fraction"],
+            "adventure_render_parameters": self._track_map_parameter_signature(variant),
+        }
+
     @objc.IBAction
     def createControlFile_(self, _sender):
         if self.geolocations_thread is not None and self.geolocations_thread.is_alive():
@@ -5196,6 +6235,8 @@ class GPXTrackerController(NSObject):
         control_file_path = self._control_file_path()
         if control_file_path is None:
             show_alert("Please choose a project directory first.")
+            return
+        if not self._confirm_shared_asset_change("control_file", control_file_path.name, "control file"):
             return
 
         tracks_summary_path = self._tracks_summary_json_path()
@@ -5245,6 +6286,9 @@ class GPXTrackerController(NSObject):
         self.geolocations_mode = "create"
         self.geolocations_temp_paths = []
         output_writer = GeoLocationsOutputWriter(self)
+        media_map_options = self._media_map_options()
+        sort_date_sections_by_tracks = self._use_track_order()
+        geolocation_options = self._geolocation_options()
 
         def progress_callback(current, total, filename):
             label = f"Processing {current}/{total}: {filename}" if filename else "Preparing media list..."
@@ -5261,12 +6305,13 @@ class GPXTrackerController(NSObject):
                     project_dir,
                     photolist=control_file_path,
                     tracks=tracks_summary_path,
-                    sort_date_sections_by_tracks=self._use_track_order(),
+                    sort_date_sections_by_tracks=sort_date_sections_by_tracks,
+                    media_map_options=media_map_options,
                     progress_callback=progress_callback,
                     stdout=output_writer,
                     stderr=output_writer,
                     cancel_event=cancel_event,
-                    **self._geolocation_options(),
+                    **geolocation_options,
                 )
             except GeoLocationsCancelled:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("geoLocationsRunFinished:", "cancelled", True)
@@ -5295,6 +6340,8 @@ class GPXTrackerController(NSObject):
         control_file_path = self._control_file_path()
         if control_file_path is None:
             show_alert("Please choose a project directory first.")
+            return
+        if not self._confirm_shared_asset_change("control_file", control_file_path.name, "control file"):
             return
         if not control_file_path.exists() and not self.control_table_rows:
             show_alert(
@@ -5389,7 +6436,14 @@ class GPXTrackerController(NSObject):
             return None
         return project_dir, control_file_path
 
-    def _start_control_file_merge(self, title, merge_tracks_path=None, merge_media_paths=None):
+    def _start_control_file_merge(
+        self,
+        title,
+        merge_tracks_path=None,
+        merge_media_paths=None,
+        obsolete_track_maps=None,
+        special_map_updates=None,
+    ):
         validated = self._validate_control_file_merge()
         if validated is None:
             return
@@ -5399,11 +6453,41 @@ class GPXTrackerController(NSObject):
             show_alert("Nothing selected to merge.")
             return
 
+        work_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{control_file_path.stem}-sync-",
+                suffix="-sorted.lst",
+                dir=project_dir,
+                delete=False,
+            ) as handle:
+                work_path = Path(handle.name)
+            shutil.copy2(control_file_path, work_path)
+            removed_count = self._remove_control_track_map_entries(
+                work_path,
+                obsolete_track_maps or [],
+                refresh=False,
+            )
+            updated_special_count = update_control_special_map_entries(
+                work_path,
+                dict(special_map_updates or {}),
+            )
+        except OSError as exc:
+            if work_path is not None:
+                work_path.unlink(missing_ok=True)
+            show_alert("Could not prepare the control-file update.", str(exc))
+            self.set_status("Control-file update preparation failed.")
+            return
+
         self._prepare_geolocations_window(title)
         self.appendGeoLocationsOutputLine_(f"Project directory: {project_dir}")
         self.appendGeoLocationsOutputLine_(f"Control file: {control_file_path}")
         if merge_tracks_path is not None:
             self.appendGeoLocationsOutputLine_(f"Merge tracks summary: {merge_tracks_path}")
+        if removed_count:
+            self.appendGeoLocationsOutputLine_(f"Replace obsolete track-map entries: {removed_count}")
+        if updated_special_count:
+            self.appendGeoLocationsOutputLine_(f"Update adjacent-day track-map references: {updated_special_count}")
         if merge_media_paths:
             self.appendGeoLocationsOutputLine_(f"Merge media files: {len(merge_media_paths)}")
             for media_path in merge_media_paths:
@@ -5415,21 +6499,26 @@ class GPXTrackerController(NSObject):
         self.geolocations_cancel_event = cancel_event
         self.geolocations_result_path = control_file_path
         self.geolocations_mode = "merge"
-        self.geolocations_temp_paths = []
+        self.geolocations_temp_paths = [work_path]
+        self.geolocations_merge_work_path = work_path
         output_writer = GeoLocationsOutputWriter(self)
+        media_map_options = self._media_map_options()
+        sort_date_sections_by_tracks = self._use_track_order()
+        geolocation_options = self._geolocation_options()
 
         def run_task():
             try:
                 run_geolocations_with_options(
                     project_dir,
-                    photolist=control_file_path,
+                    photolist=work_path,
                     merge_tracks=merge_tracks_path,
                     merge_media=merge_media_paths,
-                    sort_date_sections_by_tracks=self._use_track_order(),
+                    sort_date_sections_by_tracks=sort_date_sections_by_tracks,
+                    media_map_options=media_map_options,
                     stdout=output_writer,
                     stderr=output_writer,
                     cancel_event=cancel_event,
-                    **self._geolocation_options(),
+                    **geolocation_options,
                 )
             except GeoLocationsCancelled:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("geoLocationsRunFinished:", "cancelled", True)
@@ -5647,6 +6736,11 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def mergeTracksIntoControlFile_(self, _sender):
+        control_path = self._control_file_path()
+        if control_path is not None and not self._confirm_shared_asset_change(
+            "control_file", control_path.name, "control file"
+        ):
+            return
         tracks_summary_path = self._tracks_summary_json_path()
         if tracks_summary_path is None or not tracks_summary_path.exists():
             show_alert("No tracks summary was found.", "Run Track Maps Create first to create the updated track summary.")
@@ -5658,7 +6752,9 @@ class GPXTrackerController(NSObject):
         sync_status = self._control_track_map_sync_status(control_file_path, tracks_summary_path)
         missing_items = sync_status["missing_overview"] + sync_status["missing_tracks"]
         obsolete_items = sync_status["obsolete_overview"] + sync_status["obsolete_tracks"]
-        if missing_items or obsolete_items:
+        special_updates = sync_status.get("special_updates", [])
+        remove_obsolete = False
+        if missing_items or obsolete_items or special_updates:
             details = []
             if missing_items:
                 details.append("Will merge:")
@@ -5670,6 +6766,11 @@ class GPXTrackerController(NSObject):
                 details.extend(f"  {name}" for name in obsolete_items[:12])
                 if len(obsolete_items) > 12:
                     details.append(f"  ... and {len(obsolete_items) - 12} more")
+            if special_updates:
+                details.append("Adjacent-day map references to update:")
+                details.extend(f"  {old} -> {new}" for old, new, _kind in special_updates[:12])
+                if len(special_updates) > 12:
+                    details.append(f"  ... and {len(special_updates) - 12} more")
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Track map changes detected.")
             alert.setInformativeText_("\n".join(details))
@@ -5681,18 +6782,27 @@ class GPXTrackerController(NSObject):
             if response == 1000:
                 pass
             elif obsolete_items and response == 1001:
-                removed = self._remove_control_track_map_entries(control_file_path, obsolete_items)
-                self.set_status(f"Removed {removed} old track map entr{'ies' if removed != 1 else 'y'} before merge.")
+                remove_obsolete = True
             else:
                 self.set_status("Update tracks cancelled.")
                 return
         else:
             show_alert("No track map updates needed.", "The slide show control file already contains the current track maps.")
             return
-        self._start_control_file_merge("Sync Track Maps In Slide Show Control File", merge_tracks_path=tracks_summary_path)
+        self._start_control_file_merge(
+            "Sync Track Maps In Slide Show Control File",
+            merge_tracks_path=tracks_summary_path,
+            obsolete_track_maps=obsolete_items if remove_obsolete else None,
+            special_map_updates={old: new for old, new, _kind in special_updates},
+        )
 
     @objc.IBAction
     def mergeMediaIntoControlFile_(self, _sender):
+        control_path = self._control_file_path()
+        if control_path is not None and not self._confirm_shared_asset_change(
+            "control_file", control_path.name, "control file"
+        ):
+            return
         self.media_browser_mode = "merge"
         self.prepare_media_browser()
 
@@ -5705,12 +6815,28 @@ class GPXTrackerController(NSObject):
         if not control_file_path.exists():
             show_alert("Slide show control file does not exist.", str(control_file_path))
             return
+        if not self._confirm_shared_asset_change("control_file", control_file_path.name, "control file"):
+            return
         if self.load_slideshow_control_file(control_file_path):
             self.set_status(f"Loaded slide show control file {control_file_path}")
 
     @objc.IBAction
+    def startSelectedSlideShow_(self, _sender):
+        self._start_slide_show(
+            time_lapse=int(self.slideshow_mode_popup.indexOfSelectedItem()) == 0,
+            continue_previous=False,
+        )
+
+    @objc.IBAction
+    def continueSelectedSlideShow_(self, _sender):
+        self._start_slide_show(
+            time_lapse=int(self.slideshow_mode_popup.indexOfSelectedItem()) == 0,
+            continue_previous=True,
+        )
+
+    @objc.IBAction
     def startSlideShow_(self, _sender):
-        self._start_slide_show(time_lapse=False)
+        self.startSelectedSlideShow_(_sender)
 
     @objc.IBAction
     def startTimeLapseShow_(self, _sender):
@@ -5734,23 +6860,15 @@ class GPXTrackerController(NSObject):
             return None
         return dict(position)
 
-    def _ask_to_resume_slideshow(self, position):
-        playlist_index = int(position.get("playlist_index", 0))
-        mode = "Time-Lapse" if position.get("mode") == "time-lapse" else "Standard Slide Show"
-        saved_at = str(position.get("saved_at", "") or "")
-        detail = f"Continue {mode} near control-file row {playlist_index + 1}?"
-        if saved_at:
-            detail += f"\nLast stopped: {saved_at}"
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Resume Slide Show?")
-        alert.setInformativeText_(detail + "\n\nPress y for Yes or n for No.")
-        yes_button = alert.addButtonWithTitle_("Yes")
-        no_button = alert.addButtonWithTitle_("No - Start at Beginning")
-        yes_button.setKeyEquivalent_("y")
-        no_button.setKeyEquivalent_("n")
-        return int(alert.runModal()) == 1000
+    def _update_slideshow_continue_button(self):
+        if not hasattr(self, "slideshow_continue_button"):
+            return
+        position = self.slideshow_resume_position
+        self.slideshow_continue_button.setEnabled_(
+            isinstance(position, dict) and not bool(position.get("completed"))
+        )
 
-    def _start_slide_show(self, time_lapse: bool):
+    def _start_slide_show(self, time_lapse: bool, continue_previous: bool = False):
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
             show_alert("Please choose a project directory first.")
@@ -5775,9 +6893,20 @@ class GPXTrackerController(NSObject):
             self.set_status("Slide show is already running.")
             return
 
-        resume_position = self._validated_slideshow_resume_position(control_file_path)
-        if resume_position is not None and not self._ask_to_resume_slideshow(resume_position):
-            resume_position = None
+        resume_position = (
+            self._validated_slideshow_resume_position(control_file_path)
+            if continue_previous
+            else None
+        )
+        if continue_previous and resume_position is None:
+            self.slideshow_resume_position = None
+            self.mark_dirty(immediate=True)
+            show_alert(
+                "No saved slide-show position is available.",
+                "Use Start to begin at the start of the current slide-show control file.",
+            )
+            self._update_slideshow_continue_button()
+            return
         state_file = project_dir / ".mycamino-slideshow-state.json"
         try:
             state_file.unlink(missing_ok=True)
@@ -5798,6 +6927,10 @@ class GPXTrackerController(NSObject):
                 command,
                 cwd=str(self.base_dir),
             )
+            if not continue_previous and self.slideshow_resume_position is not None:
+                self.slideshow_resume_position = None
+                self._update_slideshow_continue_button()
+                self.mark_dirty(immediate=True)
         except Exception as exc:
             show_alert("Could not start slide show.", str(exc))
             self.set_status("Slide show failed to start.")
@@ -5869,6 +7002,7 @@ class GPXTrackerController(NSObject):
             new_position = None if resume_state.get("completed") else resume_state
             if new_position != self.slideshow_resume_position:
                 self.slideshow_resume_position = new_position
+                self._update_slideshow_continue_button()
                 if self.save_project_configuration():
                     suffix = " Resume position saved automatically." if new_position is not None else " Resume position cleared."
                     self.set_status(str(result.get("message", "Slide show closed.")) + suffix)
@@ -5924,12 +7058,17 @@ class GPXTrackerController(NSObject):
             "--time-lapse-marker",
             str(settings["timelapse.marker_style"]),
         ]
-        if settings["slideshow.map_window"]:
+        if not settings["timelapse.overview_as_media"]:
+            args.append("--time-lapse-overview-fullscreen")
+        if settings["slideshow.track_map_before_media"]:
+            args.append("--track-map-before-media")
+        window_mode = settings["slideshow.window_mode"]
+        if settings["slideshow.join_windows"]:
+            args.extend(["--mapwindow", "--join-windows"])
+        elif window_mode == "multiple":
             args.append("--mapwindow")
-        else:
+        elif window_mode == "single":
             args.append("--no-mapwindow")
-        if settings["slideshow.join_windows"] and settings["slideshow.map_window"]:
-            args.append("--join-windows")
         if settings["slideshow.display_swap"]:
             args.append("--switch-display")
         if settings["slideshow.repeat"]:
@@ -6197,6 +7336,14 @@ class GPXTrackerController(NSObject):
                 "name": track_name,
                 "date": date_text,
             })
+        for item in plot_context.get("media_map_items", []):
+            number = int(item["selection_number"])
+            name = "Media locations"
+            if number in update_numbers:
+                name = f"* {name}"
+            media_day = item.get("date")
+            date_text = media_day.strftime("%d.%m.%Y") if hasattr(media_day, "strftime") else str(media_day or "")
+            rows.append({"nr": str(number), "name": name, "date": date_text})
         return rows
 
     def _parse_plot_selection_text(self, range_text):
@@ -6436,13 +7583,25 @@ class GPXTrackerController(NSObject):
     def _metadata_parameters_are_current(self, metadata, expected, variant):
         if not isinstance(metadata, dict):
             return False
+        if variant != "overview":
+            extent = metadata.get("extent_mercator")
+            if isinstance(extent, dict):
+                try:
+                    short_dimension = min(
+                        float(extent["max_x"]) - float(extent["min_x"]),
+                        float(extent["max_y"]) - float(extent["min_y"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    short_dimension = MINIMUM_MAP_SHORT_DIMENSION_M
+                if short_dimension + 1.0 < MINIMUM_MAP_SHORT_DIMENSION_M:
+                    return False
         saved = metadata.get("adventure_render_parameters")
         if isinstance(saved, dict):
             return saved == expected
         defaults = default_parameters()
         return expected == self._track_map_parameter_signature(variant, defaults)
 
-    def _plot_common_options(self, project_name, trackimages_dir):
+    def _plot_common_options(self, project_name, trackimages_dir, output_base=None):
         use_track_order = self._use_track_order()
         variant = "time-lapse" if self.track_maps_for_time_lapse else "standard"
         labels = "none" if self.parameters["trackmaps.overview_labels"] == "none" else None
@@ -6460,7 +7619,7 @@ class GPXTrackerController(NSObject):
             "zoom": min(int(self.parameters["trackmaps.zoom"]), maximum_zoom),
             "header": project_name,
             "output_dir": str(trackimages_dir),
-            "output_base": project_name,
+            "output_base": output_base or self.track_map_base or project_name,
             "nojson": False,
             "verbose": False,
             "sort_original": use_track_order,
@@ -6486,22 +7645,42 @@ class GPXTrackerController(NSObject):
         for item in selection_context.get("track_plot_paths", []):
             if self._existing_track_plot_path(item["output_image"]) is not None:
                 count += 1
+        count += sum(
+            1
+            for item in selection_context.get("media_map_items", [])
+            if Path(item["output_image"]).exists()
+        )
         return count
 
     def _start_plot_creation(self, project_name, gpx_path, trackimages_dir, common_options, selection_context, selected_numbers):
         removed_obsolete = self._cleanup_obsolete_track_map_files(selection_context)
+        media_items_by_number = {
+            int(item["selection_number"]): item
+            for item in selection_context.get("media_map_items", [])
+        }
         if selected_numbers == "all":
             include_overview = True
             track_numbers = [item["track_number"] for item in selection_context.get("track_plot_paths", [])]
+            selected_media_items = list(media_items_by_number.values())
             plot_tracks_option = "all"
         else:
             selected_numbers = [int(number) for number in selected_numbers]
             include_overview = 0 in selected_numbers
-            track_numbers = [number for number in selected_numbers if number > 0]
-            if not include_overview and not track_numbers:
+            selected_media_items = [
+                media_items_by_number[number]
+                for number in selected_numbers
+                if number in media_items_by_number
+            ]
+            track_numbers = [
+                number
+                for number in selected_numbers
+                if number > 0 and number not in media_items_by_number
+            ]
+            if not include_overview and not track_numbers and not selected_media_items:
                 show_alert("No images selected.")
                 return
             plot_tracks_option = ",".join(str(number) for number in track_numbers) if track_numbers else None
+        media_map_options = self._media_map_options()
         self.plot_cancel_event = threading.Event()
         self.plot_creation_image_paths = []
         self.gpx_cancel_plots_button.setHidden_(False)
@@ -6533,7 +7712,7 @@ class GPXTrackerController(NSObject):
                     return
                 plot_context = prepare_with_options(str(gpx_path), plot_tracks=plot_tracks_option, **common_options)
                 track_numbers = [item["track_number"] for item in plot_context.get("track_plot_paths", [])] if plot_tracks_option else []
-                total = max(len(track_numbers), 1)
+                total = max(len(track_numbers) + len(selected_media_items), 1)
                 self.performSelectorOnMainThread_withObject_waitUntilDone_("setProgressFromWorker:", (0.0, float(total)), False)
                 for index, track_number in enumerate(track_numbers, start=1):
                     if self.plot_cancel_event is not None and self.plot_cancel_event.is_set():
@@ -6568,6 +7747,38 @@ class GPXTrackerController(NSObject):
                         (float(index), float(total)),
                         False,
                     )
+                completed = len(track_numbers)
+                for media_index, item in enumerate(selected_media_items, start=1):
+                    if self.plot_cancel_event is not None and self.plot_cancel_event.is_set():
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            "plotCreationFinished:",
+                            ("cancelled", created_count, str(trackimages_dir)),
+                            False,
+                        )
+                        return
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "setStatusFromWorker:",
+                        f"Creating media location map {media_index}/{len(selected_media_items)}...",
+                        False,
+                    )
+                    paths = render_media_map_specs(
+                        [item],
+                        Path(item["control_file"]),
+                        media_map_options,
+                    )
+                    for image_path in paths:
+                        if image_path.exists():
+                            created_count += 1
+                            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                                "plotImageCreated:",
+                                (str(image_path), f"Plots: {project_name}"),
+                                False,
+                            )
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "setProgressFromWorker:",
+                        (float(completed + media_index), float(total)),
+                        False,
+                    )
             except Exception as exc:
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
                     "plotCreationFinished:",
@@ -6593,9 +7804,12 @@ class GPXTrackerController(NSObject):
         if validated is None:
             return
         project_name, gpx_path, trackimages_dir = validated
+        if not self._confirm_shared_asset_change("track_map_base", self.track_map_base, "Track Maps"):
+            return
         common_options = self._plot_common_options(project_name, trackimages_dir)
         try:
             selection_context = prepare_with_options(str(gpx_path), plot_tracks="all", **common_options)
+            self._add_media_maps_to_plot_context(selection_context)
         except (OSError, ValueError, FileNotFoundError, RuntimeError) as exc:
             show_alert("Could not inspect GPX tracks.", str(exc))
             self.set_status("Plot creation failed.")
@@ -6603,7 +7817,7 @@ class GPXTrackerController(NSObject):
         existing_count = self._existing_expected_track_map_count(selection_context)
         if existing_count and not confirm_alert(
             "Overwrite existing Track Maps?",
-            f"{existing_count} existing overview/track map image(s) will be recreated.",
+            f"{existing_count} existing overview, track, or media-location map image(s) will be recreated.",
             "Overwrite",
             "Cancel",
         ):
@@ -6620,16 +7834,19 @@ class GPXTrackerController(NSObject):
         if validated is None:
             return
         project_name, gpx_path, trackimages_dir = validated
+        if not self._confirm_shared_asset_change("track_map_base", self.track_map_base, "Track Maps"):
+            return
         common_options = self._plot_common_options(project_name, trackimages_dir)
         try:
             selection_context = prepare_with_options(str(gpx_path), plot_tracks="all", **common_options)
+            self._add_media_maps_to_plot_context(selection_context)
         except (OSError, ValueError, FileNotFoundError, RuntimeError) as exc:
             show_alert("Could not inspect GPX tracks.", str(exc))
             self.set_status("Plot update failed.")
             return
         default_numbers = self._track_map_update_numbers(gpx_path, selection_context)
         if not default_numbers:
-            show_alert("No Track Maps need updating.", "All current overview and track map images appear to be up-to-date.")
+            show_alert("No Track Maps need updating.", "All current overview, track, and media-location map images appear to be up-to-date.")
         selected_numbers = self.choose_plot_tracks(
             selection_context,
             default_numbers=default_numbers,
@@ -6666,10 +7883,10 @@ class GPXTrackerController(NSObject):
         self.refresh_control_file_display()
         status = str(status)
         if status == "success":
-            self.set_status(f"Created overview and {created_count} track plot(s) in {trackimages_dir}.")
+            self.set_status(f"Created overview and {created_count} track/media map(s) in {trackimages_dir}.")
             return
         if status == "cancelled":
-            self.set_status(f"Plot creation cancelled after {created_count} track plot(s).")
+            self.set_status(f"Plot creation cancelled after {created_count} track/media map(s).")
             return
         if status.startswith("error:"):
             show_alert("Could not create plot images.", status[6:].strip())
@@ -6700,6 +7917,13 @@ class GPXTrackerController(NSObject):
                 continue
             existing_path = resolve_track_map_variant(
                 output_dir / canonical_name,
+                prefer_time_lapse=self.track_maps_for_time_lapse,
+            )
+            if existing_path is not None:
+                image_paths.append(existing_path.resolve(strict=False))
+        for item in context.get("media_map_items", []):
+            existing_path = resolve_track_map_variant(
+                output_dir / item["filename"],
                 prefer_time_lapse=self.track_maps_for_time_lapse,
             )
             if existing_path is not None:
@@ -6755,6 +7979,11 @@ class GPXTrackerController(NSObject):
     def _open_gpx_editor(self, input_paths=None, output_path=None, open_pdf_summary=False, project_name=None):
         from GPXEditor import show_gpx_editor_from_cli_args
 
+        if not open_pdf_summary and self.current_project_file is not None:
+            gpx_name = self._gpx_field_basename()
+            if not self._confirm_shared_asset_change("gpx_file", gpx_name, "GPX file"):
+                return
+
         existing_controller = self.gpx_editor_controller
         existing_window = getattr(existing_controller, "window", None) if existing_controller is not None else None
         if existing_window is not None and existing_window.isVisible():
@@ -6798,6 +8027,7 @@ class GPXTrackerController(NSObject):
                 returned_path = adopted_path
             self._set_gpx_field_value(returned_path.name, manual=not self._is_default_gpx_path(returned_path))
             self.mark_dirty()
+            self._refresh_project_file_menus()
             if returned_path.exists():
                 try:
                     self.populate_track_summary(returned_path)
@@ -6980,21 +8210,30 @@ class GPXTrackerController(NSObject):
                 self.clear_gpx_summary()
                 self.mark_dirty()
         if field is self.title_field:
-            self.mark_dirty()
+            self.adventureNameCommitted_(self.title_field)
+        if field is self.control_file_field:
+            self.controlFileCommitted_(self.control_file_field)
 
     def controlTextDidChange_(self, notification):
         field = notification.object()
+        if field is self.control_table_search_field:
+            # Do not select a table row while the NSSearchField field editor is
+            # handling keystrokes. Changing the table selection can retire that
+            # editor and reset the insertion point after every typed character.
+            self._refresh_control_table_search(select_first=False)
+            return
         if field in self.parameter_controls.values():
             self._capture_parameter_controls()
 
     @objc.IBAction
     def fieldChanged_(self, _sender):
-        if _sender is self.title_field:
-            self.refresh_current_gpx_summary()
-            self.refresh_control_file_display()
         if _sender is self.gpx_track_order_popup:
             self.parameters["trackmaps.ordering"] = "track_number" if self._use_track_order() else "date"
             self.refresh_track_maps_summary()
+        if _sender is self.slideshow_mode_popup:
+            self.parameters["slideshow.start_mode"] = (
+                "time_lapse" if int(self.slideshow_mode_popup.indexOfSelectedItem()) == 0 else "standard"
+            )
         self.mark_dirty()
 
     @objc.IBAction
@@ -7049,6 +8288,33 @@ class GPXTrackerController(NSObject):
             except Exception:
                 pass
             self.media_browser_window = None
+        if self.media_viewer_window is not None:
+            try:
+                self.stop_media_viewer_video()
+                self.media_viewer_window.setDelegate_(None)
+                self.media_viewer_window.orderOut_(None)
+                self.media_viewer_window.close()
+            except Exception:
+                pass
+            self.media_viewer_window = None
+            self.media_viewer_view = None
+            self.media_viewer_delegate = None
+        if self.control_table_window is not None:
+            try:
+                if self.control_table_search_field is not None:
+                    self.control_table_search_field.setDelegate_(None)
+                self.control_table_window.setDelegate_(None)
+                self.control_table_window.orderOut_(None)
+                self.control_table_window.close()
+            except Exception:
+                pass
+            self.control_table_window = None
+            self.control_table_window_delegate = None
+            self.control_table_view = None
+            self.control_table_data_source = None
+            self.control_table_search_field = None
+            self.control_table_search_status = None
+            self.control_table_search_matches = []
         if self.main_help_window is not None:
             try:
                 self.main_help_window.orderOut_(None)

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from gpx_tracks_table import extent_for_image, prepare_with_options
+from gpx_tracks_table import extent_for_image, extent_with_minimum_short_dimension, prepare_with_options
 from track_map_layout_utils import (
     CORNER_ORDER,
     build_media_clear_boxes_metadata,
@@ -20,6 +20,12 @@ from track_map_layout_utils import (
 
 
 class TrackMapLayoutTests(unittest.TestCase):
+    def test_short_map_extent_is_expanded_without_changing_its_center(self):
+        expanded = extent_with_minimum_short_dimension((100.0, 1100.0, 200.0, 700.0), 10_000.0)
+        self.assertAlmostEqual((expanded[0] + expanded[1]) / 2.0, 600.0)
+        self.assertAlmostEqual((expanded[2] + expanded[3]) / 2.0, 450.0)
+        self.assertAlmostEqual(min(expanded[1] - expanded[0], expanded[3] - expanded[2]), 10_000.0)
+
     def test_variant_names_keep_standard_canonical(self):
         self.assertEqual(time_lapse_track_map_name("0001_stage_trip.png"), "0001_stage_trip-timelapse.png")
         self.assertEqual(

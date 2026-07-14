@@ -81,6 +81,7 @@ try:
         NSViewWidthSizable,
         NSFloatingWindowLevel,
         NSWindow,
+        NSWindowAbove,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
         NSWindowCollectionBehaviorFullScreenPrimary,
         NSWindowStyleMaskClosable,
@@ -126,6 +127,35 @@ def available_screen_count() -> int:
         return 1
 
 
+def resolve_map_window(requested: Optional[bool], screen_count: int) -> bool:
+    """Resolve automatic window mode without requiring AppKit in tests."""
+    if requested is not None:
+        return bool(requested)
+    return int(screen_count) >= 2
+
+
+def set_runtime_map_window(config: "Config", enabled: bool) -> None:
+    """Update the frozen runtime configuration during a live `w` toggle."""
+    object.__setattr__(config, "mapwindow", bool(enabled))
+
+
+def should_show_single_window_stage_overview(
+    has_map_presenter: bool,
+    start_fraction: float,
+    has_resume_media: bool,
+) -> bool:
+    """Return whether a fresh stage needs a timed overview before motion."""
+    return not has_map_presenter and start_fraction <= 0.0 and not has_resume_media
+
+
+def slideshow_transition_completion_allowed(
+    time_lapse_running: bool,
+    overview_preview_active: bool,
+) -> bool:
+    """Allow only the single-window overview to finish during Time-Lapse."""
+    return not time_lapse_running or overview_preview_active
+
+
 DEFAULT_LIST_NAME = "photos-sorted.lst"
 TRANSITION_MS = 700
 TRANSITION_STEPS = 14
@@ -154,6 +184,7 @@ KEY_HELP_LINES = [
     "t                     cycle transition mode",
     "T                     switch standard/time-lapse stage mode",
     "f                     toggle fullscreen/window mode",
+    "w                     toggle single/separate overview windows",
     "d                     swap photo/map displays",
     "D                     toggle memory debug display",
     "i                     show photo metadata overlay",
@@ -329,6 +360,8 @@ class Config:
     time_lapse_duration: float = 30.0
     time_lapse_media_min_fraction: float = 0.5
     time_lapse_marker: str = "pilgrim"
+    time_lapse_overview_as_media: bool = True
+    track_map_before_media: bool = False
     resume_index: Optional[int] = None
     resume_progress: Optional[float] = None
     resume_media_index: Optional[int] = None
@@ -389,13 +422,48 @@ class TimeLapseStage:
     media_indexes: list[int]
     media_entries: list[PhotoListEntry]
     media_date_texts: list[Optional[str]]
+    relation: Optional[str] = None
+    next_date_text: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MapDirective:
+    """One normal or adjacent-day map directive from a control file."""
+
+    keyword: str
+    filename: str
+    relation: Optional[str] = None
+
+    @property
+    def is_special(self) -> bool:
+        return self.relation is not None
+
+
+def parse_map_directive(line: str) -> Optional[MapDirective]:
+    """Parse map directives while keeping adjacent-day maps distinct."""
+    for keyword, relation in (
+        ("#MapBefore:", "Day before"),
+        ("#MapAfter:", "Day after"),
+        ("#MediaMap:", ""),
+        ("#Map:", None),
+    ):
+        if line.startswith(keyword):
+            filename = line[len(keyword) :].strip()
+            return MapDirective(keyword[:-1], filename, relation) if filename else None
+    return None
+
+
+def is_normal_map_directive(line: str) -> bool:
+    """Return whether a line advances the journey by one regular stage."""
+    directive = parse_map_directive(line)
+    return directive is not None and not directive.is_special
 
 
 def previous_displayable_playlist_index(lines: list[str], before_index: int) -> Optional[int]:
     """Find the previous map or media row without retaining rendered images."""
     for index in range(min(before_index - 1, len(lines) - 1), -1, -1):
         line = lines[index]
-        if line.startswith("#Map:") or not line.startswith("#"):
+        if parse_map_directive(line) is not None or not line.startswith("#"):
             return index
     return None
 
@@ -434,7 +502,11 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument("--state-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--duration", "-d", type=float, default=3.0, help="Seconds per main slide.")
     parser.add_argument("--transition-duration-ms", type=int, default=TRANSITION_MS, help="Animated transition duration in milliseconds.")
-    parser.add_argument("--time-lapse-stages", action="store_true", help="Play each #Map stage as an animated GPS time-lapse.")
+    parser.add_argument(
+        "--time-lapse-stages",
+        action="store_true",
+        help="Play regular map stages as GPS time-lapses and adjacent-day stages as static maps.",
+    )
     parser.add_argument("--time-lapse-duration", type=float, default=30.0, help="Seconds of active arrow motion per time-lapse stage (default: 30).")
     parser.add_argument(
         "--time-lapse-media-min-fraction",
@@ -449,6 +521,18 @@ def parse_args(argv: list[str]) -> Config:
         choices=("pilgrim", "arrow"),
         default="pilgrim",
         help="Moving Time-Lapse marker: walking pilgrim or traditional arrow (default: pilgrim).",
+    )
+    parser.add_argument(
+        "--time-lapse-overview-fullscreen",
+        action="store_false",
+        dest="time_lapse_overview_as_media",
+        default=True,
+        help="In single-window Time-Lapse mode, show the stage overview full-screen instead of framed over the track map.",
+    )
+    parser.add_argument(
+        "--track-map-before-media",
+        action="store_true",
+        help="In single-window Standard mode, show the marked track map before each photo or video.",
     )
     parser.add_argument(
         "--transition",
@@ -535,8 +619,8 @@ def parse_args(argv: list[str]) -> Config:
     collage_size_min, collage_size_max = parse_percentage_range(args.collage_size_range, parser)
     if args.collage_max_images < 1:
         parser.error("--collage-max-images must be at least 1")
-    mapwindow_enabled = True if args.mapwindow is None else bool(args.mapwindow)
     auto_two_screen_mode = available_screen_count() >= 2
+    mapwindow_enabled = resolve_map_window(args.mapwindow, 2 if auto_two_screen_mode else 1)
     fullscreen_enabled = auto_two_screen_mode if args.fullscreen is None else bool(args.fullscreen)
     if args.join_windows and not mapwindow_enabled:
         parser.error("--join-windows requires --mapwindow")
@@ -573,6 +657,8 @@ def parse_args(argv: list[str]) -> Config:
         time_lapse_duration=float(args.time_lapse_duration),
         time_lapse_media_min_fraction=float(args.time_lapse_media_min_fraction),
         time_lapse_marker=str(args.time_lapse_marker),
+        time_lapse_overview_as_media=bool(args.time_lapse_overview_as_media),
+        track_map_before_media=bool(args.track_map_before_media),
         resume_index=args.resume_index,
         resume_progress=args.resume_progress,
         resume_media_index=args.resume_media_index,
@@ -697,6 +783,8 @@ def config_from_options(
     time_lapse_media_min_fraction: float = 0.5,
     time_lapse_media_max_fraction: Optional[float] = None,
     time_lapse_marker: str = "pilgrim",
+    time_lapse_overview_as_media: bool = True,
+    track_map_before_media: bool = False,
     resume_index: Optional[int] = None,
     resume_progress: Optional[float] = None,
     resume_media_index: Optional[int] = None,
@@ -746,7 +834,7 @@ def config_from_options(
     if transition_value not in ENABLED_TRANSITIONS:
         raise ValueError(f"transition is not enabled: {transition_value.value}")
     collage_size_min, collage_size_max = parse_percentage_range_option(collage_size_range)
-    mapwindow_enabled = True if mapwindow is None else bool(mapwindow)
+    mapwindow_enabled = resolve_map_window(mapwindow, 1)
     fullscreen_enabled = False if fullscreen is None else bool(fullscreen)
     if join_windows and not mapwindow_enabled:
         raise ValueError("join_windows requires mapwindow")
@@ -783,6 +871,8 @@ def config_from_options(
         time_lapse_duration=float(time_lapse_duration),
         time_lapse_media_min_fraction=float(time_lapse_media_min_fraction),
         time_lapse_marker=str(time_lapse_marker),
+        time_lapse_overview_as_media=bool(time_lapse_overview_as_media),
+        track_map_before_media=bool(track_map_before_media),
         resume_index=resume_index,
         resume_progress=resume_progress,
         resume_media_index=resume_media_index,
@@ -1107,6 +1197,7 @@ if APPKIT_AVAILABLE:
             self.route_points = []
             self.arrow_latlon = None
             self.media_marker_latlon = None
+            self.media_marker_fixed_arrow = False
             self.media_image = None
             self.highlight_route = False
             self.marker_color = COLOR_NAMES[DEFAULT_DOT_COLOR_NAME]
@@ -1125,6 +1216,7 @@ if APPKIT_AVAILABLE:
             self.media_video_view = None
             self.place_text = None
             self.metrics_lines = ()
+            self.relation_title = None
             self.overlay_font_size = 30.0
             self.overlay_font_color = COLOR_NAMES["white"]
             self.clock_overlay_key = None
@@ -1200,6 +1292,24 @@ if APPKIT_AVAILABLE:
             """Keep the clock above an optional AVPlayer child view."""
             self.clock_view.removeFromSuperview()
             self.addSubview_(self.clock_view)
+
+        def _retire_content(self):
+            """Drop heavyweight content while a closed Cocoa window stays retained."""
+            self._update_clock_overlay(None, None, False)
+            self.map_image = None
+            self.map_metadata = None
+            self.route_points = []
+            self.arrow_latlon = None
+            self.media_image = None
+            self.media_marker_latlon = None
+            self.media_marker_fixed_arrow = False
+            self.place_text = None
+            self.metrics_lines = ()
+            self.relation_title = None
+            self.media_clear_rects = None
+            self.media_placement_cache_key = None
+            self.pilgrim_frames = []
+            self.setHidden_(True)
 
         def imageRectAndScale(self):
             bounds = self.bounds()
@@ -1353,6 +1463,33 @@ if APPKIT_AVAILABLE:
             if image_width <= 0.0 or image_height <= 0.0:
                 return
 
+            if self.relation_title:
+                title_x, title_y, title_width, title_height = relation_title_band(
+                    (
+                        float(image_rect.origin.x),
+                        float(image_rect.origin.y),
+                        image_width,
+                        image_height,
+                    ),
+                    self.map_metadata,
+                )
+                title_font_size = max(
+                    6.0,
+                    min(float(self.overlay_font_size) * 1.05, title_height * 0.62),
+                )
+                title_font = NSFont.boldSystemFontOfSize_(title_font_size)
+                title_size = NSString.stringWithString_(self.relation_title).sizeWithAttributes_(
+                    {NSFontAttributeName: title_font}
+                )
+                draw_shadowed_text(
+                    self.relation_title,
+                    title_x + title_width / 2.0,
+                    title_y + max(0.0, (title_height - title_size.height) / 2.0),
+                    title_font,
+                    self.overlay_font_color,
+                    "center",
+                )
+
             if self.metrics_lines:
                 axes = self.map_metadata.get("axes_box_fraction") if isinstance(self.map_metadata, dict) else None
                 if isinstance(axes, dict):
@@ -1433,6 +1570,16 @@ if APPKIT_AVAILABLE:
                         transform.translateXBy_yBy_(image_rect.origin.x, image_rect.origin.y)
                         transform.scaleXBy_yBy_(scale, scale)
                         transform.concat()
+                        if self.media_marker_fixed_arrow and self.arrow_factor > 0:
+                            draw_open_arrow_at_marker(
+                                marker_pixel[0],
+                                marker_pixel[1],
+                                image_h,
+                                (math.sqrt(0.5), -math.sqrt(0.5)),
+                                COLOR_NAMES["red"],
+                                self.marker_radius,
+                                self.arrow_factor,
+                            )
                         draw_marker_at(
                             marker_pixel[0],
                             marker_pixel[1],
@@ -1487,6 +1634,22 @@ def safe_float(value: object) -> Optional[float]:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def relation_title_band(
+    image_rect: RectTuple,
+    metadata: Optional[dict],
+) -> RectTuple:
+    """Return the top map-margin strip reserved above framed media."""
+    plot_x, plot_y, plot_width, plot_height = map_plot_rect(image_rect, metadata)
+    cache = metadata.get("media_clear_boxes") if isinstance(metadata, dict) else None
+    try:
+        margin_fraction = float(cache.get("margin_fraction", 0.05))
+    except (AttributeError, TypeError, ValueError):
+        margin_fraction = 0.05
+    margin_fraction = max(0.01, min(0.20, margin_fraction))
+    band_height = max(1.0, plot_height * margin_fraction)
+    return plot_x, plot_y + plot_height - band_height, plot_width, band_height
 
 
 def parse_geometry(geometry: Optional[str], default_width: int, default_height: int) -> tuple[int, int, int, int]:
@@ -1651,6 +1814,34 @@ def draw_track_photo_marker(
             debug_print(config, "Skipping track marker arrow because no usable track direction metadata is available")
         else:
             draw_open_arrow_at_marker(pixel_x, pixel_y, height, tangent, color, radius, arrow_factor)
+    draw_marker_at(pixel_x, pixel_y, height, color, radius)
+    result.unlockFocus()
+    return result
+
+
+def draw_media_location_marker(
+    image,
+    pixel_x: float,
+    pixel_y: float,
+    color: tuple[float, float, float, float],
+    radius: int,
+    arrow_factor: float,
+):
+    """Draw a media-map marker with a fixed 45-degree arrow pointing at it."""
+    result = copy_image(image)
+    _, height = image_size_tuple(result)
+    result.lockFocus()
+    if arrow_factor > 0:
+        diagonal_tangent = (math.sqrt(0.5), -math.sqrt(0.5))
+        draw_open_arrow_at_marker(
+            pixel_x,
+            pixel_y,
+            height,
+            diagonal_tangent,
+            color,
+            radius,
+            arrow_factor,
+        )
     draw_marker_at(pixel_x, pixel_y, height, color, radius)
     result.unlockFocus()
     return result
@@ -2641,7 +2832,13 @@ def resolve_preview_photo_from_line(base_dir: Path, line: str) -> Optional[Path]
     return candidate if candidate.is_file() else None
 
 
-def draw_overview_overlay(overview_image, overview_metadata: dict, track_metadata: dict, date_text: Optional[str], config: Config):
+def draw_overview_overlay(
+    overview_image,
+    overview_metadata: dict,
+    track_metadata: dict,
+    date_text: Optional[str],
+    config: Config,
+):
     """Return the overview map with endpoints and date drawn on top."""
     debug_print(config, "Drawing overview overlay with track endpoints and date")
     result = copy_image(overview_image)
@@ -2715,6 +2912,108 @@ def draw_overview_overlay(overview_image, overview_metadata: dict, track_metadat
 
     result.unlockFocus()
     debug_print(config, "Finished overview overlay drawing")
+    return result
+
+
+def draw_relation_title_on_image(
+    image,
+    metadata: Optional[dict],
+    relation_title: Optional[str],
+    config: Config,
+):
+    """Draw the fixed adjacent-day title over a track map copy."""
+    if not relation_title:
+        return image
+    result = copy_image(image)
+    width, height = image_size_tuple(result)
+    result.lockFocus()
+    try:
+        title_x, title_y, title_width, title_height = relation_title_band(
+            (0.0, 0.0, width, height),
+            metadata,
+        )
+        font_size = max(6.0, min(float(config.font_size) * 1.05, title_height * 0.62))
+        font = NSFont.boldSystemFontOfSize_(font_size)
+        title_size = NSString.stringWithString_(relation_title).sizeWithAttributes_(
+            {NSFontAttributeName: font}
+        )
+        draw_shadowed_text(
+            relation_title,
+            title_x + title_width / 2.0,
+            title_y + max(0.0, (title_height - title_size.height) / 2.0),
+            font,
+            config.font_color,
+            "center",
+        )
+    finally:
+        result.unlockFocus()
+    return result
+
+
+def draw_time_lapse_overview_media(
+    overview_image,
+    overview_metadata: dict,
+    track_metadata: dict,
+    route_points: list[dict],
+    date_text: Optional[str],
+    config: Config,
+):
+    """Render the current stage route into an overview used as framed media."""
+    result = draw_overview_overlay(
+        overview_image,
+        overview_metadata,
+        track_metadata,
+        date_text,
+        config,
+    )
+    width, height = image_size_tuple(result)
+    projected = []
+    for point in route_points:
+        lat, lon = safe_float(point.get("lat")), safe_float(point.get("lon"))
+        if lat is None or lon is None:
+            continue
+        try:
+            pixel_x, pixel_y = coordinate_to_pixel(lat, lon, overview_metadata)
+            pixel_x, pixel_y = scale_metadata_pixel_to_image(
+                pixel_x,
+                pixel_y,
+                overview_metadata,
+                result,
+            )
+        except Exception:
+            continue
+        projected.append((pixel_x, height - pixel_y))
+    if len(projected) < 2:
+        return result
+
+    result.lockFocus()
+    try:
+        outline = NSBezierPath.bezierPath()
+        outline.moveToPoint_(projected[0])
+        for point in projected[1:]:
+            outline.lineToPoint_(point)
+        ns_color(COLOR_NAMES["black"]).setStroke()
+        outline.setLineWidth_(max(5.0, width * 0.0055))
+        outline.stroke()
+
+        route = NSBezierPath.bezierPath()
+        route.moveToPoint_(projected[0])
+        for point in projected[1:]:
+            route.lineToPoint_(point)
+        ns_color(COLOR_NAMES["yellow"]).setStroke()
+        route.setLineWidth_(max(3.0, width * 0.0035))
+        route.stroke()
+
+        first = projected[0]
+        draw_marker_at(
+            first[0],
+            height - first[1],
+            height,
+            config.dot_color,
+            config.dot_size,
+        )
+    finally:
+        result.unlockFocus()
     return result
 
 
@@ -2946,15 +3245,16 @@ if APPKIT_AVAILABLE:
     class GPSTrackShowWindowDelegate(NSObject):
         """Window delegate for resize and close events."""
 
-        def initWithController_(self, controller):  # type: ignore[override]
+        def initWithController_role_(self, controller, role):  # type: ignore[override]
             self = objc.super(GPSTrackShowWindowDelegate, self).init()
             if self is None:
                 return None
             self.controller = controller
+            self.role = str(role)
             return self
 
-        def windowWillClose_(self, _notification) -> None:
-            self.controller.quit()
+        def windowWillClose_(self, notification) -> None:
+            self.controller.window_will_close(notification.object(), self.role)
 
 
     class ScheduledCallback:
@@ -3509,6 +3809,8 @@ class GPSTrackShowApp:
         self.time_lapse_video_view = None
         self.time_photo_view = None
         self.time_map_view = None
+        self.time_lapse_overview_preview_active = False
+        self.time_lapse_overview_inset_active = False
         self.resume_progress_pending = config.resume_progress
         self.resume_media_index_pending = config.resume_media_index
         self.resume_standard_map_index_pending = None
@@ -3522,6 +3824,8 @@ class GPSTrackShowApp:
         self.timer_handles: dict[int, ScheduledCallback] = {}
         self._next_timer_token = 0
         self.window_delegates = []
+        self.parked_map_resource = None
+        self.retired_map_resources = []
         self.photo_presenter: Optional[CocoaImagePresenter] = None
         self.map_presenter: Optional[CocoaImagePresenter] = None
         self.current_state: Optional[DisplayState] = None
@@ -3596,14 +3900,14 @@ class GPSTrackShowApp:
         resume_index = self.config.resume_index
         if resume_index is not None and 0 <= resume_index < len(self.playlist_lines):
             if self.time_lapse_active:
-                if not self.playlist_lines[resume_index].startswith("#Map:"):
+                if parse_map_directive(self.playlist_lines[resume_index]) is None:
                     if not self.playlist_lines[resume_index].startswith("#"):
                         self.resume_media_index_pending = resume_index
                     resume_index = next(
                         (
                             index
                             for index in range(resume_index, -1, -1)
-                            if self.playlist_lines[index].startswith("#Map:")
+                            if parse_map_directive(self.playlist_lines[index]) is not None
                         ),
                         None,
                     )
@@ -3618,7 +3922,7 @@ class GPSTrackShowApp:
                     (
                         index
                         for index in range(resume_index, -1, -1)
-                        if self.playlist_lines[index].startswith("#Map:")
+                        if parse_map_directive(self.playlist_lines[index]) is not None
                     ),
                     None,
                 )
@@ -3632,7 +3936,7 @@ class GPSTrackShowApp:
         self.resume_standard_map_index_pending = None
         start_index = self._find_track_start_index(self.config.start_track)
         if start_index is None:
-            track_count = sum(1 for line in self.playlist_lines if line.startswith("#Map:"))
+            track_count = sum(1 for line in self.playlist_lines if is_normal_map_directive(line))
             warn_message(
                 f"--start {self.config.start_track} requested, but only {track_count} track maps were found; starting at the beginning"
             )
@@ -3644,7 +3948,7 @@ class GPSTrackShowApp:
         """Return the playlist index of the requested 1-based #Map entry."""
         seen_tracks = 0
         for index, line in enumerate(self.playlist_lines):
-            if line.startswith("#Map:"):
+            if is_normal_map_directive(line):
                 seen_tracks += 1
                 if seen_tracks == track_number:
                     return index
@@ -3719,6 +4023,9 @@ class GPSTrackShowApp:
                 return None
             if chars in {"f", "F"} or raw_chars in {"f", "F"}:
                 self._toggle_fullscreen()
+                return None
+            if chars in {"w", "W"} or raw_chars in {"w", "W"}:
+                self._toggle_window_mode()
                 return None
             if raw_chars == "D":
                 self._toggle_memory_debug()
@@ -3942,7 +4249,17 @@ class GPSTrackShowApp:
         if self.time_lapse_handle is not None:
             self.time_lapse_handle.cancel()
             self.time_lapse_handle = None
-        if not self.manual_mode and self.time_lapse_stage is not None:
+        if not self.manual_mode and self.time_lapse_overview_inset_active:
+            self._schedule_callback(self.config.duration, self._begin_time_lapse_motion)
+        elif (
+            not self.manual_mode
+            and self.time_lapse_stage is not None
+            and self.time_lapse_stage.relation is not None
+        ):
+            self._schedule_special_time_lapse_advance(
+                self.time_lapse_media_remaining or self.config.duration
+            )
+        elif not self.manual_mode and self.time_lapse_stage is not None and not self.time_lapse_overview_preview_active:
             self.time_lapse_last_tick = time.monotonic()
             self._time_lapse_tick()
         elif not self.manual_mode and self.current_state is not None and self.current_state.next_callback is not None and self.current_state.auto_delay is not None:
@@ -3971,7 +4288,13 @@ class GPSTrackShowApp:
         debug_print(self.config, "Resumed automatic playback")
         self._update_window_titles("Running")
         self._show_temporary_status_overlay("Auto", 2.0)
-        if self.time_lapse_stage is not None:
+        if self.time_lapse_overview_inset_active:
+            self._schedule_callback(self.config.duration, self._begin_time_lapse_motion)
+        elif self.time_lapse_stage is not None and self.time_lapse_stage.relation is not None:
+            self._schedule_special_time_lapse_advance(
+                self.time_lapse_media_remaining or self.config.duration
+            )
+        elif self.time_lapse_stage is not None and not self.time_lapse_overview_preview_active:
             self.time_lapse_last_tick = time.monotonic()
             self._time_lapse_tick()
         elif self.current_state is not None and self.current_state.next_callback is not None and self.current_state.auto_delay is not None:
@@ -3988,6 +4311,16 @@ class GPSTrackShowApp:
         self._update_window_titles(f"Duration {new_duration:.1f}s")
         self._show_temporary_status_overlay(f"Duration {new_duration:.1f}s", 2.0)
         print(f"[GPSTrackShow] Duration: {new_duration:.1f}s", flush=True)
+        if self.time_lapse_overview_preview_active:
+            if not self.manual_mode and not self.paused:
+                callback = (
+                    self._begin_time_lapse_motion
+                    if self.time_lapse_overview_inset_active
+                    else (self.current_state.next_callback if self.current_state is not None else None)
+                )
+                if callback is not None:
+                    self._schedule_callback(new_duration, callback)
+            return
         if self.time_lapse_stage is not None:
             if self.time_lapse_current_media is not None:
                 _row_index, entry = self.time_lapse_current_media
@@ -4015,19 +4348,31 @@ class GPSTrackShowApp:
             self.time_lapse_handle = None
         if self.time_lapse_active:
             current_index = max(0, self.playlist_index - 1)
-            map_index = next((index for index in range(current_index, -1, -1) if self.playlist_lines[index].startswith("#Map:")), None)
+            map_index = next(
+                (
+                    index
+                    for index in range(current_index, -1, -1)
+                    if parse_map_directive(self.playlist_lines[index]) is not None
+                ),
+                None,
+            )
             if map_index is not None:
+                directive = parse_map_directive(self.playlist_lines[map_index])
+                if directive is None:
+                    return
                 current_media = None
                 if current_index > map_index and not self.playlist_lines[current_index].startswith("#"):
                     current_media = (current_index, parse_photo_entry(self.playlist_lines[current_index]))
                 self._start_time_lapse_stage(
                     map_index,
-                    self.playlist_lines[map_index].partition(":")[2].strip(),
+                    directive.filename,
                     resume_media=current_media,
+                    relation=directive.relation,
                 )
             else:
                 self._show_temporary_status_overlay("Time-Lapse armed for next stage", 2.0)
         else:
+            self.time_lapse_overview_preview_active = False
             self._clear_time_lapse_views()
             if self.time_lapse_current_media is not None:
                 row_index, entry = self.time_lapse_current_media
@@ -4133,6 +4478,11 @@ class GPSTrackShowApp:
         """Resume animation after one arrow-key step without changing playback mode."""
         if self.manual_mode or self.paused or self.time_lapse_stage is None:
             return
+        if getattr(self.time_lapse_stage, "relation", None) is not None:
+            self._schedule_special_time_lapse_advance(
+                self.time_lapse_media_remaining or self.config.duration
+            )
+            return
         self.time_lapse_last_tick = time.monotonic()
         self._time_lapse_tick()
 
@@ -4140,6 +4490,18 @@ class GPSTrackShowApp:
         """Advance once while retaining the current automatic/manual mode."""
         debug_print(self.config, "Forward navigation requested")
         if self.time_lapse_active and self.time_lapse_stage is not None:
+            if self.time_lapse_stage.relation is not None:
+                if self.time_lapse_handle is not None:
+                    self.time_lapse_handle.cancel()
+                    self.time_lapse_handle = None
+                self._advance_special_time_lapse()
+                return
+            if self.time_lapse_overview_preview_active:
+                if self.active_callback is not None:
+                    self.active_callback.cancel()
+                    self.active_callback = None
+                self._begin_time_lapse_motion()
+                return
             if self.time_lapse_handle is not None:
                 self.time_lapse_handle.cancel()
                 self.time_lapse_handle = None
@@ -4185,17 +4547,33 @@ class GPSTrackShowApp:
                 self._start_time_lapse_media(row_index, entry)
                 self._continue_time_lapse_after_navigation()
                 return
+            if (
+                self.time_lapse_stage.relation is not None
+                and self.time_lapse_current_media is not None
+            ):
+                self._end_time_lapse_media(redraw=True)
+                self.time_lapse_media_cursor = 0
+                self._continue_time_lapse_after_navigation()
+                return
             current_map_index = (
                 self.time_lapse_stage.map_index
                 if self.time_lapse_stage is not None
                 else next(
-                    (index for index in range(max(0, self.playlist_index - 1), -1, -1) if self.playlist_lines[index].startswith("#Map:")),
+                    (
+                        index
+                        for index in range(max(0, self.playlist_index - 1), -1, -1)
+                        if parse_map_directive(self.playlist_lines[index]) is not None
+                    ),
                     None,
                 )
             )
             previous_map_index = (
                 next(
-                    (index for index in range(current_map_index - 1, -1, -1) if self.playlist_lines[index].startswith("#Map:")),
+                    (
+                        index
+                        for index in range(current_map_index - 1, -1, -1)
+                        if parse_map_directive(self.playlist_lines[index]) is not None
+                    ),
                     None,
                 )
                 if current_map_index is not None
@@ -4206,8 +4584,15 @@ class GPSTrackShowApp:
                 return
             self._cancel_time_lapse_stage()
             self._prime_context_before_index(previous_map_index)
-            previous_filename = self.playlist_lines[previous_map_index].partition(":")[2].strip()
-            previous_stage = self._collect_time_lapse_stage(previous_map_index, previous_filename)
+            previous_directive = parse_map_directive(self.playlist_lines[previous_map_index])
+            if previous_directive is None:
+                return
+            previous_filename = previous_directive.filename
+            previous_stage = self._collect_time_lapse_stage(
+                previous_map_index,
+                previous_filename,
+                previous_directive.relation,
+            )
             resume_media = (
                 (previous_stage.media_indexes[-1], previous_stage.media_entries[-1])
                 if previous_stage.media_entries
@@ -4218,6 +4603,7 @@ class GPSTrackShowApp:
                 previous_filename,
                 start_fraction=1.0 if resume_media is None else 0.0,
                 resume_media=resume_media,
+                relation=previous_directive.relation,
             )
             return
         if not self.manual_mode:
@@ -4260,6 +4646,20 @@ class GPSTrackShowApp:
         window.setLevel_(NSFloatingWindowLevel if floating else 0)
         window.orderFrontRegardless()
 
+    def _configure_map_window_for_screens(self, screens: list[object]) -> None:
+        """Keep a one-screen map visible while preserving dual-screen fullscreen."""
+        if self.map_window is None or not screens:
+            return
+        parent_window = self.map_window.parentWindow()
+        if len(screens) == 1:
+            self.map_window.setCollectionBehavior_(NSWindowCollectionBehaviorFullScreenAuxiliary)
+            if self.photo_window is not None and parent_window is None:
+                self.photo_window.addChildWindow_ordered_(self.map_window, NSWindowAbove)
+        else:
+            self.map_window.setCollectionBehavior_(NSWindowCollectionBehaviorFullScreenPrimary)
+            if parent_window is not None:
+                parent_window.removeChildWindow_(self.map_window)
+
     def _apply_screen_layout(self) -> None:
         """Place slideshow windows onto screens according to current mode."""
         if self.config.join_windows or not self.config.mapwindow or self.map_window is None:
@@ -4273,6 +4673,8 @@ class GPSTrackShowApp:
 
         primary_screen = screens[1] if len(screens) > 1 else screens[0]
         secondary_screen = screens[0]
+
+        self._configure_map_window_for_screens(screens)
 
         self._apply_window_to_screen(self.photo_window, primary_screen, False)
         self._apply_window_to_screen(
@@ -4377,6 +4779,181 @@ class GPSTrackShowApp:
         if handle is not None:
             handle.dispose()
 
+    def window_will_close(self, window, role: str) -> None:
+        """Close only the requested secondary view; the primary window quits."""
+        if role == "map":
+            self._deactivate_separate_map_window(window_already_closing=True)
+            return
+        if self.running:
+            self.quit()
+
+    def _create_separate_map_window(self, apply_layout: bool = True) -> None:
+        """Create the optional overview/map window while playback continues."""
+        if self.config.join_windows or getattr(self, "map_window", None) is not None:
+            return
+        set_runtime_map_window(self.config, True)
+        restored = self.parked_map_resource is not None
+        if restored:
+            resource = self.parked_map_resource
+            self.parked_map_resource = None
+            self.map_window = resource["window"]
+            self.map_presenter = resource["presenter"]
+            self.time_map_view = resource["view"]
+            if self.time_map_view is not None:
+                self.time_map_view.setHidden_(False)
+        else:
+            self.map_window = self._create_window("GPSTrackShow - Maps", self.config.map_geometry, False)
+            map_host = NSView.alloc().initWithFrame_(self.map_window.contentView().bounds())
+            map_host.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            self.map_window.contentView().addSubview_(map_host)
+            self._attach_time_lapse_view(map_host, "map")
+            self.map_presenter = CocoaImagePresenter(
+                map_host,
+                self.config.background_color,
+                self.schedule_callback,
+                transition_duration_ms=self.config.transition_duration_ms,
+            )
+        self.map_window.makeKeyAndOrderFront_(None)
+        self._update_window_titles()
+        screens = self._available_screens()
+        self._configure_map_window_for_screens(screens)
+        if apply_layout and self.fullscreen_active and screens:
+            target_screen = screens[0]
+            self._apply_window_to_screen(
+                self.map_window,
+                target_screen,
+                len(screens) == 1,
+                half_size=len(screens) == 1,
+            )
+            if len(screens) > 1 and not restored:
+                self.schedule_callback(0.15, lambda: self.map_window and self.map_window.toggleFullScreen_(None))
+        elif apply_layout and not self.fullscreen_active:
+            self._apply_screen_layout()
+
+        if self.time_lapse_active and self.time_lapse_stage is not None:
+            if self.time_lapse_overview_preview_active:
+                if self.active_callback is not None:
+                    self.active_callback.cancel()
+                    self.active_callback = None
+                self._begin_time_lapse_motion()
+            else:
+                self._set_time_lapse_views()
+        else:
+            map_target = self.role_targets.get("map")
+            map_image = (
+                self.current_track_image
+                if self.current_track_image is not None
+                else (map_target.image if map_target is not None else None)
+            )
+            if map_image is not None:
+                self.map_presenter.transition_to(map_image, Transition.SWITCH)
+        if self.map_window is not None:
+            self.map_window.orderFrontRegardless()
+            self.map_window.makeKeyWindow()
+            self.app.activateIgnoringOtherApps_(True)
+
+    def _dispose_retired_map_windows(self) -> None:
+        """Clear heavyweight content without releasing bridged Cocoa wrappers."""
+        for resource in self.retired_map_resources:
+            if resource.get("disposed"):
+                continue
+            presenter = resource.get("presenter")
+            retired_view = resource.get("view")
+            delegate = resource.get("delegate")
+            if delegate in self.window_delegates:
+                self.window_delegates.remove(delegate)
+            if presenter is not None:
+                try:
+                    presenter.dispose()
+                except Exception:
+                    pass
+            if retired_view is not None:
+                try:
+                    retired_view._retire_content()
+                except Exception:
+                    pass
+            resource["disposed"] = True
+
+    def _close_retired_map_windows(self) -> None:
+        """Close hidden map windows outside the keyboard event callback."""
+        closed_any = False
+        for resource in self.retired_map_resources:
+            if resource.get("state") != "pending_close":
+                continue
+            window = resource.get("window")
+            try:
+                if window is not None:
+                    window.close()
+            except Exception:
+                pass
+            resource["state"] = "closed"
+            closed_any = True
+        if closed_any:
+            self.schedule_callback(0.05, self._dispose_retired_map_windows)
+
+    def _deactivate_separate_map_window(self, window_already_closing: bool = False) -> None:
+        """Hide or retire the optional map window and continue in one window."""
+        if self.config.join_windows:
+            return
+        window = getattr(self, "map_window", None)
+        delegate = window.delegate() if window is not None else None
+        presenter = self.map_presenter
+        retired_view = self.time_map_view
+        resource = {
+            "window": window,
+            "presenter": presenter,
+            "delegate": delegate,
+            "view": retired_view,
+            "state": "closed" if window_already_closing else "pending_close",
+            "disposed": False,
+        }
+        if window_already_closing and any(value is not None for value in (window, presenter, delegate, retired_view)):
+            self.retired_map_resources.append(resource)
+        set_runtime_map_window(self.config, False)
+        self.screen_swap = False
+        self.map_window = None
+        self.map_presenter = None
+        self.time_map_view = None
+        if self.time_lapse_active and self.time_lapse_stage is not None:
+            self._set_time_lapse_views()
+        elif self.role_targets:
+            self._show_targets(self._ordered_targets(self.role_targets), on_complete=None)
+        self._update_window_titles("Single window")
+        if window is not None and not window_already_closing:
+            try:
+                parent_window = window.parentWindow()
+                if parent_window is not None:
+                    parent_window.removeChildWindow_(window)
+                window.orderOut_(None)
+            except Exception:
+                pass
+            self.parked_map_resource = {
+                "window": window,
+                "presenter": presenter,
+                "delegate": delegate,
+                "view": retired_view,
+            }
+            return
+        if window is None and presenter is None and delegate is None and retired_view is None:
+            return
+        if window_already_closing:
+            self.schedule_callback(0.05, self._dispose_retired_map_windows)
+            return
+        # A programmatic `w` switch parks rather than closes the native window.
+        # Only a window already being closed by AppKit reaches this point.
+
+    def _toggle_window_mode(self) -> None:
+        """Switch live between one window and a separate overview window."""
+        if self.config.join_windows:
+            self._show_temporary_status_overlay("Window switch unavailable in joined layout", 2.0)
+            return
+        if getattr(self, "map_window", None) is None:
+            self._create_separate_map_window()
+            self._show_temporary_status_overlay("Separate overview window", 2.0)
+        else:
+            self._deactivate_separate_map_window()
+            self._show_temporary_status_overlay("Single window", 2.0)
+
     def _build_windows(self) -> None:
         debug_print(self.config, "Building Cocoa windows")
         if self.config.join_windows and self.config.mapwindow:
@@ -4437,20 +5014,8 @@ class GPSTrackShowApp:
         self._update_window_titles()
 
         if self.config.mapwindow:
-            self.map_window = self._create_window("GPSTrackShow - Maps", self.config.map_geometry, False)
-            map_host = NSView.alloc().initWithFrame_(self.map_window.contentView().bounds())
-            map_host.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-            self.map_window.contentView().addSubview_(map_host)
-            self._attach_time_lapse_view(map_host, "map")
-            self.map_presenter = CocoaImagePresenter(
-                map_host,
-                self.config.background_color,
-                self.schedule_callback,
-                transition_duration_ms=self.config.transition_duration_ms,
-            )
+            self._create_separate_map_window(apply_layout=False)
             debug_print(self.config, "Created map window")
-            self.map_window.makeKeyAndOrderFront_(None)
-            self._update_window_titles()
 
         self._apply_screen_layout()
 
@@ -4470,10 +5035,20 @@ class GPSTrackShowApp:
             NSBackingStoreBuffered,
             False,
         )
+        # PyObjC wrappers can otherwise outlive AppKit's native object after
+        # close(), producing a zombie lookup when a window is created again.
+        window.setReleasedWhenClosed_(False)
         window.setTitle_(title)
-        behavior = NSWindowCollectionBehaviorFullScreenPrimary
+        behavior = (
+            NSWindowCollectionBehaviorFullScreenPrimary
+            if primary
+            else NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
         window.setCollectionBehavior_(behavior)
-        delegate = GPSTrackShowWindowDelegate.alloc().initWithController_(self)
+        delegate = GPSTrackShowWindowDelegate.alloc().initWithController_role_(
+            self,
+            "photo" if primary else "map",
+        )
         window.setDelegate_(delegate)
         self.window_delegates.append(delegate)
         return window
@@ -4500,9 +5075,10 @@ class GPSTrackShowApp:
         if map_index is None or self.map_presenter is None:
             return
         line = self.playlist_lines[map_index]
-        if not line.startswith("#Map:"):
+        directive = parse_map_directive(line)
+        if directive is None:
             return
-        canonical_path = resolve_path(self._track_asset_dir(), line.partition(":")[2].strip())
+        canonical_path = resolve_path(self._track_asset_dir(), directive.filename)
         track_path = resolve_track_map_variant(canonical_path, prefer_time_lapse=False) or canonical_path
         try:
             self.current_track_image = load_nsimage(track_path)
@@ -4703,13 +5279,19 @@ class GPSTrackShowApp:
             )
         )
 
-    def _collect_time_lapse_stage(self, map_index: int, filename: str) -> TimeLapseStage:
-        date_text = self.current_date
+    def _collect_time_lapse_stage(
+        self,
+        map_index: int,
+        filename: str,
+        relation: Optional[str] = None,
+    ) -> TimeLapseStage:
+        stage_date_text = self.current_date
+        date_text = stage_date_text
         media_indexes, media_entries, media_date_texts = [], [], []
         next_index = len(self.playlist_lines)
         for index in range(map_index + 1, len(self.playlist_lines)):
             line = self.playlist_lines[index]
-            if line.startswith("#Map:"):
+            if parse_map_directive(line) is not None:
                 next_index = index
                 break
             if line.startswith("#Datum:"):
@@ -4718,13 +5300,23 @@ class GPSTrackShowApp:
                 media_indexes.append(index)
                 media_entries.append(parse_photo_entry(line))
                 media_date_texts.append(date_text)
-        return TimeLapseStage(map_index, next_index, filename, date_text, media_indexes, media_entries, media_date_texts)
+        return TimeLapseStage(
+            map_index,
+            next_index,
+            filename,
+            stage_date_text,
+            media_indexes,
+            media_entries,
+            media_date_texts,
+            relation,
+            date_text,
+        )
 
     def _time_lapse_distance_before_stage(self, map_index: int) -> float:
         """Sum the route lengths of preceding control-file stages."""
         total_km = 0.0
         for line in self.playlist_lines[:map_index]:
-            if not line.startswith("#Map:"):
+            if not is_normal_map_directive(line):
                 continue
             canonical_path = resolve_path(self._track_asset_dir(), line.partition(":")[2].strip())
             map_path = resolve_track_map_variant(canonical_path, prefer_time_lapse=True) or canonical_path
@@ -4775,7 +5367,16 @@ class GPSTrackShowApp:
         return 0.0 if total <= 0 else max(0.0, min(1.0, (photo_time - start).total_seconds() / total))
 
     def _set_time_lapse_views(self):
-        marker_state = interpolate_timeline_state(self.time_lapse_points, self.time_lapse_progress)
+        special_stage = self.time_lapse_stage is not None and self.time_lapse_stage.relation is not None
+        media_map_stage = (
+            special_stage
+            and isinstance(self.current_track_metadata, dict)
+            and self.current_track_metadata.get("map_kind") == "media"
+        )
+        marker_state = None if special_stage else interpolate_timeline_state(
+            self.time_lapse_points,
+            self.time_lapse_progress,
+        )
         arrow = None if marker_state is None else (marker_state["lat"], marker_state["lon"])
         stage_distance_km = 0.0 if marker_state is None else float(marker_state.get("stage_distance_km") or 0.0)
         if marker_state is not None and stage_distance_km <= 0.0 and self.time_lapse_progress > 0.0:
@@ -4785,7 +5386,7 @@ class GPSTrackShowApp:
             self.time_lapse_stage_start_distance_km + stage_distance_km,
             stage_distance_km,
             elevation_m,
-        )
+        ) if not special_stage else ()
         marker_time = None if marker_state is None else marker_state.get("time")
         media_time = None
         if self.time_lapse_current_media is not None:
@@ -4818,8 +5419,10 @@ class GPSTrackShowApp:
             )
             stage_view.media_min_fraction = self.config.time_lapse_media_min_fraction
             stage_view.media_marker_latlon = self.time_lapse_media_marker_latlon
+            stage_view.media_marker_fixed_arrow = media_map_stage
             stage_view.place_text = self.time_lapse_place_text if self.config.placenames else None
             stage_view.metrics_lines = metrics_lines
+            stage_view.relation_title = self.time_lapse_stage.relation if special_stage else None
             stage_view.overlay_font_size = self.config.font_size
             stage_view.overlay_font_color = self.config.font_color
             stage_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(self.current_track_image, self.current_track_metadata, self.time_lapse_points, arrow, self.time_lapse_media_image, False)
@@ -4852,8 +5455,10 @@ class GPSTrackShowApp:
                 overview=True,
             )
             overview_view.media_marker_latlon = self.time_lapse_media_marker_latlon
+            overview_view.media_marker_fixed_arrow = media_map_stage
             overview_view.place_text = None
             overview_view.metrics_lines = ()
+            overview_view.relation_title = None
             overview_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(self.current_overview_image, self.current_overview_metadata, self.time_lapse_points, arrow, None, True)
 
     def _clear_time_lapse_views(self):
@@ -4881,6 +5486,8 @@ class GPSTrackShowApp:
         if self.time_lapse_handle is not None:
             self.time_lapse_handle.cancel()
             self.time_lapse_handle = None
+        self.time_lapse_overview_preview_active = False
+        self.time_lapse_overview_inset_active = False
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
         self.time_lapse_media_image = None
@@ -4904,11 +5511,12 @@ class GPSTrackShowApp:
         filename: str,
         start_fraction: float = 0.0,
         resume_media: Optional[tuple[int, PhotoListEntry]] = None,
+        relation: Optional[str] = None,
     ):
         if self.current_overview_image is None:
             raise RuntimeError("encountered #Map before #Overviewmap")
         self._suspend_standard_playback_for_time_lapse()
-        self.time_lapse_stage = self._collect_time_lapse_stage(map_index, filename)
+        self.time_lapse_stage = self._collect_time_lapse_stage(map_index, filename, relation)
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
         self.time_lapse_media_image = None
@@ -4926,7 +5534,10 @@ class GPSTrackShowApp:
         self.current_track_metadata = try_read_plot_metadata(track_path.with_suffix(".json"))
         self.time_lapse_points = timed_points_from_metadata(self.current_track_metadata)
         self.time_lapse_stage_start_distance_km = self._time_lapse_distance_before_stage(map_index)
-        if len(self.time_lapse_points) < 2 or all(point.get("estimated") for point in self.time_lapse_points):
+        if relation is None and (
+            len(self.time_lapse_points) < 2
+            or all(point.get("estimated") for point in self.time_lapse_points)
+        ):
             warn_message("Track map has no stored timing; using distance-based motion and showing untimed media at stage end.")
         self.time_lapse_progress = max(0.0, min(1.0, start_fraction))
         media_events = []
@@ -4946,7 +5557,14 @@ class GPSTrackShowApp:
                 photo_time=media_datetime,
             )
             media_events.append((fraction, row_index, entry))
-        queue = build_time_lapse_media_queue(media_events)
+        queue = (
+            [(1.0, row_index, entry) for row_index, entry in zip(
+                self.time_lapse_stage.media_indexes,
+                self.time_lapse_stage.media_entries,
+            )]
+            if relation is not None
+            else build_time_lapse_media_queue(media_events)
+        )
         self.time_lapse_media_queue = queue
         self.time_lapse_media_cursor = next((index for index, item in enumerate(queue) if item[0] >= self.time_lapse_progress), len(queue))
         if resume_media is not None:
@@ -4956,10 +5574,125 @@ class GPSTrackShowApp:
                     self.time_lapse_media_cursor = index + 1
                     self._start_time_lapse_media(row_index, entry)
                     break
+        if relation is not None:
+            self.time_lapse_progress = 1.0
+            self._begin_special_time_lapse_stage(skip_map_delay=resume_media is not None)
+            return
+        if should_show_single_window_stage_overview(
+            self.map_presenter is not None,
+            start_fraction,
+            resume_media is not None,
+        ):
+            self.time_lapse_overview_preview_active = True
+            if self.config.time_lapse_overview_as_media:
+                self.time_lapse_overview_inset_active = True
+                if self.current_overview_metadata is not None and self.current_track_metadata is not None:
+                    self.time_lapse_media_image = draw_time_lapse_overview_media(
+                        self.current_overview_image,
+                        self.current_overview_metadata,
+                        self.current_track_metadata,
+                        self.time_lapse_points,
+                        self.current_date,
+                        self.config,
+                    )
+                else:
+                    self.time_lapse_media_image = self.current_overview_image
+                self.time_lapse_media_marker_latlon = None
+                self.time_lapse_place_text = None
+                self.time_lapse_last_tick = time.monotonic()
+                self._set_time_lapse_views()
+                self._update_window_titles("Stage overview")
+                if not self.manual_mode and not self.paused:
+                    self._schedule_callback(self.config.duration, self._begin_time_lapse_motion)
+                return
+            if self.current_overview_metadata is not None and self.current_track_metadata is not None:
+                overview_image = draw_overview_overlay(
+                    self.current_overview_image,
+                    self.current_overview_metadata,
+                    self.current_track_metadata,
+                    self.current_date,
+                    self.config,
+                )
+            else:
+                overview_image = self.current_overview_image
+            self._clear_time_lapse_views()
+            self._display_state(
+                DisplayState(
+                    targets=[WindowTarget("photo", overview_image, Transition.FADE)],
+                    next_callback=self._begin_time_lapse_motion,
+                    auto_delay=self.config.duration,
+                    description="Stage overview",
+                    playlist_index=self.playlist_index,
+                )
+            )
+            return
+        self._begin_time_lapse_motion()
+
+    def _begin_special_time_lapse_stage(self, skip_map_delay: bool = False) -> None:
+        """Show an adjacent-day map statically before its sequential media."""
+        if self.time_lapse_stage is None or self.time_lapse_stage.relation is None:
+            return
+        self.time_lapse_overview_preview_active = False
+        self.time_lapse_overview_inset_active = False
+        self.current_state = None
+        self._set_time_lapse_views()
+        self._update_window_titles(self.time_lapse_stage.relation)
+        if self.manual_mode or self.paused:
+            return
+        if self.time_lapse_current_media is not None:
+            delay = self.time_lapse_media_remaining or self.config.duration
+        else:
+            delay = 0.0 if skip_map_delay else self.config.duration
+        self._schedule_special_time_lapse_advance(delay)
+
+    def _schedule_special_time_lapse_advance(self, delay: float) -> None:
+        if self.time_lapse_handle is not None:
+            self.time_lapse_handle.cancel()
+        self.time_lapse_handle = self.schedule_callback(
+            max(0.0, delay),
+            self._advance_special_time_lapse,
+        )
+
+    def _advance_special_time_lapse(self) -> None:
+        """Advance a static adjacent-day stage by one medium."""
+        self.time_lapse_handle = None
+        if self.time_lapse_stage is None or self.time_lapse_stage.relation is None:
+            return
+        if self.time_lapse_current_media is not None:
+            self._end_time_lapse_media(redraw=False)
+        if self.time_lapse_media_cursor >= len(self.time_lapse_media_queue):
+            self._finish_time_lapse_stage()
+            return
+        _fraction, row_index, entry = self.time_lapse_media_queue[self.time_lapse_media_cursor]
+        self.time_lapse_media_cursor += 1
+        if not self._start_time_lapse_media(row_index, entry):
+            self._advance_special_time_lapse()
+            return
+        if not self.manual_mode and not self.paused:
+            self._schedule_special_time_lapse_advance(
+                self.time_lapse_media_remaining or self.config.duration
+            )
+
+    def _begin_time_lapse_motion(self) -> None:
+        """Leave the optional single-window overview and animate the stage."""
+        if self.time_lapse_stage is None or not self.time_lapse_active:
+            return
+        if self.time_lapse_overview_inset_active:
+            self.time_lapse_media_image = None
+            self.time_lapse_media_marker_latlon = None
+        self.time_lapse_overview_preview_active = False
+        self.time_lapse_overview_inset_active = False
+        self.active_callback = None
+        self.current_state = None
+        for presenter in (self.photo_presenter, self.map_presenter):
+            if presenter is not None:
+                presenter.cancel_pending()
+                presenter.set_content_visible(False)
         self.time_lapse_last_tick = time.monotonic()
         self._set_time_lapse_views()
         self._update_window_titles("Time-Lapse")
-        self._time_lapse_tick()
+        if not self.paused and not self.manual_mode:
+            self._time_lapse_tick()
 
     def _time_lapse_tick(self):
         if not self.running or not self.time_lapse_active or self.paused or self.manual_mode:
@@ -5020,10 +5753,21 @@ class GPSTrackShowApp:
         if not isinstance(raw_place, str) or not raw_place.strip():
             raw_place = entry.place
         self.time_lapse_place_text = format_place_for_time_lapse(raw_place)
-        self.time_lapse_media_marker_latlon = interpolate_timeline_point(
-            self.time_lapse_points,
-            self.time_lapse_progress,
-        )
+        if self.time_lapse_stage is not None and self.time_lapse_stage.relation is not None:
+            latitude = safe_float(metadata.get("latitude"))
+            longitude = safe_float(metadata.get("longitude"))
+            if latitude is None or longitude is None:
+                latitude, longitude = entry.latitude, entry.longitude
+            self.time_lapse_media_marker_latlon = (
+                (latitude, longitude)
+                if latitude is not None and longitude is not None
+                else None
+            )
+        else:
+            self.time_lapse_media_marker_latlon = interpolate_timeline_point(
+                self.time_lapse_points,
+                self.time_lapse_progress,
+            )
         self.time_lapse_media_remaining = max(0.1, delay)
         display_started = time.monotonic()
         self.time_lapse_media_deadline = None if self.manual_mode else display_started + self.time_lapse_media_remaining
@@ -5051,6 +5795,9 @@ class GPSTrackShowApp:
     def _finish_time_lapse_stage(self):
         if self.time_lapse_stage is None:
             return
+        next_date_text = self.time_lapse_stage.next_date_text
+        self.time_lapse_overview_preview_active = False
+        self.time_lapse_overview_inset_active = False
         self.playlist_index = self.time_lapse_stage.next_index
         self.time_lapse_stage = None
         self.time_lapse_current_media = None
@@ -5063,6 +5810,8 @@ class GPSTrackShowApp:
         self.time_lapse_media_deadline = None
         self.time_lapse_media_remaining = None
         self.time_lapse_media_datetimes = {}
+        if next_date_text is not None:
+            self.current_date = next_date_text
         self._clear_time_lapse_views()
         self._advance()
 
@@ -5146,7 +5895,8 @@ class GPSTrackShowApp:
                 self._reset_photo_layouts(Transition.COLLAGE)
             self._advance()
             return
-        if line.startswith("#Map:"):
+        map_directive = parse_map_directive(line)
+        if map_directive is not None:
             self.pending_display_index = row_index
             if self.time_lapse_active:
                 self.current_display_index = row_index
@@ -5166,12 +5916,13 @@ class GPSTrackShowApp:
                     self.resume_media_index_pending = None
                 self._start_time_lapse_stage(
                     row_index,
-                    line.partition(":")[2].strip(),
+                    map_directive.filename,
                     start_fraction=start_fraction,
                     resume_media=resume_media,
+                    relation=map_directive.relation,
                 )
                 return
-            self._handle_map(line.partition(":")[2].strip())
+            self._handle_map(map_directive.filename, map_directive.relation)
             self.resume_start_pending = False
             return
         self.pending_display_index = row_index
@@ -5189,7 +5940,7 @@ class GPSTrackShowApp:
         else:
             debug_print(self.config, "Overview metadata missing; continuing without overview markers")
 
-    def _handle_map(self, filename: str) -> None:
+    def _handle_map(self, filename: str, relation_title: Optional[str] = None) -> None:
         if self.current_overview_image is None:
             raise RuntimeError("encountered #Map before #Overviewmap")
         self._choose_random_transition_for_track()
@@ -5209,7 +5960,11 @@ class GPSTrackShowApp:
         else:
             debug_print(self.config, "Track map metadata missing; continuing without track markers")
         debug_print(self.config, "Creating rendered overview image for current track")
-        if self.current_overview_metadata is not None and self.current_track_metadata is not None:
+        is_media_map = (
+            isinstance(self.current_track_metadata, dict)
+            and self.current_track_metadata.get("map_kind") == "media"
+        )
+        if self.current_overview_metadata is not None and self.current_track_metadata is not None and not is_media_map:
             overview_image = draw_overview_overlay(
                 self.current_overview_image,
                 self.current_overview_metadata,
@@ -5219,8 +5974,15 @@ class GPSTrackShowApp:
             )
         else:
             overview_image = self.current_overview_image
-            warn_message("overview or track metadata missing; skipping overview endpoint markers")
+            if not is_media_map:
+                warn_message("overview or track metadata missing; skipping overview endpoint markers")
         debug_print(self.config, "Overview image ready; preparing to show overview then track")
+        self.current_track_image = draw_relation_title_on_image(
+            self.current_track_image,
+            self.current_track_metadata,
+            relation_title,
+            self.config,
+        )
         track_image = self.current_track_image
 
         if self.photo_presenter is not None:
@@ -5355,7 +6117,8 @@ class GPSTrackShowApp:
             self.startup_preview_identity = None
 
         marked_track = None
-        if self.current_track_image is not None:
+        needs_marked_track = self.map_presenter is not None or self.config.track_map_before_media
+        if self.current_track_image is not None and needs_marked_track:
             marked_track = self.current_track_image
             if self.current_track_metadata is not None and latitude is not None and longitude is not None:
                 pixel_x, pixel_y = coordinate_to_pixel(latitude, longitude, self.current_track_metadata)
@@ -5379,16 +6142,26 @@ class GPSTrackShowApp:
                         f"photo marker for {photo_path.name} lies outside track image bounds: "
                         f"x={scaled_x:.1f}, y={scaled_y:.1f}, width={track_width:.1f}, height={track_height:.1f}"
                     )
-                marked_track = draw_track_photo_marker(
-                    marked_track,
-                    scaled_x,
-                    scaled_y,
-                    self.current_track_metadata,
-                    self.config.dot_color,
-                    self.config.dot_size,
-                    self.config.arrow_length,
-                    self.config,
-                )
+                if self.current_track_metadata.get("map_kind") == "media":
+                    marked_track = draw_media_location_marker(
+                        marked_track,
+                        scaled_x,
+                        scaled_y,
+                        self.config.dot_color,
+                        self.config.dot_size,
+                        self.config.arrow_length,
+                    )
+                else:
+                    marked_track = draw_track_photo_marker(
+                        marked_track,
+                        scaled_x,
+                        scaled_y,
+                        self.current_track_metadata,
+                        self.config.dot_color,
+                        self.config.dot_size,
+                        self.config.arrow_length,
+                        self.config,
+                    )
             elif self.current_track_metadata is None:
                 warn_message("track metadata missing; skipping photo position marker on track map")
 
@@ -5406,7 +6179,7 @@ class GPSTrackShowApp:
             self._display_photo_state_with_transition_change(final_state, map_image=marked_track, info_text=info_text)
             return
 
-        if marked_track is not None:
+        if marked_track is not None and self.config.track_map_before_media:
             if transition_change_pending:
                 final_state = DisplayState(
                     targets=[make_photo_target(photo_transition)],
@@ -5460,7 +6233,10 @@ class GPSTrackShowApp:
             # A transition completion queued just before T must never restart
             # standard playlist advancement underneath time-lapse playback.
             time_lapse_running = self.time_lapse_active and self.time_lapse_stage is not None
-            if on_complete is not None and not time_lapse_running:
+            if on_complete is not None and slideshow_transition_completion_allowed(
+                time_lapse_running,
+                self.time_lapse_overview_preview_active,
+            ):
                 on_complete()
 
         active_photo_presenter = None
@@ -5497,7 +6273,11 @@ class GPSTrackShowApp:
             effective_transition = Transition.SWITCH if target.presenter_name == "map" else target.transition
             if target.presenter_name == "photo":
                 def photo_complete(current_presenter=presenter, current_target=target, transition=effective_transition) -> None:
-                    if self.time_lapse_active and self.time_lapse_stage is not None:
+                    time_lapse_running = self.time_lapse_active and self.time_lapse_stage is not None
+                    if not slideshow_transition_completion_allowed(
+                        time_lapse_running,
+                        self.time_lapse_overview_preview_active,
+                    ):
                         return
                     if current_target.video_path is not None:
                         frame_rect = current_presenter.last_media_rect if transition in {Transition.COLLAGE, Transition.QUAD} else None
@@ -5617,6 +6397,20 @@ class GPSTrackShowApp:
             self.photo_presenter.dispose()
         if self.map_presenter is not None:
             self.map_presenter.dispose()
+        parked = self.parked_map_resource
+        if parked is not None:
+            parked_presenter = parked.get("presenter")
+            if parked_presenter is not None:
+                parked_presenter.dispose()
+            parked_window = parked.get("window")
+            if parked_window is not None:
+                try:
+                    parked_window.setDelegate_(None)
+                    parked_window.orderOut_(None)
+                    parked_window.close()
+                except Exception:
+                    pass
+            self.parked_map_resource = None
         for window_name in ("photo_window", "map_window"):
             window = getattr(self, window_name, None)
             if window is not None:

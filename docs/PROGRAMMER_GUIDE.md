@@ -84,7 +84,8 @@ The sections are:
 - Photos and Video Clips
 - Slide Show Control File
 - Start Slide Show
-- Load/Help/Quit controls, status line, and progress bar
+- Show-type selector, Start/PDF/Quit controls, status line, and progress
+  bar. Help is in the header beside Settings.
 
 Each section has a non-editable status checkbox. It is used as a visual
 completion indicator:
@@ -97,7 +98,8 @@ completion indicator:
 
 ## Adventure Files
 
-Adventure files use the extension `.adv` but contain JSON.
+Adventure files use the extension `.adv`, contain JSON, and require
+`adventure_format_version: 2`. Older formats are deliberately unsupported.
 
 The GUI saves and loads them with:
 
@@ -105,18 +107,32 @@ The GUI saves and loads them with:
 - `load_project_configuration(...)`
 - `_activate_project_directory(...)`
 
-The first use of a directory without an Adventure requires confirmation.
-Afterward `mark_dirty()` schedules a 500 ms coalesced auto-save. Discrete
+`adventure_files.py` validates and discovers format-2 files, sorts them by
+modification time, and implements transactional rename/copy operations. An
+empty directory remains active without an Adventure until its suggested or
+typed name is committed. After creation, `mark_dirty()` schedules a 500 ms coalesced auto-save. Discrete
 operations use the same path, while callers that need durability immediately
 flush it. `atomic_write_json(...)` writes and fsyncs a temporary sibling before
-`os.replace(...)`. Once set, `current_project_file` is authoritative, so a
-project-title edit does not rename or duplicate the `.adv` file.
+`os.replace(...)`. `current_project_file`, `gpx_file`, `control_file`, and
+`track_map_base` are authoritative. Adventure-name edits are never autosaved
+as ordinary text changes; committing them invokes Rename/Copy/Cancel.
+
+`slideshow.start_mode` stores the preferred Standard or Time-Lapse selection.
+`slideshow.window_mode` stores `auto`, `single`, or `multiple`. Automatic mode
+resolves against `NSScreen.screens()` in the player: one screen uses one window
+and two or more screens create the separate overview window. Legacy
+`slideshow.map_window` booleans are migrated when an Adventure is loaded:
+the former enabled default becomes `auto`, while disabled becomes `single`.
+`slideshow.track_map_before_media` defaults to false and controls the optional
+single-window Standard preview of a marked track map before every medium.
 
 Stored values include:
 
 - project name
 - project directory
-- GPX file basename/path as shown by the GUI
+- format version 2
+- project-relative GPX and control-file basenames
+- Track Map output base
 - last picture import directory
 - `time_lapse_media_min_fraction` (currently stored with a default of `0.5`;
   the legacy `time_lapse_media_max_fraction` key is accepted while loading)
@@ -124,10 +140,9 @@ Stored values include:
 - `parameters`: a versioned object containing normalized values from the
   central registry
 
-Older adventures without `parameters` load registry defaults and mirror the
-legacy ordering, map-variant, edge-margin, and time-lapse media-size fields.
-Unknown future keys are ignored safely. Top-level compatibility fields continue
-to be written for older releases.
+The three development Adventures were migrated directly to format 2; runtime
+legacy Adventure migration is intentionally absent. Parameter-registry
+normalization remains independent of the Adventure file-format version.
 
 ## Adventure Parameter Editor
 
@@ -152,9 +167,10 @@ Track-map sidecars store `adventure_render_parameters`; the track summary stores
 signatures. Legacy outputs remain current only while the corresponding settings
 still equal their old defaults.
 
-When a project directory is selected, the GUI creates it if needed and tries to
-load an `.adv` file from that directory. The default GPX file is derived from
-the project name unless the user manually changed the GPX field.
+When a project directory is selected, the GUI creates it if needed, discovers
+all valid `.adv` files, and loads the newest one. Adventure, GPX, and control
+file use editable combo boxes populated from that directory. Explicit stored
+references, not the visible title, drive GPX processing and slide-show output.
 
 ## GPX Plot Pipeline
 
@@ -264,6 +280,40 @@ Merge actions use:
 Merge logic should avoid duplicate media and duplicate track maps. Track map
 duplicate detection must normalize legacy/new track plot numbering.
 
+Initial sorting and Merge New Media share `assign_adjacent_day_track(...)`.
+Only media dates without an exact-date track are considered. GPS media must be
+within `0.5 * track_length` of the next track's start (`before`) or previous
+track's end (`after`); media without GPS is accepted by date. Candidate ties
+prefer the next track. `build_control_sections(...)` emits qualifying media as
+`#MapBefore:` or `#MapAfter:` sections. A third pass turns remaining GPS-bearing
+date groups into `#MediaMap:` sections and inserts each complete section by
+date without splitting a before/track/after group. Groups without any usable
+GPS coordinate remain mapless. Merge applies the same classification without
+reordering existing user-edited rows.
+
+Media-only maps are written to `trackimages` as
+`<control-base>-media-YYYY-MM-DD.png` for Standard and
+`<control-base>-media-YYYY-MM-DD-timelapse.png` for Time-Lapse, with matching
+JSON sidecars. The control file always keeps the canonical Standard filename;
+playback resolves the preferred variant with fallback exactly like a track map.
+They use the same map provider and rendering parameters as track maps, contain
+a date-only header, and store `map_kind: media`, all media coordinates,
+normalized clear boxes, and coordinate-to-pixel metadata. Per-track and media-only map extents
+have a fixed 10 km minimum short dimension. This value is a conservative lower
+bound derived from the smaller dimensions of the existing Santiago standard
+track maps; it prevents very short routes or tightly grouped photos from
+producing an excessively magnified, low-context map. Overview maps are not
+affected.
+
+Time-Lapse media maps call the same `optimized_track_extent(...)` and clear-box
+functions as track maps, passing time-ordered media coordinates in place of GPX
+points. Standard media maps use the same centered extent as Standard track
+maps. `render_media_map_specs(...)` is the only variant-aware media-map render
+path and is shared by initial control-file creation, Merge New Media, and Track
+Maps Create/Update. Merge classification calls `build_control_sections(...)`,
+so exact-date, adjacent-day, and remaining-media passes cannot drift from
+initial creation.
+
 The GUI also performs a preflight sync check for the slide-show control file:
 
 - current track maps missing from the control file
@@ -273,7 +323,33 @@ The GUI also performs a preflight sync check for the slide-show control file:
 
 The Slide Show Control File status line reports these problems. The
 `Sync Track Maps` button shows the exact canonical maps to insert and old entries to remove,
-and can remove obsolete entries before calling the GetGeoLocations merge path.
+then performs removal and insertion in a temporary sibling list. The active
+control file is replaced atomically only after the complete merge succeeds;
+cancelled or failed merges leave it unchanged. The reusable Cocoa table window
+is retained and hidden on close so reopening it never addresses a released
+Objective-C window.
+
+`SlideShowControlTableWindow.performKeyEquivalent_(...)` handles `Cmd-F` and
+`Shift-Cmd-F` at window scope, including while a cell or the search field has
+focus. `control_table_search_indexes(...)` searches serialized control rows so
+the UI matches the actual `.lst` representation. Navigation selects and
+scrolls the matching row into view and wraps in both directions.
+
+`SlideShowControlTableView.menuForEvent_(...)` selects the right-clicked row
+and constructs the row-editing context menu. Preview and Finder actions use
+`resolve_control_row_path(...)`, including Standard/Time-Lapse map fallback;
+Finder receives file URLs through `activateFileViewerSelectingURLs_(...)`.
+
+Control-file viewer items retain their source row index. Every viewer
+navigation calls `sync_control_table_to_media_viewer_item(...)` to select and
+scroll that row. Video items use one retained `AVPlayer`/`AVPlayerView` with
+inline controls; switching items pauses, detaches, and clears the previous
+player before creating another one.
+
+`_resolve_unsaved_control_table_changes()` is shared by the editor Close
+action and application termination. It first commits any active cell editor,
+then offers Save, Don't Save, or Cancel. Don't Save reloads the on-disk list
+and removes the recovery state so reopening cannot expose discarded rows.
 
 Reverse geocoding uses a temporary list so the user-edited sorted list is not
 overwritten. After completion, the GUI updates place names in memory from
@@ -288,6 +364,9 @@ Supported line types:
 - normal media line: image or video filename plus time/GPS/place columns.
 - `#Overviewmap: filename`: overview map image.
 - `#Map: filename`: per-track map image.
+- `#MapBefore: filename`: associated track map for media on the day before.
+- `#MapAfter: filename`: associated track map for media on the day after.
+- `#MediaMap: filename`: date-only location map for media not assigned to a track.
 - `#Date:` or `#Datum:`: date section line.
 
 The GUI table maps these to row types:
@@ -296,6 +375,9 @@ The GUI table maps these to row types:
 - `VID`: video
 - `MAP`: overview map
 - `TRK`: track map
+- `BEF`: day-before track map
+- `AFT`: day-after track map
+- `LOC`: media-only location map
 - `DAT`: date row
 
 `parse_slideshow_control_line(...)` and `serialize_slideshow_control_row(...)`
@@ -344,13 +426,59 @@ It supports keyboard navigation, media overlays, clock/place overlays, and map
 windows. Since it is a separate process, quitting it must not affect the main
 GUI.
 
+`GPSTrackShowWindowDelegate` gives every Cocoa window a stable `photo` or `map`
+role. Closing the primary photo window quits playback. Closing the secondary
+map window calls `_deactivate_separate_map_window()` and reroutes playback into
+the photo window. Window closure and disposal of heavyweight presenter/view
+content are deferred until `windowWillClose_` has returned to avoid PyObjC
+autorelease-pool crashes. The
+`w` key creates or removes this secondary window at runtime. Secondary windows
+use `NSWindowCollectionBehaviorFullScreenAuxiliary`, allowing one created after
+startup to appear over the primary full-screen Space.
+
+Programmatic removal with `w` does not close the native window. It removes an
+optional child-window relationship, calls `orderOut_()`, and stores the intact
+window/view/presenter/delegate group in `parked_map_resource`. A later `w`
+restores that same group instead of allocating another Cocoa window. This
+avoids both AppKit full-screen lifecycle races and zombie PyObjC wrappers.
+
+If the user closes the map through its window control, AppKit has already begun
+the native close. In that path, disposal of heavyweight presenter/view content
+is deferred until `windowWillClose_` has returned. Timer callbacks are bound
+controller methods and never closures that capture Cocoa objects. Lightweight
+bridged wrappers remain retained in `retired_map_resources` until the player
+process exits. All created windows also set `releasedWhenClosed` to false.
+These lifetime rules prevent Python 3.14/PyObjC from calling `objc_release` or
+`object_getClass` for an AppKit object that has already been destroyed.
+
 ### Stage Time-Lapse Mode
 
 `--time-lapse-stages` starts the player in stage-map mode. A stage consists of
-one `#Map:` row and its following media rows until the next `#Map:`. The stage
+one map directive and its following media rows until the next map directive. The stage
 map is rendered by a retained `TimeLapseMapView`; the overview is drawn in the
 map role with the complete active route and current position. This avoids
 allocating a new full-screen image for every 20 ms animation tick.
+
+`parse_map_directive(...)` distinguishes canonical stages from
+`#MapBefore:`/`#MapAfter:` and `#MediaMap:`. Adjacent-day and media-only
+directives create static Time-Lapse
+stages: the map is shown alone for one media duration, then media is shown
+sequentially in route-aware white frames. Their route remains highlighted in
+the overview, but they have no moving marker or travelled-distance metrics and
+do not contribute to `_time_lapse_distance_before_stage(...)`. Media markers
+use the media sidecar coordinates, with control-row coordinates as fallback.
+Standard playback draws the fixed English relation title on the associated
+map. Resume, history, `T`, and `w` use the common directive parser.
+
+Media-only stages have no route highlight, moving pilgrim/arrow, distance, or
+height metrics. Every displayed medium marks its GPS position on the location
+map and overview. The location map uses the standard marker plus a fixed
+45-degree arrow. In both regular and media-only Time-Lapse stages, markers and
+arrows are drawn before the framed medium, so the medium may cover them. The
+editor writes a debounced recovery file and minute-spaced
+snapshots under `.mycamino-control-backups`; when a newer recovery file is
+found, reopening the table offers to restore it. Saving replaces the real list
+atomically and removes the active recovery file.
 
 `--time-lapse-duration SECONDS` controls active route motion and defaults to
 30 seconds. In time-lapse mode, the existing `--duration` setting is the
@@ -360,6 +488,18 @@ order at the end of its stage. `T` switches between normal and time-lapse mode
 without intentionally skipping a media row. Entering time-lapse cancels the
 standard continuation timer and presenter transitions, then hides every
 standard content layer so both modes cannot animate concurrently.
+
+With no map presenter, a fresh Time-Lapse stage first displays the overview in
+the stage view as a framed medium for `--duration`, then starts route motion.
+`draw_time_lapse_overview_media(...)` projects the active stage's repaired
+track points through the overview sidecar coordinates before the rendered
+overview is scaled into its media frame, preserving the route highlight.
+`timelapse.overview_as_media=false` or `--time-lapse-overview-fullscreen`
+retains the former full-window presentation. A resumed stage starts at its
+saved progress without replaying that overview. Standard
+single-window playback retains the overview, track-map, media sequence. The
+shared transition-completion guard explicitly permits the temporary Time-Lapse
+overview callback while rejecting stale Standard callbacks.
 
 `--time-lapse-media-min-fraction FRACTION` sets the preferred minimum size of
 the complete white-framed medium and defaults to `0.5`. It is not an upper
@@ -428,9 +568,10 @@ main thread, stores or clears `slideshow_resume_position` in the `.adv` payload,
 and saves the adventure automatically.
 
 Before a later launch, the GUI validates the stored control-file path, row
-range, and line text. Its modal Yes/No buttons have `y` and `n` key equivalents.
-When accepted, it passes `--resume-index`, `--resume-progress`, and
-`--resume-media-index` as applicable. The same optional values are available to
+range, and line text. **Start** deliberately omits resume arguments and begins
+at the beginning. **Continue** is enabled when saved state exists and passes
+`--resume-index`, `--resume-progress`, and `--resume-media-index` after
+validation, without a modal confirmation. The same optional values are available to
 `config_from_options(...)` and `run_with_options(...)`. Standard playback
 reopens the exact media/map row; Time-Lapse reconstructs the containing stage,
 marker progress, and visible medium. Edited or replaced control files invalidate

@@ -34,6 +34,8 @@ from plot_metadata_utils import (
     read_photo_metadata,
     write_photo_metadata,
 )
+from gpx_tracks_table import render_media_location_map
+from track_map_layout_utils import time_lapse_track_map_name
 
 
 IMAGE_EXTENSIONS = {
@@ -143,6 +145,7 @@ def sleep_with_cancel(seconds: float) -> None:
 
 
 LOCAL_TIMEZONE = detect_local_timezone()
+ADJACENT_TRACK_RADIUS_FRACTION = 0.5
 
 
 try:
@@ -182,6 +185,7 @@ class Params:
     merge_tracks: Optional[Path]
     merge_media: tuple[Path, ...]
     migrate_media_sidecars: bool = False
+    media_map_options: Optional[dict[str, Any]] = None
     progress_callback: Optional[Callable[[int, int, str], None]] = None
 
 
@@ -222,6 +226,20 @@ class TrackInfo:
     start_time: datetime
     track_plot_image_filename: str
     original_sequence_number: int
+    length_km: Optional[float] = None
+    start_latitude: Optional[float] = None
+    start_longitude: Optional[float] = None
+    end_latitude: Optional[float] = None
+    end_longitude: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class AdjacentDayAssignment:
+    """One media-to-track relation for a date without an exact track."""
+
+    relation: str
+    track: TrackInfo
+    distance_m: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -430,6 +448,7 @@ def params_from_options(
     merge_tracks: Path | str | None = None,
     merge_media: list[Path | str] | tuple[Path | str, ...] | str | None = None,
     migrate_media_sidecars: bool = False,
+    media_map_options: Optional[dict[str, Any]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Params:
     """Build validated parameters for direct in-process execution."""
@@ -520,6 +539,7 @@ def params_from_options(
         merge_tracks=merge_tracks_path,
         merge_media=merge_media_paths,
         migrate_media_sidecars=bool(migrate_media_sidecars),
+        media_map_options=dict(media_map_options) if media_map_options is not None else None,
         progress_callback=progress_callback,
     )
 
@@ -1235,6 +1255,22 @@ def normalize_track_plot_filename_for_match(path_text: str) -> str:
     return name
 
 
+def _optional_float(value: object) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _coordinate_pair(value: object) -> tuple[Optional[float], Optional[float]]:
+    if not isinstance(value, dict):
+        return None, None
+    latitude = _optional_float(value.get("lat", value.get("latitude")))
+    longitude = _optional_float(value.get("lon", value.get("longitude")))
+    return latitude, longitude
+
+
 def is_resolved_place_name(place: Optional[str]) -> bool:
     """Return True when a place string is a resolved human-readable place name."""
     return bool(place and place not in {PLACE_NOT_AVAILABLE, PLACE_NOT_REQUESTED, PLACE_FAILED})
@@ -1257,6 +1293,59 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
         + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
     )
     return 2.0 * earth_radius_m * math.atan2(math.sqrt(haversine), math.sqrt(1.0 - haversine))
+
+
+def assign_adjacent_day_track(
+    record: PhotoRecord,
+    tracks_in_order: list[TrackInfo],
+) -> Optional[AdjacentDayAssignment]:
+    """Assign media on a trackless date to a nearby previous/next stage."""
+    record_day = record.photo_datetime.date()
+    if any(track.start_time.date() == record_day for track in tracks_in_order):
+        return None
+    has_gps = record.latitude is not None and record.longitude is not None
+    candidates: list[tuple[float, int, int, AdjacentDayAssignment]] = []
+    for order_index, track in enumerate(tracks_in_order):
+        day_delta = (track.start_time.date() - record_day).days
+        if day_delta == 1:
+            relation = "before"
+            relation_priority = 0
+            endpoint = (track.start_latitude, track.start_longitude)
+        elif day_delta == -1:
+            relation = "after"
+            relation_priority = 1
+            endpoint = (track.end_latitude, track.end_longitude)
+        else:
+            continue
+        distance = None
+        if has_gps:
+            if (
+                track.length_km is None
+                or track.length_km <= 0.0
+                or endpoint[0] is None
+                or endpoint[1] is None
+            ):
+                continue
+            distance = distance_meters(
+                float(record.latitude),
+                float(record.longitude),
+                float(endpoint[0]),
+                float(endpoint[1]),
+            )
+            if distance > track.length_km * 1000.0 * ADJACENT_TRACK_RADIUS_FRACTION:
+                continue
+        assignment = AdjacentDayAssignment(relation, track, distance)
+        candidates.append(
+            (
+                float("inf") if distance is None else distance,
+                relation_priority,
+                order_index,
+                assignment,
+            )
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[:3])[3]
 
 
 def find_nearby_known_place(
@@ -1323,6 +1412,9 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
             original_sequence_number = int(item.get("original_sequence_number", item.get("nr", len(tracks) + 1)))
         except (TypeError, ValueError):
             original_sequence_number = len(tracks) + 1
+        length_km = _optional_float(item.get("laenge_km", item.get("track_length_km")))
+        start_latitude, start_longitude = _coordinate_pair(item.get("start_point"))
+        end_latitude, end_longitude = _coordinate_pair(item.get("end_point"))
         if isinstance(item.get("track_plot_image_filename"), str):
             ignored_photo_names.add(normalize_filename_for_match(str(item["track_plot_image_filename"])))
         if start_time is None or not image_name:
@@ -1332,6 +1424,11 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
                 start_time=start_time,
                 track_plot_image_filename=image_name,
                 original_sequence_number=original_sequence_number,
+                length_km=length_km,
+                start_latitude=start_latitude,
+                start_longitude=start_longitude,
+                end_latitude=end_latitude,
+                end_longitude=end_longitude,
             )
         )
 
@@ -1909,35 +2006,374 @@ def sort_records_for_output(
     return sorted(records, key=sort_key)
 
 
+def build_control_sections(
+    records: list[PhotoRecord],
+    tracks_summary: Optional[TracksSummary],
+    sort_date_sections_by_tracks: bool,
+    media_map_filenames: Optional[dict[date, str]] = None,
+) -> list[dict[str, Any]]:
+    """Build ordered normal, adjacent-day, and leftover date sections."""
+    tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
+    if sort_date_sections_by_tracks:
+        ordered_tracks = sorted(tracks, key=lambda track: (track.original_sequence_number, track.start_time))
+    else:
+        ordered_tracks = sorted(tracks, key=lambda track: (track.start_time, track.original_sequence_number))
+    tracks_by_date: dict[date, list[TrackInfo]] = {}
+    for track in ordered_tracks:
+        tracks_by_date.setdefault(track.start_time.date(), []).append(track)
+
+    exact_records: dict[date, list[PhotoRecord]] = {}
+    adjacent_records: dict[tuple[str, int, str, date], list[PhotoRecord]] = {}
+    adjacent_assignments: dict[tuple[str, int, str, date], AdjacentDayAssignment] = {}
+    leftover_records: dict[date, list[PhotoRecord]] = {}
+    for record in records:
+        record_day = record.photo_datetime.date()
+        if record_day in tracks_by_date:
+            exact_records.setdefault(record_day, []).append(record)
+            continue
+        assignment = assign_adjacent_day_track(record, ordered_tracks)
+        if assignment is None:
+            leftover_records.setdefault(record_day, []).append(record)
+            continue
+        key = (
+            assignment.relation,
+            assignment.track.original_sequence_number,
+            assignment.track.track_plot_image_filename,
+            record_day,
+        )
+        adjacent_records.setdefault(key, []).append(record)
+        adjacent_assignments[key] = assignment
+
+    def sorted_media(items: list[PhotoRecord]) -> list[PhotoRecord]:
+        return sorted(items, key=lambda item: (item.photo_datetime, item.source_filename.lower()))
+
+    track_groups: list[dict[str, Any]] = []
+    ordered_dates: list[date] = []
+    for track in ordered_tracks:
+        track_day = track.start_time.date()
+        if track_day not in ordered_dates:
+            ordered_dates.append(track_day)
+    for track_day in ordered_dates:
+        day_tracks = tracks_by_date[track_day]
+        group_sections: list[dict[str, Any]] = []
+        day_track_keys = {
+            (track.original_sequence_number, track.track_plot_image_filename)
+            for track in day_tracks
+        }
+        for relation in ("before", "normal", "after"):
+            if relation == "normal":
+                if track_day in exact_records:
+                    group_sections.append(
+                        {
+                            "date": track_day,
+                            "maps": [("Map", track.track_plot_image_filename) for track in day_tracks],
+                            "records": sorted_media(exact_records[track_day]),
+                            "relation": None,
+                        }
+                    )
+                continue
+            matching_keys = [
+                key
+                for key, assignment in adjacent_assignments.items()
+                if assignment.relation == relation
+                and (assignment.track.original_sequence_number, assignment.track.track_plot_image_filename) in day_track_keys
+            ]
+            matching_keys.sort(key=lambda key: (key[3], key[1], key[2].casefold()))
+            for key in matching_keys:
+                assignment = adjacent_assignments[key]
+                keyword = "MapBefore" if relation == "before" else "MapAfter"
+                group_sections.append(
+                    {
+                        "date": key[3],
+                        "maps": [(keyword, assignment.track.track_plot_image_filename)],
+                        "records": sorted_media(adjacent_records[key]),
+                        "relation": relation,
+                    }
+                )
+
+        if group_sections:
+            track_groups.append(
+                {
+                    "date": track_day,
+                    "sections": group_sections,
+                    "sequence": min(track.original_sequence_number for track in day_tracks),
+                }
+            )
+
+    map_names = media_map_filenames or {}
+    media_groups = [
+        {
+            "date": record_day,
+            "sections": [
+                {
+                    "date": record_day,
+                    "maps": [
+                        ("MediaMap", map_names[record_day])
+                    ] if record_day in map_names else [],
+                    "records": sorted_media(items),
+                    "relation": "media" if record_day in map_names else None,
+                }
+            ],
+            "sequence": None,
+        }
+        for record_day, items in leftover_records.items()
+    ]
+
+    if sort_date_sections_by_tracks:
+        groups = list(track_groups)
+        for media_group in sorted(media_groups, key=lambda item: item["date"]):
+            insert_at = len(groups)
+            for index, group in enumerate(groups):
+                if media_group["date"] < group["date"]:
+                    insert_at = index
+                    break
+                if media_group["date"] == group["date"]:
+                    media_records = media_group["sections"][0]["records"]
+                    track_records = [
+                        record
+                        for section in group["sections"]
+                        if section.get("relation") is None
+                        for record in section["records"]
+                    ]
+                    media_average = sum(record.photo_datetime.timestamp() for record in media_records) / len(media_records)
+                    track_times = [record.photo_datetime.timestamp() for record in track_records]
+                    if track_times and media_average <= (min(track_times) + max(track_times)) / 2.0:
+                        insert_at = index
+                    else:
+                        insert_at = index + 1
+                    break
+            groups.insert(insert_at, media_group)
+    else:
+        groups = sorted(
+            track_groups + media_groups,
+            key=lambda item: (
+                item["date"],
+                0 if item["sequence"] is not None else 1,
+                item["sequence"] if item["sequence"] is not None else 0,
+            ),
+        )
+        # Keep media blocks outside the complete before/track/after group. On a
+        # shared date, use average capture time to choose the side of the group.
+        for media_group in [group for group in list(groups) if group["sequence"] is None]:
+            matching = next(
+                (group for group in groups if group["sequence"] is not None and group["date"] == media_group["date"]),
+                None,
+            )
+            if matching is None:
+                continue
+            groups.remove(media_group)
+            track_records = [
+                record
+                for section in matching["sections"]
+                if section.get("relation") is None
+                for record in section["records"]
+            ]
+            media_records = media_group["sections"][0]["records"]
+            media_average = sum(record.photo_datetime.timestamp() for record in media_records) / len(media_records)
+            track_times = [record.photo_datetime.timestamp() for record in track_records]
+            matching_index = groups.index(matching)
+            insert_at = matching_index
+            if not track_times or media_average > (min(track_times) + max(track_times)) / 2.0:
+                insert_at += 1
+            groups.insert(insert_at, media_group)
+
+    return [section for group in groups for section in group["sections"]]
+
+
+def media_map_filename(sorted_output_path: Path, media_day: date, filename_base: Optional[str] = None) -> str:
+    """Return a deterministic project-local filename for one media-only map."""
+    base = str(filename_base or sorted_output_path.stem)
+    if base.endswith("-sorted"):
+        base = base[:-7]
+    safe_base = re.sub(r"[^\w.-]+", "_", base, flags=re.UNICODE).strip("_") or "adventure"
+    return f"{safe_base}-media-{media_day.isoformat()}.png"
+
+
+def media_map_output_filename(canonical_filename: str, map_layout: str) -> str:
+    """Return the selected variant filename while keeping control rows canonical."""
+    if str(map_layout) == "time-lapse":
+        return time_lapse_track_map_name(canonical_filename)
+    return canonical_filename
+
+
+def render_media_map_specs(
+    specs: list[dict[str, Any]],
+    sorted_output_path: Path,
+    options: Optional[dict[str, Any]],
+) -> list[Path]:
+    """Render media-map specifications through one shared variant-aware path."""
+    if options is None:
+        return []
+    output_dir = Path(options.get("output_dir") or (sorted_output_path.parent / "trackimages"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    map_layout = str(options.get("map_layout", "standard"))
+    render_options = {
+        key: value
+        for key, value in options.items()
+        if key not in {"output_dir", "filename_base"}
+    }
+    rendered = []
+    for spec in specs:
+        check_cancelled()
+        output_name = media_map_output_filename(spec["filename"], map_layout)
+        print(f"Creating {map_layout} media location map: {output_name}")
+        render_media_location_map(
+            spec["coordinates"],
+            spec["date"],
+            output_dir / output_name,
+            **render_options,
+        )
+        rendered.append((output_dir / output_name).resolve(strict=False))
+    return rendered
+
+
+def create_media_maps_for_sections(
+    sections: list[dict[str, Any]],
+    sorted_output_path: Path,
+    options: Optional[dict[str, Any]],
+) -> dict[date, str]:
+    """Render location maps for leftover date sections that contain GPS media."""
+    if options is None:
+        return {}
+    filename_base = options.get("filename_base")
+    filenames: dict[date, str] = {}
+    specs = []
+    for section in sections:
+        check_cancelled()
+        if section.get("maps") or not section.get("records"):
+            continue
+        coordinates = [
+            (record.latitude, record.longitude)
+            for record in section["records"]
+            if record.latitude is not None and record.longitude is not None
+        ]
+        if not coordinates:
+            continue
+        filename = media_map_filename(sorted_output_path, section["date"], filename_base)
+        specs.append({"date": section["date"], "filename": filename, "coordinates": coordinates})
+        filenames[section["date"]] = filename
+    render_media_map_specs(specs, sorted_output_path, options)
+    return filenames
+
+
+def add_media_maps_to_control_entries(
+    entries: list[dict[str, Any]],
+    sorted_output_path: Path,
+    options: Optional[dict[str, Any]],
+) -> int:
+    """Create and insert maps for mapless date sections in a merged list."""
+    if options is None:
+        return 0
+    inserted = 0
+    for header_index, end_index in reversed(_control_section_ranges(entries)):
+        section_entries = entries[header_index + 1 : end_index]
+        if any(entry.get("type") in {"map", "map_before", "map_after"} for entry in section_entries):
+            continue
+        existing_media_map = next(
+            (entry for entry in section_entries if entry.get("type") == "media_map"),
+            None,
+        )
+        coordinates = control_media_coordinates(section_entries)
+        media_day = entries[header_index].get("date")
+        if not coordinates or not isinstance(media_day, date):
+            continue
+        filename = (
+            str(existing_media_map.get("name"))
+            if existing_media_map is not None and existing_media_map.get("name")
+            else media_map_filename(sorted_output_path, media_day, options.get("filename_base"))
+        )
+        if existing_media_map is not None:
+            continue
+        entries.insert(
+            header_index + 1,
+            {
+                "line": f"#MediaMap: {filename}",
+                "type": "media_map",
+                "date": media_day,
+                "name": filename,
+            },
+        )
+        inserted += 1
+    render_media_map_specs(
+        media_map_specs_from_control_entries(entries),
+        sorted_output_path,
+        options,
+    )
+    return inserted
+
+
+def control_media_coordinates(entries: list[dict[str, Any]]) -> list[tuple[float, float]]:
+    """Extract ordered GPS coordinates from media rows in one control section."""
+    coordinates = []
+    for entry in entries:
+        if entry.get("type") != "media":
+            continue
+        parts = [part.strip() for part in str(entry.get("line", "")).split("|")]
+        if len(parts) < 3 or "," not in parts[2]:
+            continue
+        try:
+            latitude_text, longitude_text = parts[2].split(",", 1)
+            coordinates.append((float(latitude_text), float(longitude_text)))
+        except ValueError:
+            continue
+    return coordinates
+
+
+def media_map_specs_from_control_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return canonical media-map render specifications from parsed control rows."""
+    specs = []
+    for header_index, end_index in _control_section_ranges(entries):
+        media_day = entries[header_index].get("date")
+        section_entries = entries[header_index + 1 : end_index]
+        media_map_entry = next(
+            (entry for entry in section_entries if entry.get("type") == "media_map"),
+            None,
+        )
+        if media_map_entry is None or not isinstance(media_day, date):
+            continue
+        coordinates = control_media_coordinates(section_entries)
+        if not coordinates:
+            continue
+        specs.append(
+            {
+                "date": media_day,
+                "filename": str(media_map_entry.get("name", "")).strip(),
+                "coordinates": coordinates,
+            }
+        )
+    return [spec for spec in specs if spec["filename"]]
+
+
 def write_sorted_output(
     records: list[PhotoRecord],
     sorted_output_path: Path,
     tracks_summary: Optional[TracksSummary],
     sort_date_sections_by_tracks: bool = False,
+    media_map_options: Optional[dict[str, Any]] = None,
 ) -> None:
     """Write the grouped sorted list after collecting all records."""
-    sorted_records = sort_records_for_output(records, tracks_summary, sort_date_sections_by_tracks)
+    sections = build_control_sections(records, tracks_summary, sort_date_sections_by_tracks)
+    media_map_filenames = create_media_maps_for_sections(sections, sorted_output_path, media_map_options)
+    if media_map_filenames:
+        sections = build_control_sections(
+            records,
+            tracks_summary,
+            sort_date_sections_by_tracks,
+            media_map_filenames,
+        )
     sorted_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sorted_output_path.open("w", encoding="utf-8") as output_file:
         if tracks_summary and tracks_summary.overview_image:
             output_file.write(f"#Overviewmap: {tracks_summary.overview_image}\n")
 
-        current_date_label = None
-        for record in sorted_records:
-            date_label = format_german_date(record.photo_datetime)
-            if date_label != current_date_label:
-                output_file.write(f"#Datum: {date_label}\n")
-                if tracks_summary:
-                    for track in tracks_summary.tracks:
-                        if track.start_time.date() == record.photo_datetime.date():
-                            output_file.write(f"#Map: {track.track_plot_image_filename}\n")
-                current_date_label = date_label
-
-            time_text = record.photo_datetime.strftime("%H:%M")
-            gps_text = format_gps_text(record.latitude, record.longitude)
-            place_text = format_place_text(record.latitude, record.longitude, record.place, record.geocode_requested)
-            output_file.write(f"{record.source_filename} | {time_text} | {gps_text} | {place_text}\n")
+        for section in sections:
+            date_datetime = datetime.combine(section["date"], datetime.min.time()).replace(tzinfo=LOCAL_TIMEZONE)
+            output_file.write(f"#Datum: {format_german_date(date_datetime)}\n")
+            for keyword, filename in section["maps"]:
+                output_file.write(f"#{keyword}: {filename}\n")
+            for record in section["records"]:
+                output_file.write(sorted_media_output_line(record) + "\n")
 
 
 def parse_german_date_label(value: str) -> Optional[date]:
@@ -1989,6 +2425,12 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
                 entry.update({"type": "overview"})
             elif normalized == "map":
                 entry.update({"type": "map"})
+            elif normalized == "mapbefore":
+                entry.update({"type": "map_before", "relation": "before"})
+            elif normalized == "mapafter":
+                entry.update({"type": "map_after", "relation": "after"})
+            elif normalized == "mediamap":
+                entry.update({"type": "media_map", "relation": "media"})
         else:
             parts = [part.strip() for part in stripped.split("|")]
             if parts:
@@ -2001,6 +2443,78 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
                         pass
         entries.append(entry)
     return entries
+
+
+def remove_control_track_map_entries(control_file_path: Path | str, names_to_remove: list[str]) -> int:
+    """Remove selected overview/map lines without touching dates or media rows."""
+    names = {
+        normalize_filename_for_match(name)
+        for name in names_to_remove
+        if str(name).strip()
+    }
+    map_names = {
+        normalize_track_plot_filename_for_match(name)
+        for name in names_to_remove
+        if str(name).strip()
+    }
+    if not names and not map_names:
+        return 0
+    path = Path(control_file_path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept_lines = []
+    removed = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            keyword, _separator, value = stripped[1:].partition(":")
+            normalized_keyword = keyword.strip().lower()
+            name = value.strip()
+            if normalized_keyword == "overviewmap" and normalize_filename_for_match(name) in names:
+                removed += 1
+                continue
+            if normalized_keyword == "map" and normalize_track_plot_filename_for_match(name) in map_names:
+                removed += 1
+                continue
+            if normalized_keyword in {"mapbefore", "mapafter"} and normalize_track_plot_filename_for_match(name) in map_names:
+                removed += 1
+                continue
+        kept_lines.append(line)
+    if removed:
+        path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8")
+    return removed
+
+
+def update_control_special_map_entries(
+    control_file_path: Path | str,
+    replacements: dict[str, str],
+) -> int:
+    """Update MapBefore/MapAfter filenames while preserving their directives."""
+    normalized_replacements = {
+        normalize_track_plot_filename_for_match(old): new
+        for old, new in replacements.items()
+        if str(old).strip() and str(new).strip()
+    }
+    if not normalized_replacements:
+        return 0
+    path = Path(control_file_path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    changed = 0
+    output = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            keyword, separator, value = stripped[1:].partition(":")
+            if separator and keyword.strip().lower() in {"mapbefore", "mapafter"}:
+                replacement = normalized_replacements.get(
+                    normalize_track_plot_filename_for_match(value.strip())
+                )
+                if replacement is not None and replacement != value.strip():
+                    line = f"#{keyword.strip()}: {replacement}"
+                    changed += 1
+        output.append(line)
+    if changed:
+        path.write_text("\n".join(output) + ("\n" if output else ""), encoding="utf-8")
+    return changed
 
 
 def date_order_key(day: date, tracks_summary: Optional[TracksSummary], sort_date_sections_by_tracks: bool) -> tuple[int, date]:
@@ -2125,6 +2639,195 @@ def insert_media_entry(
     )
 
 
+def _control_section_ranges(entries: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    headers = [index for index, entry in enumerate(entries) if entry.get("type") == "date"]
+    return [
+        (header, headers[index + 1] if index + 1 < len(headers) else len(entries))
+        for index, header in enumerate(headers)
+    ]
+
+
+def _track_number_from_map_name(filename: str) -> Optional[int]:
+    match = re.match(r"^0*(\d+)_", normalize_filename_for_match(filename))
+    return int(match.group(1)) if match else None
+
+
+def _map_name_matches_track(candidate: str, expected: str) -> bool:
+    if normalize_track_plot_filename_for_match(candidate) == normalize_track_plot_filename_for_match(expected):
+        return True
+    candidate_number = _track_number_from_map_name(candidate)
+    expected_number = _track_number_from_map_name(expected)
+    return candidate_number is not None and candidate_number == expected_number
+
+
+def _insert_media_in_section(
+    entries: list[dict[str, Any]],
+    header_index: int,
+    end_index: int,
+    record: PhotoRecord,
+) -> None:
+    insert_at = header_index + 1
+    for index in range(header_index + 1, end_index):
+        entry = entries[index]
+        if entry.get("type") in {"map", "map_before", "map_after"}:
+            insert_at = index + 1
+            continue
+        if entry.get("type") != "media":
+            continue
+        existing_datetime = entry.get("datetime")
+        if existing_datetime is not None and existing_datetime > record.photo_datetime:
+            break
+        insert_at = index + 1
+    entries.insert(
+        insert_at,
+        {
+            "line": sorted_media_output_line(record),
+            "type": "media",
+            "date": record.photo_datetime.date(),
+            "datetime": record.photo_datetime,
+            "name": record.source_filename,
+        },
+    )
+
+
+def _new_date_entry(day: date) -> dict[str, Any]:
+    label = format_german_date(datetime.combine(day, datetime.min.time()).replace(tzinfo=LOCAL_TIMEZONE))
+    return {"line": f"#Datum: {label}", "type": "date", "date": day, "date_label": label, "name": label}
+
+
+def insert_adjacent_media_entry(
+    entries: list[dict[str, Any]],
+    record: PhotoRecord,
+    assignment: AdjacentDayAssignment,
+) -> None:
+    """Insert merged media into a matching or newly created special section."""
+    day = record.photo_datetime.date()
+    special_type = "map_before" if assignment.relation == "before" else "map_after"
+    keyword = "MapBefore" if assignment.relation == "before" else "MapAfter"
+    for header_index, end_index in _control_section_ranges(entries):
+        if entries[header_index].get("date") != day:
+            continue
+        if any(
+            entry.get("type") == special_type
+            and _map_name_matches_track(str(entry.get("name", "")), assignment.track.track_plot_image_filename)
+            for entry in entries[header_index + 1 : end_index]
+        ):
+            _insert_media_in_section(entries, header_index, end_index, record)
+            return
+
+    target_section = None
+    for header_index, end_index in _control_section_ranges(entries):
+        if any(
+            entry.get("type") == "map"
+            and _map_name_matches_track(str(entry.get("name", "")), assignment.track.track_plot_image_filename)
+            for entry in entries[header_index + 1 : end_index]
+        ):
+            target_section = (header_index, end_index)
+            break
+    if target_section is None:
+        insert_at = len(entries)
+    elif assignment.relation == "before":
+        insert_at = target_section[0]
+    else:
+        insert_at = target_section[1]
+    entries[insert_at:insert_at] = [
+        _new_date_entry(day),
+        {
+            "line": f"#{keyword}: {assignment.track.track_plot_image_filename}",
+            "type": special_type,
+            "relation": assignment.relation,
+            "date": day,
+            "name": assignment.track.track_plot_image_filename,
+        },
+    ]
+    _insert_media_in_section(entries, insert_at, insert_at + 2, record)
+
+
+def insert_classified_media_entry(
+    entries: list[dict[str, Any]],
+    record: PhotoRecord,
+    tracks_summary: Optional[TracksSummary],
+    sort_date_sections_by_tracks: bool,
+) -> None:
+    """Insert merged media into an exact, adjacent, or trailing leftover section."""
+    tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
+    tracks_in_order = sorted(
+        tracks,
+        key=(
+            (lambda track: (track.original_sequence_number, track.start_time))
+            if sort_date_sections_by_tracks
+            else (lambda track: (track.start_time, track.original_sequence_number))
+        ),
+    )
+    day = record.photo_datetime.date()
+    day_tracks = [track for track in tracks_in_order if track.start_time.date() == day]
+    if day_tracks:
+        for header_index, end_index in _control_section_ranges(entries):
+            if entries[header_index].get("date") != day:
+                continue
+            if any(entry.get("type") == "map" for entry in entries[header_index + 1 : end_index]):
+                _insert_media_in_section(entries, header_index, end_index, record)
+                return
+        insert_at = len(entries)
+        entries[insert_at:insert_at] = [
+            _new_date_entry(day),
+            *[
+                {
+                    "line": f"#Map: {track.track_plot_image_filename}",
+                    "type": "map",
+                    "date": day,
+                    "name": track.track_plot_image_filename,
+                }
+                for track in day_tracks
+            ],
+        ]
+        _insert_media_in_section(entries, insert_at, insert_at + 1 + len(day_tracks), record)
+        return
+
+    # Reuse the complete creation classifier so Merge cannot diverge from the
+    # exact-date and adjacent-day passes used for a newly created list.
+    classified_sections = build_control_sections(
+        [record],
+        tracks_summary,
+        sort_date_sections_by_tracks,
+    )
+    classified_maps = classified_sections[0].get("maps", []) if classified_sections else []
+    if classified_maps and classified_maps[0][0] in {"MapBefore", "MapAfter"}:
+        keyword, track_filename = classified_maps[0]
+        matched_track = next(
+            (
+                track
+                for track in tracks_in_order
+                if _map_name_matches_track(track.track_plot_image_filename, track_filename)
+            ),
+            None,
+        )
+        if matched_track is not None:
+            insert_adjacent_media_entry(
+                entries,
+                record,
+                AdjacentDayAssignment(
+                    "before" if keyword == "MapBefore" else "after",
+                    matched_track,
+                    None,
+                ),
+            )
+            return
+
+    for header_index, end_index in _control_section_ranges(entries):
+        if entries[header_index].get("date") != day:
+            continue
+        if not any(
+            entry.get("type") in {"map", "map_before", "map_after"}
+            for entry in entries[header_index + 1 : end_index]
+        ):
+            _insert_media_in_section(entries, header_index, end_index, record)
+            return
+    insert_at = len(entries)
+    entries.insert(insert_at, _new_date_entry(day))
+    _insert_media_in_section(entries, insert_at, insert_at + 1, record)
+
+
 def record_for_merge_media(params: Params, media_path: Path) -> PhotoRecord:
     """Build or load metadata for one media file being merged."""
     json_path = get_json_path_for_photo(media_path)
@@ -2196,7 +2899,6 @@ def merge_sorted_control_file(params: Params) -> Path:
             normalized_map_name = normalize_track_plot_filename_for_match(track.track_plot_image_filename)
             if (
                 not track.track_plot_image_filename
-                or normalized_name in existing_names
                 or normalized_map_name in existing_map_names
             ):
                 continue
@@ -2210,14 +2912,21 @@ def merge_sorted_control_file(params: Params) -> Path:
         normalized_name = normalize_filename_for_match(record.source_filename)
         if normalized_name in existing_names or normalized_name in existing_media_names:
             continue
-        insert_media_entry(entries, record, tracks_summary, params.sort_date_sections_by_tracks)
+        insert_classified_media_entry(entries, record, tracks_summary, params.sort_date_sections_by_tracks)
         existing_names.add(normalized_name)
         existing_media_names.add(normalized_name)
         inserted_media += 1
 
+    inserted_media_maps = add_media_maps_to_control_entries(
+        entries,
+        sorted_output_path,
+        params.media_map_options,
+    )
+
     sorted_output_path.write_text("\n".join(entry["line"] for entry in entries) + "\n", encoding="utf-8")
     print(
-        f"Merged {inserted_maps} track map/overview line(s) and {inserted_media} media line(s) into {sorted_output_path}",
+        f"Merged {inserted_maps} track map/overview line(s), {inserted_media_maps} media map(s), "
+        f"and {inserted_media} media line(s) into {sorted_output_path}",
         flush=True,
     )
     return sorted_output_path
@@ -2350,6 +3059,7 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
         build_sorted_output_path(params.photolist),
         tracks_summary,
         params.sort_date_sections_by_tracks,
+        params.media_map_options,
     )
     return None
 

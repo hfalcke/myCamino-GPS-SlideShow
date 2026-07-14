@@ -23,12 +23,162 @@ from GPSTrackShow import (
     previous_displayable_playlist_index,
     pilgrim_orientation_for_tangent,
     pilgrim_motion_threshold,
+    relation_title_band,
+    resolve_map_window,
+    set_runtime_map_window,
+    should_show_single_window_stage_overview,
+    slideshow_transition_completion_allowed,
     time_lapse_marker_style,
     time_lapse_media_minimum_pending,
 )
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_automatic_window_mode_uses_screen_count(self):
+        self.assertFalse(resolve_map_window(None, 1))
+        self.assertTrue(resolve_map_window(None, 2))
+        self.assertTrue(resolve_map_window(True, 1))
+        self.assertFalse(resolve_map_window(False, 2))
+
+    def test_single_window_stage_overview_is_only_for_fresh_stages(self):
+        self.assertTrue(should_show_single_window_stage_overview(False, 0.0, False))
+        self.assertFalse(should_show_single_window_stage_overview(True, 0.0, False))
+        self.assertFalse(should_show_single_window_stage_overview(False, 0.4, False))
+        self.assertFalse(should_show_single_window_stage_overview(False, 0.0, True))
+
+    def test_time_lapse_overview_transition_may_schedule_motion(self):
+        self.assertTrue(slideshow_transition_completion_allowed(True, True))
+        self.assertFalse(slideshow_transition_completion_allowed(True, False))
+        self.assertTrue(slideshow_transition_completion_allowed(False, False))
+
+    def test_closing_map_window_does_not_quit_player(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        map_window = object()
+        app.map_window = map_window
+        app.running = True
+        actions = []
+        app._deactivate_separate_map_window = lambda window_already_closing=False: actions.append(
+            ("map", window_already_closing)
+        )
+        app.quit = lambda: actions.append(("quit", True))
+        app.window_will_close(map_window, "map")
+        self.assertEqual(actions, [("map", True)])
+        app.window_will_close(object(), "photo")
+        self.assertEqual(actions[-1], ("quit", True))
+
+    def test_w_creates_and_removes_the_optional_map_window(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = type("ConfigStub", (), {"join_windows": False})()
+        app.map_window = None
+        actions = []
+        app._create_separate_map_window = lambda: actions.append("create")
+        app._deactivate_separate_map_window = lambda: actions.append("remove")
+        app._show_temporary_status_overlay = lambda text, _seconds: actions.append(text)
+        app._toggle_window_mode()
+        self.assertEqual(actions[:2], ["create", "Separate overview window"])
+
+        app.map_window = object()
+        app._toggle_window_mode()
+        self.assertEqual(actions[-2:], ["remove", "Single window"])
+
+    def test_retired_map_cleanup_uses_bound_callbacks_and_retains_wrappers(self):
+        class WindowStub:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class PresenterStub:
+            def __init__(self):
+                self.disposed = False
+
+            def dispose(self):
+                self.disposed = True
+
+        class ViewStub:
+            def __init__(self):
+                self.retired = False
+
+            def _retire_content(self):
+                self.retired = True
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        window = WindowStub()
+        presenter = PresenterStub()
+        view = ViewStub()
+        delegate = object()
+        resource = {
+            "window": window,
+            "presenter": presenter,
+            "delegate": delegate,
+            "view": view,
+            "state": "pending_close",
+            "disposed": False,
+        }
+        app.retired_map_resources = [resource]
+        app.window_delegates = [delegate]
+        scheduled = []
+        app.schedule_callback = lambda delay, callback: scheduled.append((delay, callback))
+
+        app._close_retired_map_windows()
+
+        self.assertTrue(window.closed)
+        self.assertEqual(resource["state"], "closed")
+        self.assertEqual(scheduled[0][0], 0.05)
+        self.assertIs(scheduled[0][1].__self__, app)
+        self.assertEqual(scheduled[0][1].__func__, GPSTrackShowApp._dispose_retired_map_windows)
+
+        scheduled[0][1]()
+        self.assertTrue(presenter.disposed)
+        self.assertTrue(view.retired)
+        self.assertTrue(resource["disposed"])
+        self.assertIs(app.retired_map_resources[0], resource)
+
+    def test_w_parks_map_window_without_closing_native_object(self):
+        class WindowStub:
+            def __init__(self):
+                self.ordered_out = False
+                self.closed = False
+                self.delegate_value = object()
+
+            def delegate(self):
+                return self.delegate_value
+
+            def parentWindow(self):
+                return None
+
+            def orderOut_(self, _sender):
+                self.ordered_out = True
+
+            def close(self):
+                self.closed = True
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = type("ConfigStub", (), {"join_windows": False, "mapwindow": True})()
+        app.map_window = WindowStub()
+        app.map_presenter = object()
+        app.time_map_view = object()
+        app.parked_map_resource = None
+        app.retired_map_resources = []
+        app.screen_swap = False
+        app.time_lapse_active = False
+        app.time_lapse_stage = None
+        app.role_targets = {}
+        app._update_window_titles = lambda *_args: None
+        app.schedule_callback = lambda *_args: self.fail("parking must not schedule window destruction")
+
+        original_window = app.map_window
+        original_delegate = original_window.delegate()
+        app._deactivate_separate_map_window()
+
+        self.assertTrue(original_window.ordered_out)
+        self.assertFalse(original_window.closed)
+        self.assertIs(original_window.delegate(), original_delegate)
+        self.assertIs(app.parked_map_resource["window"], original_window)
+        self.assertIsNone(app.map_window)
+        self.assertEqual(app.retired_map_resources, [])
+
     def test_arrow_navigation_resumes_only_in_previous_automatic_mode(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.manual_mode = False
@@ -58,6 +208,22 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         }
         for actual, expected in zip(map_plot_rect(image_rect, metadata), (180.0, 130.0, 640.0, 240.0)):
             self.assertAlmostEqual(actual, expected)
+
+    def test_relation_title_uses_top_five_percent_of_map_axes(self):
+        image_rect = (100.0, 50.0, 800.0, 400.0)
+        metadata = {
+            "axes_box_fraction": {
+                "left": 0.10,
+                "bottom": 0.20,
+                "width": 0.80,
+                "height": 0.60,
+            },
+            "media_clear_boxes": {"margin_fraction": 0.05},
+        }
+        actual = relation_title_band(image_rect, metadata)
+        expected = (180.0, 358.0, 640.0, 12.0)
+        for value, wanted in zip(actual, expected):
+            self.assertAlmostEqual(value, wanted)
 
     def test_missing_axes_metadata_uses_full_image_and_all_corners(self):
         image_rect = (100.0, 50.0, 800.0, 400.0)
@@ -167,9 +333,15 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             control_file = project_dir / "slides.lst"
             control_file.write_text("#Datum: 01.01.2024\n", encoding="utf-8")
             config = config_from_options(project_dir, inputlist=control_file)
+            set_runtime_map_window(config, True)
+            self.assertTrue(config.mapwindow)
+            set_runtime_map_window(config, False)
+            self.assertFalse(config.mapwindow)
             self.assertEqual(config.time_lapse_media_min_fraction, 0.5)
             self.assertEqual(config.time_lapse_media_max_fraction, 0.5)
             self.assertEqual(config.time_lapse_marker, "pilgrim")
+            self.assertTrue(config.time_lapse_overview_as_media)
+            self.assertFalse(config.track_map_before_media)
             self.assertEqual(
                 config_from_options(project_dir, inputlist=control_file, transition="blend").transition.value,
                 "BLEND",
@@ -181,6 +353,20 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
                 time_lapse_marker="arrow",
             )
             self.assertEqual(arrow_config.time_lapse_marker, "arrow")
+            self.assertTrue(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    track_map_before_media=True,
+                ).track_map_before_media
+            )
+            self.assertFalse(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    time_lapse_overview_as_media=False,
+                ).time_lapse_overview_as_media
+            )
             with self.assertRaises(ValueError):
                 config_from_options(
                     project_dir,

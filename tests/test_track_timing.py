@@ -21,6 +21,7 @@ from GPSTrackShow import (
     format_time_lapse_metrics,
     interpolate_timeline_point,
     interpolate_timeline_state,
+    parse_map_directive,
     parse_control_datetime,
     parse_iso_datetime,
     timed_points_from_metadata,
@@ -32,6 +33,31 @@ from track_timing_utils import haversine_km, repair_timed_points, timed_points_p
 
 
 class TrackTimingTests(unittest.TestCase):
+    def test_adjacent_day_map_directives_remain_distinct(self):
+        before = parse_map_directive("#MapBefore: 0001_stage.png")
+        normal = parse_map_directive("#Map: 0001_stage.png")
+        after = parse_map_directive("#MapAfter: 0001_stage.png")
+        media = parse_map_directive("#MediaMap: trip-media-2024-07-14.png")
+        self.assertEqual((before.filename, before.relation), ("0001_stage.png", "Day before"))
+        self.assertEqual((normal.filename, normal.relation), ("0001_stage.png", None))
+        self.assertEqual((after.filename, after.relation), ("0001_stage.png", "Day after"))
+        self.assertEqual((media.filename, media.relation), ("trip-media-2024-07-14.png", ""))
+        self.assertTrue(media.is_special)
+
+    def test_special_stage_keeps_its_date_and_carries_the_next_date_separately(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.current_date = "Sunday, 14.07.2024"
+        app.playlist_lines = [
+            "#MapBefore: stage.png",
+            "before.jpeg | 09:30 | - | -",
+            "#Datum: Monday, 15.07.2024",
+            "#Map: stage.png",
+        ]
+        stage = app._collect_time_lapse_stage(0, "stage.png", "Day before")
+        self.assertEqual(stage.date_text, "Sunday, 14.07.2024")
+        self.assertEqual(stage.media_date_texts, ["Sunday, 14.07.2024"])
+        self.assertEqual(stage.next_date_text, "Monday, 15.07.2024")
+
     def test_haversine_returns_kilometres(self):
         self.assertAlmostEqual(haversine_km(0.0, 0.0, 1.0, 0.0), 111.2, delta=0.2)
 
@@ -164,6 +190,29 @@ class TrackTimingTests(unittest.TestCase):
         self.assertEqual(app.playlist_index, 3)
         self.assertEqual(app.resume_media_index_pending, 5)
         self.assertEqual(primed, [3])
+
+    def test_time_lapse_resume_rewinds_adjacent_media_to_special_map(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(resume_index=4, start_track=1)
+        app.playlist_lines = [
+            "#Overviewmap: overview.png",
+            "#Datum: 31.12.2023",
+            "#MapBefore: stage.png",
+            "#Datum: 31.12.2023",
+            "photo.jpeg",
+            "#Datum: 01.01.2024",
+            "#Map: stage.png",
+        ]
+        app.time_lapse_active = True
+        app.resume_media_index_pending = None
+        app.resume_standard_map_index_pending = None
+        app.resume_start_pending = True
+        primed = []
+        app._prime_context_before_index = primed.append
+        app._apply_start_track()
+        self.assertEqual(app.playlist_index, 2)
+        self.assertEqual(app.resume_media_index_pending, 4)
+        self.assertEqual(primed, [2])
 
     def test_iso_timestamp_and_metadata_payload_are_parsed(self):
         first = "2020-10-17T11:00:00+00:00"
