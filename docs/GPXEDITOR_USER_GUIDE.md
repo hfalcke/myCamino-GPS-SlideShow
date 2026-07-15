@@ -42,8 +42,9 @@ The project name is stored in GPX metadata when saved.
 
 The gear button opens **GPX Editor Settings** with three sections:
 
-- GPX Processing: timestamp fallback, filtering, recovery interval, and
-  interactive map behavior.
+- GPX Processing: separate horizontal and elevation smoothing, retained-point
+  spacing, horizontal/vertical error and HDOP/VDOP limits, timestamp fallback,
+  recovery interval, and interactive map behavior.
 - PDF Export: document/map resolution, zoom, and tile limits.
 - Map Service: OpenStreetMap, Esri, or a custom tile service.
 
@@ -69,6 +70,9 @@ Behavior:
   empty.
 - Original GPX structure and metadata are preserved as much as possible.
 - Every track receives a unique `Nr.` that is not changed by sorting.
+- Large files are processed one track at a time. The status line and progress
+  bar show the current track while the window remains responsive; Help and
+  Quit remain available during loading.
 
 If an autosave recovery file exists from a previous session, the editor offers
 to load it.
@@ -98,7 +102,16 @@ Important behavior:
 - Name and Date & Time are editable.
 - Show controls whether a track is included in statistics, overview plots, and
   PDF output.
-- Numeric values are calculated from track points.
+- Numeric values, plots, Track Maps, PDFs, and Time-Lapse timing all use the
+  same segment-aware processed geometry. Raw GPX points remain unchanged.
+- Horizontal coordinates are smoothed over 10 m by default, and retained
+  output points are spaced by at least 10 m. Elevation uses its own 50 m
+  smoothing distance because GPS height is less precise.
+- Explicit horizontal/vertical uncertainty and HDOP/VDOP can reject unreliable
+  coordinates or elevations independently. Missing quality values are allowed.
+  A value of zero disables the corresponding filter or smoothing operation.
+- Ascent and descent use the processed elevation profile so normal altitude
+  jitter is not counted as repeated climbing.
 - Distance is measured from the current anchor point.
 - The final row summarizes visible tracks.
 - Click a column header to sort.
@@ -107,6 +120,14 @@ Important behavior:
 - Backspace/Delete deletes selected tracks after confirmation.
 - Double-click a track row to open the waypoint inspector and raise the track
   plot plus the associated elevation profile.
+
+The processing summary above the table always shows the active XY smoothing,
+spacing, elevation smoothing, error, and DOP limits. At the right end of the
+waypoint inspector, the compact **XY use** and **Elevation use** columns explain
+how each raw point was processed. `Used` means retained in the processed
+geometry, while `Smooth` is a valid point used only during smoothing. `Interp`
+includes the reason for elevation interpolation; other short values identify
+rejection reasons. The inspector header shows retained/raw point counts.
 
 Date sorting uses a special rule for tracks with missing, zero, or invalid
 duration: those tracks are placed by distance from the anchor among the regular
@@ -205,10 +226,12 @@ Common keys:
 - Cmd-+ / Cmd--: zoom two steps in or out.
 - `c`: center on cursor.
 - `z`: zoom to current selection.
-- `r`: reset to full map extent.
+- Shift-`Z`: reset to full map extent.
 - `p`: save current plot as PNG.
 - `u`: clear plot selection.
 - `e`: open or focus elevation profile.
+- Cmd-Z / Shift-Cmd-Z: undo or redo the last track edit.
+- Cmd-X: cut a track at the current cursor point in a track plot.
 - `q`: close plot window.
 
 Mouse:
@@ -234,7 +257,7 @@ Track editing keys:
 - Delete/Backspace: delete the point range from marker to cursor after
   confirmation.
 - `x`: cut the track at the cursor after confirmation.
-- `a`, `i`, `h`, `+`, `-`, `c`, `z`, `r`, `p`, `e`, `q`: same general behavior
+- `a`, `i`, `h`, `+`, `-`, `c`, `z`, Shift-`Z`, `p`, `e`, `q`: same general behavior
   as the overview plot.
 
 When points are deleted or a track is cut, the table and open plots are updated.
@@ -248,6 +271,14 @@ Plot windows can open an elevation profile.
 The profile shows elevation versus distance and follows the current plot cursor
 and selection. It can also open the waypoint inspector by double-clicking when
 appropriate.
+
+Press `h` to open the separate elevation-profile key reference. It closes a
+few seconds after the key is released. The profile supports the same cursor,
+selection, editing, track-navigation, PNG export, undo, and redo controls as
+the track plot. In addition, `y` fits the height axis to the elevations in the
+currently visible distance range with five percent headroom above and below.
+Press `0` to restore the zero-based default height axis; this does not change
+the current distance zoom.
 
 When the editor closes, plot and elevation windows close with it. Closing a
 track plot also closes its associated elevation profile, and closing an

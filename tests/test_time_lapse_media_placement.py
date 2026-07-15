@@ -342,6 +342,7 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             self.assertEqual(config.time_lapse_marker, "pilgrim")
             self.assertTrue(config.time_lapse_overview_as_media)
             self.assertFalse(config.track_map_before_media)
+            self.assertEqual(config.audio_crossfade_seconds, 2.0)
             self.assertEqual(
                 config_from_options(project_dir, inputlist=control_file, transition="blend").transition.value,
                 "BLEND",
@@ -378,6 +379,12 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
                     project_dir,
                     inputlist=control_file,
                     time_lapse_marker="unknown",
+                )
+            with self.assertRaises(ValueError):
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    audio_crossfade_seconds=31.0,
                 )
 
     def test_pilgrim_stands_and_resumes_with_frame_three(self):

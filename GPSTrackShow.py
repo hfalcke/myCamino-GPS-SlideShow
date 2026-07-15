@@ -41,6 +41,14 @@ from track_map_layout_utils import (
     map_plot_rect,
     resolve_track_map_variant,
 )
+from audio_playlist import AUDIO_EXTENSIONS, MusicTransportState, load_audio_playlist
+from slideshow_control_format import (
+    MusicAction,
+    MusicDirective,
+    MusicSyntaxError,
+    is_music_directive,
+    parse_music_directive,
+)
 
 try:
     import objc
@@ -179,6 +187,7 @@ KEY_HELP_LINES = [
     "Cmd + arrows          jump to previous/next date",
     "m                     toggle auto/manual mode",
     "p                     toggle place-name overlay",
+    "a                     toggle background audio",
     "+ / -                 change duration in auto mode",
     "c                     toggle analog clock overlay",
     "t                     cycle transition mode",
@@ -366,6 +375,9 @@ class Config:
     resume_progress: Optional[float] = None
     resume_media_index: Optional[int] = None
     state_file: Optional[Path] = None
+    music_source: Optional[Path] = None
+    music_playlist: Optional[Path] = None
+    audio_crossfade_seconds: float = 2.0
 
     @property
     def time_lapse_media_max_fraction(self) -> float:
@@ -441,14 +453,15 @@ class MapDirective:
 
 def parse_map_directive(line: str) -> Optional[MapDirective]:
     """Parse map directives while keeping adjacent-day maps distinct."""
+    content = str(line).strip()
     for keyword, relation in (
         ("#MapBefore:", "Day before"),
         ("#MapAfter:", "Day after"),
         ("#MediaMap:", ""),
         ("#Map:", None),
     ):
-        if line.startswith(keyword):
-            filename = line[len(keyword) :].strip()
+        if content.startswith(keyword):
+            filename = content[len(keyword) :].strip()
             return MapDirective(keyword[:-1], filename, relation) if filename else None
     return None
 
@@ -500,6 +513,9 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument("--resume-progress", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--resume-media-index", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--state-file", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--music", type=Path, default=None, help="One audio file or a directory of background music.")
+    parser.add_argument("--music-playlist", type=Path, default=None, help="Optional $label playlist for a music directory.")
+    parser.add_argument("--audio-crossfade-seconds", type=float, default=2.0, help="Seconds used to crossfade music titles and #MUSIC transport changes (default: 2).")
     parser.add_argument("--duration", "-d", type=float, default=3.0, help="Seconds per main slide.")
     parser.add_argument("--transition-duration-ms", type=int, default=TRANSITION_MS, help="Animated transition duration in milliseconds.")
     parser.add_argument(
@@ -606,6 +622,8 @@ def parse_args(argv: list[str]) -> Config:
         parser.error("--duration must be greater than 0")
     if args.transition_duration_ms < 0:
         parser.error("--transition-duration-ms must be 0 or greater")
+    if not 0.0 <= args.audio_crossfade_seconds <= 30.0:
+        parser.error("--audio-crossfade-seconds must be between 0 and 30")
     if args.time_lapse_duration <= 0:
         parser.error("--time-lapse-duration must be greater than 0")
     if not 0 < args.time_lapse_media_min_fraction <= 1:
@@ -624,6 +642,14 @@ def parse_args(argv: list[str]) -> Config:
     fullscreen_enabled = auto_two_screen_mode if args.fullscreen is None else bool(args.fullscreen)
     if args.join_windows and not mapwindow_enabled:
         parser.error("--join-windows requires --mapwindow")
+    music_source = args.music.expanduser().resolve() if args.music else None
+    if music_source is not None and not music_source.exists():
+        parser.error(f"music source not found: {music_source}")
+    if music_source is not None and music_source.is_file() and music_source.suffix.casefold() not in AUDIO_EXTENSIONS:
+        parser.error(f"unsupported music file: {music_source}")
+    music_playlist = args.music_playlist.expanduser().resolve() if args.music_playlist else None
+    if music_playlist is not None and not music_playlist.is_file():
+        parser.error(f"music playlist not found: {music_playlist}")
 
     return Config(
         photodir=photodir,
@@ -663,6 +689,9 @@ def parse_args(argv: list[str]) -> Config:
         resume_progress=args.resume_progress,
         resume_media_index=args.resume_media_index,
         state_file=args.state_file.expanduser().resolve() if args.state_file else None,
+        music_source=music_source,
+        music_playlist=music_playlist,
+        audio_crossfade_seconds=float(args.audio_crossfade_seconds),
     )
 
 
@@ -789,6 +818,9 @@ def config_from_options(
     resume_progress: Optional[float] = None,
     resume_media_index: Optional[int] = None,
     state_file: str | Path | None = None,
+    music_source: str | Path | None = None,
+    music_playlist: str | Path | None = None,
+    audio_crossfade_seconds: float = 2.0,
 ) -> Config:
     """Build a slideshow configuration for direct Python callers."""
     photo_dir_path = Path(photodir).expanduser().resolve()
@@ -813,6 +845,8 @@ def config_from_options(
         raise ValueError("duration must be greater than 0")
     if transition_duration_ms < 0:
         raise ValueError("transition_duration_ms must be 0 or greater")
+    if not 0.0 <= audio_crossfade_seconds <= 30.0:
+        raise ValueError("audio_crossfade_seconds must be between 0 and 30")
     if time_lapse_duration <= 0:
         raise ValueError("time_lapse_duration must be greater than 0")
     if time_lapse_media_max_fraction is not None:
@@ -838,6 +872,14 @@ def config_from_options(
     fullscreen_enabled = False if fullscreen is None else bool(fullscreen)
     if join_windows and not mapwindow_enabled:
         raise ValueError("join_windows requires mapwindow")
+    music_source_path = Path(music_source).expanduser().resolve() if music_source is not None else None
+    if music_source_path is not None and not music_source_path.exists():
+        raise ValueError(f"music source not found: {music_source_path}")
+    if music_source_path is not None and music_source_path.is_file() and music_source_path.suffix.casefold() not in AUDIO_EXTENSIONS:
+        raise ValueError(f"unsupported music file: {music_source_path}")
+    music_playlist_path = Path(music_playlist).expanduser().resolve() if music_playlist is not None else None
+    if music_playlist_path is not None and not music_playlist_path.is_file():
+        raise ValueError(f"music playlist not found: {music_playlist_path}")
 
     return Config(
         photodir=photo_dir_path,
@@ -877,6 +919,9 @@ def config_from_options(
         resume_progress=resume_progress,
         resume_media_index=resume_media_index,
         state_file=Path(state_file).expanduser().resolve() if state_file is not None else None,
+        music_source=music_source_path,
+        music_playlist=music_playlist_path,
+        audio_crossfade_seconds=float(audio_crossfade_seconds),
     )
 
 
@@ -909,7 +954,7 @@ def parse_coordinate_pair(text: str) -> tuple[Optional[float], Optional[float]]:
 
 def parse_photo_entry(line: str) -> PhotoListEntry:
     """Parse one standard photo list line."""
-    parts = [part.strip() for part in line.split("|")]
+    parts = [part.strip() for part in str(line).split("|")]
     filename = parts[0]
     time_text = parts[1] if len(parts) > 1 and parts[1] else None
     latitude = None
@@ -3775,6 +3820,482 @@ class CocoaImagePresenter:
             self.pending_handles.append(self.schedule_callback(0.0, on_complete))
 
 
+class BackgroundMusicController:
+    """Retained two-player engine controlled by explicit ``#MUSIC:`` rows."""
+
+    def __init__(self, config: Config, control_lines: list[str], schedule_callback, overlay_callback):
+        self.config = config
+        self.schedule_callback = schedule_callback
+        self.overlay_callback = overlay_callback
+        playlist_path = config.music_playlist
+        if playlist_path is None and config.music_source is not None and config.music_source.is_dir():
+            adventure_name = config.inputlist.stem
+            if adventure_name.casefold().endswith("-sorted"):
+                adventure_name = adventure_name[:-7]
+            candidate = config.music_source / f"{adventure_name}.playlist"
+            playlist_path = candidate if candidate.is_file() else None
+        self.playlist = load_audio_playlist(config.music_source, playlist_path) if config.music_source else None
+        self.directives: dict[int, MusicDirective] = {}
+        for index, line in enumerate(control_lines):
+            if not is_music_directive(line):
+                continue
+            try:
+                directive = parse_music_directive(line)
+            except MusicSyntaxError as exc:
+                warn_message(f"control line {index + 1}: {exc}")
+                continue
+            if directive is not None:
+                self.directives[index] = directive
+        self.transport = MusicTransportState(self.playlist) if self.playlist is not None else None
+        self.warned_music_errors: set[str] = set()
+        self.players = [None, None]
+        self.active_slot = 0
+        self.current_index: Optional[int] = None
+        self.user_enabled = True
+        self.control_enabled = True
+        self.volume_level = 9
+        self.queue_resume_index: Optional[int] = None
+        self.queue_resume_seconds: Optional[float] = None
+        self.slideshow_paused = False
+        self.video_paused = False
+        self.poll_handle = None
+        self.fade_handles = []
+        self.last_control_row = -1
+        self.disposed = False
+        self.started = False
+        if self.playlist is not None:
+            for warning in self.playlist.warnings:
+                warn_message(warning)
+
+    @property
+    def available(self) -> bool:
+        return bool(AVKIT_VIDEO_AVAILABLE and AVPlayer is not None and self.playlist and self.playlist.files)
+
+    @property
+    def effective_playing(self) -> bool:
+        return self.user_enabled and self.control_enabled and not self.slideshow_paused and not self.video_paused
+
+    def _player(self):
+        return self.players[self.active_slot]
+
+    def start(self, row_index: int) -> None:
+        if self.started or not self.available:
+            return
+        self.started = True
+        target = self._reconstruct_through(int(row_index) - 1)
+        self.last_control_row = int(row_index) - 1
+        self._switch_to(target, immediate=True)
+        self._schedule_poll()
+
+    def synchronize_row(self, row_index: int) -> None:
+        if not self.available:
+            return
+        if not self.started:
+            self.start(row_index)
+        row_index = int(row_index)
+        if row_index < self.last_control_row:
+            target = self._reconstruct_through(row_index)
+            self._switch_to(target)
+            self.last_control_row = row_index
+            return
+        for index in range(self.last_control_row + 1, row_index + 1):
+            directive = self.directives.get(index)
+            if directive is not None:
+                self._execute_directive(directive, switch_player=True, show_status=True)
+        self.last_control_row = row_index
+
+    def _warn_once(self, message: str) -> None:
+        key = str(message).casefold()
+        if key not in self.warned_music_errors:
+            self.warned_music_errors.add(key)
+            warn_message(message)
+
+    def _resolve_target(self, action: MusicAction) -> Optional[int]:
+        if self.playlist is None:
+            return None
+        if action.kind == "target_label":
+            index = self.playlist.index_for_label(action.value)
+            if index is None:
+                self._warn_once(f"music label ${action.value} is not present in the playlist")
+            return index
+        if action.kind == "target_path":
+            index = self.playlist.index_for_path(action.value)
+            if index is None:
+                self._warn_once(f"music file is not present in the playlist: {action.value}")
+            return index
+        return None
+
+    def _activate_transport(self, target: Optional[int], switch_player: bool) -> None:
+        if target is None:
+            return
+        if switch_player:
+            self._set_control_enabled(True)
+        else:
+            self.control_enabled = True
+        if switch_player:
+            self._switch_to(target)
+
+    def _set_volume_level(self, level: int, show_status: bool) -> None:
+        self.volume_level = max(0, min(9, int(level)))
+        player = self._player()
+        if player is not None:
+            player.setVolume_(self._target_gain() if self.effective_playing else 0.0)
+        if show_status:
+            self.overlay_callback(f"Music Volume {self.volume_level}", 1.5)
+
+    def _target_gain(self) -> float:
+        return max(0.0, min(1.0, float(self.volume_level) / 9.0))
+
+    def _reconstruct_through(self, row_index: int) -> int:
+        self.control_enabled = True
+        self.volume_level = 9
+        self.queue_resume_index = None
+        self.queue_resume_seconds = None
+        if self.transport is not None:
+            self.transport.reset()
+        for index in sorted(key for key in self.directives if key <= int(row_index)):
+            self._execute_directive(self.directives[index], switch_player=False, show_status=False)
+        if self.transport is not None and self.transport.current_index is not None:
+            return self.transport.current_index
+        return 0
+
+    def _execute_directive(self, directive: MusicDirective, switch_player: bool, show_status: bool) -> None:
+        if self.transport is None or self.playlist is None:
+            return
+        actions = list(directive.actions)
+        consumed: set[int] = set()
+        pending_targets: list[int] = []
+        transport_commands = {
+            "jump", "continue", "loop_line", "loop_one", "loop_range", "loop_album", "loop_all"
+        }
+
+        def flush_targets() -> None:
+            if not pending_targets:
+                return
+            return_index = None
+            if self.transport.mode == "queue":
+                return_index = self.transport.continuation_index
+            elif switch_player:
+                return_index = self.current_index
+                self._remember_queue_resume_position(return_index)
+            else:
+                return_index = self.transport.current_index
+            target = self.transport.set_queue(tuple(pending_targets), return_index=return_index)
+            pending_targets.clear()
+            self._activate_transport(target, switch_player)
+
+        for position, action in enumerate(actions):
+            if position in consumed:
+                continue
+            kind = action.kind
+            if kind in {"target_label", "target_path"}:
+                target = self._resolve_target(action)
+                if target is not None:
+                    pending_targets.append(target)
+                continue
+            # Bare targets form a queue, but that queue takes effect before
+            # the next command so directive order remains observable.
+            flush_targets()
+            if kind == "on":
+                if switch_player:
+                    self._set_control_enabled(True)
+                else:
+                    self.control_enabled = True
+                continue
+            if kind == "off":
+                if switch_player:
+                    self._set_control_enabled(False)
+                else:
+                    self.control_enabled = False
+                continue
+            if kind == "volume_up":
+                self._set_volume_level(self.volume_level + 1, show_status)
+                continue
+            if kind == "volume_down":
+                self._set_volume_level(self.volume_level - 1, show_status)
+                continue
+            if kind == "volume":
+                self._set_volume_level(int(action.value), show_status)
+                continue
+
+            self._clear_queue_resume_position()
+            target = None
+            if kind == "jump":
+                target = self.playlist.index_for_label(action.value)
+                if target is None:
+                    self._warn_once(f"music label ${action.value} is not present in the playlist")
+                else:
+                    target = self.transport.set_playlist(target)
+            elif kind == "continue":
+                self.transport.continue_normally()
+            elif kind == "loop_one":
+                current = self.transport.current_index
+                if current is None:
+                    current = self.current_index
+                if current is None:
+                    self._warn_once("#LOOPONE has no previously played title")
+                else:
+                    target = self.transport.set_loop("loop_one", (current,))
+            elif kind == "loop_all":
+                target = self.transport.set_loop("loop_all", tuple(range(len(self.playlist.files))))
+            elif kind == "loop_range":
+                first_label, last_label = action.value
+                first = self.playlist.index_for_label(first_label)
+                last = self.playlist.index_for_label(last_label)
+                if first is None or last is None:
+                    self._warn_once(f"#LOOPRANGE labels not found: ${first_label} ${last_label}")
+                elif first > last:
+                    self._warn_once(f"#LOOPRANGE starts after its end: ${first_label} ${last_label}")
+                else:
+                    target = self.transport.set_loop("loop_range", tuple(range(first, last + 1)))
+            elif kind == "loop_line":
+                indexes = []
+                for later, candidate in enumerate(actions[position + 1 :], start=position + 1):
+                    if candidate.kind in transport_commands:
+                        break
+                    if candidate.kind not in {"target_label", "target_path"}:
+                        continue
+                    consumed.add(later)
+                    resolved = self._resolve_target(candidate)
+                    if resolved is not None:
+                        indexes.append(resolved)
+                if not indexes:
+                    self._warn_once("#LOOPLINE requires at least one later label or pathname")
+                else:
+                    target = self.transport.set_loop("loop_line", indexes)
+            elif kind == "loop_album":
+                explicit = None
+                for later, candidate in enumerate(actions[position + 1 :], start=position + 1):
+                    if candidate.kind in transport_commands:
+                        break
+                    if candidate.kind in {"target_label", "target_path"}:
+                        consumed.add(later)
+                        explicit = self._resolve_target(candidate)
+                        break
+                indexes = (
+                    self.playlist.album_for_target(explicit)
+                    if explicit is not None
+                    else self.playlist.next_album(self.transport.current_index)
+                )
+                if not indexes:
+                    self._warn_once("#LOOPALBUM could not resolve a non-root album")
+                else:
+                    target = self.transport.set_loop("loop_album", indexes)
+            self._activate_transport(target, switch_player)
+        flush_targets()
+
+    def _remember_queue_resume_position(self, return_index: Optional[int]) -> None:
+        """Remember where normal playlist playback was interrupted by a queue."""
+        if self.transport is not None and self.transport.mode == "queue":
+            return
+        self.queue_resume_index = return_index
+        self.queue_resume_seconds = None
+        player = self._player()
+        if player is None or return_index is None:
+            return
+        seconds = self._current_seconds(player)
+        if seconds is not None and self.effective_playing:
+            seconds += self._effective_crossfade(player)
+        self.queue_resume_seconds = seconds
+
+    def _clear_queue_resume_position(self) -> None:
+        self.queue_resume_index = None
+        self.queue_resume_seconds = None
+
+    def _apply_gate_transition(self, was_playing: bool) -> None:
+        """Fade the retained title when the effective audio gate changes."""
+        now_playing = self.effective_playing
+        player = self._player()
+        if player is None or was_playing == now_playing:
+            return
+        if now_playing:
+            self._fade(None, player, self.config.audio_crossfade_seconds)
+        else:
+            self._fade(player, None, self.config.audio_crossfade_seconds)
+
+    def _set_control_enabled(self, enabled: bool) -> None:
+        was_playing = self.effective_playing
+        self.control_enabled = bool(enabled)
+        self._apply_gate_transition(was_playing)
+
+    def _new_player(self, index: int):
+        path = self.playlist.files[index]
+        player = AVPlayer.playerWithURL_(NSURL.fileURLWithPath_(str(path)))
+        player.setVolume_(0.0)
+        return player
+
+    def _duration_seconds(self, player) -> Optional[float]:
+        try:
+            item = player.currentItem()
+            seconds = float(CMTimeGetSeconds(item.duration())) if item is not None and CMTimeGetSeconds is not None else math.nan
+            return seconds if math.isfinite(seconds) and seconds > 0 else None
+        except Exception:
+            return None
+
+    def _current_seconds(self, player) -> Optional[float]:
+        try:
+            seconds = float(CMTimeGetSeconds(player.currentTime())) if CMTimeGetSeconds is not None else math.nan
+            return seconds if math.isfinite(seconds) and seconds >= 0 else None
+        except Exception:
+            return None
+
+    def _cancel_fades(self, preserve=()) -> None:
+        for handle in self.fade_handles:
+            handle.cancel()
+        self.fade_handles.clear()
+        retained = {id(player) for player in preserve if player is not None}
+        for player in self.players:
+            if player is None or id(player) in retained:
+                continue
+            try:
+                player.setVolume_(0.0)
+                player.pause()
+            except Exception:
+                pass
+
+    def _fade(self, outgoing, incoming, seconds: float, pause_outgoing=True) -> None:
+        self._cancel_fades((outgoing, incoming))
+        duration = max(0.0, float(seconds))
+        if duration <= 0.0:
+            if outgoing is not None:
+                outgoing.setVolume_(0.0)
+                if pause_outgoing:
+                    outgoing.pause()
+            if incoming is not None:
+                incoming.setVolume_(self._target_gain() if self.effective_playing else 0.0)
+                if self.effective_playing:
+                    incoming.play()
+            return
+        steps = max(2, min(40, int(math.ceil(duration / 0.05))))
+        if incoming is not None and self.effective_playing:
+            incoming.play()
+        for step in range(1, steps + 1):
+            fraction = step / steps
+
+            def apply_fade(value=fraction, final=step == steps):
+                if self.disposed:
+                    return
+                if outgoing is not None:
+                    outgoing.setVolume_(self._target_gain() * max(0.0, 1.0 - value))
+                    if final and pause_outgoing:
+                        outgoing.pause()
+                if incoming is not None:
+                    incoming.setVolume_(self._target_gain() * value if self.effective_playing else 0.0)
+
+            self.fade_handles.append(self.schedule_callback(duration * fraction, apply_fade))
+
+    def _effective_crossfade(self, outgoing) -> float:
+        fade = max(0.0, float(self.config.audio_crossfade_seconds))
+        duration = self._duration_seconds(outgoing) if outgoing is not None else None
+        return min(fade, duration / 2.0) if duration is not None else fade
+
+    def _switch_to(self, index: int, immediate=False, resume_seconds: Optional[float] = None) -> None:
+        if not self.available or not 0 <= index < len(self.playlist.files):
+            return
+        outgoing = self._player()
+        new_slot = 1 - self.active_slot
+        incoming = self._new_player(index)
+        if resume_seconds is not None and CMTimeMake is not None:
+            try:
+                milliseconds = max(0, int(round(float(resume_seconds) * 1000.0)))
+                incoming.seekToTime_(CMTimeMake(milliseconds, 1000))
+            except Exception as exc:
+                self._warn_once(f"could not restore music playback position: {exc}")
+        self.players[new_slot] = incoming
+        self.active_slot = new_slot
+        self.current_index = index
+        fade = 0.0 if immediate or outgoing is None else self._effective_crossfade(outgoing)
+        self._fade(outgoing, incoming, fade)
+        old_slot = 1 - self.active_slot
+
+        def release_outgoing():
+            old = self.players[old_slot]
+            if old is outgoing:
+                try:
+                    old.pause()
+                except Exception:
+                    pass
+                self.players[old_slot] = None
+
+        self.fade_handles.append(self.schedule_callback(fade + 0.05, release_outgoing))
+
+    def _schedule_poll(self) -> None:
+        if self.disposed:
+            return
+        self.poll_handle = self.schedule_callback(0.25, self._poll)
+
+    def _poll(self) -> None:
+        self.poll_handle = None
+        if self.disposed:
+            return
+        player = self._player()
+        if self.effective_playing and player is not None and self.current_index is not None:
+            duration = self._duration_seconds(player)
+            current = self._current_seconds(player)
+            fade = self._effective_crossfade(player)
+            if duration is not None and current is not None and current >= max(0.0, duration - fade - 0.05):
+                was_queue = self.transport is not None and self.transport.mode == "queue"
+                target = self.transport.next_index() if self.transport is not None else None
+                if target is not None:
+                    queue_completed = was_queue and self.transport.mode == "playlist"
+                    resume_seconds = (
+                        self.queue_resume_seconds
+                        if queue_completed and target == self.queue_resume_index
+                        else None
+                    )
+                    self._switch_to(target, resume_seconds=resume_seconds)
+                    if queue_completed:
+                        self._clear_queue_resume_position()
+        self._schedule_poll()
+
+    def toggle(self) -> None:
+        if not self.available:
+            self.overlay_callback("No audio available", 2.0)
+            return
+        self.user_enabled = not self.user_enabled
+        player = self._player()
+        if self.user_enabled:
+            if self.effective_playing and player is not None:
+                self._fade(None, player, self.config.audio_crossfade_seconds)
+            self.overlay_callback("Audio On" if self.control_enabled else "Audio Off (#OFF)", 2.0)
+        else:
+            self._fade(player, None, self.config.audio_crossfade_seconds)
+            self.overlay_callback("Audio Off", 2.0)
+
+    def set_slideshow_paused(self, paused: bool) -> None:
+        self._set_temporary_pause("slideshow_paused", paused)
+
+    def set_video_active(self, active: bool) -> None:
+        self._set_temporary_pause("video_paused", active)
+
+    def _set_temporary_pause(self, attribute: str, value: bool) -> None:
+        was_playing = self.effective_playing
+        setattr(self, attribute, bool(value))
+        now_playing = self.effective_playing
+        player = self._player()
+        if player is None or was_playing == now_playing:
+            return
+        if now_playing:
+            self._fade(None, player, self.config.audio_crossfade_seconds)
+        else:
+            self._fade(player, None, self.config.audio_crossfade_seconds)
+
+    def dispose(self) -> None:
+        self.disposed = True
+        if self.poll_handle is not None:
+            self.poll_handle.cancel()
+            self.poll_handle = None
+        self._cancel_fades()
+        for player in self.players:
+            if player is not None:
+                try:
+                    player.pause()
+                    player.setVolume_(0.0)
+                except Exception:
+                    pass
+        self.players = [None, None]
+
+
 class GPSTrackShowApp:
     """Cocoa application controller for the slideshow."""
 
@@ -3794,6 +4315,7 @@ class GPSTrackShowApp:
         self.time_lapse_media_queue: list[tuple[float, int, PhotoListEntry]] = []
         self.time_lapse_media_datetimes: dict[int, datetime] = {}
         self.time_lapse_media_cursor = 0
+        self.time_lapse_audio_row_cursor = -1
         self.time_lapse_handle = None
         self.time_lapse_last_tick = None
         self.time_lapse_current_media: Optional[tuple[int, PhotoListEntry]] = None
@@ -3868,6 +4390,12 @@ class GPSTrackShowApp:
         debug_print(self.config, f"Starting at track {self.config.start_track}; playlist index={self.playlist_index}")
         debug_print(self.config, f"Initial mode={'manual' if self.manual_mode else 'automatic'} duration={self.config.duration:.1f}s")
         self._build_windows()
+        self.music_controller = BackgroundMusicController(
+            self.config,
+            self.playlist_lines,
+            self.schedule_callback,
+            self._show_temporary_status_overlay,
+        )
         self._install_key_monitor()
         signal.signal(signal.SIGINT, self._handle_sigint)
         signal.signal(signal.SIGTERM, self._handle_sigint)
@@ -3959,10 +4487,11 @@ class GPSTrackShowApp:
         overview_filename = None
         date_text = None
         for line in self.playlist_lines[:start_index]:
-            if line.startswith("#Overviewmap:"):
-                overview_filename = line.partition(":")[2].strip()
-            elif line.startswith("#Datum:"):
-                date_text = line.partition(":")[2].strip()
+            content = line.strip()
+            if content.startswith("#Overviewmap:"):
+                overview_filename = content.partition(":")[2].strip()
+            elif content.startswith("#Datum:"):
+                date_text = content.partition(":")[2].strip()
         self.current_date = date_text
         if overview_filename is not None:
             self._handle_overview(overview_filename)
@@ -3987,6 +4516,9 @@ class GPSTrackShowApp:
                 return None
             if chars in {"p", "P"} or raw_chars in {"p", "P"}:
                 self._toggle_placenames()
+                return None
+            if chars in {"a", "A"} or raw_chars in {"a", "A"}:
+                self.music_controller.toggle()
                 return None
             if chars == "t" or raw_chars == "t":
                 if self.transition_key_down:
@@ -4235,6 +4767,7 @@ class GPSTrackShowApp:
         """Switch between automatic and manual stepping."""
         self.manual_mode = not self.manual_mode
         self.paused = False
+        self.music_controller.set_slideshow_paused(False)
         if self.manual_mode:
             self._freeze_time_lapse_media()
         else:
@@ -4270,6 +4803,7 @@ class GPSTrackShowApp:
         if self.manual_mode:
             return
         self.paused = not self.paused
+        self.music_controller.set_slideshow_paused(self.paused)
         if self.paused:
             self._freeze_time_lapse_media()
         else:
@@ -4521,6 +5055,7 @@ class GPSTrackShowApp:
             return
         if not self.manual_mode:
             self.paused = False
+            self.music_controller.set_slideshow_paused(False)
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
@@ -4608,6 +5143,7 @@ class GPSTrackShowApp:
             return
         if not self.manual_mode:
             self.paused = False
+            self.music_controller.set_slideshow_paused(False)
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
@@ -5061,6 +5597,7 @@ class GPSTrackShowApp:
             self._show_initial_photo_preview()
         self._show_startup_hint()
         self._run_memory_watchdog()
+        self.music_controller.start(self.playlist_index)
         if self.config.debug:
             self._show_startup_test_image()
         else:
@@ -5180,6 +5717,9 @@ class GPSTrackShowApp:
 
     def _display_state(self, state: DisplayState) -> None:
         """Display one slideshow state without retaining older rendered images."""
+        self.music_controller.set_video_active(
+            any(target.presenter_name == "photo" and target.video_path is not None for target in state.targets)
+        )
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
@@ -5291,12 +5831,13 @@ class GPSTrackShowApp:
         next_index = len(self.playlist_lines)
         for index in range(map_index + 1, len(self.playlist_lines)):
             line = self.playlist_lines[index]
+            content = line.strip()
             if parse_map_directive(line) is not None:
                 next_index = index
                 break
-            if line.startswith("#Datum:"):
-                date_text = line.partition(":")[2].strip()
-            elif not line.startswith("#"):
+            if content.startswith("#Datum:"):
+                date_text = content.partition(":")[2].strip()
+            elif not content.startswith("#"):
                 media_indexes.append(index)
                 media_entries.append(parse_photo_entry(line))
                 media_date_texts.append(date_text)
@@ -5316,9 +5857,10 @@ class GPSTrackShowApp:
         """Sum the route lengths of preceding control-file stages."""
         total_km = 0.0
         for line in self.playlist_lines[:map_index]:
-            if not is_normal_map_directive(line):
+            directive = parse_map_directive(line)
+            if directive is None or directive.is_special:
                 continue
-            canonical_path = resolve_path(self._track_asset_dir(), line.partition(":")[2].strip())
+            canonical_path = resolve_path(self._track_asset_dir(), directive.filename)
             map_path = resolve_track_map_variant(canonical_path, prefer_time_lapse=True) or canonical_path
             metadata_path = map_path.with_suffix(".json")
             try:
@@ -5517,6 +6059,7 @@ class GPSTrackShowApp:
             raise RuntimeError("encountered #Map before #Overviewmap")
         self._suspend_standard_playback_for_time_lapse()
         self.time_lapse_stage = self._collect_time_lapse_stage(map_index, filename, relation)
+        self.time_lapse_audio_row_cursor = map_index
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
         self.time_lapse_media_image = None
@@ -5745,6 +6288,7 @@ class GPSTrackShowApp:
             warn_message(f"could not load time-lapse media {path}: {exc}")
             return False
         self._stop_time_lapse_video()
+        self._sync_time_lapse_audio_through(row_index)
         self.playlist_index = row_index + 1
         self.time_lapse_current_media = (row_index, entry)
         self.time_lapse_media_image = image
@@ -5795,6 +6339,7 @@ class GPSTrackShowApp:
     def _finish_time_lapse_stage(self):
         if self.time_lapse_stage is None:
             return
+        self._sync_time_lapse_audio_through(self.time_lapse_stage.next_index - 1)
         next_date_text = self.time_lapse_stage.next_date_text
         self.time_lapse_overview_preview_active = False
         self.time_lapse_overview_inset_active = False
@@ -5815,7 +6360,20 @@ class GPSTrackShowApp:
         self._clear_time_lapse_views()
         self._advance()
 
+    def _sync_time_lapse_audio_through(self, row_index: int) -> None:
+        """Execute every music directive consumed internally by a Time-Lapse stage."""
+        target = max(0, min(int(row_index), len(self.playlist_lines) - 1))
+        if target < self.time_lapse_audio_row_cursor:
+            self.music_controller.synchronize_row(target)
+            self.time_lapse_audio_row_cursor = target
+            return
+        for index in range(self.time_lapse_audio_row_cursor + 1, target + 1):
+            if is_music_directive(self.playlist_lines[index]) or index == target:
+                self.music_controller.synchronize_row(index)
+        self.time_lapse_audio_row_cursor = target
+
     def _stop_time_lapse_video(self):
+        self.music_controller.set_video_active(False)
         if self.time_lapse_video_player is not None:
             try:
                 self.time_lapse_video_player.pause()
@@ -5862,6 +6420,7 @@ class GPSTrackShowApp:
             stage_view._raise_clock_overlay()
             self.time_lapse_video_player = player
             self.time_lapse_video_view = view
+            self.music_controller.set_video_active(True)
             player.play()
         except Exception as exc:
             warn_message(f"could not play time-lapse video {path}: {exc}")
@@ -5881,14 +6440,19 @@ class GPSTrackShowApp:
 
         row_index = self.playlist_index
         line = self.playlist_lines[row_index]
+        content = line.strip()
+        self.music_controller.synchronize_row(row_index)
         self.playlist_index += 1
         debug_print(self.config, f"Processing line: {line}")
-        if line.startswith("#Overviewmap:"):
-            self._handle_overview(line.partition(":")[2].strip())
+        if is_music_directive(content):
             self._advance()
             return
-        if line.startswith("#Datum:"):
-            self.current_date = line.partition(":")[2].strip()
+        if content.startswith("#Overviewmap:"):
+            self._handle_overview(content.partition(":")[2].strip())
+            self._advance()
+            return
+        if content.startswith("#Datum:"):
+            self.current_date = content.partition(":")[2].strip()
             if self.active_transition == Transition.QUAD:
                 self._reset_photo_layouts(Transition.QUAD)
             elif self.active_transition == Transition.COLLAGE:
@@ -6374,6 +6938,7 @@ class GPSTrackShowApp:
         debug_print(self.config, "Quitting application")
         self.running = False
         self._write_resume_state()
+        self.music_controller.dispose()
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None

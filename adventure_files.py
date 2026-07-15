@@ -186,7 +186,10 @@ def _rewrite_control_text(text: str, replacements: dict[str, str]) -> str:
     for raw_line in text.splitlines(keepends=True):
         content = raw_line.rstrip("\r\n")
         ending = raw_line[len(content):]
-        if content.startswith("#Overviewmap:") or content.startswith("#Map:"):
+        if any(
+            content.startswith(prefix)
+            for prefix in ("#Overviewmap:", "#Map:", "#MapBefore:", "#MapAfter:", "#MediaMap:")
+        ):
             key, separator, value = content.partition(":")
             stripped = value.strip()
             replacement = replacements.get(stripped)
@@ -244,7 +247,10 @@ def rename_or_copy_adventure(
                 ("gpx_file", current["gpx_file"]),
                 ("control_file", current["control_file"]),
                 ("track_map_base", current["track_map_base"]),
+                ("music_playlist", current.get("music_playlist", "")),
             ):
+                if not value:
+                    continue
                 users = shared_references(project_dir, source_adv, field, str(value))
                 if users:
                     shared_labels.append(f"{field}: {', '.join(path.name for path in users)}")
@@ -260,6 +266,20 @@ def rename_or_copy_adventure(
         if source_control.exists():
             mapping[source_control] = target_control
         mapping.update(related_track_assets(project_dir, old_map_base, target_base))
+        playlist_value = str(current.get("music_playlist", "") or "").strip()
+        if playlist_value:
+            source_playlist = Path(playlist_value).expanduser()
+            if not source_playlist.is_absolute():
+                source_playlist = project_dir / source_playlist
+            source_playlist = source_playlist.resolve(strict=False)
+            if source_playlist.exists():
+                target_playlist = source_playlist.with_name(f"{target_base}.playlist")
+                mapping[source_playlist] = target_playlist
+                target_payload["music_playlist"] = (
+                    target_playlist.name
+                    if target_playlist.parent == project_dir.resolve(strict=False)
+                    else str(target_playlist)
+                )
         target_payload["gpx_file"] = target_gpx.name
         target_payload["control_file"] = target_control.name
         target_payload["track_map_base"] = target_base

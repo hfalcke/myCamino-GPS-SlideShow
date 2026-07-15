@@ -126,6 +126,38 @@ class AdventureFileTests(unittest.TestCase):
             self.assertEqual(copied_summary["tracks"][0]["track_plot_image_filename"], f"0001_Stage_{new_name}.png")
             self.assertEqual((directory / "photo.jpeg").read_bytes(), b"media")
 
+    def test_related_copy_preserves_music_directives_and_copies_playlist(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            old_name = "Old"
+            new_name = "New"
+            source_adv = directory / "Old.adv"
+            track_dir = directory / "trackimages"
+            track_dir.mkdir()
+            (directory / "Old.gpx").write_text("<gpx/>")
+            (directory / "Old-sorted.lst").write_text(
+                "#MUSIC: #JUMP $EVENING\n"
+                "#MapAfter: 0001_Old.png\n"
+                "photo.jpeg | 12:00 | - | -\n"
+            )
+            (directory / "Old.playlist").write_text("$EVENING\nsong.m4a\n")
+            (track_dir / "0001_Old.png").write_bytes(b"map")
+            payload = adventure_payload(directory, old_name)
+            payload["music_source"] = "."
+            payload["music_playlist"] = "Old.playlist"
+            atomic_write_json(source_adv, payload)
+
+            _target_adv, copied = rename_or_copy_adventure(
+                source_adv, payload, new_name, "copy", include_related=True
+            )
+
+            self.assertEqual(copied["music_playlist"], "New.playlist")
+            self.assertTrue((directory / "New.playlist").is_file())
+            copied_control = (directory / "New-sorted.lst").read_text()
+            self.assertIn("#MUSIC: #JUMP $EVENING", copied_control)
+            self.assertIn("#MapAfter: 0001_New.png", copied_control)
+            self.assertIn("photo.jpeg | 12:00 | - | -", copied_control)
+
     def test_rename_without_related_files_preserves_explicit_references(self):
         with TemporaryDirectory() as temporary:
             directory = Path(temporary)

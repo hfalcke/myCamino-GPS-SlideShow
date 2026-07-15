@@ -21,6 +21,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+
 from typing import Any, Callable, Optional, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2413,9 +2414,15 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
         stripped = line.strip()
         if not stripped:
             continue
-        entry: dict[str, Any] = {"line": stripped, "type": "other", "date": current_date, "name": control_line_name(stripped)}
-        if stripped.startswith("#"):
-            keyword, _separator, value = stripped[1:].partition(":")
+        content = stripped
+        entry: dict[str, Any] = {
+            "line": stripped,
+            "type": "other",
+            "date": current_date,
+            "name": control_line_name(stripped),
+        }
+        if content.startswith("#"):
+            keyword, _separator, value = content[1:].partition(":")
             normalized = keyword.strip().lower()
             if normalized in {"datum", "date"}:
                 current_date_label = value.strip()
@@ -2431,8 +2438,10 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
                 entry.update({"type": "map_after", "relation": "after"})
             elif normalized == "mediamap":
                 entry.update({"type": "media_map", "relation": "media"})
+            elif normalized == "music":
+                entry.update({"type": "music", "name": ""})
         else:
-            parts = [part.strip() for part in stripped.split("|")]
+            parts = [part.strip() for part in content.split("|")]
             if parts:
                 entry.update({"type": "media", "name": parts[0], "date": current_date})
                 if len(parts) > 1 and current_date is not None:
@@ -2465,8 +2474,9 @@ def remove_control_track_map_entries(control_file_path: Path | str, names_to_rem
     removed = 0
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("#"):
-            keyword, _separator, value = stripped[1:].partition(":")
+        content = stripped
+        if content.startswith("#"):
+            keyword, _separator, value = content[1:].partition(":")
             normalized_keyword = keyword.strip().lower()
             name = value.strip()
             if normalized_keyword == "overviewmap" and normalize_filename_for_match(name) in names:
@@ -2502,8 +2512,9 @@ def update_control_special_map_entries(
     output = []
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("#"):
-            keyword, separator, value = stripped[1:].partition(":")
+        content = stripped
+        if content.startswith("#"):
+            keyword, separator, value = content[1:].partition(":")
             if separator and keyword.strip().lower() in {"mapbefore", "mapafter"}:
                 replacement = normalized_replacements.get(
                     normalize_track_plot_filename_for_match(value.strip())

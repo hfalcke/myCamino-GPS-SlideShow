@@ -7,6 +7,7 @@ import unittest
 from adventure_parameters import (
     PARAMETER_SCHEMA_VERSION,
     default_parameters,
+    map_affecting_parameter_keys,
     normalize_parameter_value,
     normalize_parameters,
     parameter_payload,
@@ -27,6 +28,13 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["slideshow.window_mode"], "auto")
         self.assertFalse(defaults["slideshow.track_map_before_media"])
         self.assertTrue(defaults["timelapse.overview_as_media"])
+        self.assertEqual(defaults["gpx.horizontal_smoothing_distance_m"], 10.0)
+        self.assertEqual(defaults["gpx.minimum_point_spacing_m"], 10.0)
+        self.assertEqual(defaults["gpx.elevation_smoothing_distance_m"], 50.0)
+        self.assertEqual(defaults["gpx.maximum_accuracy_m"], 10.0)
+        self.assertEqual(defaults["gpx.maximum_vertical_accuracy_m"], 20.0)
+        self.assertEqual(defaults["gpx.maximum_hdop"], 20.0)
+        self.assertEqual(defaults["gpx.maximum_vdop"], 20.0)
 
     def test_invalid_loaded_values_fall_back_individually(self):
         normalized = normalize_parameters(
@@ -78,6 +86,20 @@ class AdventureParameterTests(unittest.TestCase):
         custom_keys = {spec.key for spec in visible_specs_for_section("Map Service", values)}
         self.assertIn("maps.custom_url", custom_keys)
         self.assertIn("maps.custom_attribution", custom_keys)
+
+    def test_all_geometry_parameters_invalidate_track_maps(self):
+        keys = map_affecting_parameter_keys()
+        self.assertTrue(
+            {
+                "gpx.horizontal_smoothing_distance_m",
+                "gpx.minimum_point_spacing_m",
+                "gpx.elevation_smoothing_distance_m",
+                "gpx.maximum_accuracy_m",
+                "gpx.maximum_vertical_accuracy_m",
+                "gpx.maximum_hdop",
+                "gpx.maximum_vdop",
+            }.issubset(keys)
+        )
 
 
 if __name__ == "__main__":

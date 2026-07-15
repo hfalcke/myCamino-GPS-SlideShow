@@ -11,6 +11,17 @@ from datetime import date, datetime, timezone
 from math import asin, atan2, cos, degrees, floor, log, pi, radians, sin, sqrt, tan
 from pathlib import Path
 
+from gpx_processing import (
+    ProcessingOptions,
+    RawTrackPoint,
+    extract_raw_track_points,
+    haversine_km as shared_haversine_km,
+    parse_time,
+    process_raw_points,
+    process_track_element,
+    semantic_track_fingerprint as shared_semantic_track_fingerprint,
+)
+
 from plot_metadata_utils import (
     build_coordinate_point,
     image_origin_metadata,
@@ -42,34 +53,9 @@ DEFAULT_IMAGE_SIZE = (1600, 1200)
 
 # AI prompt: "Write a function that parses GPX/ISO timestamps, handles trailing Z,
 # treats naive times as UTC, and returns a timezone-aware datetime or None."
-def parse_time(value):
-    """Parse a GPX timestamp into a timezone-aware datetime."""
-    if not value:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
 # AI prompt: "Write a haversine helper that returns distance in kilometers
 # between two latitude/longitude pairs."
-def haversine_km(lat1, lon1, lat2, lon2):
-    """Return the great-circle distance in kilometers between two coordinates."""
-    radius_km = 6371.0088
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    c = 2 * asin(sqrt(a))
-    return radius_km * c
+haversine_km = shared_haversine_km
 
 
 # AI prompt: "Write a converter from WGS84 longitude/latitude to Web Mercator
@@ -194,34 +180,27 @@ def extract_point_accuracy(point_element):
 def extract_track_points(track_element):
     """Return ordered trackpoints with coordinates, time, elevation, and accuracy."""
     points = []
-    for segment in track_element.findall("gpx:trkseg", GPX_NS):
-        for point_element in segment.findall("gpx:trkpt", GPX_NS):
-            lat_text = point_element.get("lat")
-            lon_text = point_element.get("lon")
-            if lat_text is None or lon_text is None:
-                continue
-            try:
-                lat_value = float(lat_text)
-                lon_value = float(lon_text)
-            except ValueError:
-                continue
-            point_time = parse_time(point_element.findtext("gpx:time", default="", namespaces=GPX_NS))
-            elevation_text = point_element.findtext("gpx:ele", default="", namespaces=GPX_NS)
-            try:
-                elevation_m = float(elevation_text) if elevation_text.strip() else None
-            except ValueError:
-                elevation_m = None
-            accuracy_value, accuracy_field = extract_point_accuracy(point_element)
-            points.append(
-                {
-                    "lat": lat_value,
-                    "lon": lon_value,
-                    "time": point_time,
-                    "elevation_m": elevation_m,
-                    "accuracy": accuracy_value,
-                    "accuracy_field": accuracy_field,
-                }
-            )
+    for point in extract_raw_track_points(track_element):
+        accuracy_field = "accuracy" if point.horizontal_accuracy_m is not None else None
+        points.append(
+            {
+                "source_index": point.source_index,
+                "segment_index": point.segment_index,
+                "segment_point_index": point.segment_point_index,
+                "lat": point.lat,
+                "lon": point.lon,
+                "time": point.time,
+                "elevation_m": point.elevation_m,
+                "accuracy": point.horizontal_accuracy_m,
+                "accuracy_field": accuracy_field,
+                "vertical_accuracy_m": point.vertical_accuracy_m,
+                "hdop": point.hdop,
+                "vdop": point.vdop,
+                "pdop": point.pdop,
+                "satellites": point.satellites,
+                "fix": point.fix,
+            }
+        )
     return points
 
 
@@ -229,24 +208,44 @@ def extract_track_points(track_element):
 # minimum spacing in meters, preserving order and ignoring missing accuracy."
 def filter_track_points(points, threshold_distance_m, threshold_accuracy_m):
     """Return filtered points using accuracy and spacing thresholds."""
-    filtered = []
-    for point in points:
-        accuracy = point["accuracy"]
-        if accuracy is not None and accuracy > threshold_accuracy_m:
-            continue
-        if not filtered:
-            filtered.append(point)
-            continue
-        previous = filtered[-1]
-        distance_m = haversine_km(
-            previous["lat"],
-            previous["lon"],
-            point["lat"],
-            point["lon"],
-        ) * 1000.0
-        if distance_m >= threshold_distance_m:
-            filtered.append(point)
-    return filtered
+    raw = [
+        RawTrackPoint(
+            source_index=int(point.get("source_index", index)),
+            segment_index=int(point.get("segment_index", 0)),
+            segment_point_index=int(point.get("segment_point_index", index)),
+            lat=float(point["lat"]),
+            lon=float(point["lon"]),
+            elevation_m=point.get("elevation_m"),
+            time=point.get("time"),
+            horizontal_accuracy_m=point.get("accuracy"),
+            vertical_accuracy_m=point.get("vertical_accuracy_m"),
+            hdop=point.get("hdop"),
+            vdop=point.get("vdop"),
+            pdop=point.get("pdop"),
+            satellites=point.get("satellites"),
+            fix=point.get("fix"),
+        )
+        for index, point in enumerate(points)
+    ]
+    processed = process_raw_points(
+        raw,
+        ProcessingOptions(
+            horizontal_smoothing_distance_m=0.0,
+            minimum_point_spacing_m=threshold_distance_m,
+            elevation_smoothing_distance_m=0.0,
+            maximum_horizontal_accuracy_m=threshold_accuracy_m,
+            maximum_vertical_accuracy_m=0.0,
+            maximum_hdop=0.0,
+            maximum_vdop=0.0,
+        ),
+    )
+    original = {int(point.get("source_index", index)): point for index, point in enumerate(points)}
+    result = []
+    for point in processed.points:
+        item = dict(original.get(point.source_index, {}))
+        item.update(point.as_record())
+        result.append(item)
+    return result
 
 
 # AI prompt: "Write a helper that returns the first non-missing timestamp from
@@ -261,32 +260,49 @@ def first_point_time(points):
 
 def semantic_track_fingerprint(track_element):
     """Return a stable hash for one track, ignoring XML formatting whitespace."""
-    parts = []
-    for element in track_element.iter():
-        tag = local_tag_name(element.tag)
-        attrs = "|".join(f"{key}={value}" for key, value in sorted(element.attrib.items()))
-        text = (element.text or "").strip()
-        parts.append(f"{tag}\t{attrs}\t{text}")
-    payload = "\n".join(parts).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return shared_semantic_track_fingerprint(track_element)
 
 
 # AI prompt: "Write a summarizer for one GPX <trk> element that extracts display
 # fields, timing, geometry, length, endpoints, and the point list for plotting."
-def summarize_track(track_element, remove_prefix, threshold_distance_m, threshold_accuracy_m, verbose):
+def summarize_track(
+    track_element,
+    remove_prefix,
+    threshold_distance_m,
+    threshold_accuracy_m,
+    verbose,
+    horizontal_smoothing_distance_m=10.0,
+    elevation_smoothing_distance_m=50.0,
+    maximum_vertical_accuracy_m=20.0,
+    maximum_hdop=20.0,
+    maximum_vdop=20.0,
+):
     """Build a normalized track dictionary from a GPX <trk> element."""
     track_name = normalize_track_name(
         track_element.findtext("gpx:name", default="", namespaces=GPX_NS),
         remove_prefix,
     )
-    raw_points = extract_track_points(track_element)
-    points = filter_track_points(raw_points, threshold_distance_m, threshold_accuracy_m)
+    options = ProcessingOptions(
+        horizontal_smoothing_distance_m=horizontal_smoothing_distance_m,
+        minimum_point_spacing_m=threshold_distance_m,
+        elevation_smoothing_distance_m=elevation_smoothing_distance_m,
+        maximum_horizontal_accuracy_m=threshold_accuracy_m,
+        maximum_vertical_accuracy_m=maximum_vertical_accuracy_m,
+        maximum_hdop=maximum_hdop,
+        maximum_vdop=maximum_vdop,
+    )
+    processed = process_track_element(track_element, options)
+    raw_points = processed.raw_points
+    points = [point.as_record() for point in processed.points]
     detected_accuracy_fields = sorted(
-        {
-            point["accuracy_field"]
-            for point in raw_points
-            if point.get("accuracy_field")
-        }
+        name
+        for name, present in {
+            "horizontal accuracy": any(point.horizontal_accuracy_m is not None for point in raw_points),
+            "vertical accuracy": any(point.vertical_accuracy_m is not None for point in raw_points),
+            "hdop": any(point.hdop is not None for point in raw_points),
+            "vdop": any(point.vdop is not None for point in raw_points),
+        }.items()
+        if present
     )
     accuracy_field_text = ", ".join(detected_accuracy_fields) if detected_accuracy_fields else "keine"
     if verbose:
@@ -296,54 +312,62 @@ def summarize_track(track_element, remove_prefix, threshold_distance_m, threshol
             f"{'ja' if detected_accuracy_fields else 'nein'} | Felder: {accuracy_field_text}"
         )
 
-    start_time = None
-    end_time = None
-    if points:
-        times = [point["time"] for point in points if point["time"] is not None]
-        if times:
-            start_time = min(times)
-            end_time = max(times)
+    start_time = processed.start_time
+    end_time = processed.end_time
 
     track_time = parse_time(track_element.findtext("gpx:time", default="", namespaces=GPX_NS))
     if track_time is None:
         track_time = first_point_time(points)
 
-    length_km = 0.0
-    for previous, current in zip(points, points[1:]):
-        length_km += haversine_km(previous["lat"], previous["lon"], current["lat"], current["lon"])
-
-    first_point = None
-    last_point = None
-    if points:
-        first_point = (points[0]["lat"], points[0]["lon"])
-        last_point = (points[-1]["lat"], points[-1]["lon"])
-
-    duration = None
-    if start_time is not None and end_time is not None:
-        duration = end_time - start_time
+    first_point = None if processed.first_point is None else (processed.first_point.lat, processed.first_point.lon)
+    last_point = None if processed.last_point is None else (processed.last_point.lat, processed.last_point.lon)
 
     return {
         "name": track_name,
         "time": track_time,
         "start_time": start_time,
         "end_time": end_time,
-        "duration": duration,
-        "length_km": length_km,
+        "duration": processed.duration,
+        "length_km": processed.length_km,
+        "ascent_m": processed.ascent_m,
+        "descent_m": processed.descent_m,
         "first_point": first_point,
         "last_point": last_point,
         "points": [(point["lat"], point["lon"]) for point in points],
         "point_records": points,
         "distance_km": None,
-        "raw_points": [(point["lat"], point["lon"]) for point in raw_points],
+        "segments": [
+            [(point.lat, point.lon) for point in segment.points]
+            for segment in processed.segments
+        ],
+        "segment_records": [
+            [point.as_record() for point in segment.points]
+            for segment in processed.segments
+        ],
+        "raw_points": [(point.lat, point.lon) for point in raw_points],
         "filtered_point_count": len(points),
         "raw_point_count": len(raw_points),
+        "rejection_counts": processed.rejection_counts,
+        "processing_options": processed.options.as_dict(),
         "track_fingerprint": semantic_track_fingerprint(track_element),
     }
 
 
 # AI prompt: "Write a GPX 1.1 parser using xml.etree.ElementTree that loads all
 # <trk> elements from a file and returns summarized track dictionaries."
-def parse_gpx_file(file_path, remove_prefix, threshold_distance_m, threshold_accuracy_m, verbose):
+def parse_gpx_file(
+    file_path,
+    remove_prefix,
+    threshold_distance_m,
+    threshold_accuracy_m,
+    verbose,
+    horizontal_smoothing_distance_m=10.0,
+    elevation_smoothing_distance_m=50.0,
+    maximum_vertical_accuracy_m=20.0,
+    maximum_hdop=20.0,
+    maximum_vdop=20.0,
+    track_processing_callback=None,
+):
     """Parse the GPX file and return summarized tracks."""
     try:
         tree = ET.parse(file_path)
@@ -356,12 +380,19 @@ def parse_gpx_file(file_path, remove_prefix, threshold_distance_m, threshold_acc
 
     tracks = []
     for original_sequence_number, track_element in enumerate(root.findall("gpx:trk", GPX_NS), start=1):
+        if track_processing_callback is not None:
+            track_processing_callback()
         track = summarize_track(
             track_element,
             remove_prefix,
             threshold_distance_m,
             threshold_accuracy_m,
             verbose,
+            horizontal_smoothing_distance_m,
+            elevation_smoothing_distance_m,
+            maximum_vertical_accuracy_m,
+            maximum_hdop,
+            maximum_vdop,
         )
         track["original_sequence_number"] = original_sequence_number
         tracks.append(track)
@@ -665,6 +696,11 @@ def print_startup_parameters(args, output_dir, output_base, overview_path, pdf_o
     print(f"  Titelfarbe: {args.title_color}")
     print(f"  GPX-THRESHOLD-DISTANCE: {args.gpx_threshold_distance}")
     print(f"  GPX-THRESHOLD-ACCURACY: {args.gpx_threshold_accuracy}")
+    print(f"  GPX-HORIZONTAL-SMOOTHING: {args.gpx_horizontal_smoothing_distance}")
+    print(f"  GPX-ELEVATION-SMOOTHING: {args.gpx_elevation_smoothing_distance}")
+    print(f"  GPX-MAXIMUM-VERTICAL-ACCURACY: {args.gpx_maximum_vertical_accuracy}")
+    print(f"  GPX-MAXIMUM-HDOP: {args.gpx_maximum_hdop}")
+    print(f"  GPX-MAXIMUM-VDOP: {args.gpx_maximum_vdop}")
     print(f"  Prefix entfernen: {args.remove_prefix if args.remove_prefix else '(keiner)'}")
     print(f"  Ausgabeordner: {output_dir}")
     print(f"  Basisname: {output_base}")
@@ -702,8 +738,8 @@ def build_table_rows(tracks, include_original_sequence=False):
 
 # AI prompt: "Write a helper that builds structured JSON-ready summary data for
 # the sorted tracks, including table fields and extra timing/coordinate details."
-def build_table_summary_data(gpx_path, tracks):
-    """Return structured summary data for JSON export."""
+def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
+    """Return compact summary data; point geometry remains in plot sidecars."""
     cumulative_km = 0.0
     track_items = []
     for track in tracks:
@@ -719,6 +755,8 @@ def build_table_summary_data(gpx_path, tracks):
                 "erstellungsdatum": format_datetime_local(track["time"]),
                 "dauer": format_duration(track["duration"]),
                 "laenge_km": round(track["length_km"], 1),
+                "ascent_m": round(track.get("ascent_m", 0.0), 1),
+                "descent_m": round(track.get("descent_m", 0.0), 1),
                 "kumulativ_km": round(cumulative_km, 1),
                 "abstand_km": None if track["distance_km"] is None else round(track["distance_km"], 1),
                 "start_time": format_datetime_local_seconds(track["start_time"]),
@@ -733,12 +771,22 @@ def build_table_summary_data(gpx_path, tracks):
                 ),
                 "raw_point_count": track["raw_point_count"],
                 "filtered_point_count": track["filtered_point_count"],
+                "rejection_counts": track.get("rejection_counts", {}),
+                "processing_options": track.get("processing_options", {}),
             }
         )
     return {
         "source_gpx": os.path.abspath(gpx_path),
         "tracks": track_items,
     }
+
+
+def processed_point_json_record(point):
+    """Return one processed point record with a JSON-safe timestamp."""
+    record = dict(point)
+    point_time = record.pop("time", None)
+    record["time_iso"] = point_time.isoformat() if point_time is not None else None
+    return record
 
 
 # AI prompt: "Write a helper that formats a table with optional multi-line cells
@@ -965,17 +1013,26 @@ def label_font_size(track_count):
 # AI prompt: "Write a helper that returns projected track geometries and the
 # flattened coordinate lists needed for extent calculation."
 def projected_track_data(tracks):
-    """Return projected point lists and flattened coordinates."""
+    """Return flattened and segment-preserving projected track coordinates."""
     projected_tracks = []
+    projected_track_segments = []
     all_x = []
     all_y = []
     for track in tracks:
-        projected_points = [lonlat_to_web_mercator(lon, lat) for lat, lon in track["points"]]
+        projected_segments = [
+            [lonlat_to_web_mercator(lon, lat) for lat, lon in segment]
+            for segment in track.get("segments", [])
+            if segment
+        ]
+        if not projected_segments and track.get("points"):
+            projected_segments = [[lonlat_to_web_mercator(lon, lat) for lat, lon in track["points"]]]
+        projected_points = [point for segment in projected_segments for point in segment]
         projected_tracks.append(projected_points)
+        projected_track_segments.append(projected_segments)
         for x_coord, y_coord in projected_points:
             all_x.append(x_coord)
             all_y.append(y_coord)
-    return projected_tracks, all_x, all_y
+    return projected_tracks, projected_track_segments, all_x, all_y
 
 
 # AI prompt: "Write a helper that selects the configured basemap provider from
@@ -1186,7 +1243,7 @@ def render_track_plot(
             "Plotting requires matplotlib and contextily. Install them first."
         ) from exc
 
-    projected_tracks, all_x, all_y = projected_track_data(tracks)
+    projected_tracks, projected_track_segments, all_x, all_y = projected_track_data(tracks)
 
     if not all_x or not all_y:
         raise RuntimeError("No valid track points available for plotting.")
@@ -1366,10 +1423,10 @@ def render_track_plot(
             "Please check the internet connection or try again later; the map server may have timed out."
         ) from exc
     if media_map_date is None:
-        for track, projected_points in zip(tracks, projected_tracks):
-            if not projected_points:
-                continue
-            draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size)
+        for track_segments in projected_track_segments:
+            for projected_points in track_segments:
+                if projected_points:
+                    draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size)
     if overview_mode:
         add_overview_markers(ax, projected_tracks, height_px, dpi, line_color)
         add_overview_labels(
@@ -1716,9 +1773,39 @@ def build_argument_parser():
     )
     parser.add_argument(
         "--gpx-threshold-accuracy",
-        type=parse_positive_float,
+        type=parse_non_negative_float,
         default=10.0,
-        help="Maximum allowed point accuracy in meters when present (default: 10).",
+        help="Maximum horizontal point error in meters; zero disables it (default: 10).",
+    )
+    parser.add_argument(
+        "--gpx-horizontal-smoothing-distance",
+        type=parse_non_negative_float,
+        default=10.0,
+        help="Horizontal coordinate smoothing width in meters; zero disables it (default: 10).",
+    )
+    parser.add_argument(
+        "--gpx-elevation-smoothing-distance",
+        type=parse_non_negative_float,
+        default=50.0,
+        help="Elevation smoothing width in meters; zero disables it (default: 50).",
+    )
+    parser.add_argument(
+        "--gpx-maximum-vertical-accuracy",
+        type=parse_non_negative_float,
+        default=20.0,
+        help="Maximum vertical point error in meters; zero disables it (default: 20).",
+    )
+    parser.add_argument(
+        "--gpx-maximum-hdop",
+        type=parse_non_negative_float,
+        default=20.0,
+        help="Maximum horizontal dilution of precision; zero disables it (default: 20).",
+    )
+    parser.add_argument(
+        "--gpx-maximum-vdop",
+        type=parse_non_negative_float,
+        default=20.0,
+        help="Maximum vertical dilution of precision; zero disables it (default: 20).",
     )
     parser.add_argument(
         "--fallback-walking-speed-kmh",
@@ -1752,8 +1839,16 @@ def normalize_runtime_args(args):
         raise ValueError("Zoom level must be a non-negative integer.")
     if float(args.gpx_threshold_distance) < 0:
         raise ValueError("gpx_threshold_distance must be non-negative.")
-    if float(args.gpx_threshold_accuracy) <= 0:
-        raise ValueError("gpx_threshold_accuracy must be positive.")
+    for name in (
+        "gpx_threshold_accuracy",
+        "gpx_horizontal_smoothing_distance",
+        "gpx_elevation_smoothing_distance",
+        "gpx_maximum_vertical_accuracy",
+        "gpx_maximum_hdop",
+        "gpx_maximum_vdop",
+    ):
+        if float(getattr(args, name, 0.0)) < 0:
+            raise ValueError(f"{name} must be non-negative.")
     if float(getattr(args, "fallback_walking_speed_kmh", 3.5)) <= 0:
         raise ValueError("fallback_walking_speed_kmh must be positive.")
     if getattr(args, "maximum_map_zoom", 19) < 0:
@@ -1827,6 +1922,12 @@ def prepare_run_context(args):
         args.gpx_threshold_distance,
         args.gpx_threshold_accuracy,
         args.verbose,
+        args.gpx_horizontal_smoothing_distance,
+        args.gpx_elevation_smoothing_distance,
+        args.gpx_maximum_vertical_accuracy,
+        args.gpx_maximum_hdop,
+        args.gpx_maximum_vdop,
+        getattr(args, "track_processing_callback", None),
     )
 
     tracks, anchor_point, anchor_name = sort_tracks(
@@ -1965,7 +2066,12 @@ def execute_run_context(context, print_table_output=True):
         if args.verbose:
             print(f"PDF gespeichert: {context['pdf_output_path']}")
     if not args.nojson:
-        table_summary = build_table_summary_data(gpx_path, tracks)
+        table_summary = build_table_summary_data(
+            gpx_path,
+            tracks,
+            args.fallback_walking_speed_kmh,
+        )
+        table_summary["gpx_processing"] = tracks[0].get("processing_options", {}) if tracks else {}
         processing_parameters = getattr(args, "adventure_processing_parameters", None)
         if isinstance(processing_parameters, dict):
             table_summary["adventure_processing_parameters"] = processing_parameters
@@ -2023,6 +2129,7 @@ def execute_run_context(context, print_table_output=True):
                 "title_color": args.title_color,
                 "gpx_threshold_distance_m": args.gpx_threshold_distance,
                 "gpx_threshold_accuracy_m": args.gpx_threshold_accuracy,
+                "gpx_processing": tracks[0].get("processing_options", {}) if tracks else {},
                 "overview_labels": args.print_labels,
                 "tracks": [
                     {
@@ -2117,6 +2224,10 @@ def execute_run_context(context, print_table_output=True):
                     "title_color": args.title_color,
                     "gpx_threshold_distance_m": args.gpx_threshold_distance,
                     "gpx_threshold_accuracy_m": args.gpx_threshold_accuracy,
+                    "gpx_processing": track.get("processing_options", {}),
+                    "raw_point_count": track.get("raw_point_count", 0),
+                    "retained_point_count": track.get("filtered_point_count", 0),
+                    "rejection_counts": track.get("rejection_counts", {}),
                     "start_point": build_coordinate_point(
                         track["first_point"][0] if track["first_point"] is not None else None,
                         track["first_point"][1] if track["first_point"] is not None else None,
@@ -2126,6 +2237,14 @@ def execute_run_context(context, print_table_output=True):
                         track["last_point"][1] if track["last_point"] is not None else None,
                     ),
                     "track_points": [(point[0], point[1]) for point in track["points"]],
+                    "track_segments": [
+                        [(point[0], point[1]) for point in segment]
+                        for segment in track.get("segments", [])
+                    ],
+                    "processed_track_segments": [
+                        [processed_point_json_record(point) for point in segment]
+                        for segment in track.get("segment_records", [])
+                    ],
                     "timed_track_points": timed_points_payload(
                         track.get("point_records", []),
                         args.fallback_walking_speed_kmh,
@@ -2207,6 +2326,11 @@ def namespace_from_options(gpx_file, **overrides):
         verbose=False,
         gpx_threshold_distance=10.0,
         gpx_threshold_accuracy=10.0,
+        gpx_horizontal_smoothing_distance=10.0,
+        gpx_elevation_smoothing_distance=50.0,
+        gpx_maximum_vertical_accuracy=20.0,
+        gpx_maximum_hdop=20.0,
+        gpx_maximum_vdop=20.0,
         fallback_walking_speed_kmh=3.5,
         map_layout="standard",
         track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
@@ -2214,6 +2338,7 @@ def namespace_from_options(gpx_file, **overrides):
         adventure_render_parameters=None,
         adventure_overview_render_parameters=None,
         adventure_processing_parameters=None,
+        track_processing_callback=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)

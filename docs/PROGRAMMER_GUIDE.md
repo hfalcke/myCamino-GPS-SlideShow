@@ -23,6 +23,10 @@ The active source files are:
   parameter-subset loading.
 - `map_provider_utils.py`: shared Contextily provider construction and bounded
   tile-request handling.
+- `audio_playlist.py`: recursive audio discovery, `$`-label playlist
+  parsing/generation/update, album membership, and pure transport progression.
+- `slideshow_control_format.py`: strict CSV-style `#MUSIC:` parsing and command
+  normalization.
 - `gpxjoin.py`, `gpxlist.py`, `editGPXTrack.py`: older or supporting GPX tools.
 
 ## Runtime Model
@@ -70,6 +74,8 @@ Important GUI support classes:
   undo, and redo keyboard handling.
 - `GPSTrackShowGUIPlotViewerView`: key-aware plot image viewer.
 - `SlideShowMediaViewerView`: key-aware media viewer.
+- `WorkflowAssistantBubbleView`: retained in-window speech-bubble overlay for
+  first-time workflow guidance.
 - Window delegate classes retain lifecycle hooks and should be kept alive while
   their windows are open.
 
@@ -94,7 +100,22 @@ completion indicator:
 - GPX Files: at least one GPX file exists.
 - Track Maps: overview and all expected track maps exist and are current.
 - Photos and Video Clips: at least one supported media file exists.
-- Slide Show Control File: control file exists and contains at least one image.
+- Slide Show Control File: control file exists and contains at least one image
+  or video.
+
+`_workflow_readiness()` is the shared readiness source for these indicators
+and the workflow assistant. Do not add a separate assistant-only file check;
+otherwise the bubble and colored marks can disagree. The pure helpers in
+`workflow_assistant.py` normalize persisted state, choose the first incomplete
+stage, and calculate an in-window bubble placement suitable for unit tests.
+
+New Adventures save `workflow_assistant.enabled`,
+`workflow_assistant.place_names_completed`, and
+`workflow_assistant.slideshow_started`. Loading an older format-2 Adventure
+without this optional object treats the two action markers as complete while
+still evaluating file-backed readiness. A successful Add Place Names run sets
+a transient pending flag; only saving the changed control table commits the
+marker. A successful player process launch commits the slideshow marker.
 
 ## Adventure Files
 
@@ -137,6 +158,8 @@ Stored values include:
 - `time_lapse_media_min_fraction` (currently stored with a default of `0.5`;
   the legacy `time_lapse_media_max_fraction` key is accepted while loading)
 - description and other GUI state that belongs to the adventure
+- optional `music_source` and `music_playlist` paths; paths inside the project
+  are stored relative and external paths are absolute
 - `parameters`: a versioned object containing normalized values from the
   central registry
 
@@ -159,13 +182,40 @@ The registry currently propagates settings to:
 - `gpx_tracks_table.py` for filtering, sorting, rendering, provider choice,
   timeout, dimensions, and styling.
 - embedded `GPXEditor.py` instances for autosave, map behavior, PDF rendering,
-  provider choice, cache retention, and timestamp fallback.
+  provider choice, cache retention, timestamp fallback, and shared GPX
+  processing.
 - `GetGeoLocations.py` for known-place radius, timeout, and request pacing.
 
 Track-map sidecars store `adventure_render_parameters`; the track summary stores
 `adventure_processing_parameters`. Freshness checks compare these normalized
 signatures. Legacy outputs remain current only while the corresponding settings
 still equal their old defaults.
+
+## Shared GPX Processing
+
+`gpx_processing.py` is the single source for GPX geometry and quality metrics.
+It defines `ProcessingOptions`, `RawTrackPoint`, `ProcessedPoint`,
+`ProcessedSegment`, and `ProcessedTrack`. The processor keeps `<trkseg>`
+boundaries, filters horizontal and vertical quality independently, smooths XY
+and elevation over separate route-distance kernels, applies retained-point
+spacing, interpolates missing/rejected elevations only between valid anchors,
+and computes length/ascent/descent from the resulting geometry.
+
+Consumers must not recalculate point-to-point geometry independently.
+`GPXEditor.py`, `gpx_tracks_table.py`, `gpxlist.py`, `track_timing_utils.py`,
+PDF output, Track Maps, and slideshow timing all use the shared output.
+`elevation_metrics.py` remains only as a compatibility re-export. Editor caches
+are keyed by the semantic track fingerprint and complete processing-parameter
+signature; XML edits invalidate only the affected track. Parameter changes are
+processed on one background worker using XML snapshots, with AppKit updates
+returned to the main thread.
+
+Summary and map sidecars record processing options, raw/retained counts,
+rejection counts, segment-preserving geometry, processed elevation, and timed
+points. Retained point records also preserve explicit horizontal/vertical
+uncertainty, HDOP, VDOP, PDOP, satellite count, and fix type when present; PDOP,
+satellites, and fix are metadata only in this version. Every processing option is also part of GUI freshness signatures, so
+changing a threshold or kernel marks summaries and Track Maps for Update.
 
 When a project directory is selected, the GUI creates it if needed, discovers
 all valid `.adv` files, and loads the newest one. Adventure, GPX, and control
@@ -203,10 +253,19 @@ The GUI uses these fingerprints to detect stale track maps per track. It falls
 back to modification times only for older metadata that does not contain
 fingerprints.
 
-After `GPXEditor.py` saves or closes with an accepted GPX file, the main GUI
-regenerates the track summary JSON with `run_gpx_tracks_table_with_options(...)`
-without rendering maps. This keeps control-file operations consistent while
-leaving slow map rendering under explicit user control.
+The global `*-summary.json` intentionally contains only compact per-track
+statistics, endpoints, processing settings, fingerprints, and plot filenames.
+Point-by-point processed geometry and `timed_track_points` belong only to the
+matching per-track map sidecars. This avoids duplicating hundreds of megabytes
+of data in large Adventures while preserving the timing data needed by the
+Time-Lapse player.
+
+After `GPXEditor.py` saves an accepted changed GPX file, the main GUI regenerates
+the track summary JSON with `run_gpx_tracks_table_with_options(...)` without
+rendering maps. Closing the editor does not repeat that work when the same file
+version was already handled or the GPX file was unchanged. This keeps
+control-file operations consistent while leaving slow map rendering under
+explicit user control.
 
 The GUI deliberately tolerates legacy plot file names when detecting existing
 plots. Matching code normalizes track plot names so old zero-padding variants
@@ -368,6 +427,21 @@ Supported line types:
 - `#MapAfter: filename`: associated track map for media on the day after.
 - `#MediaMap: filename`: date-only location map for media not assigned to a track.
 - `#Date:` or `#Datum:`: date section line.
+- `#MUSIC: command, target, ...`: ordered non-display music transport commands.
+
+Media lines have exactly the normal filename/time/GPS/place fields; music is
+never attached to another row. `parse_music_directive(...)` uses strict CSV
+quoting, normalizes case-insensitive `$LABEL` references, rejects malformed
+command syntax, and leaves unresolved labels/files for runtime warnings.
+GetGeoLocations merge/sync and Adventure rename/copy keep `#MUSIC:` entries as
+ordinary ordered directives and never interpret their payload as a map path.
+
+The control-table window intercepts Command- and Control-C/X/V before row
+commands and sends them to the shared field editor whenever a cell is actively
+being edited. Media filtering does not call AppKit's unreliable hidden-row API:
+the data source publishes an explicit view-to-model index list instead. Every
+selection, edit, search, preview, and drag callback translates through that
+list, while serialization continues to use the complete unchanged model.
 
 The GUI table maps these to row types:
 
@@ -379,10 +453,22 @@ The GUI table maps these to row types:
 - `AFT`: day-after track map
 - `LOC`: media-only location map
 - `DAT`: date row
+- `MUS`: music directive
+
+The editable Type combo displays the canonical short code in its closed cell
+and `<code> - <description>` in its dropdown menu.
+`normalize_control_row_type(...)` keeps only the canonical short code in the
+row model, keeping serialization independent of the UI label.
 
 `parse_slideshow_control_line(...)` and `serialize_slideshow_control_row(...)`
 are the key conversion functions. Keep them compatible with
 `GetGeoLocations.py`.
+
+Opening the control-file editor derives the Track Map summary path directly
+from `track_map_base`; it must not prepare or parse the GPX file. The retained
+editor model is reused when the control-file path, size, and nanosecond
+modification time are unchanged and no newer recovery copy exists. Save,
+Discard, and Revert must keep that signature state synchronized.
 
 ## GPX Editor Integration
 
@@ -391,6 +477,20 @@ The GUI opens `GPXEditor.py` with:
 - `show_gpx_editor_from_cli_args(...)`
 - `on_close` callback
 - `on_save` callback
+- `on_initial_load_complete` callback
+
+While a newly created editor performs its staged initial track load, the main
+GUI pauses only the GPX part of its asynchronous project-status refresh. The
+shared `threading.Event` is checked through `parse_gpx_file(...)` before each
+track, so waiting releases the GIL and obsolete status generations can stop.
+The editor's one-shot initial-load callback resumes the status refresh as soon
+as its table is ready, including empty-input, failure, cancellation, and close
+paths. Merely raising an existing editor never pauses status processing.
+
+The asynchronous status refresh creates one `gpx_tracks_table` preparation
+context and derives both the GPX summary label and Track Map freshness from
+its tracks. Do not add a separate `_format_gpx_summary(...)` traversal to that
+path; synchronous callers may continue to use it directly.
 
 The editor must return the most recently saved GPX path. The main GUI then
 updates the GPX field, refreshes GPX statistics, regenerates the track summary
@@ -425,6 +525,30 @@ It reads:
 It supports keyboard navigation, media overlays, clock/place overlays, and map
 windows. Since it is a separate process, quitting it must not affect the main
 GUI.
+
+`BackgroundMusicController` retains at most two `AVPlayer` instances for
+crossfades and uses one 250-ms polling timer for title completion. It parses
+`#MUSIC:` rows once and delegates deterministic title progression to
+`MusicTransportState`. It must be disposed before presenter and window
+teardown. Standard and Time-Lapse activation paths call `synchronize_row()`;
+Time-Lapse also executes directives crossed internally before each media event.
+Backward navigation and Continue reconstruct gate, volume, queue, and loop
+state by replaying preceding directives without rendering slides or repeatedly
+crossfading. Videos and Space pause audio transiently, while `a` changes the
+independent user-enabled state. This manual state always has priority over the
+control-file gate.
+
+The transport supports ordered target queues that return to the interrupted
+playlist title and time position, permanent playlist jumps, continue,
+single/line/range/album/all loops, a 0–9 gain level, and `#ON/#OFF`. Targets
+open the control gate; volume and gate actions do not cancel transport modes.
+The player reports unresolved targets but keeps the current title running.
+
+Player entry points accept `music_source`, `music_playlist`, and
+`audio_crossfade_seconds`; CLI equivalents are `--music`, `--music-playlist`,
+and `--audio-crossfade-seconds`. A directory without an explicit playlist
+looks for the control-list stem (without `-sorted`) plus `.playlist`, then
+falls back to recursive case-insensitive relative-path order.
 
 `GPSTrackShowWindowDelegate` gives every Cocoa window a stable `photo` or `map`
 role. Closing the primary photo window quits playback. Closing the secondary
@@ -638,7 +762,10 @@ Core classes:
 - `EditorTableDataSource` and `EditorTableView`: main track table.
 - `PlotView`: overview/track map display with cursor, zoom, selection, delete,
   cut, and anchor handling.
-- `ElevationProfileView`: elevation profile window linked to a plot view.
+- `ElevationProfileView`: elevation profile window linked to a plot view. It
+  shares selection and edit commands with `PlotView`, supports independent
+  distance and visible-elevation scaling, and retains its own temporary help
+  window and close timer.
 - `TrackInspectorController`: waypoint-level editor for one track.
 
 The editor writes:

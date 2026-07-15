@@ -38,6 +38,19 @@ The normal order is:
 Green check marks beside sections show that the minimum required step for that
 section is complete. Red marks show what is still missing.
 
+New Adventures also start with the **Assistant** enabled. Its yellow speech
+bubble points to the next required control in this order: project directory,
+Adventure name, GPX file, Track Maps, media, control file, place names, and the
+first slide-show start. The bubble moves on automatically as each step becomes
+ready. Click its `x`, or clear **Assistant** in the header, to disable it for
+the active Adventure. That choice and the completed action steps are saved
+automatically with the Adventure.
+
+Adventures created before the Assistant was introduced do not repeat the two
+action-only prompts for place names and starting the show. Missing GPX files,
+maps, media, or control files are still detected and can reactivate a relevant
+data step.
+
 ## Adventure Section
 
 Use this section to choose the project directory and describe the adventure.
@@ -93,6 +106,13 @@ HTTP(S) tile address containing `{z}`, `{x}`, and `{y}`, plus attribution.
 Selecting Custom reveals both required fields immediately. Numerical settings
 can be typed or adjusted with the adjacent up/down stepper.
 
+GPX Processing separates horizontal smoothing (default 10 m), retained-point
+spacing (10 m), and elevation smoothing (50 m). Horizontal/vertical uncertainty
+limits default to 10/20 m, and HDOP/VDOP limits to 20/20. Missing quality data
+is accepted. Setting any individual smoothing, spacing, or quality limit to
+zero disables it. The same processed geometry drives statistics, Track Maps,
+PDFs, timing, and Time-Lapse motion; the original GPX points are not rewritten.
+
 The Time-Lapse **Moving marker** setting chooses between the animated walking
 pilgrim and the traditional arrow. The pilgrim is the default. It uses a
 standing pose while the GPS marker remains within the screen-scaled motion
@@ -112,6 +132,8 @@ temporary and do not overwrite the saved project settings.
 
 Main controls:
 
+- Assistant, beside Help: show or hide the guided next-step bubble for the
+  active Adventure.
 - Help, beside Settings in the header: show the workflow and files used by the
   program.
 - Quit: flush any pending auto-save and quit. If writing fails, the program
@@ -212,13 +234,15 @@ Use this section to import and inspect the media files for the adventure.
 
 Controls:
 
-- Import: choose images and videos to copy into the project directory.
+- Import: choose images and videos to import into the project directory.
 - View: open the project media browser.
 - Folder icon: open project media in Finder.
 
 Files created:
 
 - Imported image/video files are copied directly into the project directory.
+- A file already present under the destination name is reported as
+  **Skipping existing** and is not copied or counted as newly imported.
 - Existing files are skipped so duplicates are not imported.
 - Sidecar `.json` files are created later by the Slide Show Control File
   section or by media browser preparation when needed.
@@ -309,6 +333,24 @@ Right-click a table row to Delete, Cut, Copy, Paste, Preview, or Open in
 Finder. Finder opens the containing folder with the selected image, video, or
 map file already highlighted. The Previews checkbox remains available at the
 top left when the editor window is resized.
+
+Music control uses separate `MUS` rows rather than an extra column. Press
+**Insert Row** or Command-I, choose `MUS` in the Type field, and enter the
+comma-separated commands in **File / Date / Map**. A nonmodal command reference
+opens for a `MUS` row. **Hide Media Rows** temporarily removes only image and
+video rows and then changes to **Show Media Rows**. The selected stage remains
+selected and is scrolled into view when media rows return, making it easy to
+continue editing there. Filtering never changes the saved row order, and
+search uses only visible rows while the filter is active.
+
+The compact Type column shows only its short code. Its dropdown menu shows both
+the short type and its meaning, for example `TRK - Track map` and
+`MUS - Music control`. The short code also remains the type used in saved
+directives.
+
+While a table cell is being edited, both Command-C/X/V and Control-C/X/V act
+on the text inside that cell. With no active cell editor, the same shortcuts
+copy, cut, or paste complete selected rows.
 
 When the media viewer moves with the arrow keys, the corresponding control-file
 row is selected and scrolled into view. Videos open at their first frame in an
@@ -417,6 +459,22 @@ Merge New Media:
 
 The Start Slide Show section contains:
 
+- Music: choose one supported audio file or a directory containing MP3, M4A,
+  AAC, WAV, AIFF, CAF, or FLAC files. One file repeats by itself. A directory
+  is scanned recursively and uses case-insensitive relative-path order unless
+  `<Adventure name>.playlist` is present. Choose creates and initially selects
+  the project's `audio` folder when no source has been selected yet.
+- Create Playlist: write an editable playlist into the selected music
+  directory. Each album folder and filename receives a unique short `$LABEL`.
+  Existing playlists are replaced only after confirmation.
+- Update Playlist: keep existing text and append newly discovered files,
+  grouped by folder, with new unique album and file labels.
+- Edit Playlist: open the active playlist in TextEdit. If no playlist exists
+  yet, it is first created from the supported audio files in the directory.
+- The Adventure stores the selected music source and explicit playlist path.
+  Renaming or copying an Adventure with related files enabled also renames or
+  copies its playlist; the audio recordings themselves remain unchanged.
+
 - Show type: choose **Time-Lapse** or **Standard**. Time-Lapse is selected by
   default; this preference is saved with the Adventure and can also be set in
   Settings.
@@ -490,6 +548,9 @@ Common slide-show keys:
 
 - Space: pause or resume automatic playback.
 - `m`: switch between automatic and manual stepping.
+- `a`: fade background music out and pause it, or resume it at the same
+  position with a fade-in. Space-pausing automatic playback also pauses music;
+  videos pause it temporarily without changing the `a` setting.
 - Right or Down: advance to the next item; in manual time-lapse mode, advance
   to the next scheduled media pause or the end of the stage. Arrow-key
   navigation retains the current automatic or manual playback mode.
@@ -515,6 +576,38 @@ Common slide-show keys:
 
 Because the slide show runs separately, quitting it should not close or crash
 the main GUI.
+
+### Music playlists and directives
+
+A playlist is a plain text file. Blank lines are ignored, paths are relative to
+the selected music directory, and a line such as `$MORNING` labels the next
+audio file. Several labels may precede one file. Labels are case-insensitive;
+ambiguous extensionless names are skipped with a warning. Subfolders that
+directly contain audio are albums and receive an `$ALB_...` label when a
+playlist is created.
+
+Add a standalone line such as `#MUSIC: #JUMP $MORNING` to the control file.
+Entries are CSV-style comma-separated; quote a pathname containing commas.
+Available commands are:
+
+- `$LABEL` or pathname: temporarily queue titles in the listed order, then
+  resume the previously interrupted playlist title at its saved position.
+- `#JUMP $LABEL`: discard a queue or loop and continue from the label.
+- `#ON` / `#OFF`: open or close the control-file audio gate.
+- `#CONTINUE`: cancel the active queue or loop without a hard cut.
+- `#LOOPLINE`: repeat labels/files later on the same line.
+- `#LOOPONE`: repeat the current or most recently played title.
+- `#LOOPRANGE $A $B`: repeat the inclusive playlist range.
+- `#LOOPALBUM, $LABEL`: repeat the target's album; without a target it uses the
+  next album after the current position.
+- `#LOOPALL`: repeat the complete playlist.
+- `#VOLUME+`, `#VOLUME-`, or `#VOLUME N`: change the internal level from 0–9.
+
+Targets, jumps, continue, and loop commands replace the active transport mode;
+gate and volume commands do not. A valid target opens the control gate. A
+manual `a` toggle to Audio Off always has priority, so no control-file command
+can restart audio until `a` is pressed again. The crossfade duration is set in
+**Settings > Audio**. Missing labels or files warn and leave playback running.
 
 The time-lapse uses the recorded GPX point times where available. Missing times
 are estimated along the travelled distance; when a track has no usable duration,

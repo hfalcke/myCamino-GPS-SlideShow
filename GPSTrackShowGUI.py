@@ -29,10 +29,12 @@ from AppKit import (
     NSColorSpace,
     NSColorWell,
     NSComboBox,
+    NSComboBoxCell,
     NSFont,
     NSFontAttributeName,
     NSFontManager,
     NSForegroundColorAttributeName,
+    NSGraphicsContext,
     NSImage,
     NSImageAlignCenter,
     NSImageCell,
@@ -49,6 +51,7 @@ from AppKit import (
     NSPopUpButton,
     NSProgressIndicator,
     NSScrollView,
+    NSShadow,
     NSSearchField,
     NSSortDescriptor,
     NSStepper,
@@ -75,7 +78,9 @@ from AppKit import (
     NSControlStateValueOn,
     NSDragOperationMove,
     NSEventModifierFlagCommand,
+    NSEventModifierFlagControl,
     NSEventModifierFlagShift,
+    NSEventTypeKeyDown,
     NSItalicFontMask,
     NSBoldFontMask,
     NSPasteboardTypeString,
@@ -160,6 +165,20 @@ from adventure_files import (
     shared_references,
     validate_adventure_payload,
 )
+from audio_playlist import (
+    AUDIO_EXTENSIONS,
+    album_directories,
+    audio_files_in_directory,
+    generated_playlist_text,
+    load_audio_playlist,
+    updated_playlist_text,
+)
+from slideshow_control_format import MusicSyntaxError, is_music_directive, parse_music_parameters
+from workflow_assistant import bubble_geometry, next_assistant_stage, normalize_assistant_state
+
+
+class ProjectStatusRefreshSuperseded(Exception):
+    """Stop an obsolete cooperative project-status calculation."""
 
 
 PHOTOS_FRAMEWORK_AVAILABLE = True
@@ -192,10 +211,10 @@ SMALL_BUTTON_WIDTH = 90.0
 PLOT_BUTTON_WIDTH = 110.0
 FIELD_HEIGHT = 28.0
 PADDING = 18.0
-BLOCK_GAP = 14.0
+BLOCK_GAP = 8.0
 INNER_GAP = 10.0
-ROW_GAP = 12.0
-DESCRIPTION_HEIGHT = 56.0
+ROW_GAP = 8.0
+DESCRIPTION_HEIGHT = 48.0
 STATUS_HEIGHT = 24.0
 PROGRESS_HEIGHT = 18.0
 PLOT_VIEWER_CAPTION_HEIGHT = 32.0
@@ -226,7 +245,24 @@ CONTROL_ROW_TYPE_KEYWORDS = {
     "AFT": "MapAfter",
     "LOC": "MediaMap",
     "DAT": "Datum",
+    "MUS": "MUSIC",
 }
+CONTROL_ROW_TYPE_DESCRIPTIONS = {
+    "IMG": "Image",
+    "VID": "Video",
+    "MAP": "Overview map",
+    "TRK": "Track map",
+    "BEF": "Day before map",
+    "AFT": "Day after map",
+    "LOC": "Media location map",
+    "DAT": "Date",
+    "MUS": "Music control",
+}
+CONTROL_ROW_TYPES = tuple(CONTROL_ROW_TYPE_DESCRIPTIONS)
+CONTROL_ROW_TYPE_CHOICES = tuple(
+    f"{row_type} - {description}"
+    for row_type, description in CONTROL_ROW_TYPE_DESCRIPTIONS.items()
+)
 CONTROL_TABLE_DRAG_TYPE = NSPasteboardTypeString
 PH_AUTH_NOT_DETERMINED = 0
 PH_AUTH_RESTRICTED = 1
@@ -237,6 +273,25 @@ PH_COLLECTION_TYPE_ALBUM = 1
 PH_COLLECTION_TYPE_SMART_ALBUM = 2
 PH_COLLECTION_SUBTYPE_ANY = 9223372036854775807
 PH_ASSET_MEDIA_TYPE_IMAGE = 1
+
+
+def control_file_signature(path):
+    """Return the stable identity used to detect an unchanged control file."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    try:
+        stat_result = candidate.stat()
+    except OSError:
+        return None
+    return (str(candidate), int(stat_result.st_size), int(stat_result.st_mtime_ns))
+
+
+def control_file_recovery_is_newer(control_path, recovery_path):
+    """Return whether a recovery copy should take precedence over the saved list."""
+    recovery_signature = control_file_signature(recovery_path)
+    if recovery_signature is None:
+        return False
+    control_signature = control_file_signature(control_path)
+    return control_signature is None or recovery_signature[2] > control_signature[2]
 
 
 def show_alert(message: str, informative: str = "") -> None:
@@ -343,7 +398,7 @@ def slideshow_row_type_for_filename(filename: str) -> str:
 
 def parse_slideshow_control_line(line: str) -> dict:
     """Parse one sorted slideshow control-file line into a table row."""
-    text = line.rstrip("\n")
+    text = str(line).rstrip("\r\n")
     if text.startswith("#"):
         body = text[1:]
         keyword, separator, value = body.partition(":")
@@ -362,6 +417,8 @@ def parse_slideshow_control_line(line: str) -> dict:
             row_type = "LOC"
         elif normalized in {"date", "datum"}:
             row_type = "DAT"
+        elif normalized == "music":
+            row_type = "MUS"
         else:
             row_type = keyword.upper() if keyword else "#"
         return {
@@ -432,6 +489,32 @@ def next_control_table_search_position(current, count, direction):
     return (current + direction) % count
 
 
+def visible_control_row_indexes(rows, hide_media=False):
+    """Return model indexes exposed by the control-table data source."""
+    if not hide_media:
+        return list(range(len(rows)))
+    return [
+        index
+        for index, row in enumerate(rows)
+        if str(row.get("type", "")).upper() not in {"IMG", "VID"}
+    ]
+
+
+def control_table_filter_anchor_index(rows, selected_indexes, hide_media=False):
+    """Return the selected or nearest row that remains visible after filtering."""
+    visible = visible_control_row_indexes(rows, hide_media)
+    if not visible:
+        return None
+    selected = [int(index) for index in selected_indexes if 0 <= int(index) < len(rows)]
+    for index in selected:
+        if index in visible:
+            return index
+    if not selected:
+        return visible[0]
+    pivot = selected[0]
+    return min(visible, key=lambda index: (abs(index - pivot), 0 if index <= pivot else 1))
+
+
 def media_viewer_control_row_index(source, items, index):
     """Return the originating control-table row for the visible viewer item."""
     if source != "control" or not items or index < 0 or index >= len(items):
@@ -442,13 +525,33 @@ def media_viewer_control_row_index(source, items, index):
         return None
 
 
+def normalize_control_row_type(value: str) -> str:
+    """Return the canonical short type accepted from a combo-box entry."""
+    text = str(value or "").strip()
+    candidate = text.split(" - ", 1)[0].strip().upper()
+    if candidate in CONTROL_ROW_TYPE_DESCRIPTIONS:
+        return candidate
+    folded = text.casefold()
+    for row_type, description in CONTROL_ROW_TYPE_DESCRIPTIONS.items():
+        if folded == description.casefold():
+            return row_type
+    return text.upper()
+
+
+def display_control_row_type(value: str) -> str:
+    """Return a readable combo-box label for a canonical control-row type."""
+    row_type = normalize_control_row_type(value)
+    description = CONTROL_ROW_TYPE_DESCRIPTIONS.get(row_type)
+    return f"{row_type} - {description}" if description else str(value or "")
+
+
 def update_slideshow_control_row_cell(row: dict, column_id: str, value: str) -> None:
     """Apply one table edit while keeping type and directive keyword consistent."""
     text = str(value or "")
     if column_id != "type":
         row[column_id] = text
         return
-    row_type = text.strip().upper()
+    row_type = normalize_control_row_type(text)
     row["type"] = row_type
     if row_type in CONTROL_ROW_TYPE_KEYWORDS:
         row["keyword"] = CONTROL_ROW_TYPE_KEYWORDS[row_type]
@@ -549,25 +652,31 @@ class SlideShowControlTableDataSource(NSObject):
         return self
 
     def numberOfRowsInTableView_(self, _table_view):
-        return len(self.controller.control_table_rows)
+        return len(self.controller.control_table_view_model_indexes)
 
     def tableView_objectValueForTableColumn_row_(self, _table_view, table_column, row_index):
-        if row_index < 0 or row_index >= len(self.controller.control_table_rows):
+        model_index = self.controller.control_table_model_index_for_view_row(row_index)
+        if model_index is None:
             return ""
         identifier = str(table_column.identifier())
         if identifier == "preview":
-            return self.controller.preview_image_for_control_row(row_index)
+            return self.controller.preview_image_for_control_row(model_index)
         if identifier == "file_datetime":
-            return self.controller.file_datetime_for_control_row(row_index)
-        return self.controller.control_table_rows[row_index].get(identifier, "")
+            return self.controller.file_datetime_for_control_row(model_index)
+        if identifier == "type":
+            return normalize_control_row_type(
+                self.controller.control_table_rows[model_index].get(identifier, "")
+            )
+        return self.controller.control_table_rows[model_index].get(identifier, "")
 
     def tableView_setObjectValue_forTableColumn_row_(self, _table_view, value, table_column, row_index):
-        if row_index < 0 or row_index >= len(self.controller.control_table_rows):
+        model_index = self.controller.control_table_model_index_for_view_row(row_index)
+        if model_index is None:
             return
         identifier = str(table_column.identifier())
         if identifier in {"preview", "file_datetime"} or identifier not in CONTROL_TABLE_COLUMNS:
             return
-        self.controller.update_control_table_cell(row_index, identifier, str(value or ""))
+        self.controller.update_control_table_cell(model_index, identifier, str(value or ""))
 
     def tableView_shouldEditTableColumn_row_(self, table_view, _table_column, _row_index):
         if str(_table_column.identifier()) in {"preview", "file_datetime"}:
@@ -579,25 +688,34 @@ class SlideShowControlTableDataSource(NSObject):
             )
         return True
 
+    def tableViewSelectionDidChange_(self, notification):
+        table_view = notification.object()
+        for model_index in self.controller._selected_control_table_indexes():
+            if str(self.controller.control_table_rows[model_index].get("type", "")).upper() == "MUS":
+                self.controller.showMusicDirectiveHelp_(table_view)
+                break
+
     def tableView_willDisplayCell_forTableColumn_row_(self, _table_view, cell, _table_column, row_index):
-        if row_index < 0 or row_index >= len(self.controller.control_table_rows):
+        model_index = self.controller.control_table_model_index_for_view_row(row_index)
+        if model_index is None:
             return
-        row_type = str(self.controller.control_table_rows[row_index].get("type", "")).upper()
+        row_type = str(self.controller.control_table_rows[model_index].get("type", "")).upper()
         base_font = NSFont.systemFontOfSize_(13.0)
         if row_type == "DAT":
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSBoldFontMask)
-        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS"}:
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSItalicFontMask)
         else:
             font = base_font
         cell.setFont_(font)
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table_view, row_indexes, pasteboard):
-        indexes = [
-            index
-            for index in range(len(self.controller.control_table_rows))
-            if row_indexes.containsIndex_(index)
-        ]
+        indexes = []
+        for view_index in range(len(self.controller.control_table_view_model_indexes)):
+            if row_indexes.containsIndex_(view_index):
+                model_index = self.controller.control_table_model_index_for_view_row(view_index)
+                if model_index is not None:
+                    indexes.append(model_index)
         if not indexes:
             return False
         self.controller.control_table_drag_indexes = indexes
@@ -610,7 +728,8 @@ class SlideShowControlTableDataSource(NSObject):
         return NSDragOperationMove
 
     def tableView_acceptDrop_row_dropOperation_(self, _table_view, _info, row, _operation):
-        return self.controller.move_control_rows_by_drag(row)
+        model_row = self.controller.control_table_model_insertion_index_for_view_row(row)
+        return self.controller.move_control_rows_by_drag(model_row)
 
 
 class SlideShowControlTableView(NSTableView):
@@ -663,6 +782,7 @@ class SlideShowControlTableView(NSTableView):
         add_item("Cut", "cutControlRows:")
         add_item("Copy", "copyControlRowsToPasteboard:")
         add_item("Paste", "pasteControlRows:")
+        add_item("Insert Row", "insertControlRow:")
         menu.addItem_(NSMenuItem.separatorItem())
         has_viewable_file = self.controller.selectedControlRowsHaveViewableFiles()
         add_item("Preview", "openSelectedControlMedia:", has_viewable_file)
@@ -676,9 +796,11 @@ class SlideShowControlTableView(NSTableView):
         key = str(event.charactersIgnoringModifiers() or event.characters() or "")
         key_code = int(event.keyCode())
         modifiers = int(event.modifierFlags())
-        command_down = bool(modifiers & int(NSEventModifierFlagCommand))
+        shortcut_down = bool(
+            modifiers & (int(NSEventModifierFlagCommand) | int(NSEventModifierFlagControl))
+        )
         shift_down = bool(modifiers & int(NSEventModifierFlagShift))
-        if command_down:
+        if shortcut_down:
             lower_key = key.lower()
             if lower_key == "c":
                 self.controller.copyControlRowsToPasteboard_(self)
@@ -688,6 +810,9 @@ class SlideShowControlTableView(NSTableView):
                 return
             if lower_key == "v":
                 self.controller.pasteControlRows_(self)
+                return
+            if lower_key == "i":
+                self.controller.insertControlRow_(self)
                 return
             if lower_key == "z" and shift_down:
                 self.controller.redoControlTable_(self)
@@ -748,6 +873,24 @@ class SlideShowControlTableView(NSTableView):
 class SlideShowControlTableWindow(NSWindow):
     """Control-table window with window-wide search shortcuts."""
 
+    def sendEvent_(self, event):
+        """Give cell text editing priority over whole-row clipboard actions."""
+        if int(event.type()) == int(NSEventTypeKeyDown):
+            modifiers = int(event.modifierFlags())
+            shortcut_down = bool(
+                modifiers & (int(NSEventModifierFlagCommand) | int(NSEventModifierFlagControl))
+            )
+            key = str(event.charactersIgnoringModifiers() or "").lower()
+            table = getattr(self.controller, "control_table_view", None)
+            editor = table.currentEditor() if table is not None else None
+            selector = {"c": "copy_", "x": "cut_", "v": "paste_"}.get(key)
+            if shortcut_down and editor is not None and selector is not None:
+                method = getattr(editor, selector, None)
+                if method is not None:
+                    method(None)
+                    return
+        objc.super(SlideShowControlTableWindow, self).sendEvent_(event)
+
     def performKeyEquivalent_(self, event):
         key = str(event.charactersIgnoringModifiers() or "").lower()
         modifiers = int(event.modifierFlags())
@@ -756,6 +899,9 @@ class SlideShowControlTableWindow(NSWindow):
                 self.controller.findPreviousControlTableMatch_(self)
             else:
                 self.controller.findNextControlTableMatch_(self)
+            return True
+        if modifiers & int(NSEventModifierFlagCommand) and key == "i":
+            self.controller.insertControlRow_(self)
             return True
         return objc.super(SlideShowControlTableWindow, self).performKeyEquivalent_(event)
 
@@ -1088,6 +1234,110 @@ class GeoLocationsOutputWriter:
             self.buffer = ""
 
 
+class WorkflowAssistantBubbleView(NSView):
+    """Small retained overlay that points at the next workflow control."""
+
+    def initWithController_(self, controller):
+        self = objc.super(WorkflowAssistantBubbleView, self).initWithFrame_(NSMakeRect(0, 0, 350, 112))
+        if self is None:
+            return None
+        self.controller = controller
+        self.pointer_side = "bottom"
+        self.pointer_offset = 50.0
+        self.setHidden_(True)
+
+        self.message_label = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 18, 300, 76))
+        self.message_label.setEditable_(False)
+        self.message_label.setSelectable_(False)
+        self.message_label.setBordered_(False)
+        self.message_label.setDrawsBackground_(False)
+        self.message_label.setFont_(NSFont.systemFontOfSize_(13.0))
+        self.message_label.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(0.12, 1.0))
+        self.message_label.setLineBreakMode_(0)
+        self.message_label.setUsesSingleLineMode_(False)
+        self.addSubview_(self.message_label)
+
+        self.close_button = NSButton.alloc().initWithFrame_(NSMakeRect(318, 82, 22, 22))
+        self.close_button.setTitle_("x")
+        self.close_button.setBordered_(False)
+        self.close_button.setFont_(NSFont.boldSystemFontOfSize_(13.0))
+        self.close_button.setTarget_(controller)
+        self.close_button.setAction_("disableWorkflowAssistant:")
+        self.close_button.setToolTip_("Turn off the workflow assistant for this Adventure.")
+        self.addSubview_(self.close_button)
+        return self
+
+    def setMessage_geometry_(self, message, geometry):
+        self.pointer_side = geometry.pointer_side
+        self.pointer_offset = geometry.pointer_offset
+        self.setFrame_(NSMakeRect(*geometry.frame))
+        width = geometry.frame[2]
+        height = geometry.frame[3]
+        pointer_inset = 12.0
+        left = pointer_inset if self.pointer_side == "left" else 0.0
+        bottom = pointer_inset if self.pointer_side == "bottom" else 0.0
+        right = pointer_inset if self.pointer_side == "right" else 0.0
+        top = pointer_inset if self.pointer_side == "top" else 0.0
+        self.message_label.setFrame_(NSMakeRect(left + 16.0, bottom + 13.0, width - left - right - 46.0, height - bottom - top - 25.0))
+        self.message_label.setStringValue_(str(message))
+        self.close_button.setFrame_(NSMakeRect(width - right - 28.0, height - top - 28.0, 20.0, 20.0))
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, _dirty_rect):
+        bounds = self.bounds()
+        inset = 12.0
+        body = NSMakeRect(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height)
+        if self.pointer_side == "bottom":
+            body.origin.y += inset
+            body.size.height -= inset
+        elif self.pointer_side == "top":
+            body.size.height -= inset
+        elif self.pointer_side == "left":
+            body.origin.x += inset
+            body.size.width -= inset
+        else:
+            body.size.width -= inset
+
+        context = NSGraphicsContext.currentContext()
+        context.saveGraphicsState()
+        shadow = NSShadow.alloc().init()
+        shadow.setShadowColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.28))
+        shadow.setShadowBlurRadius_(7.0)
+        shadow.setShadowOffset_(NSMakeSize(0.0, -2.0))
+        shadow.set()
+        fill = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.98, 0.95, 0.78, 0.98)
+        fill.setFill()
+        NSColor.colorWithCalibratedWhite_alpha_(0.55, 1.0).setStroke()
+        body_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(body, 12.0, 12.0)
+        body_path.setLineWidth_(1.0)
+        body_path.fill()
+        body_path.stroke()
+
+        triangle = NSBezierPath.bezierPath()
+        offset = self.pointer_offset
+        if self.pointer_side == "bottom":
+            triangle.moveToPoint_(NSMakePoint(offset - 10.0, inset + 1.0))
+            triangle.lineToPoint_(NSMakePoint(offset, 0.0))
+            triangle.lineToPoint_(NSMakePoint(offset + 10.0, inset + 1.0))
+        elif self.pointer_side == "top":
+            top = bounds.size.height - inset - 1.0
+            triangle.moveToPoint_(NSMakePoint(offset - 10.0, top))
+            triangle.lineToPoint_(NSMakePoint(offset, bounds.size.height))
+            triangle.lineToPoint_(NSMakePoint(offset + 10.0, top))
+        elif self.pointer_side == "left":
+            triangle.moveToPoint_(NSMakePoint(inset + 1.0, offset - 10.0))
+            triangle.lineToPoint_(NSMakePoint(0.0, offset))
+            triangle.lineToPoint_(NSMakePoint(inset + 1.0, offset + 10.0))
+        else:
+            right = bounds.size.width - inset - 1.0
+            triangle.moveToPoint_(NSMakePoint(right, offset - 10.0))
+            triangle.lineToPoint_(NSMakePoint(bounds.size.width, offset))
+            triangle.lineToPoint_(NSMakePoint(right, offset + 10.0))
+        triangle.closePath()
+        triangle.fill()
+        context.restoreGraphicsState()
+
+
 class GPXTrackerController(NSObject):
     """Main Cocoa controller."""
 
@@ -1116,6 +1366,8 @@ class GPXTrackerController(NSObject):
         self.shared_asset_warning_accepted = set()
         self.recent_adventures = self._load_recent_adventures()
         self.last_picture_import_directory = None
+        self.music_source = None
+        self.music_playlist = None
         self.parameters = default_parameters()
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_maps_for_time_lapse = self.parameters["trackmaps.variant"] == "time_lapse"
@@ -1160,16 +1412,26 @@ class GPXTrackerController(NSObject):
         self.geolocations_merge_work_path = None
         self.geolocations_places_overwrite = False
         self.status_refresh_generation = 0
+        self.project_status_processing_gate = threading.Event()
+        self.project_status_processing_gate.set()
         self.media_counts_cache = None
         self.control_ready_cache = None
         self.track_maps_status_cache = None
         self.gpx_ready_cache = None
+        self.project_status_pending = False
+        self.workflow_assistant_state = normalize_assistant_state(None, existing_adventure=False)
+        self.workflow_assistant_stage = None
+        self.assistant_place_names_pending_save = False
         self.control_table_window = None
         self.control_table_window_delegate = None
         self.control_table_view = None
         self.control_table_data_source = None
         self.control_table_rows = []
+        self.control_table_view_model_indexes = []
+        self.control_table_model_to_view_index = {}
         self.control_table_path = None
+        self.control_table_file_signature = None
+        self.control_table_pending_refresh = None
         self.control_table_undo_stack = []
         self.control_table_redo_stack = []
         self.control_table_hint_label = None
@@ -1177,6 +1439,8 @@ class GPXTrackerController(NSObject):
         self.control_table_preview_cache = {}
         self.control_table_file_datetime_cache = {}
         self.control_table_show_previews = False
+        self.control_table_media_hidden = False
+        self.control_table_media_filter_button = None
         self.control_table_preview_checkbox = None
         self.control_table_search_field = None
         self.control_table_search_status = None
@@ -1186,6 +1450,8 @@ class GPXTrackerController(NSObject):
         self.control_table_recovery_timer = None
         self.control_table_dirty = False
         self.control_table_last_snapshot_time = 0.0
+        self.music_directive_help_window = None
+        self.music_directive_help_text = None
         self.saved_project_payload = None
         self.media_viewer_window = None
         self.media_viewer_view = None
@@ -1245,7 +1511,7 @@ class GPXTrackerController(NSObject):
         return self.initWithProjectDirectory_projectFile_(None, None)
 
     def _build_window(self):
-        rect = NSMakeRect(120.0, 80.0, 980.0, 740.0)
+        rect = NSMakeRect(120.0, 48.0, 980.0, 740.0)
         style = (
             NSWindowStyleMaskTitled
             | NSWindowStyleMaskClosable
@@ -1341,8 +1607,11 @@ class GPXTrackerController(NSObject):
         self.root_view.addSubview_(self.description_scroll)
 
         self.help_button = self._make_button("Help", "showMainHelp:")
+        self.assistant_checkbox = self._make_checkbox("Assistant", "toggleWorkflowAssistant:")
+        self.assistant_checkbox.setState_(NSControlStateValueOn)
         self.quit_button = self._make_button("Quit", "quit:")
         self.root_view.addSubview_(self.help_button)
+        self.root_view.addSubview_(self.assistant_checkbox)
         self.root_view.addSubview_(self.quit_button)
 
         self.gpx_status_checkbox = self._make_section_status_checkbox()
@@ -1473,6 +1742,26 @@ class GPXTrackerController(NSObject):
         self.root_view.addSubview_(self.slideshow_continue_button)
         self.root_view.addSubview_(self.pdf_summary_button)
 
+        self.music_label = self._make_label("Music")
+        self.music_field = self._make_text_field("Choose one audio file or a music directory")
+        self.music_field.setTarget_(self)
+        self.music_field.setAction_("musicSourceCommitted:")
+        self.music_choose_button = self._make_button("Choose", "chooseMusicSource:")
+        self.music_playlist_button = self._make_button("Create Playlist", "createMusicPlaylist:")
+        self.music_playlist_update_button = self._make_button("Update Playlist", "updateMusicPlaylist:")
+        self.music_playlist_edit_button = self._make_button("Edit Playlist", "editMusicPlaylist:")
+        self.music_summary_label = self._make_label("No music selected.", size=12.0)
+        for control in (
+            self.music_label,
+            self.music_field,
+            self.music_choose_button,
+            self.music_playlist_button,
+            self.music_playlist_update_button,
+            self.music_playlist_edit_button,
+            self.music_summary_label,
+        ):
+            self.root_view.addSubview_(control)
+
         self.status_label = self._make_status_label("Choose or create an adventure directory to begin.")
         self.root_view.addSubview_(self.status_label)
         self.progress_bar = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(0, 0, 100, PROGRESS_HEIGHT))
@@ -1482,6 +1771,9 @@ class GPXTrackerController(NSObject):
         self.progress_bar.setDoubleValue_(0.0)
         self.progress_bar.setHidden_(True)
         self.root_view.addSubview_(self.progress_bar)
+
+        self.workflow_assistant_bubble = WorkflowAssistantBubbleView.alloc().initWithController_(self)
+        self.root_view.addSubview_(self.workflow_assistant_bubble)
 
         self.window_delegate = GPSTrackShowGUIWindowDelegate.alloc().initWithController_(self)
         self.window.setDelegate_(self.window_delegate)
@@ -1721,8 +2013,18 @@ class GPXTrackerController(NSObject):
         self.slideshow_start_button.setToolTip_("Launch the selected slide-show type from the beginning.")
         self.slideshow_continue_button.setToolTip_("Continue the selected slide-show type from its last automatically saved position.")
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
+        self.music_label.setToolTip_("Optional background music: select one audio file or a directory containing audio files.")
+        self.music_field.setToolTip_("Music file or directory. Directories use the Adventure playlist when present, otherwise alphabetical order.")
+        self.music_choose_button.setToolTip_("Choose one audio file or directory. If none is selected, the project's audio folder is created and selected first.")
+        self.music_playlist_button.setToolTip_("Regenerate a recursive playlist with unique $album and $file labels.")
+        self.music_playlist_update_button.setToolTip_("Preserve the playlist and append newly discovered audio files with unique labels.")
+        self.music_playlist_edit_button.setToolTip_("Open the active playlist in TextEdit. If needed, create it first from the selected music directory.")
+        self.music_summary_label.setToolTip_("Shows the number of playable audio files and whether playlist or alphabetical ordering is used.")
 
         self.help_button.setToolTip_("Show a simple overview of the program and the recommended workflow.")
+        self.assistant_checkbox.setToolTip_(
+            "Show or hide the Adventure-specific assistant that points to the next required workflow step."
+        )
         self.quit_button.setToolTip_("Auto-save pending Adventure changes and quit the program.")
         self.status_label.setToolTip_("Current operation status.")
         self.progress_bar.setToolTip_("Progress for longer-running operations.")
@@ -1753,12 +2055,18 @@ class GPXTrackerController(NSObject):
         self.control_file_places_button.setNextKeyView_(self.control_file_places_overwrite_checkbox)
         self.control_file_places_overwrite_checkbox.setNextKeyView_(self.control_file_merge_tracks_button)
         self.control_file_merge_tracks_button.setNextKeyView_(self.control_file_merge_media_button)
-        self.control_file_merge_media_button.setNextKeyView_(self.slideshow_mode_popup)
+        self.control_file_merge_media_button.setNextKeyView_(self.music_field)
+        self.music_field.setNextKeyView_(self.music_choose_button)
+        self.music_choose_button.setNextKeyView_(self.music_playlist_button)
+        self.music_playlist_button.setNextKeyView_(self.music_playlist_update_button)
+        self.music_playlist_update_button.setNextKeyView_(self.music_playlist_edit_button)
+        self.music_playlist_edit_button.setNextKeyView_(self.slideshow_mode_popup)
         self.slideshow_mode_popup.setNextKeyView_(self.slideshow_start_button)
         self.slideshow_start_button.setNextKeyView_(self.slideshow_continue_button)
         self.slideshow_continue_button.setNextKeyView_(self.pdf_summary_button)
         self.pdf_summary_button.setNextKeyView_(self.quit_button)
-        self.quit_button.setNextKeyView_(self.help_button)
+        self.quit_button.setNextKeyView_(self.assistant_checkbox)
+        self.assistant_checkbox.setNextKeyView_(self.help_button)
         self.help_button.setNextKeyView_(self.parameter_button)
         self.parameter_button.setNextKeyView_(self.project_dir_field)
 
@@ -1777,14 +2085,16 @@ class GPXTrackerController(NSObject):
 
         current_top = height - PADDING
 
-        title_height = 58.0
+        title_height = 50.0
         logo_size = 112.0
         logo_x = field_x + description_width - logo_size
         parameter_button_size = 34.0
         parameter_button_x = logo_x - parameter_button_size - INNER_GAP
         help_button_width = 62.0
         help_button_x = parameter_button_x - help_button_width - INNER_GAP
-        text_width = max(180.0, help_button_x - left_x - INNER_GAP)
+        assistant_width = 92.0
+        assistant_x = help_button_x - assistant_width - INNER_GAP
+        text_width = max(180.0, assistant_x - left_x - INNER_GAP)
         self.header_text_label.setFrame_(
             NSMakeRect(left_x, current_top - title_height + 13.0, text_width, 34.0)
         )
@@ -1794,6 +2104,9 @@ class GPXTrackerController(NSObject):
         self.help_button.setFrame_(
             NSMakeRect(help_button_x, current_top - title_height + 12.0, help_button_width, parameter_button_size)
         )
+        self.assistant_checkbox.setFrame_(
+            NSMakeRect(assistant_x, current_top - title_height + 14.0, assistant_width, parameter_button_size)
+        )
         self.header_logo_view.setFrame_(
             NSMakeRect(logo_x, current_top - logo_size + 26.0, logo_size, logo_size)
         )
@@ -1802,7 +2115,7 @@ class GPXTrackerController(NSObject):
         section_label_x = PADDING + SECTION_STATUS_SIZE + 4.0
         self.adventure_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
         self.adventure_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, width - section_label_x - PADDING, 18.0))
-        current_top -= 24.0
+        current_top -= 22.0
 
         row_y = current_top - FIELD_HEIGHT
         self.project_dir_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
@@ -1826,7 +2139,7 @@ class GPXTrackerController(NSObject):
 
         self.gpx_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
         self.gpx_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, width - section_label_x - PADDING, 18.0))
-        current_top -= 24.0
+        current_top -= 22.0
         row_y = current_top - FIELD_HEIGHT
         self.gpx_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         self.gpx_field.setFrame_(NSMakeRect(field_x, row_y, gpx_field_width, FIELD_HEIGHT))
@@ -1840,7 +2153,7 @@ class GPXTrackerController(NSObject):
                 FIELD_HEIGHT + 2.0,
             )
         )
-        row_y -= 20.0
+        row_y -= 18.0
         self.gpx_summary_label.setFrame_(
             NSMakeRect(
                 field_x,
@@ -1853,7 +2166,7 @@ class GPXTrackerController(NSObject):
         current_top = row_y - BLOCK_GAP
         self.track_maps_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
         self.track_maps_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, width - section_label_x - PADDING, 18.0))
-        current_top -= 24.0
+        current_top -= 22.0
         row_y = current_top - FIELD_HEIGHT
         self.gpx_track_images_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         track_button_x = field_x
@@ -1870,7 +2183,7 @@ class GPXTrackerController(NSObject):
         order_label_x = cancel_x + 72.0 + INNER_GAP
         self.gpx_track_order_label.setFrame_(NSMakeRect(order_label_x, row_y + 4.0, 112.0, 18.0))
         self.gpx_track_order_popup.setFrame_(NSMakeRect(order_label_x + 112.0, row_y, 106.0, FIELD_HEIGHT))
-        row_y -= 20.0
+        row_y -= 18.0
         self.track_maps_summary_label.setFrame_(
             NSMakeRect(
                 field_x,
@@ -1883,14 +2196,14 @@ class GPXTrackerController(NSObject):
         current_top = row_y - BLOCK_GAP
         self.media_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
         self.media_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, width - section_label_x - PADDING, 18.0))
-        current_top -= 24.0
+        current_top -= 22.0
         row_y = current_top - FIELD_HEIGHT
         self.media_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         media_button_start = field_x
         self.media_import_button.setFrame_(NSMakeRect(media_button_start, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
         self.media_view_button.setFrame_(NSMakeRect(media_button_start + SMALL_BUTTON_WIDTH + INNER_GAP, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
         self.media_edit_button.setFrame_(NSMakeRect(media_button_start + 2 * (SMALL_BUTTON_WIDTH + INNER_GAP), row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH))
-        media_summary_y = row_y - 20.0
+        media_summary_y = row_y - 18.0
         self.media_summary_label.setFrame_(
             NSMakeRect(
                 field_x,
@@ -1903,11 +2216,11 @@ class GPXTrackerController(NSObject):
         current_top = media_summary_y - BLOCK_GAP
         self.control_file_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
         self.control_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, width - section_label_x - PADDING, 18.0))
-        current_top -= 24.0
+        current_top -= 22.0
         row_y = current_top - FIELD_HEIGHT
         self.control_file_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         self.control_file_field.setFrame_(NSMakeRect(field_x, row_y, description_width, FIELD_HEIGHT))
-        row_y -= FIELD_HEIGHT + 4.0
+        row_y -= FIELD_HEIGHT + 2.0
         self.control_file_create_button.setFrame_(NSMakeRect(field_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
         edit_x = field_x + SMALL_BUTTON_WIDTH + INNER_GAP
         self.control_file_edit_button.setFrame_(NSMakeRect(edit_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
@@ -1923,7 +2236,7 @@ class GPXTrackerController(NSObject):
         merge_media_width = 132.0
         merge_media_x = merge_tracks_x + merge_tracks_width + INNER_GAP
         self.control_file_merge_media_button.setFrame_(NSMakeRect(merge_media_x, row_y, merge_media_width, FIELD_HEIGHT))
-        summary_y = row_y - 20.0
+        summary_y = row_y - 18.0
         self.control_file_summary_label.setFrame_(
             NSMakeRect(
                 field_x,
@@ -1935,8 +2248,24 @@ class GPXTrackerController(NSObject):
 
         current_top = summary_y - BLOCK_GAP
         self.slideshow_box.setFrame_(NSMakeRect(PADDING, current_top - 18.0, width - 2 * PADDING, 18.0))
-        current_top -= 24.0
+        current_top -= 22.0
         row_y = current_top - FIELD_HEIGHT
+        self.music_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
+        music_field_width = min(300.0, max(200.0, description_width * 0.38))
+        self.music_field.setFrame_(NSMakeRect(field_x, row_y, music_field_width, FIELD_HEIGHT))
+        music_choose_x = field_x + music_field_width + INNER_GAP
+        self.music_choose_button.setFrame_(NSMakeRect(music_choose_x, row_y, 76.0, FIELD_HEIGHT))
+        playlist_x = music_choose_x + 76.0 + INNER_GAP
+        self.music_playlist_button.setFrame_(NSMakeRect(playlist_x, row_y, 108.0, FIELD_HEIGHT))
+        playlist_update_x = playlist_x + 108.0 + INNER_GAP
+        self.music_playlist_update_button.setFrame_(NSMakeRect(playlist_update_x, row_y, 108.0, FIELD_HEIGHT))
+        playlist_edit_x = playlist_update_x + 108.0 + INNER_GAP
+        self.music_playlist_edit_button.setFrame_(NSMakeRect(playlist_edit_x, row_y, 88.0, FIELD_HEIGHT))
+        music_summary_x = playlist_edit_x + 88.0 + INNER_GAP
+        self.music_summary_label.setFrame_(
+            NSMakeRect(music_summary_x, row_y + 4.0, max(80.0, field_x + description_width - music_summary_x), 18.0)
+        )
+        row_y -= FIELD_HEIGHT + 2.0
         self.slideshow_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         self.slideshow_mode_popup.setFrame_(NSMakeRect(field_x, row_y, 132.0, FIELD_HEIGHT))
         start_x = field_x + 132.0 + INNER_GAP
@@ -1947,10 +2276,11 @@ class GPXTrackerController(NSObject):
         self.pdf_summary_button.setFrame_(NSMakeRect(pdf_x, row_y, 124.0, FIELD_HEIGHT))
         quit_x = field_x + description_width - BUTTON_WIDTH
         self.quit_button.setFrame_(NSMakeRect(quit_x, row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        status_bottom = row_y - STATUS_HEIGHT - 6.0
-        progress_bottom = status_bottom - PROGRESS_HEIGHT - 6.0
+        status_bottom = row_y - STATUS_HEIGHT - 4.0
+        progress_bottom = status_bottom - PROGRESS_HEIGHT - 4.0
         self.status_label.setFrame_(NSMakeRect(field_x, status_bottom, description_width, STATUS_HEIGHT))
         self.progress_bar.setFrame_(NSMakeRect(field_x, progress_bottom, description_width, PROGRESS_HEIGHT))
+        self.layout_workflow_assistant()
 
     def set_status(self, message: str):
         self.status_label.setStringValue_(message)
@@ -2064,18 +2394,14 @@ class GPXTrackerController(NSObject):
         self.gpx_track_order_popup.selectItemAtIndex_(1 if use_track_order else 0)
 
     def _tracks_summary_json_path(self):
-        gpx_path = self._current_single_gpx_path()
-        if gpx_path is None:
+        """Return the deterministic summary path without processing the GPX file."""
+        trackimages_dir = self._track_images_dir()
+        output_base = str(self.track_map_base or self._current_project_name()).strip()
+        if trackimages_dir is None or not output_base:
             return None
-        try:
-            context = self._plot_context_for_gpx(gpx_path)
-        except (OSError, ValueError, FileNotFoundError, RuntimeError):
-            return None
-        if context is None:
-            return None
-        return Path(context["table_json_path"]).resolve(strict=False)
+        return (trackimages_dir / f"{output_base}-summary.json").resolve(strict=False)
 
-    def refresh_control_file_display(self):
+    def refresh_control_file_display(self, rows=None, control_lines=None):
         if not hasattr(self, "control_file_summary_label"):
             return
         control_file_path = self._control_file_path()
@@ -2087,18 +2413,29 @@ class GPXTrackerController(NSObject):
             self.control_file_summary_label.setStringValue_("No control file available yet.")
             self.refresh_section_status_indicators()
             return
-        try:
+        if rows is None:
+            try:
+                control_lines = control_file_path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                self.control_file_summary_label.setStringValue_(f"Could not read control file: {exc}")
+                self.refresh_section_status_indicators()
+                return
             rows = [
                 parse_slideshow_control_line(line)
-                for line in control_file_path.read_text(encoding="utf-8").splitlines()
+                for line in control_lines
                 if line.strip()
             ]
-        except OSError as exc:
-            self.control_file_summary_label.setStringValue_(f"Could not read control file: {exc}")
-            self.refresh_section_status_indicators()
-            return
+        elif control_lines is None:
+            control_lines = [serialize_slideshow_control_row(row) for row in rows]
         summary = self._control_file_summary_text(rows, control_file_path)
-        summary += self._control_track_map_sync_suffix(control_file_path)
+        summary += self._control_track_map_sync_suffix(
+            control_file_path,
+            control_lines=control_lines,
+        )
+        self.control_ready_cache = any(
+            str(row.get("type", "")).upper() in {"IMG", "VID"}
+            for row in rows
+        )
         self.control_file_summary_label.setStringValue_(summary)
         self.refresh_section_status_indicators()
 
@@ -2154,7 +2491,12 @@ class GPXTrackerController(NSObject):
         canonical_name = canonical_track_map_name(Path(str(filename)).name)
         return normalize_track_plot_filename_for_match(canonical_name)
 
-    def _control_track_map_sync_status(self, control_file_path=None, tracks_summary_path=None):
+    def _control_track_map_sync_status(
+        self,
+        control_file_path=None,
+        tracks_summary_path=None,
+        control_lines=None,
+    ):
         control_file_path = control_file_path or self._control_file_path()
         tracks_summary_path = tracks_summary_path or self._current_tracks_summary_path_if_available()
         empty = {
@@ -2171,7 +2513,9 @@ class GPXTrackerController(NSObject):
         if not control_file_path.exists() or not tracks_summary_path.exists():
             return empty
         try:
-            entries = parse_control_file_entries(control_file_path.read_text(encoding="utf-8").splitlines())
+            if control_lines is None:
+                control_lines = control_file_path.read_text(encoding="utf-8").splitlines()
+            entries = parse_control_file_entries(control_lines)
             tracks_summary = load_tracks_summary(tracks_summary_path, control_file_path)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return empty
@@ -2286,8 +2630,11 @@ class GPXTrackerController(NSObject):
             "special_updates": special_updates,
         }
 
-    def _control_track_map_sync_suffix(self, control_file_path=None):
-        status = self._control_track_map_sync_status(control_file_path=control_file_path)
+    def _control_track_map_sync_suffix(self, control_file_path=None, control_lines=None):
+        status = self._control_track_map_sync_status(
+            control_file_path=control_file_path,
+            control_lines=control_lines,
+        )
         missing_count = len(status["missing_overview"]) + len(status["missing_tracks"])
         obsolete_count = len(status["obsolete_overview"]) + len(status["obsolete_tracks"])
         update_count = len(status.get("special_updates", []))
@@ -2309,7 +2656,6 @@ class GPXTrackerController(NSObject):
         if removed:
             if refresh:
                 self.load_slideshow_control_file(path)
-                self.refresh_control_file_display()
                 self.mark_dirty()
         return removed
 
@@ -2396,7 +2742,15 @@ class GPXTrackerController(NSObject):
             )
         context["media_map_items"] = items
 
-    def _plot_context_for_values(self, gpx_path, project_name, trackimages_dir, use_track_order, track_map_base=None):
+    def _plot_context_for_values(
+        self,
+        gpx_path,
+        project_name,
+        trackimages_dir,
+        use_track_order,
+        track_map_base=None,
+        track_processing_callback=None,
+    ):
         options = self._plot_common_options(project_name, trackimages_dir, track_map_base or project_name)
         options.update(
             {
@@ -2404,6 +2758,7 @@ class GPXTrackerController(NSObject):
                 "create_output_dir": False,
                 "sort_original": use_track_order,
                 "sort_date": not use_track_order,
+                "track_processing_callback": track_processing_callback,
             }
         )
         return prepare_with_options(str(gpx_path), **options)
@@ -2430,6 +2785,11 @@ class GPXTrackerController(NSObject):
             remove_prefix=self.parameters["trackmaps.remove_name_prefix"],
             gpx_threshold_distance=self.parameters["gpx.minimum_point_spacing_m"],
             gpx_threshold_accuracy=self.parameters["gpx.maximum_accuracy_m"],
+            gpx_horizontal_smoothing_distance=self.parameters["gpx.horizontal_smoothing_distance_m"],
+            gpx_elevation_smoothing_distance=self.parameters["gpx.elevation_smoothing_distance_m"],
+            gpx_maximum_vertical_accuracy=self.parameters["gpx.maximum_vertical_accuracy_m"],
+            gpx_maximum_hdop=self.parameters["gpx.maximum_hdop"],
+            gpx_maximum_vdop=self.parameters["gpx.maximum_vdop"],
             fallback_walking_speed_kmh=self.parameters["gpx.fallback_walking_speed_kmh"],
             adventure_processing_parameters=self._track_summary_parameter_signature(),
         )
@@ -2634,7 +2994,6 @@ class GPXTrackerController(NSObject):
         summary_exists = summary_path.exists()
         summary_parameters = self._summary_processing_parameters(summary_path) if summary_exists else None
         expected_summary_parameters = self._track_summary_parameter_signature()
-        default_summary_parameters = self._track_summary_parameter_signature(default_parameters())
         tracks = context.get("tracks", [])
         track_total = len(tracks)
         standard_count = 0
@@ -2655,7 +3014,7 @@ class GPXTrackerController(NSObject):
         if summary_exists:
             if summary_parameters is not None:
                 summary_out_of_date = summary_out_of_date or summary_parameters != expected_summary_parameters
-            elif expected_summary_parameters != default_summary_parameters:
+            else:
                 summary_out_of_date = True
         if not summary_has_fingerprints and summary_exists and gpx_mtime is not None:
             try:
@@ -2839,14 +3198,8 @@ class GPXTrackerController(NSObject):
         self.track_maps_summary_label.setStringValue_(self._format_track_maps_summary_from_status(status))
         self.refresh_section_status_indicators()
 
-    def _format_gpx_summary(self, gpx_path):
-        tracks = parse_gpx_file(
-            str(gpx_path),
-            self.parameters["trackmaps.remove_name_prefix"],
-            self.parameters["gpx.minimum_point_spacing_m"],
-            self.parameters["gpx.maximum_accuracy_m"],
-            False,
-        )
+    @staticmethod
+    def _format_gpx_summary_from_tracks(gpx_path, tracks):
         if not tracks:
             return f"Tracks: 0 | Name: {gpx_path.name} | Date range: N/A"
         start_candidates = [track.get("start_time") or track.get("time") for track in tracks if (track.get("start_time") or track.get("time")) is not None]
@@ -2854,6 +3207,21 @@ class GPXTrackerController(NSObject):
         start_text = local_datetime_text(min(start_candidates)) if start_candidates else "N/A"
         end_text = local_datetime_text(max(end_candidates)) if end_candidates else "N/A"
         return f"Tracks: {len(tracks)} | Name: {gpx_path.name} | Date range: {start_text} - {end_text}"
+
+    def _format_gpx_summary(self, gpx_path):
+        tracks = parse_gpx_file(
+            str(gpx_path),
+            self.parameters["trackmaps.remove_name_prefix"],
+            self.parameters["gpx.minimum_point_spacing_m"],
+            self.parameters["gpx.maximum_accuracy_m"],
+            False,
+            self.parameters["gpx.horizontal_smoothing_distance_m"],
+            self.parameters["gpx.elevation_smoothing_distance_m"],
+            self.parameters["gpx.maximum_vertical_accuracy_m"],
+            self.parameters["gpx.maximum_hdop"],
+            self.parameters["gpx.maximum_vdop"],
+        )
+        return self._format_gpx_summary_from_tracks(gpx_path, tracks)
 
     def update_gpx_summary(self, gpx_path):
         self.gpx_summary_label.setStringValue_(self._format_gpx_summary(gpx_path))
@@ -2901,7 +3269,7 @@ class GPXTrackerController(NSObject):
     def _has_existing_gpx_file(self):
         return any(path.exists() and path.is_file() and path.suffix.lower() == ".gpx" for path in self._gpx_paths())
 
-    def _control_file_has_image(self):
+    def _control_file_has_media(self):
         control_file_path = self._control_file_path()
         if control_file_path is None or not control_file_path.exists():
             return False
@@ -2913,24 +3281,25 @@ class GPXTrackerController(NSObject):
             ]
         except OSError:
             return False
-        return any(str(row.get("type", "")).upper() == "IMG" for row in rows)
+        return any(str(row.get("type", "")).upper() in {"IMG", "VID"} for row in rows)
 
-    def refresh_section_status_indicators(self):
-        if not hasattr(self, "adventure_status_checkbox"):
-            return
+    def _workflow_readiness(self):
         project_ready = bool(
             self.current_project_dir is not None
             and self.current_project_dir.exists()
             and self.current_project_dir.is_dir()
         )
+        adventure_ready = bool(
+            project_ready
+            and self.current_project_file is not None
+            and Path(self.current_project_file).exists()
+            and str(self.title_field.stringValue()).strip()
+        )
         gpx_ready = self.gpx_ready_cache if self.gpx_ready_cache is not None else self._has_existing_gpx_file()
         if self.media_counts_cache is None:
-            photo_count, video_count = self.media_counts()
-            self.media_counts_cache = (photo_count, video_count)
-        else:
-            photo_count, video_count = self.media_counts_cache
-        media_ready = (photo_count + video_count) > 0
-        control_ready = self.control_ready_cache if self.control_ready_cache is not None else self._control_file_has_image()
+            self.media_counts_cache = self.media_counts()
+        photo_count, video_count = self.media_counts_cache
+        control_ready = self.control_ready_cache if self.control_ready_cache is not None else self._control_file_has_media()
         track_maps_status = self.track_maps_status_cache
         track_maps_ready = bool(
             track_maps_status
@@ -2940,6 +3309,24 @@ class GPXTrackerController(NSObject):
             and track_maps_status["track_count"] == track_maps_status["track_total"]
             and not track_maps_status.get("out_of_date")
         )
+        return {
+            "project": project_ready,
+            "adventure": adventure_ready,
+            "gpx": bool(gpx_ready),
+            "track_maps": track_maps_ready,
+            "media": (photo_count + video_count) > 0,
+            "control": bool(control_ready),
+        }
+
+    def refresh_section_status_indicators(self):
+        if not hasattr(self, "adventure_status_checkbox"):
+            return
+        readiness = self._workflow_readiness()
+        project_ready = readiness["project"]
+        gpx_ready = readiness["gpx"]
+        media_ready = readiness["media"]
+        control_ready = readiness["control"]
+        track_maps_ready = readiness["track_maps"]
         self._set_section_status_checkbox(
             self.adventure_status_checkbox,
             project_ready,
@@ -2968,8 +3355,96 @@ class GPXTrackerController(NSObject):
         self._set_section_status_checkbox(
             self.control_file_status_checkbox,
             control_ready,
-            "Control file complete: file exists and contains at least one image." if control_ready else "Control file incomplete: create a slide-show control file with at least one image.",
+            "Control file complete: file exists and contains at least one photo or video." if control_ready else "Control file incomplete: create a slide-show control file with at least one photo or video.",
         )
+        self.refresh_workflow_assistant(readiness)
+
+    def _assistant_operation_active(self):
+        return bool(
+            self.project_status_pending
+            or self.geolocations_running
+            or (self.plot_creation_thread is not None and self.plot_creation_thread.is_alive())
+        )
+
+    def _assistant_stage_details(self, stage):
+        details = {
+            "project": (
+                self.project_dir_field,
+                "Choose the folder that will hold this Adventure and all files created for it.",
+            ),
+            "adventure": (
+                self.title_field,
+                "Enter an Adventure name and press Return or leave the field to create the Adventure.",
+            ),
+            "gpx": (
+                self.gpx_field,
+                "Choose one or more GPX files. Add & Edit Tracks can join several files and lets you inspect or edit them.",
+            ),
+            "track_maps": (
+                self.gpx_make_plots_button,
+                "Create the overview and Track Maps required by the slide show.",
+            ),
+            "media": (
+                self.media_import_button,
+                "Import at least one photo or video. Files already present in the project folder are skipped, not copied again.",
+            ),
+            "control": (
+                self.control_file_create_button,
+                "Create the slide-show control file. Afterwards, use Edit to change the order of photos and videos.",
+            ),
+            "place_names": (
+                self.control_file_places_button,
+                "Add Place Names converts coordinates into readable locations. Save the edited control table when it opens.",
+            ),
+            "slideshow": (
+                self.slideshow_start_button,
+                "Start the slide show for the first time. You can later continue from its last saved position.",
+            ),
+        }
+        return details.get(stage, (None, ""))
+
+    def refresh_workflow_assistant(self, readiness=None):
+        if not hasattr(self, "workflow_assistant_bubble"):
+            return
+        enabled = bool(self.workflow_assistant_state.get("enabled", True))
+        self.assistant_checkbox.setState_(NSControlStateValueOn if enabled else NSControlStateValueOff)
+        if not enabled or self._assistant_operation_active():
+            self.workflow_assistant_stage = None
+            self.workflow_assistant_bubble.setHidden_(True)
+            return
+        readiness = readiness or self._workflow_readiness()
+        stage = next_assistant_stage(readiness, self.workflow_assistant_state)
+        self.workflow_assistant_stage = stage
+        if stage is None:
+            self.workflow_assistant_bubble.setHidden_(True)
+            return
+        target, message = self._assistant_stage_details(stage)
+        if target is None:
+            self.workflow_assistant_bubble.setHidden_(True)
+            return
+        geometry = bubble_geometry(
+            (0.0, 0.0, self.root_view.bounds().size.width, self.root_view.bounds().size.height),
+            (target.frame().origin.x, target.frame().origin.y, target.frame().size.width, target.frame().size.height),
+        )
+        self.workflow_assistant_bubble.setMessage_geometry_(message, geometry)
+        self.workflow_assistant_bubble.setHidden_(False)
+
+    def layout_workflow_assistant(self):
+        if hasattr(self, "workflow_assistant_bubble") and not self.workflow_assistant_bubble.isHidden():
+            self.refresh_workflow_assistant()
+
+    @objc.IBAction
+    def toggleWorkflowAssistant_(self, sender):
+        self.workflow_assistant_state["enabled"] = int(sender.state()) == NSControlStateValueOn
+        self.mark_dirty(immediate=True)
+        self.refresh_workflow_assistant()
+
+    @objc.IBAction
+    def disableWorkflowAssistant_(self, _sender):
+        self.workflow_assistant_state["enabled"] = False
+        self.assistant_checkbox.setState_(NSControlStateValueOff)
+        self.mark_dirty(immediate=True)
+        self.refresh_workflow_assistant()
 
     def _collect_project_payload(self):
         return {
@@ -2983,7 +3458,83 @@ class GPXTrackerController(NSObject):
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
             "parameters": parameter_payload(self.parameters),
             "slideshow_resume_position": self.slideshow_resume_position,
+            "music_source": self._stored_optional_project_path(self.music_source),
+            "music_playlist": self._stored_optional_project_path(self.music_playlist),
+            "workflow_assistant": dict(self.workflow_assistant_state),
         }
+
+    def _stored_optional_project_path(self, value):
+        """Store project-contained optional paths relatively and external paths absolutely."""
+        if value is None:
+            return ""
+        path = Path(value).expanduser().resolve(strict=False)
+        if self.current_project_dir is not None:
+            project_dir = self.current_project_dir.resolve(strict=False)
+            try:
+                return str(path.relative_to(project_dir))
+            except ValueError:
+                pass
+        return str(path)
+
+    def _resolve_optional_project_path(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute() and self.current_project_dir is not None:
+            path = self.current_project_dir / path
+        return path.resolve(strict=False)
+
+    def _preferred_music_playlist(self, source=None):
+        source_path = Path(source or self.music_source).expanduser().resolve(strict=False) if (source or self.music_source) else None
+        if source_path is None or not source_path.is_dir():
+            return None
+        name = project_filename_base(self._current_project_name())
+        candidate = source_path / f"{name}.playlist"
+        return candidate if candidate.is_file() else None
+
+    def _refresh_music_summary(self):
+        if not hasattr(self, "music_summary_label"):
+            return
+        source = self.music_source
+        if source is None:
+            self.music_summary_label.setStringValue_("No music selected.")
+            self.music_playlist_button.setEnabled_(False)
+            self.music_playlist_update_button.setEnabled_(False)
+            self.music_playlist_edit_button.setEnabled_(False)
+            return
+        source = Path(source).expanduser().resolve(strict=False)
+        if not source.exists():
+            self.music_summary_label.setStringValue_("Music source does not exist.")
+            self.music_playlist_button.setEnabled_(False)
+            self.music_playlist_update_button.setEnabled_(False)
+            self.music_playlist_edit_button.setEnabled_(False)
+            return
+        if source.is_file():
+            valid = source.suffix.casefold() in AUDIO_EXTENSIONS
+            self.music_summary_label.setStringValue_("1 audio file" if valid else "Unsupported audio file.")
+            self.music_playlist_button.setEnabled_(False)
+            self.music_playlist_update_button.setEnabled_(False)
+            self.music_playlist_edit_button.setEnabled_(False)
+            return
+        files = audio_files_in_directory(source)
+        self.music_playlist_button.setEnabled_(bool(files))
+        self.music_playlist_update_button.setEnabled_(bool(files))
+        album_count = len(album_directories(files, source))
+        playlist = self.music_playlist
+        if playlist is None or not Path(playlist).is_file():
+            playlist = self._preferred_music_playlist(source)
+        if playlist is not None and Path(playlist).is_file():
+            parsed = load_audio_playlist(source, Path(playlist))
+            details = [f"{len(files)} audio", f"{album_count} albums", Path(playlist).name]
+            if parsed.unlisted_files:
+                details.append(f"{len(parsed.unlisted_files)} unlisted")
+            if parsed.warnings:
+                details.append(f"{len(parsed.warnings)} warnings")
+            self.music_summary_label.setStringValue_(", ".join(details))
+        else:
+            self.music_summary_label.setStringValue_(f"{len(files)} audio, {album_count} albums, relative-path order")
+        self.music_playlist_edit_button.setEnabled_(bool(files) or bool(playlist and Path(playlist).is_file()))
 
     def _confirm_shared_asset_change(self, field, value, label):
         if self.current_project_dir is None or self.current_project_file is None or not value:
@@ -3115,8 +3666,16 @@ class GPXTrackerController(NSObject):
             self._set_gpx_field_value(f"{suggested}.gpx", manual=False)
             self.current_control_file = resolved / f"{suggested}-sorted.lst"
             self.control_file_field.setStringValue_(self.current_control_file.name)
+            self.music_source = None
+            self.music_playlist = None
+            self.music_field.setStringValue_("")
+            self._refresh_music_summary()
             self.description_text.setString_("")
             self.slideshow_resume_position = None
+            assistant_enabled = bool(self.workflow_assistant_state.get("enabled", True))
+            self.workflow_assistant_state = normalize_assistant_state(None, existing_adventure=False)
+            self.workflow_assistant_state["enabled"] = assistant_enabled
+            self.assistant_place_names_pending_save = False
         finally:
             self.adventure_autosave_suspended = max(0, self.adventure_autosave_suspended - 1)
         self.saved_project_payload = None
@@ -3160,6 +3719,15 @@ class GPXTrackerController(NSObject):
         )
         loaded_resume_position = data.get("slideshow_resume_position")
         self.slideshow_resume_position = loaded_resume_position if isinstance(loaded_resume_position, dict) else None
+        self.music_source = self._resolve_optional_project_path(data.get("music_source"))
+        self.music_playlist = self._resolve_optional_project_path(data.get("music_playlist"))
+        self.music_field.setStringValue_(str(self.music_source) if self.music_source is not None else "")
+        self._refresh_music_summary()
+        self.workflow_assistant_state = normalize_assistant_state(
+            data.get("workflow_assistant"),
+            existing_adventure=True,
+        )
+        self.assistant_place_names_pending_save = False
         self._update_slideshow_continue_button()
         if self.parameter_editor_controller is not None:
             self.parameter_editor_controller.update_values(self.parameters)
@@ -3168,6 +3736,7 @@ class GPXTrackerController(NSObject):
         self.start_async_project_status_refresh("loaded adventure")
 
     def _set_project_status_pending(self):
+        self.project_status_pending = True
         self.media_counts_cache = (0, 0)
         self.control_ready_cache = False
         self.track_maps_status_cache = None
@@ -3181,6 +3750,22 @@ class GPXTrackerController(NSObject):
         if hasattr(self, "control_file_summary_label"):
             self.control_file_summary_label.setStringValue_("Updating slide show control file status...")
         self.refresh_section_status_indicators()
+
+    def _wait_for_project_status_processing(self, generation):
+        """Wait cooperatively until GPX status processing may continue."""
+        while True:
+            if int(generation) != self.status_refresh_generation:
+                raise ProjectStatusRefreshSuperseded()
+            if self.project_status_processing_gate.wait(0.05):
+                if int(generation) != self.status_refresh_generation:
+                    raise ProjectStatusRefreshSuperseded()
+                return
+
+    def _pause_project_status_for_editor_startup(self):
+        self.project_status_processing_gate.clear()
+
+    def _resume_project_status_after_editor_startup(self):
+        self.project_status_processing_gate.set()
 
     def _async_gpx_paths_from_text(self, gpx_text, project_dir):
         text = str(gpx_text or "").strip()
@@ -3259,16 +3844,17 @@ class GPXTrackerController(NSObject):
                     if line.strip()
                 ]
                 result["control_summary"] = self._control_file_summary_text(rows, control_file_path)
-                result["control_ready"] = any(str(row.get("type", "")).upper() == "IMG" for row in rows)
+                result["control_ready"] = any(str(row.get("type", "")).upper() in {"IMG", "VID"} for row in rows)
             except OSError as exc:
                 result["control_summary"] = f"Could not read control file: {exc}"
 
         if len(gpx_paths) == 1 and gpx_paths[0] is not None and gpx_paths[0].exists():
             gpx_path = gpx_paths[0].resolve(strict=False)
-            try:
-                result["gpx_summary"] = self._format_gpx_summary(gpx_path)
-            except (OSError, RuntimeError, ValueError):
-                result["gpx_summary"] = default_gpx_summary_text()
+            generation = int(snapshot["generation"])
+
+            def wait_for_status_turn():
+                self._wait_for_project_status_processing(generation)
+
             try:
                 trackimages_dir = project_dir / "trackimages"
                 context = self._plot_context_for_values(
@@ -3277,7 +3863,9 @@ class GPXTrackerController(NSObject):
                     trackimages_dir,
                     snapshot["use_track_order"],
                     snapshot["track_map_base"],
+                    track_processing_callback=wait_for_status_turn,
                 )
+                result["gpx_summary"] = self._format_gpx_summary_from_tracks(gpx_path, context.get("tracks", []))
                 result["track_maps_status"] = self._track_maps_status_from_context(
                     gpx_path,
                     context,
@@ -3304,7 +3892,10 @@ class GPXTrackerController(NSObject):
         self.set_status(f"Updating project status{f' ({reason})' if reason else ''}...")
 
         def run_task():
-            result = self._compute_async_project_status(snapshot)
+            try:
+                result = self._compute_async_project_status(snapshot)
+            except ProjectStatusRefreshSuperseded:
+                return
             self.performSelectorOnMainThread_withObject_waitUntilDone_("applyAsyncProjectStatus:", result, True)
 
         threading.Thread(target=run_task, name="project-status-refresh", daemon=True).start()
@@ -3312,6 +3903,7 @@ class GPXTrackerController(NSObject):
     def applyAsyncProjectStatus_(self, result):
         if int(result.get("generation", -1)) != self.status_refresh_generation:
             return
+        self.project_status_pending = False
         self.media_counts_cache = tuple(result.get("media_counts", (0, 0)))
         self.control_ready_cache = bool(result.get("control_ready", False))
         self.track_maps_status_cache = result.get("track_maps_status")
@@ -3452,23 +4044,29 @@ class GPXTrackerController(NSObject):
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Editing an existing name offers Rename or Copy, optionally including its GPX, control file, and Track Maps.\n"
-            "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. Applied changes are auto-saved with the Adventure.\n"
+            "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Applied changes are auto-saved with the Adventure.\n"
             "4. Select one GPX file in the adventure folder, or choose external/multiple GPX files and use Add & Edit Tracks to save one final GPX file.\n"
             "5. In Track Maps, choose whether to work on Standard or for Time-Lapse maps. Create makes the selected kind for every stage; Update refreshes only missing or outdated maps. Rows marked with * need update.\n"
             "6. Import photos and video clips. They are copied into the adventure folder. Existing files are skipped so they are not duplicated.\n"
             "7. Select or enter the .lst name in Slide Show Control File, then press Create. The program reads photo dates and positions, combines them with the tracks and maps, and creates the ordered slide-show list. Media from a trackless day immediately before or after a stage can be attached to that stage when its location is close enough. Remaining dated media with positions receives its own date-only location map.\n"
             "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. If tracks or maps changed after the control file was edited, press Sync Track Maps. It shows which map entries should be inserted and can remove old entries; it does not render maps.\n"
-            "10. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
-            "11. If desired, press Add Place Names to add readable place names for photos that have GPS positions.\n"
-            "12. Choose Time-Lapse or Standard. Press Start to begin at the start, or Continue to resume from the last automatically saved position. Time-Lapse is selected by default.\n"
-            "13. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. In one-window Time-Lapse mode the overview is shown by default as a framed image over the track map before each stage and advances automatically in Auto mode. Settings can instead make it full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
-            "14. Standard playback shows the track map once at the beginning of each stage. Settings can optionally show the marked track map again before every photo or video.\n\n"
+            "10. Optionally choose one music file or a music folder. Choose initially creates and selects the audio folder inside the Adventure. Create Playlist scans subfolders and writes editable $album and $title labels; Update Playlist appends newly found files without replacing your edits. Insert MUS rows in the control-file table to add #MUSIC commands for jumps, queues, loops, gate control, and internal volume. A manual Audio Off with the a key always has priority.\n"
+            "11. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
+            "12. If desired, press Add Place Names to add readable place names for photos that have GPS positions.\n"
+            "13. Choose Time-Lapse or Standard. Press Start to begin at the start, or Continue to resume from the last automatically saved position. Time-Lapse is selected by default.\n"
+            "14. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. In one-window Time-Lapse mode the overview is shown by default as a framed image over the track map before each stage and advances automatically in Auto mode. Settings can instead make it full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
+            "15. Standard playback shows the track map once at the beginning of each stage. Settings can optionally show the marked track map again before every photo or video. Press a during either show to pause or resume background audio.\n\n"
+            "Workflow Assistant:\n"
+            "- Assistant in the header is enabled for new Adventures and points to the next required field or action.\n"
+            "- Its bubble follows Project directory, Adventure name, GPX files, Track Maps, media, control file, place names, and the first slide-show start.\n"
+            "- Click the bubble's x or uncheck Assistant to turn it off for the active Adventure. The choice is auto-saved.\n\n"
             "Files and folders you will see:\n"
             "- The Adventure file stores the explicit GPX, slide-show list, Track Map family, folder, and other settings.\n"
             "- The GPX track file contains the travel route.\n"
             "- The trackimages folder contains the overview map, track map pictures, date-only media location maps, and the track summary used to keep maps and the slide-show list synchronized.\n"
-            "- The slide-show list controls the final order of photos, videos, date headings, and maps.\n"
+            "- The slide-show list controls the final order of photos, videos, date headings, maps, and optional #MUSIC directives.\n"
+            "- A .playlist file controls music order and names synchronization positions.\n"
             "- Small companion files next to photos, videos, and maps store dates, positions, and place names used by the program.\n\n"
             "The colored marks at the left of each section show whether the minimum required step is complete. "
             "The status lines also warn when maps or track entries need updating."
@@ -3574,6 +4172,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_window.setTitle_(title)
         self.geolocations_text_view.setString_("")
         self.geolocations_running = True
+        self.refresh_workflow_assistant()
         self.geolocations_cancel_button.setEnabled_(True)
         if self.geolocations_close_button is not None:
             self.geolocations_close_button.setEnabled_(False)
@@ -3601,6 +4200,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_running = False
         self.geolocations_mode = None
         self.geolocations_merge_work_path = None
+        self.refresh_workflow_assistant()
 
     def _finish_media_browser_preparation(self):
         self._cleanup_geolocations_temp_paths()
@@ -3647,6 +4247,19 @@ class GPXTrackerController(NSObject):
         if mode == "places":
             overwrite = bool(getattr(self, "geolocations_places_overwrite", False))
             updated_count = self.update_place_names_from_sidecars(overwrite=overwrite)
+            if updated_count is None:
+                self._cleanup_geolocations_temp_paths()
+                self._finish_geolocations_run(
+                    "Finished, but the control table could not be updated.",
+                    "Reverse geolocation finished, but updating the control table failed.",
+                )
+                return
+            if updated_count > 0:
+                self.assistant_place_names_pending_save = True
+            else:
+                self.assistant_place_names_pending_save = False
+                self.workflow_assistant_state["place_names_completed"] = True
+                self.mark_dirty(immediate=True)
             self._cleanup_geolocations_temp_paths()
             self._finish_geolocations_run(
                 f"Finished. Updated {updated_count} place name(s) in the table.",
@@ -4131,6 +4744,21 @@ class GPXTrackerController(NSObject):
         preview_checkbox.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
         content.addSubview_(preview_checkbox)
 
+        media_filter_button = self._make_button(
+            "Show Media Rows" if self.control_table_media_hidden else "Hide Media Rows",
+            "toggleControlTableMediaRows:",
+        )
+        media_filter_button.setFrame_(NSMakeRect(132.0, 344.0, 160.0, FIELD_HEIGHT))
+        media_filter_button.setToolTip_("Hide photo and video rows so stage, date, and map rows are easier to edit.")
+        media_filter_button.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        content.addSubview_(media_filter_button)
+
+        insert_row_button = self._make_button("Insert Row", "insertControlRow:")
+        insert_row_button.setFrame_(NSMakeRect(300.0, 344.0, 96.0, FIELD_HEIGHT))
+        insert_row_button.setToolTip_("Insert a row after the selection (Cmd-I), then choose its directive type.")
+        insert_row_button.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        content.addSubview_(insert_row_button)
+
         search_field = NSSearchField.alloc().initWithFrame_(NSMakeRect(670.0, 344.0, 210.0, FIELD_HEIGHT))
         search_field.setPlaceholderString_("Search control file")
         search_field.setFont_(NSFont.systemFontOfSize_(13.0))
@@ -4187,8 +4815,8 @@ class GPXTrackerController(NSObject):
         column_widths = {
             "preview": 64.0,
             "file_datetime": 128.0,
-            "type": 58.0,
-            "name": 190.0,
+            "type": 65.0,
+            "name": 230.0,
             "time": 54.0,
             "gps": 138.0,
             "place": 300.0,
@@ -4196,12 +4824,17 @@ class GPXTrackerController(NSObject):
         for column_id in CONTROL_TABLE_COLUMNS:
             column = NSTableColumn.alloc().initWithIdentifier_(nsstring(column_id))
             column.setWidth_(column_widths[column_id])
-            column.setMinWidth_(8.0 if column_id == "separator" else 45.0)
+            column.setMinWidth_(62.0 if column_id == "type" else 45.0)
             column.headerCell().setStringValue_(CONTROL_TABLE_TITLES[column_id])
             if column_id == "preview":
                 image_cell = NSImageCell.alloc().init()
                 image_cell.setImageScaling_(NSImageScaleProportionallyUpOrDown)
                 column.setDataCell_(image_cell)
+            elif column_id == "type":
+                type_cell = NSComboBoxCell.alloc().init()
+                type_cell.addItemsWithObjectValues_(list(CONTROL_ROW_TYPE_CHOICES))
+                type_cell.setCompletes_(True)
+                column.setDataCell_(type_cell)
             table.addTableColumn_(column)
 
         data_source = SlideShowControlTableDataSource.alloc().initWithController_(self)
@@ -4253,7 +4886,7 @@ class GPXTrackerController(NSObject):
             x += width + 8.0
 
         hint = self._make_label(
-            "Double-click previews media; right-click for actions/Finder. Drag rows. Cmd-F: next match; Shift-Cmd-F: previous; Cmd-C/V/X/Z edit.",
+            "Double-click previews media; right-click for actions/Finder. Drag rows. Cmd-I inserts a row; Cmd-F/Shift-Cmd-F searches; Cmd-C/V/X/Z edits.",
             size=12.0,
         )
         hint.setFrame_(NSMakeRect(16.0, 8.0, 948.0, 16.0))
@@ -4266,12 +4899,19 @@ class GPXTrackerController(NSObject):
         self.control_table_data_source = data_source
         self.control_table_hint_label = hint
         self.control_table_preview_checkbox = preview_checkbox
+        self.control_table_media_filter_button = media_filter_button
         self.control_table_search_field = search_field
         self.control_table_search_status = search_status
 
     def _control_table_search_indexes(self, query):
         """Return rows containing a case-insensitive control-file substring."""
-        return control_table_search_indexes(self.control_table_rows, query)
+        matches = control_table_search_indexes(self.control_table_rows, query)
+        if self.control_table_media_hidden:
+            matches = [
+                index for index in matches
+                if str(self.control_table_rows[index].get("type", "")).upper() not in {"IMG", "VID"}
+            ]
+        return matches
 
     def _refresh_control_table_search(self, select_first=False):
         if self.control_table_search_field is None:
@@ -4312,8 +4952,7 @@ class GPXTrackerController(NSObject):
         selected_range = editor.selectedRange() if editor is not None else None
         row_index = self.control_table_search_matches[self.control_table_search_position]
         self._select_control_table_indexes([row_index])
-        if self.control_table_view is not None:
-            self.control_table_view.scrollRowToVisible_(row_index)
+        self._scroll_control_table_model_row_to_visible(row_index)
         if self.control_table_window is not None and self.control_table_search_field is not None:
             self.control_table_window.makeFirstResponder_(self.control_table_search_field)
             restored_editor = self.control_table_search_field.currentEditor()
@@ -4347,17 +4986,55 @@ class GPXTrackerController(NSObject):
         if self.control_table_view is None:
             return []
         selected = self.control_table_view.selectedRowIndexes()
-        return [index for index in range(len(self.control_table_rows)) if selected.containsIndex_(index)]
+        indexes = []
+        for view_index, model_index in enumerate(self.control_table_view_model_indexes):
+            if selected.containsIndex_(view_index):
+                indexes.append(model_index)
+        return indexes
+
+    def _rebuild_control_table_view_index(self):
+        self.control_table_view_model_indexes = visible_control_row_indexes(
+            self.control_table_rows,
+            self.control_table_media_hidden,
+        )
+        self.control_table_model_to_view_index = {
+            model_index: view_index
+            for view_index, model_index in enumerate(self.control_table_view_model_indexes)
+        }
+
+    def control_table_model_index_for_view_row(self, view_index):
+        try:
+            return self.control_table_view_model_indexes[int(view_index)]
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def control_table_model_insertion_index_for_view_row(self, view_index):
+        view_index = max(0, int(view_index))
+        if view_index < len(self.control_table_view_model_indexes):
+            return self.control_table_view_model_indexes[view_index]
+        return len(self.control_table_rows)
+
+    def _scroll_control_table_model_row_to_visible(self, model_index):
+        if self.control_table_view is None:
+            return
+        view_index = self.control_table_model_to_view_index.get(int(model_index))
+        if view_index is not None:
+            self.control_table_view.scrollRowToVisible_(view_index)
 
     def _select_control_table_indexes(self, indexes):
         if self.control_table_view is None:
             return
-        clean_indexes = sorted(index for index in indexes if 0 <= index < len(self.control_table_rows))
-        if not clean_indexes:
+        view_indexes = sorted(
+            self.control_table_model_to_view_index[index]
+            for index in indexes
+            if index in self.control_table_model_to_view_index
+        )
+        if not view_indexes:
+            self.control_table_view.deselectAll_(None)
             return
-        selection = NSIndexSet.indexSetWithIndexesInRange_((clean_indexes[0], 1))
+        selection = NSIndexSet.indexSetWithIndexesInRange_((view_indexes[0], 1))
         mutable_selection = selection.mutableCopy()
-        for index in clean_indexes[1:]:
+        for index in view_indexes[1:]:
             mutable_selection.addIndex_(index)
         self.control_table_view.selectRowIndexes_byExtendingSelection_(mutable_selection, False)
 
@@ -4385,6 +5062,21 @@ class GPXTrackerController(NSObject):
     def _control_table_text(self):
         lines = [serialize_slideshow_control_row(row) for row in self.control_table_rows]
         return "\n".join(lines) + ("\n" if lines else "")
+
+    def _validate_control_table_music_rows(self):
+        for index, row in enumerate(self.control_table_rows, start=1):
+            row_type = str(row.get("type", "")).strip().upper()
+            if not row_type:
+                show_alert(f"Row {index} has no type.", "Choose a Type before saving the control file.")
+                return False
+            if row_type != "MUS":
+                continue
+            try:
+                parse_music_parameters(str(row.get("name", "")))
+            except MusicSyntaxError as exc:
+                show_alert(f"Invalid music directive in row {index}.", str(exc))
+                return False
+        return True
 
     @objc.IBAction
     def autosaveControlTableRecovery_(self, _sender):
@@ -4414,8 +5106,11 @@ class GPXTrackerController(NSObject):
             self.set_status(f"Could not back up control-file edits: {exc}")
 
     def _reload_control_table(self):
+        selected_model_indexes = self._selected_control_table_indexes()
+        self._rebuild_control_table_view_index()
         if self.control_table_view is not None:
             self.control_table_view.reloadData()
+            self._select_control_table_indexes(selected_model_indexes)
         self._refresh_control_table_search(select_first=False)
 
     def resolve_control_row_path(self, row):
@@ -4564,6 +5259,29 @@ class GPXTrackerController(NSObject):
         if not self.control_table_show_previews:
             self.control_table_preview_cache = {}
         self._reload_control_table()
+
+    @objc.IBAction
+    def toggleControlTableMediaRows_(self, _sender):
+        selected_indexes = self._selected_control_table_indexes()
+        hide_media = not self.control_table_media_hidden
+        anchor_index = control_table_filter_anchor_index(
+            self.control_table_rows,
+            selected_indexes,
+            hide_media,
+        )
+        self.control_table_media_hidden = hide_media
+        if self.control_table_media_filter_button is not None:
+            self.control_table_media_filter_button.setTitle_(
+                "Show Media Rows" if hide_media else "Hide Media Rows"
+            )
+            self.control_table_media_filter_button.setToolTip_(
+                "Show photo and video rows while keeping the selected stage visible." if hide_media
+                else "Hide photo and video rows so stage, date, and map rows are easier to edit."
+            )
+        self._reload_control_table()
+        if anchor_index is not None:
+            self._select_control_table_indexes([anchor_index])
+            self._scroll_control_table_model_row_to_visible(anchor_index)
 
     def control_media_items(self):
         items = []
@@ -4859,8 +5577,7 @@ class GPXTrackerController(NSObject):
         if row_index is None:
             return
         self._select_control_table_indexes([row_index])
-        if self.control_table_view is not None:
-            self.control_table_view.scrollRowToVisible_(row_index)
+        self._scroll_control_table_model_row_to_visible(row_index)
 
     def update_media_viewer_content(self):
         """Update image/video presentation and its originating table row."""
@@ -5088,27 +5805,67 @@ class GPXTrackerController(NSObject):
         self._select_control_table_indexes(range(adjusted_drop_row, adjusted_drop_row + len(moving_rows)))
         return True
 
-    def load_slideshow_control_file(self, control_file_path):
+    def _show_control_table_window(self, path):
+        """Raise the retained editor without rebuilding its table model."""
+        self._ensure_control_table_window()
+        self.control_table_window.setTitle_(f"Slide Show Control File: {Path(path).name}")
+        self.control_table_window.makeKeyAndOrderFront_(None)
+        self.control_table_window.displayIfNeeded()
+        NSApp().activateIgnoringOtherApps_(True)
+
+    def refreshControlFileDisplayAfterOpen_(self, _sender):
+        """Finish nonessential control-file status work after the editor is visible."""
+        pending = self.control_table_pending_refresh
+        self.control_table_pending_refresh = None
+        if pending is None:
+            return
+        pending_path, control_lines = pending
+        if self.control_table_path is None:
+            return
+        if self.control_table_path.resolve(strict=False) != pending_path.resolve(strict=False):
+            return
+        active_path = self._control_file_path()
+        if active_path is None or active_path.resolve(strict=False) != pending_path.resolve(strict=False):
+            return
+        self.refresh_control_file_display(
+            rows=self.control_table_rows,
+            control_lines=control_lines,
+        )
+
+    def load_slideshow_control_file(self, control_file_path, force_reload=False):
         path = Path(control_file_path).expanduser().resolve(strict=False)
         recovery_path = control_table_recovery_path(path)
+        recovery_is_newer = control_file_recovery_is_newer(path, recovery_path)
+        current_signature = control_file_signature(path)
+        same_loaded_path = bool(
+            self.control_table_path is not None
+            and self.control_table_path.resolve(strict=False) == path
+        )
+        if (
+            not force_reload
+            and same_loaded_path
+            and self.control_table_window is not None
+            and not self.control_table_dirty
+            and not recovery_is_newer
+            and current_signature is not None
+            and current_signature == self.control_table_file_signature
+        ):
+            self._show_control_table_window(path)
+            return True
+
         source_path = path
-        if recovery_path.exists():
-            try:
-                recovery_is_newer = not path.exists() or recovery_path.stat().st_mtime > path.stat().st_mtime
-            except OSError:
-                recovery_is_newer = False
-            if recovery_is_newer:
-                alert = NSAlert.alloc().init()
-                alert.setMessageText_("Unsaved control-file edits were found.")
-                alert.setInformativeText_(
-                    "The previous editing session did not save these changes. Restore the autosaved version?"
-                )
-                alert.addButtonWithTitle_("Restore")
-                alert.addButtonWithTitle_("Ignore")
-                if int(alert.runModal()) == 1000:
-                    source_path = recovery_path
-                else:
-                    recovery_path.unlink(missing_ok=True)
+        if recovery_is_newer:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Unsaved control-file edits were found.")
+            alert.setInformativeText_(
+                "The previous editing session did not save these changes. Restore the autosaved version?"
+            )
+            alert.addButtonWithTitle_("Restore")
+            alert.addButtonWithTitle_("Ignore")
+            if int(alert.runModal()) == 1000:
+                source_path = recovery_path
+            else:
+                recovery_path.unlink(missing_ok=True)
         try:
             lines = source_path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
@@ -5120,14 +5877,26 @@ class GPXTrackerController(NSObject):
         self.control_table_redo_stack = []
         self.control_table_dirty = source_path == recovery_path
         self.control_table_last_snapshot_time = time.time() if self.control_table_dirty else 0.0
+        self.control_table_file_signature = current_signature
         self.control_table_preview_cache = {}
         self.control_table_file_datetime_cache = {}
         self._ensure_control_table_window()
         self._reload_control_table()
-        self.refresh_control_file_display()
-        self.control_table_window.setTitle_(f"Slide Show Control File: {path.name}")
-        self.control_table_window.makeKeyAndOrderFront_(None)
-        NSApp().activateIgnoringOtherApps_(True)
+        if hasattr(self, "control_file_summary_label"):
+            self.control_file_summary_label.setStringValue_(
+                self._control_file_summary_text(self.control_table_rows, path)
+            )
+        self.control_ready_cache = any(
+            str(row.get("type", "")).upper() in {"IMG", "VID"}
+            for row in self.control_table_rows
+        )
+        self._show_control_table_window(path)
+        self.control_table_pending_refresh = (path, tuple(lines))
+        self.performSelector_withObject_afterDelay_(
+            "refreshControlFileDisplayAfterOpen:",
+            None,
+            0.01,
+        )
         return True
 
     def place_name_from_sidecar_for_row(self, row):
@@ -5189,7 +5958,7 @@ class GPXTrackerController(NSObject):
         current_table_path = self.control_table_path.resolve(strict=False) if self.control_table_path is not None else None
         if not self.control_table_rows or current_table_path != resolved_control_file_path:
             if not self.load_slideshow_control_file(control_file_path):
-                return 0
+                return None
         updated_count = 0
         rows_changed = False
         for row in self.control_table_rows:
@@ -5234,19 +6003,160 @@ class GPXTrackerController(NSObject):
         current = str(self.control_table_rows[row_index].get(column_id, ""))
         if current == value:
             return
+        candidate = clone_slideshow_row(self.control_table_rows[row_index])
+        update_slideshow_control_row_cell(candidate, column_id, value)
+        if str(candidate.get("type", "")).upper() == "MUS" and str(candidate.get("name", "")).strip():
+            try:
+                parse_music_parameters(str(candidate.get("name", "")))
+            except MusicSyntaxError as exc:
+                show_alert("Invalid #MUSIC directive.", str(exc))
+                return
         self._push_control_table_undo()
-        update_slideshow_control_row_cell(
-            self.control_table_rows[row_index],
-            column_id,
-            value,
-        )
+        self.control_table_rows[row_index] = candidate
         if self.control_table_view is not None:
             self.control_table_view.setNeedsDisplay_(True)
+        if str(candidate.get("type", "")).upper() == "MUS":
+            self.performSelector_withObject_afterDelay_("showMusicDirectiveHelp:", None, 0.01)
         self.performSelector_withObject_afterDelay_(
             "reloadControlTableAfterEditing:",
             None,
             0.01,
         )
+
+    @objc.IBAction
+    def insertControlRow_(self, _sender):
+        """Insert an empty directive row and begin editing its Type cell."""
+        indexes = self._selected_control_table_indexes()
+        insert_at = indexes[-1] + 1 if indexes else len(self.control_table_rows)
+        self._push_control_table_undo()
+        self.control_table_rows.insert(
+            insert_at,
+            {
+                "type": "",
+                "name": "",
+                "time": "",
+                "gps": "",
+                "place": "",
+                "keyword": "",
+                "is_keyword": True,
+            },
+        )
+        self._reload_control_table()
+        self._select_control_table_indexes([insert_at])
+        table = self.control_table_view
+        if table is None:
+            return
+        type_column = int(table.columnWithIdentifier_(nsstring("type")))
+        view_row = self.control_table_model_to_view_index.get(insert_at)
+        if type_column >= 0 and view_row is not None:
+            table.editColumn_row_withEvent_select_(type_column, int(view_row), None, True)
+
+    def _music_directive_help_content(self):
+        labels = []
+        if self.music_source is not None:
+            playlist_path = self.music_playlist or self._preferred_music_playlist(self.music_source)
+            parsed = load_audio_playlist(Path(self.music_source), Path(playlist_path) if playlist_path else None)
+            labels = sorted(
+                {f"${label}" for labels in parsed.labels_at_index.values() for label in labels},
+                key=str.casefold,
+            )
+        label_text = ", ".join(labels) if labels else "No playlist labels are currently available."
+        return (
+            "#MUSIC: commands\n\n"
+            "Separate entries with commas. Put pathnames containing commas in double quotes. "
+            "Commands and $labels are case-insensitive.\n\n"
+            "$LABEL or pathname   queue titles, then resume the interrupted title\n"
+            "#JUMP $LABEL         continue the playlist from a label\n"
+            "#ON / #OFF           open or close the control-file audio gate\n"
+            "#CONTINUE            cancel a queue or loop without a hard cut\n"
+            "#LOOPLINE            loop later labels/files on this line\n"
+            "#LOOPONE             loop the current or most recent title\n"
+            "#LOOPRANGE $A $B     loop an inclusive playlist range\n"
+            "#LOOPALBUM, $LABEL   loop the album containing the target\n"
+            "#LOOPALL             loop the complete playlist\n"
+            "#VOLUME+ / #VOLUME-  change the internal level by one\n"
+            "#VOLUME N            set level 0 through 9\n\n"
+            "Example:\n"
+            '#ON, #LOOPLINE, $INTRO, "Befluegelt/01 Auf,Seele,Gott Zu Loben.mp3"\n\n'
+            f"Available labels:\n{label_text}"
+        )
+
+    def _position_music_directive_help_window(self):
+        """Place music help above or below the active table cell without covering it."""
+        help_window = self.music_directive_help_window
+        table = self.control_table_view
+        if help_window is None or table is None or table.window() is None:
+            return
+
+        row = int(table.editedRow())
+        if row < 0:
+            row = int(table.selectedRow())
+        if row < 0:
+            return
+
+        column = int(table.editedColumn())
+        if column < 0:
+            column = int(table.columnWithIdentifier_(nsstring("name")))
+        if column < 0:
+            column = int(table.columnWithIdentifier_(nsstring("type")))
+        if column < 0:
+            return
+
+        cell_rect = table.frameOfCellAtColumn_row_(column, row)
+        window_rect = table.convertRect_toView_(cell_rect, None)
+        target_rect = table.window().convertRectToScreen_(window_rect)
+        screen = table.window().screen()
+        if screen is None:
+            return
+
+        visible = screen.visibleFrame()
+        frame = help_window.frame()
+        gap = 10.0
+        target_left = target_rect.origin.x
+        target_bottom = target_rect.origin.y
+        target_right = target_left + target_rect.size.width
+        target_top = target_bottom + target_rect.size.height
+        visible_left = visible.origin.x
+        visible_bottom = visible.origin.y
+        visible_right = visible_left + visible.size.width
+        visible_top = visible_bottom + visible.size.height
+
+        x = target_left + (target_right - target_left - frame.size.width) / 2.0
+        x = max(visible_left, min(x, visible_right - frame.size.width))
+        space_above = visible_top - target_top - gap
+        space_below = target_bottom - visible_bottom - gap
+        if space_above >= frame.size.height or space_above >= space_below:
+            y = target_top + gap
+        else:
+            y = target_bottom - frame.size.height - gap
+        y = max(visible_bottom, min(y, visible_top - frame.size.height))
+        help_window.setFrameOrigin_(NSMakePoint(x, y))
+
+    def showMusicDirectiveHelp_(self, _sender):
+        """Raise the retained, nonmodal #MUSIC syntax reference."""
+        if self.music_directive_help_window is None:
+            window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(260.0, 180.0, 360.0, 250.0),
+                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+                NSBackingStoreBuffered,
+                False,
+            )
+            window.setTitle_("Music Directive Help")
+            window.setReleasedWhenClosed_(False)
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8.0, 8.0, 344.0, 234.0))
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            scroll.setHasVerticalScroller_(True)
+            text_view = NSTextView.alloc().initWithFrame_(scroll.bounds())
+            text_view.setEditable_(False)
+            text_view.setSelectable_(True)
+            text_view.setFont_(NSFont.systemFontOfSize_(13.0))
+            scroll.setDocumentView_(text_view)
+            window.contentView().addSubview_(scroll)
+            self.music_directive_help_window = window
+            self.music_directive_help_text = text_view
+        self.music_directive_help_text.setString_(self._music_directive_help_content())
+        self._position_music_directive_help_window()
+        self.music_directive_help_window.orderFront_(None)
 
     @objc.IBAction
     def moveControlRowsUp_(self, _sender):
@@ -5355,8 +6265,11 @@ class GPXTrackerController(NSObject):
         if self.control_table_path is None:
             show_alert("No slide show control file is loaded.")
             return False
+        if not self._validate_control_table_music_rows():
+            return False
+        control_text = self._control_table_text()
         try:
-            write_text_atomic(self.control_table_path, self._control_table_text())
+            write_text_atomic(self.control_table_path, control_text)
             control_table_recovery_path(self.control_table_path).unlink(missing_ok=True)
         except OSError as exc:
             show_alert("Could not save slide show control file.", str(exc))
@@ -5365,7 +6278,17 @@ class GPXTrackerController(NSObject):
             self.control_table_recovery_timer.invalidate()
             self.control_table_recovery_timer = None
         self.control_table_dirty = False
-        self.refresh_control_file_display()
+        self.control_table_pending_refresh = None
+        self.control_table_file_signature = control_file_signature(self.control_table_path)
+        if self.assistant_place_names_pending_save:
+            self.assistant_place_names_pending_save = False
+            self.workflow_assistant_state["place_names_completed"] = True
+            self.mark_dirty(immediate=True)
+        self.refresh_control_file_display(
+            rows=self.control_table_rows,
+            control_lines=control_text.splitlines(),
+        )
+        self.refresh_workflow_assistant()
         self.set_status(f"Saved slide show control file {self.control_table_path}")
         return True
 
@@ -5390,11 +6313,17 @@ class GPXTrackerController(NSObject):
         self.control_table_undo_stack = []
         self.control_table_redo_stack = []
         self.control_table_dirty = False
+        self.control_table_pending_refresh = None
+        self.assistant_place_names_pending_save = False
         self.control_table_last_snapshot_time = 0.0
+        self.control_table_file_signature = control_file_signature(self.control_table_path)
         self.control_table_preview_cache = {}
         self.control_table_file_datetime_cache = {}
         self._reload_control_table()
-        self.refresh_control_file_display()
+        self.refresh_control_file_display(
+            rows=self.control_table_rows,
+            control_lines=lines,
+        )
         self.set_status(f"Discarded unsaved changes to {self.control_table_path.name}")
         return True
 
@@ -5427,7 +6356,7 @@ class GPXTrackerController(NSObject):
             return
         control_table_recovery_path(self.control_table_path).unlink(missing_ok=True)
         self.control_table_dirty = False
-        self.load_slideshow_control_file(self.control_table_path)
+        self.load_slideshow_control_file(self.control_table_path, force_reload=True)
 
     @objc.IBAction
     def closeControlTable_(self, _sender):
@@ -5435,6 +6364,8 @@ class GPXTrackerController(NSObject):
             return
         if self.control_table_window is not None:
             self.control_table_window.orderOut_(None)
+        if self.music_directive_help_window is not None:
+            self.music_directive_help_window.orderOut_(None)
 
     def _collect_media_candidates(self, paths, images_only=False):
         allowed = IMAGE_EXTENSIONS if images_only else MEDIA_EXTENSIONS
@@ -5459,29 +6390,47 @@ class GPXTrackerController(NSObject):
             return
         copied = 0
         skipped = []
+        failed = []
+        self.workflow_assistant_bubble.setHidden_(True)
         self.set_progress(0.0, len(media_files))
         for index, source_path in enumerate(media_files, start=1):
             target_name = source_path.stem + ".jpeg" if force_jpeg else source_path.name
             target_path = project_dir / target_name
-            self.set_status(f"Copying {index}/{len(media_files)}: {source_path.name}")
             if target_path.exists():
                 skipped.append(target_name)
+                self.set_status(f"Skipping existing {index}/{len(media_files)}: {target_name}")
                 self.set_progress(index, len(media_files))
                 continue
-            if force_jpeg and source_path.suffix.lower() not in {".jpg", ".jpeg"}:
-                subprocess.run(["sips", "-s", "format", "jpeg", str(source_path), "--out", str(target_path)], check=False, capture_output=True, text=True)
-                if not target_path.exists():
-                    skipped.append(target_name)
-            else:
-                shutil.copy2(source_path, target_path)
-            copied += 1
+            self.set_status(f"Importing {index}/{len(media_files)}: {source_path.name}")
+            try:
+                if force_jpeg and source_path.suffix.lower() not in {".jpg", ".jpeg"}:
+                    completed = subprocess.run(
+                        ["sips", "-s", "format", "jpeg", str(source_path), "--out", str(target_path)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if completed.returncode != 0:
+                        failed.append(f"{target_name}: conversion failed")
+                else:
+                    shutil.copy2(source_path, target_path)
+            except OSError as exc:
+                failed.append(f"{target_name}: {exc}")
+            if target_path.exists():
+                copied += 1
+            elif not any(item.startswith(f"{target_name}:") for item in failed):
+                failed.append(f"{target_name}: output was not created")
             self.set_progress(index, len(media_files))
         self.last_picture_import_directory = source_paths[0].parent if source_paths else self.last_picture_import_directory
         self.mark_dirty()
         self.refresh_media_summary()
-        self.set_status(f"Imported {copied} file(s), skipped {len(skipped)} duplicate(s).")
-        if skipped:
-            self._show_scrollable_list("Skipped Photos", skipped)
+        self.set_status(
+            f"Imported {copied} file(s), skipped {len(skipped)} existing file(s), failed {len(failed)} file(s)."
+        )
+        if skipped or failed:
+            lines = [f"Already present: {name}" for name in skipped] + failed
+            self._show_scrollable_list("Skipped Media", lines)
+        self.refresh_workflow_assistant()
 
     def _cleanup_album_selection_window(self):
         if self.album_selection_window is not None:
@@ -5706,19 +6655,22 @@ class GPXTrackerController(NSObject):
             return
         copied = 0
         skipped = []
+        failed = []
+        self.workflow_assistant_bubble.setHidden_(True)
         self.set_progress(0.0, total)
         for index in range(total):
             asset = assets.objectAtIndex_(index)
             target_name = self._asset_output_name(asset)
             target_path = project_dir / target_name
-            self.set_status(f"Exporting {index + 1}/{total}: {target_name}")
             if target_path.exists():
                 skipped.append(target_name)
+                self.set_status(f"Skipping existing {index + 1}/{total}: {target_name}")
                 self.set_progress(index + 1, total)
                 continue
+            self.set_status(f"Importing {index + 1}/{total}: {target_name}")
             source_path = self._full_size_image_path_for_asset(asset)
             if source_path is None or not source_path.exists():
-                skipped.append(target_name)
+                failed.append(f"{target_name}: source photo was unavailable")
                 self.set_progress(index + 1, total)
                 continue
             completed = subprocess.run(
@@ -5728,17 +6680,21 @@ class GPXTrackerController(NSObject):
                 check=False,
             )
             if completed.returncode != 0 or not target_path.exists():
-                skipped.append(target_name)
+                failed.append(f"{target_name}: export failed")
             else:
                 copied += 1
             self.set_progress(index + 1, total)
         self.last_picture_import_directory = project_dir
         self.mark_dirty()
         self.set_status(
-            f"Imported album '{album_info['title']}' with {copied} photo(s), skipped {len(skipped)} file(s)."
+            f"Imported album '{album_info['title']}' with {copied} photo(s), "
+            f"skipped {len(skipped)} existing file(s), failed {len(failed)} file(s)."
         )
-        if skipped:
-            self._show_scrollable_list("Skipped Gallery Photos", skipped)
+        if skipped or failed:
+            lines = [f"Already present: {name}" for name in skipped] + failed
+            self._show_scrollable_list("Skipped Gallery Photos", lines)
+        self.refresh_media_summary()
+        self.refresh_workflow_assistant()
 
     def _project_dir_path(self):
         text = str(self.project_dir_field.stringValue()).strip()
@@ -5983,7 +6939,7 @@ class GPXTrackerController(NSObject):
             alert.addButtonWithTitle_("Cancel")
             related_checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 430, FIELD_HEIGHT))
             related_checkbox.setButtonType_(NSButtonTypeSwitch)
-            related_checkbox.setTitle_("Also rename/copy GPX, control file, and Track Maps")
+            related_checkbox.setTitle_("Also rename/copy GPX, control file, Track Maps, and music playlist")
             related_checkbox.setState_(NSControlStateValueOn)
             alert.setAccessoryView_(related_checkbox)
             response = int(alert.runModal())
@@ -6032,6 +6988,8 @@ class GPXTrackerController(NSObject):
         self.control_file_field.setStringValue_(name)
         self.control_table_rows = []
         self.control_table_path = None
+        self.control_table_file_signature = None
+        self.control_table_pending_refresh = None
         self.mark_dirty(immediate=True)
         self.refresh_control_file_display()
         self._update_slideshow_continue_button()
@@ -6842,6 +7800,158 @@ class GPXTrackerController(NSObject):
     def startTimeLapseShow_(self, _sender):
         self._start_slide_show(time_lapse=True)
 
+    def _commit_music_source(self, show_errors=True):
+        text = str(self.music_field.stringValue()).strip()
+        if not text:
+            changed = self.music_source is not None or self.music_playlist is not None
+            self.music_source = None
+            self.music_playlist = None
+            self._refresh_music_summary()
+            if changed:
+                self.mark_dirty(immediate=True)
+            return True
+        path = Path(text).expanduser()
+        if not path.is_absolute() and self.current_project_dir is not None:
+            path = self.current_project_dir / path
+        path = path.resolve(strict=False)
+        if not path.exists() or (path.is_file() and path.suffix.casefold() not in AUDIO_EXTENSIONS):
+            if show_errors:
+                show_alert("Music source is not usable.", "Choose an existing supported audio file or a directory.")
+            self._refresh_music_summary()
+            return False
+        previous_playlist = self.music_playlist
+        changed = path != self.music_source
+        self.music_source = path
+        self.music_playlist = self._preferred_music_playlist(path)
+        self.music_field.setStringValue_(str(path))
+        self._refresh_music_summary()
+        if changed or self.music_playlist != previous_playlist:
+            self.mark_dirty(immediate=True)
+        return True
+
+    @objc.IBAction
+    def musicSourceCommitted_(self, _sender):
+        self._commit_music_source(show_errors=True)
+
+    @objc.IBAction
+    def chooseMusicSource_(self, _sender):
+        if self.current_project_dir is None:
+            show_alert("Choose a project directory first.", "The default music folder belongs inside the project directory.")
+            return
+        default_directory = self.current_project_dir / "audio"
+        try:
+            default_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            show_alert("Could not create the default audio directory.", str(exc))
+            return
+        if self.music_source is None:
+            self.music_source = default_directory.resolve(strict=False)
+            self.music_playlist = self._preferred_music_playlist(self.music_source)
+            self.music_field.setStringValue_(str(self.music_source))
+            self._refresh_music_summary()
+            self.mark_dirty(immediate=True)
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        initial = self.music_source
+        if initial is not None:
+            initial_path = Path(initial)
+            panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(initial_path if initial_path.is_dir() else initial_path.parent)))
+        if not panel.runModal():
+            return
+        url = panel.URL()
+        if url is None:
+            return
+        self.music_field.setStringValue_(str(Path(str(url.path())).resolve(strict=False)))
+        self._commit_music_source(show_errors=True)
+
+    @objc.IBAction
+    def createMusicPlaylist_(self, _sender):
+        if not self._commit_music_source(show_errors=True) or self.music_source is None:
+            return
+        directory = Path(self.music_source)
+        if not directory.is_dir():
+            show_alert("A playlist requires a music directory.", "Choose a directory rather than a single audio file.")
+            return
+        files = audio_files_in_directory(directory)
+        if not files:
+            show_alert("No supported audio files found.", str(directory))
+            return
+        playlist_path = directory / f"{project_filename_base(self._current_project_name())}.playlist"
+        if playlist_path.exists() and not confirm_alert(
+            "Replace the existing playlist?",
+            str(playlist_path),
+            "Replace",
+            "Cancel",
+        ):
+            return
+        try:
+            write_text_atomic(playlist_path, generated_playlist_text(files, directory))
+        except OSError as exc:
+            show_alert("Could not create the music playlist.", str(exc))
+            return
+        self.music_playlist = playlist_path.resolve(strict=False)
+        self._refresh_music_summary()
+        self.mark_dirty(immediate=True)
+        self.set_status(f"Created music playlist {playlist_path.name} with {len(files)} audio files.")
+
+    @objc.IBAction
+    def updateMusicPlaylist_(self, sender):
+        if not self._commit_music_source(show_errors=True) or self.music_source is None:
+            return
+        directory = Path(self.music_source)
+        if not directory.is_dir():
+            show_alert("A playlist requires a music directory.", "Choose a directory rather than a single audio file.")
+            return
+        files = audio_files_in_directory(directory)
+        if not files:
+            show_alert("No supported audio files found.", str(directory))
+            return
+        playlist_path = Path(self.music_playlist) if self.music_playlist is not None else self._preferred_music_playlist(directory)
+        if playlist_path is None or not playlist_path.is_file():
+            self.createMusicPlaylist_(sender)
+            return
+        try:
+            existing = playlist_path.read_text(encoding="utf-8")
+            updated, missing = updated_playlist_text(existing, files, directory)
+            if missing:
+                write_text_atomic(playlist_path, updated)
+        except (OSError, UnicodeError) as exc:
+            show_alert("Could not update the music playlist.", str(exc))
+            return
+        self.music_playlist = playlist_path.resolve(strict=False)
+        self._refresh_music_summary()
+        self.mark_dirty(immediate=True)
+        if missing:
+            self.set_status(f"Added {len(missing)} audio file(s) to {playlist_path.name}.")
+        else:
+            self.set_status(f"{playlist_path.name} already lists all discovered audio files.")
+
+    @objc.IBAction
+    def editMusicPlaylist_(self, sender):
+        if not self._commit_music_source(show_errors=True) or self.music_source is None:
+            return
+        directory = Path(self.music_source)
+        if not directory.is_dir():
+            show_alert("A playlist requires a music directory.", "Choose a directory rather than a single audio file.")
+            return
+        playlist_path = Path(self.music_playlist) if self.music_playlist is not None else self._preferred_music_playlist(directory)
+        if playlist_path is None or not playlist_path.is_file():
+            self.createMusicPlaylist_(sender)
+            playlist_path = Path(self.music_playlist) if self.music_playlist is not None else None
+        if playlist_path is None or not playlist_path.is_file():
+            return
+        workspace = NSWorkspace.sharedWorkspace()
+        try:
+            opened = bool(workspace.openFile_withApplication_(str(playlist_path), "TextEdit"))
+        except Exception:
+            opened = bool(workspace.openURL_(NSURL.fileURLWithPath_(str(playlist_path))))
+        if not opened:
+            show_alert("Could not open the music playlist.", str(playlist_path))
+            return
+        self.set_status(f"Opened {playlist_path.name} in TextEdit.")
+
     def _validated_slideshow_resume_position(self, control_file_path):
         position = self.slideshow_resume_position
         if not isinstance(position, dict) or position.get("completed"):
@@ -6927,6 +8037,9 @@ class GPXTrackerController(NSObject):
                 command,
                 cwd=str(self.base_dir),
             )
+            self.workflow_assistant_state["slideshow_started"] = True
+            self.mark_dirty(immediate=True)
+            self.refresh_workflow_assistant()
             if not continue_previous and self.slideshow_resume_position is not None:
                 self.slideshow_resume_position = None
                 self._update_slideshow_continue_button()
@@ -7057,7 +8170,16 @@ class GPXTrackerController(NSObject):
             str(settings["timelapse.media_min_fraction"]),
             "--time-lapse-marker",
             str(settings["timelapse.marker_style"]),
+            "--audio-crossfade-seconds",
+            str(settings["audio.crossfade_seconds"]),
         ]
+        if self.music_source is not None:
+            args.extend(["--music", str(Path(self.music_source).resolve(strict=False))])
+        playlist_path = self.music_playlist
+        if playlist_path is None or not Path(playlist_path).is_file():
+            playlist_path = self._preferred_music_playlist(self.music_source)
+        if playlist_path is not None and Path(playlist_path).is_file():
+            args.extend(["--music-playlist", str(Path(playlist_path).resolve(strict=False))])
         if not settings["timelapse.overview_as_media"]:
             args.append("--time-lapse-overview-fullscreen")
         if settings["slideshow.track_map_before_media"]:
@@ -7566,8 +8688,13 @@ class GPXTrackerController(NSObject):
             "trackmaps.ordering",
             "trackmaps.remove_name_prefix",
             "gpx.fallback_walking_speed_kmh",
+            "gpx.horizontal_smoothing_distance_m",
             "gpx.minimum_point_spacing_m",
             "gpx.maximum_accuracy_m",
+            "gpx.maximum_vertical_accuracy_m",
+            "gpx.maximum_hdop",
+            "gpx.maximum_vdop",
+            "gpx.elevation_smoothing_distance_m",
         )
         return parameter_subset(source, keys)
 
@@ -7598,8 +8725,7 @@ class GPXTrackerController(NSObject):
         saved = metadata.get("adventure_render_parameters")
         if isinstance(saved, dict):
             return saved == expected
-        defaults = default_parameters()
-        return expected == self._track_map_parameter_signature(variant, defaults)
+        return False
 
     def _plot_common_options(self, project_name, trackimages_dir, output_base=None):
         use_track_order = self._use_track_order()
@@ -7627,6 +8753,11 @@ class GPXTrackerController(NSObject):
             "remove_prefix": self.parameters["trackmaps.remove_name_prefix"],
             "gpx_threshold_distance": self.parameters["gpx.minimum_point_spacing_m"],
             "gpx_threshold_accuracy": self.parameters["gpx.maximum_accuracy_m"],
+            "gpx_horizontal_smoothing_distance": self.parameters["gpx.horizontal_smoothing_distance_m"],
+            "gpx_elevation_smoothing_distance": self.parameters["gpx.elevation_smoothing_distance_m"],
+            "gpx_maximum_vertical_accuracy": self.parameters["gpx.maximum_vertical_accuracy_m"],
+            "gpx_maximum_hdop": self.parameters["gpx.maximum_hdop"],
+            "gpx_maximum_vdop": self.parameters["gpx.maximum_vdop"],
             "fallback_walking_speed_kmh": self.parameters["gpx.fallback_walking_speed_kmh"],
             "map_layout": variant,
             "track_edge_margin_fraction": self.parameters["trackmaps.edge_margin_fraction"],
@@ -7794,6 +8925,7 @@ class GPXTrackerController(NSObject):
 
         self.plot_creation_thread = threading.Thread(target=run_task, name="make-plots", daemon=True)
         self.plot_creation_thread.start()
+        self.refresh_workflow_assistant()
 
     @objc.IBAction
     def makePlots_(self, _sender):
@@ -7878,6 +9010,7 @@ class GPXTrackerController(NSObject):
         self.gpx_cancel_plots_button.setEnabled_(True)
         self.plot_cancel_event = None
         self.plot_creation_thread = None
+        self.refresh_workflow_assistant()
         self.reset_progress()
         self.refresh_current_gpx_summary()
         self.refresh_control_file_display()
@@ -8003,6 +9136,22 @@ class GPXTrackerController(NSObject):
 
         expected_output_path = Path(output_path).expanduser().resolve(strict=False) if output_path is not None else None
 
+        def gpx_file_identity(path):
+            if path is None:
+                return None
+            candidate = Path(path).expanduser().resolve(strict=False)
+            try:
+                stat = candidate.stat()
+            except OSError:
+                return None
+            return (str(candidate), int(stat.st_size), int(stat.st_mtime_ns))
+
+        handled_gpx_identities = set()
+        opening_path = self._current_single_gpx_path() or expected_output_path
+        opening_identity = gpx_file_identity(opening_path)
+        if opening_identity is not None:
+            handled_gpx_identities.add(opening_identity)
+
         def handle_editor_output(returned_output_path, source="editor"):
             if returned_output_path is None:
                 return
@@ -8025,6 +9174,11 @@ class GPXTrackerController(NSObject):
                 if adopted_path is None:
                     return
                 returned_path = adopted_path
+            returned_identity = gpx_file_identity(returned_path)
+            if returned_identity is not None and returned_identity in handled_gpx_identities:
+                if source == "close":
+                    self.set_status(f"GPXEditor closed without new changes to {returned_path.name}.")
+                return
             self._set_gpx_field_value(returned_path.name, manual=not self._is_default_gpx_path(returned_path))
             self.mark_dirty()
             self._refresh_project_file_menus()
@@ -8038,6 +9192,9 @@ class GPXTrackerController(NSObject):
                     show_alert("Could not reload the GPX file after editing.", str(exc))
                     self.set_status("GPX file handling failed.")
                     return
+                refreshed_identity = gpx_file_identity(returned_path)
+                if refreshed_identity is not None:
+                    handled_gpx_identities.add(refreshed_identity)
             else:
                 summary_path = None
             if source == "save":
@@ -8061,15 +9218,22 @@ class GPXTrackerController(NSObject):
             cli_args.append(str(input_path))
         input_count = len(input_paths or [])
         input_names = ", ".join(path.name for path in (input_paths or [])[:4])
+        self._pause_project_status_for_editor_startup()
+
+        def handle_initial_editor_load_complete():
+            self._resume_project_status_after_editor_startup()
+
         try:
             self.gpx_editor_controller = show_gpx_editor_from_cli_args(
                 cli_args,
                 on_close=handle_editor_close,
                 on_save=handle_editor_save,
                 on_settings_change=self._apply_embedded_editor_parameters,
+                on_initial_load_complete=handle_initial_editor_load_complete,
                 settings=self.parameters,
             )
         except Exception as exc:
+            self._resume_project_status_after_editor_startup()
             show_alert("Could not open GPXEditor.", str(exc))
             self.set_status("GPX editor launch failed.")
             return None
@@ -8077,7 +9241,11 @@ class GPXTrackerController(NSObject):
             self.gpx_editor_controller.project_name = str(project_name)
             self.gpx_editor_controller.project_field.setStringValue_(str(project_name))
         if open_pdf_summary:
-            self.gpx_editor_controller.exportPdf_(None)
+            if self.gpx_editor_controller.track_load_timer is not None:
+                self.gpx_editor_controller.pending_pdf_export_after_load = True
+                self.gpx_editor_controller.set_status("Loading GPX tracks before opening PDF Summary...")
+            else:
+                self.gpx_editor_controller.exportPdf_(None)
         if expected_output_path is not None:
             suffix = f" with {input_count} input file(s)" if input_count else " with 0 input files"
             if input_names:
@@ -8213,6 +9381,8 @@ class GPXTrackerController(NSObject):
             self.adventureNameCommitted_(self.title_field)
         if field is self.control_file_field:
             self.controlFileCommitted_(self.control_file_field)
+        if field is self.music_field:
+            self._commit_music_source(show_errors=True)
 
     def controlTextDidChange_(self, notification):
         field = notification.object()
@@ -8315,6 +9485,14 @@ class GPXTrackerController(NSObject):
             self.control_table_search_field = None
             self.control_table_search_status = None
             self.control_table_search_matches = []
+        if self.music_directive_help_window is not None:
+            try:
+                self.music_directive_help_window.orderOut_(None)
+                self.music_directive_help_window.close()
+            except Exception:
+                pass
+            self.music_directive_help_window = None
+            self.music_directive_help_text = None
         if self.main_help_window is not None:
             try:
                 self.main_help_window.orderOut_(None)

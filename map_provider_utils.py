@@ -43,6 +43,18 @@ def provider_display_name(provider: str) -> str:
     }.get(provider, "OpenStreetMap.Mapnik")
 
 
+def provider_tile_url(tile_provider, x: int, y: int, z: int) -> str:
+    """Build one concrete tile URL from an xyzservices-style provider."""
+    builder = getattr(tile_provider, "build_url", None)
+    if callable(builder):
+        return str(builder(x=int(x), y=int(y), z=int(z)))
+    try:
+        template = str(tile_provider["url"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Map provider does not expose a tile URL template.") from exc
+    return template.replace("{x}", str(int(x))).replace("{y}", str(int(y))).replace("{z}", str(int(z)))
+
+
 @contextmanager
 def contextily_request_timeout(contextily_module, timeout_seconds: float):
     """Temporarily add a timeout to Contextily tile HTTP requests."""

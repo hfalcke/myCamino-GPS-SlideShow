@@ -53,6 +53,8 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.collage_size_range", "Slide Show", "Collage size range", "33-66", "range", "Minimum and maximum collage image size in percent, for example 33-66.", unit="%"),
     ParameterSpec("slideshow.collage_max_images", "Slide Show", "Maximum collage images", 9, "int", "Clear the collage after this many images.", 1, 100),
 
+    ParameterSpec("audio.crossfade_seconds", "Audio", "Crossfade duration", 2.0, "float", "Fade duration for normal music changes, marker jumps, pause, and resume.", 0.0, 30.0, unit="s"),
+
     ParameterSpec("timelapse.stage_duration_seconds", "Time-Lapse", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s"),
     ParameterSpec("timelapse.media_min_fraction", "Time-Lapse", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%"),
     ParameterSpec("timelapse.overview_as_media", "Time-Lapse", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage."),
@@ -74,12 +76,17 @@ PARAMETER_SPECS = (
     ParameterSpec("trackmaps.edge_margin_fraction", "Track Maps", "Time-Lapse edge margin", 0.05, "fraction", "Minimum route distance from the plotting-area edge.", 0.0, 0.49, advanced=True, unit="%"),
 
     ParameterSpec("gpx.fallback_walking_speed_kmh", "GPX Processing", "Fallback walking speed", 3.5, "float", "Speed used when missing timestamps cannot be anchored.", 0.1, 50.0, unit="km/h"),
-    ParameterSpec("gpx.minimum_point_spacing_m", "GPX Processing", "Minimum point spacing", 10.0, "float", "Discard filtered points closer than this distance.", 0.0, 10000.0, unit="m"),
-    ParameterSpec("gpx.maximum_accuracy_m", "GPX Processing", "Maximum GPS inaccuracy", 10.0, "float", "Discard points whose reported uncertainty exceeds this value.", 0.1, 10000.0, unit="m"),
+    ParameterSpec("gpx.horizontal_smoothing_distance_m", "GPX Processing", "Horizontal smoothing", 10.0, "float", "Smooth horizontal GPS coordinates over this route distance before spacing and length calculations. Set to zero to disable.", 0.0, 10000.0, unit="m"),
+    ParameterSpec("gpx.minimum_point_spacing_m", "GPX Processing", "Minimum point spacing", 10.0, "float", "Retain processed points at least this far apart. Set to zero to retain every quality-accepted point.", 0.0, 10000.0, unit="m"),
+    ParameterSpec("gpx.maximum_accuracy_m", "GPX Processing", "Maximum horizontal error", 10.0, "float", "Reject coordinates whose explicit horizontal uncertainty exceeds this value. Set to zero to disable.", 0.0, 10000.0, unit="m"),
+    ParameterSpec("gpx.maximum_vertical_accuracy_m", "GPX Processing", "Maximum vertical error", 20.0, "float", "Ignore elevations whose explicit vertical uncertainty exceeds this value. Set to zero to disable.", 0.0, 10000.0, unit="m"),
+    ParameterSpec("gpx.maximum_hdop", "GPX Processing", "Maximum HDOP", 20.0, "float", "Reject coordinates above this horizontal dilution of precision. Set to zero to disable.", 0.0, 10000.0),
+    ParameterSpec("gpx.maximum_vdop", "GPX Processing", "Maximum VDOP", 20.0, "float", "Ignore elevations above this vertical dilution of precision. Set to zero to disable.", 0.0, 10000.0),
     ParameterSpec("gpx.editor_autosave_seconds", "GPX Processing", "Editor autosave interval", 300.0, "float", "Interval between GPX Editor recovery saves.", 10.0, 86400.0, unit="s"),
     ParameterSpec("gpx.map_padding_fraction", "GPX Processing", "Map padding", 0.08, "fraction", "Padding around tracks in interactive maps.", 0.0, 1.0, unit="%"),
     ParameterSpec("gpx.overview_zoom", "GPX Processing", "Overview zoom", 8, "int", "Default GPX Editor overview tile zoom.", 0, 22),
     ParameterSpec("gpx.track_zoom", "GPX Processing", "Track zoom", 14, "int", "Default GPX Editor track tile zoom.", 0, 22),
+    ParameterSpec("gpx.elevation_smoothing_distance_m", "GPX Processing", "Elevation smoothing", 50.0, "float", "Smooth GPS elevations over this route distance before calculating ascent and descent. Set to zero to use raw point-to-point elevations.", 0.0, 1000.0, unit="m"),
     ParameterSpec("gpx.elevation_headroom_fraction", "GPX Processing", "Elevation headroom", 0.08, "fraction", "Vertical headroom above and below elevation profiles.", 0.0, 1.0, unit="%"),
     ParameterSpec("gpx.maximum_map_tiles", "GPX Processing", "Maximum interactive tiles", 48, "int", "Lower zoom automatically when an interactive map would exceed this tile count.", 1, 1000, advanced=True),
 
@@ -262,8 +269,13 @@ def map_affecting_parameter_keys() -> frozenset[str]:
         {
             *(spec.key for spec in PARAMETER_SPECS if spec.section == "Track Maps" and spec.key != "trackmaps.variant"),
             "gpx.fallback_walking_speed_kmh",
+            "gpx.horizontal_smoothing_distance_m",
             "gpx.minimum_point_spacing_m",
             "gpx.maximum_accuracy_m",
+            "gpx.maximum_vertical_accuracy_m",
+            "gpx.maximum_hdop",
+            "gpx.maximum_vdop",
+            "gpx.elevation_smoothing_distance_m",
             "maps.provider",
             "maps.custom_url",
             "maps.custom_attribution",

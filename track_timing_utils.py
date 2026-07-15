@@ -3,23 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from math import asin, cos, radians, sin, sqrt
 from typing import Iterable
 
+from gpx_processing import haversine_km
 
 DEFAULT_WALKING_SPEED_KMH = 3.5
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius_km = 6371.0088
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    value = sin_sq(dlat / 2.0) + cos(radians(lat1)) * cos(radians(lat2)) * sin_sq(dlon / 2.0)
-    return radius_km * 2.0 * asin(sqrt(max(0.0, value)))
-
-
-def sin_sq(value: float) -> float:
-    return sin(value) ** 2
 
 
 def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFAULT_WALKING_SPEED_KMH) -> list[dict]:
@@ -40,6 +28,10 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
         except (TypeError, ValueError):
             elevation_m = None
         point_time = point.get("time")
+        try:
+            cumulative_distance_km = float(point.get("cumulative_distance_km"))
+        except (TypeError, ValueError):
+            cumulative_distance_km = None
         result.append(
             {
                 "lat": lat,
@@ -47,6 +39,8 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
                 "time": point_time if isinstance(point_time, datetime) else None,
                 "estimated": False,
                 "elevation_m": elevation_m,
+                "segment_index": int(point.get("segment_index", 0) or 0),
+                "cumulative_distance_km": cumulative_distance_km,
             }
         )
     if not result:
@@ -64,9 +58,21 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
         if point_time is not None:
             last_valid_time = point_time
 
-    distances = [0.0]
-    for previous, current in zip(result, result[1:]):
-        distances.append(distances[-1] + haversine_km(previous["lat"], previous["lon"], current["lat"], current["lon"]))
+    stored_distances = [point.get("cumulative_distance_km") for point in result]
+    stored_valid = all(value is not None and value >= 0 for value in stored_distances)
+    stored_monotonic = stored_valid and all(
+        current >= previous for previous, current in zip(stored_distances, stored_distances[1:])
+    )
+    if stored_monotonic:
+        origin = stored_distances[0]
+        distances = [value - origin for value in stored_distances]
+    else:
+        distances = [0.0]
+        for previous, current in zip(result, result[1:]):
+            increment = 0.0
+            if current["segment_index"] == previous["segment_index"]:
+                increment = haversine_km(previous["lat"], previous["lon"], current["lat"], current["lon"])
+            distances.append(distances[-1] + increment)
     for point, cumulative_distance_km in zip(result, distances):
         point["cumulative_distance_km"] = cumulative_distance_km
     anchors = [index for index, point in enumerate(result) if point["time"] is not None]
@@ -122,6 +128,7 @@ def timed_points_payload(points: Iterable[dict], fallback_speed_kmh: float = DEF
                 "estimated": point["estimated"],
                 "elevation_m": point.get("elevation_m"),
                 "cumulative_distance_km": round(float(point.get("cumulative_distance_km", 0.0)), 6),
+                "segment_index": int(point.get("segment_index", 0) or 0),
             }
         )
     return payload
@@ -129,7 +136,16 @@ def timed_points_payload(points: Iterable[dict], fallback_speed_kmh: float = DEF
 
 def timestamps_from_start(points: Iterable[dict], start_time: datetime, end_time: datetime | None = None, fallback_speed_kmh: float = DEFAULT_WALKING_SPEED_KMH) -> list[datetime]:
     """Assign distance-weighted times from a supplied first-point timestamp."""
-    normalized = [{"lat": point["lat"], "lon": point["lon"], "time": None} for point in points]
+    normalized = [
+        {
+            "lat": point["lat"],
+            "lon": point["lon"],
+            "time": None,
+            "segment_index": point.get("segment_index", 0),
+            "cumulative_distance_km": point.get("cumulative_distance_km"),
+        }
+        for point in points
+    ]
     if not normalized:
         return []
     normalized[0]["time"] = start_time

@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from GetGeoLocations import params_from_options
-from map_provider_utils import contextily_provider, contextily_request_timeout
+from map_provider_utils import contextily_provider, contextily_request_timeout, provider_tile_url
 
 
 class ProjectParameterPropagationTests(unittest.TestCase):
@@ -56,6 +56,26 @@ class ProjectParameterPropagationTests(unittest.TestCase):
             requests.get("https://example.invalid/tile")
         self.assertEqual(calls[0]["timeout"], 7.5)
         self.assertIs(requests.get, original_get)
+
+    def test_provider_tile_url_uses_configured_provider_builder(self):
+        calls = []
+
+        class Provider:
+            def build_url(self, **values):
+                calls.append(values)
+                return f"https://tiles.example/{values['z']}/{values['x']}/{values['y']}.png"
+
+        self.assertEqual(
+            provider_tile_url(Provider(), 4, 5, 6),
+            "https://tiles.example/6/4/5.png",
+        )
+        self.assertEqual(calls, [{"x": 4, "y": 5, "z": 6}])
+
+    def test_provider_tile_url_supports_plain_url_templates(self):
+        self.assertEqual(
+            provider_tile_url({"url": "https://tiles.example/{z}/{x}/{y}.png"}, 7, 8, 9),
+            "https://tiles.example/9/7/8.png",
+        )
 
 
 if __name__ == "__main__":

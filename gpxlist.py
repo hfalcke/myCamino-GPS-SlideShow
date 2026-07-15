@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
+
+from gpx_processing import (
+    ProcessingOptions,
+    haversine_km,
+    parse_time,
+    process_track_element,
+)
 
 
 GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
@@ -54,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print additional progress information while processing files.",
     )
+    parser.add_argument("--horizontal-smoothing", type=float, default=10.0, metavar="M")
+    parser.add_argument("--point-spacing", type=float, default=10.0, metavar="M")
+    parser.add_argument("--elevation-smoothing", type=float, default=50.0, metavar="M")
+    parser.add_argument("--maximum-horizontal-error", type=float, default=10.0, metavar="M")
+    parser.add_argument("--maximum-vertical-error", type=float, default=20.0, metavar="M")
+    parser.add_argument("--maximum-hdop", type=float, default=20.0)
+    parser.add_argument("--maximum-vdop", type=float, default=20.0)
     return parser
 
 
@@ -87,18 +100,9 @@ def parse_gpx_file(filename: str) -> ET.Element:
 # AI prompt: Parse an ISO-like GPX timestamp, handle trailing Z, and normalize naive values to UTC.
 def parse_gpx_datetime(value: str) -> datetime:
     """Parse a GPX timestamp into a timezone-aware ``datetime``."""
-    text = value.strip()
-    if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
-
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ValueError(f"invalid datetime {value!r}") from exc
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-
+    parsed = parse_time(value)
+    if parsed is None:
+        raise ValueError(f"invalid datetime {value!r}")
     return parsed
 
 
@@ -151,29 +155,6 @@ def count_track_points(track: ET.Element) -> int:
     return len(track.findall(f".//{ns_tag('trkpt')}"))
 
 
-# AI prompt: Compute the haversine distance in kilometers between two latitude/longitude coordinates.
-def haversine_km(
-    latitude1: float, longitude1: float, latitude2: float, longitude2: float
-) -> float:
-    """Return the great-circle distance between two coordinates in kilometers."""
-    earth_radius_km = 6371.0088
-
-    lat1 = math.radians(latitude1)
-    lon1 = math.radians(longitude1)
-    lat2 = math.radians(latitude2)
-    lon2 = math.radians(longitude2)
-
-    delta_lat = lat2 - lat1
-    delta_lon = lon2 - lon1
-
-    a = (
-        math.sin(delta_lat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return earth_radius_km * c
-
-
 # AI prompt: Sum the distances between consecutive filtered track points and return the track length in kilometers.
 def compute_track_length_km(points: list[TrackPoint]) -> float:
     """Calculate total track length from consecutive filtered track points."""
@@ -208,11 +189,15 @@ def format_duration(value: timedelta | None) -> str:
 
 
 # AI prompt: Build a summary object for one track using track metadata and filtered track point timestamps.
-def summarize_track(track: ET.Element, number: int) -> TrackSummary:
+def summarize_track(
+    track: ET.Element,
+    number: int,
+    processing_options: ProcessingOptions | None = None,
+) -> TrackSummary:
     """Compute the summary table row for one GPX track."""
     name = child_text(track, "name") or "Unnamed"
-    filtered_points = extract_filtered_points(track)
-    point_count = count_track_points(track)
+    processed = process_track_element(track, processing_options or ProcessingOptions())
+    point_count = processed.retained_point_count
 
     track_time_text = child_text(track, "time")
     track_time: datetime | None = None
@@ -222,13 +207,11 @@ def summarize_track(track: ET.Element, number: int) -> TrackSummary:
         except ValueError:
             track_time = None
 
-    first_point_time = filtered_points[0].timestamp if filtered_points else None
+    first_point_time = processed.start_time
     display_time_source = track_time or first_point_time
 
-    start_time = filtered_points[0].timestamp if filtered_points else None
-    end_time = filtered_points[-1].timestamp if filtered_points else None
-    duration = end_time - start_time if start_time and end_time else None
-    length_km = compute_track_length_km(filtered_points)
+    duration = processed.duration
+    length_km = processed.length_km
 
     return TrackSummary(
         number=number,
@@ -280,7 +263,11 @@ def format_table(summaries: list[TrackSummary]) -> list[str]:
 
 
 # AI prompt: Read one GPX file, summarize all of its tracks, and print the required table to the console.
-def process_file(filename: str, verbose: bool = False) -> None:
+def process_file(
+    filename: str,
+    verbose: bool = False,
+    processing_options: ProcessingOptions | None = None,
+) -> None:
     """Parse one GPX file and print its track summary table."""
     root = parse_gpx_file(filename)
     tracks = root.findall(ns_tag("trk"))
@@ -290,7 +277,10 @@ def process_file(filename: str, verbose: bool = False) -> None:
 
     print(f"{filename}:")
 
-    summaries = [summarize_track(track, index) for index, track in enumerate(tracks, 1)]
+    summaries = [
+        summarize_track(track, index, processing_options)
+        for index, track in enumerate(tracks, 1)
+    ]
 
     if not summaries:
         print("No tracks found.")
@@ -306,10 +296,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    values = [
+        args.horizontal_smoothing,
+        args.point_spacing,
+        args.elevation_smoothing,
+        args.maximum_horizontal_error,
+        args.maximum_vertical_error,
+        args.maximum_hdop,
+        args.maximum_vdop,
+    ]
+    if any(value < 0 for value in values):
+        parser.error("GPX processing values must be zero or positive")
+    processing_options = ProcessingOptions(
+        horizontal_smoothing_distance_m=args.horizontal_smoothing,
+        minimum_point_spacing_m=args.point_spacing,
+        elevation_smoothing_distance_m=args.elevation_smoothing,
+        maximum_horizontal_accuracy_m=args.maximum_horizontal_error,
+        maximum_vertical_accuracy_m=args.maximum_vertical_error,
+        maximum_hdop=args.maximum_hdop,
+        maximum_vdop=args.maximum_vdop,
+    )
+
     for index, filename in enumerate(args.files):
         if index > 0:
             print()
-        process_file(filename, verbose=args.verbose)
+        process_file(filename, verbose=args.verbose, processing_options=processing_options)
 
     return 0
 

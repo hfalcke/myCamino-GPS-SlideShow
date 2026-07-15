@@ -22,6 +22,7 @@ from GPSTrackShow import (
     interpolate_timeline_point,
     interpolate_timeline_state,
     parse_map_directive,
+    parse_photo_entry,
     parse_control_datetime,
     parse_iso_datetime,
     timed_points_from_metadata,
@@ -43,6 +44,13 @@ class TrackTimingTests(unittest.TestCase):
         self.assertEqual((after.filename, after.relation), ("0001_stage.png", "Day after"))
         self.assertEqual((media.filename, media.relation), ("trip-media-2024-07-14.png", ""))
         self.assertTrue(media.is_special)
+
+    def test_music_directive_is_not_treated_as_a_map(self):
+        self.assertIsNone(parse_map_directive("#MUSIC: #JUMP $EVENING"))
+
+    def test_photo_entry_keeps_four_column_place_text(self):
+        entry = parse_photo_entry("photo.jpg | 12:00 | 50.0, 8.0 | Cologne")
+        self.assertEqual(entry.place, "Cologne")
 
     def test_special_stage_keeps_its_date_and_carries_the_next_date_separately(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)

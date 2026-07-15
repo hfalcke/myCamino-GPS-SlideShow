@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from GetGeoLocations import (
     PhotoRecord,
@@ -20,18 +23,107 @@ from GetGeoLocations import (
     update_control_special_map_entries,
 )
 from GPSTrackShowGUI import (
+    GPXTrackerController,
+    control_file_recovery_is_newer,
+    control_file_signature,
+    control_table_filter_anchor_index,
     control_table_search_indexes,
     control_table_recovery_path,
+    display_control_row_type,
     media_viewer_control_row_index,
     next_control_table_search_position,
     parse_slideshow_control_line,
     serialize_slideshow_control_row,
     update_slideshow_control_row_cell,
+    visible_control_row_indexes,
     write_text_atomic,
 )
 
 
 class ControlFileTrackSyncTests(unittest.TestCase):
+    def test_summary_path_is_derived_without_preparing_the_gpx(self):
+        with TemporaryDirectory() as temporary:
+            project_dir = Path(temporary)
+            controller = SimpleNamespace(
+                track_map_base="Camino",
+                _track_images_dir=lambda: project_dir / "trackimages",
+                _current_project_name=lambda: "Unused title",
+            )
+            with patch(
+                "GPSTrackShowGUI.prepare_with_options",
+                side_effect=AssertionError("GPX preparation must not run"),
+            ):
+                summary_path = GPXTrackerController._tracks_summary_json_path(controller)
+            self.assertEqual(
+                summary_path,
+                (project_dir / "trackimages" / "Camino-summary.json").resolve(),
+            )
+
+    def test_control_file_signature_detects_file_changes(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "Camino-sorted.lst"
+            path.write_text("photo.jpg\n", encoding="utf-8")
+            original = control_file_signature(path)
+            path.write_text("photo.jpg\nvideo.mov\n", encoding="utf-8")
+            changed = control_file_signature(path)
+            self.assertIsNotNone(original)
+            self.assertIsNotNone(changed)
+            self.assertNotEqual(original, changed)
+
+    def test_unchanged_control_file_reuses_retained_editor_state(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "Camino-sorted.lst"
+            path.write_text("photo.jpg | 12:00 | kein GPS | kein Ort\n", encoding="utf-8")
+            rows = [{"type": "IMG", "name": "photo.jpg"}]
+            preview_cache = {"photo.jpg": object()}
+            raised = []
+            controller = SimpleNamespace(
+                control_table_path=path.resolve(),
+                control_table_window=object(),
+                control_table_dirty=False,
+                control_table_file_signature=control_file_signature(path),
+                control_table_rows=rows,
+                control_table_preview_cache=preview_cache,
+                _show_control_table_window=lambda requested: raised.append(Path(requested)),
+            )
+            result = GPXTrackerController.load_slideshow_control_file(controller, path)
+            self.assertTrue(result)
+            self.assertEqual(raised, [path.resolve()])
+            self.assertIs(controller.control_table_rows, rows)
+            self.assertIs(controller.control_table_preview_cache, preview_cache)
+
+    def test_only_newer_recovery_copy_takes_precedence(self):
+        with TemporaryDirectory() as temporary:
+            project_dir = Path(temporary)
+            control_path = project_dir / "Camino-sorted.lst"
+            recovery_path = control_table_recovery_path(control_path)
+            control_path.write_text("saved\n", encoding="utf-8")
+            recovery_path.parent.mkdir(parents=True, exist_ok=True)
+            recovery_path.write_text("recovered\n", encoding="utf-8")
+            os.utime(control_path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(recovery_path, ns=(2_000_000_000, 2_000_000_000))
+            self.assertTrue(control_file_recovery_is_newer(control_path, recovery_path))
+            os.utime(recovery_path, ns=(500_000_000, 500_000_000))
+            self.assertFalse(control_file_recovery_is_newer(control_path, recovery_path))
+
+    def test_media_filter_exposes_only_non_media_model_indexes(self):
+        rows = [
+            {"type": "DAT"},
+            {"type": "IMG"},
+            {"type": "TRK"},
+            {"type": "VID"},
+            {"type": "AFT"},
+            {"type": "MUS"},
+        ]
+        self.assertEqual(
+            visible_control_row_indexes(rows, hide_media=True),
+            [0, 2, 4, 5],
+        )
+        self.assertEqual(visible_control_row_indexes(rows, hide_media=False), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(control_table_filter_anchor_index(rows, [2], hide_media=True), 2)
+        self.assertEqual(control_table_filter_anchor_index(rows, [3], hide_media=True), 2)
+        self.assertEqual(control_table_filter_anchor_index(rows, [4], hide_media=False), 4)
+
     def test_control_table_search_matches_serialized_text_and_numbers(self):
         rows = [
             parse_slideshow_control_line("#Map: 0075_stage.png"),
@@ -72,6 +164,14 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertEqual(serialize_slideshow_control_row(before), "#MapBefore: 0001_stage.png")
         self.assertEqual(serialize_slideshow_control_row(after), "#MapAfter: 0001_stage.png")
 
+    def test_gui_round_trips_music_directive_as_its_own_row(self):
+        row = parse_slideshow_control_line("#MUSIC: #ON, #JUMP $STAGE")
+        self.assertEqual(row["type"], "MUS")
+        self.assertEqual(row["name"], "#ON, #JUMP $STAGE")
+        self.assertEqual(serialize_slideshow_control_row(row), "#MUSIC: #ON, #JUMP $STAGE")
+        merge_entry = parse_control_file_entries(["#MUSIC: #ON, #JUMP $STAGE"])[0]
+        self.assertEqual((merge_entry["type"], merge_entry["line"]), ("music", "#MUSIC: #ON, #JUMP $STAGE"))
+
     def test_gui_round_trips_media_map_directive(self):
         row = parse_slideshow_control_line("#MediaMap: trip-media-2024-07-14.png")
         self.assertEqual(row["type"], "LOC")
@@ -83,6 +183,19 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertEqual(row["type"], "AFT")
         self.assertEqual(row["keyword"], "MapAfter")
         self.assertEqual(serialize_slideshow_control_row(row), "#MapAfter: 0075_stage.png")
+
+    def test_descriptive_type_choice_is_stored_as_canonical_short_type(self):
+        row = parse_slideshow_control_line("#Map: 0075_stage.png")
+        update_slideshow_control_row_cell(row, "type", "AFT - Day after map")
+        self.assertEqual(row["type"], "AFT")
+        self.assertEqual(row["keyword"], "MapAfter")
+        self.assertEqual(display_control_row_type(row["type"]), "AFT - Day after map")
+
+    def test_long_type_name_without_prefix_is_accepted(self):
+        row = parse_slideshow_control_line("#Map: 0075_stage.png")
+        update_slideshow_control_row_cell(row, "type", "Music control")
+        self.assertEqual(row["type"], "MUS")
+        self.assertEqual(serialize_slideshow_control_row(row), "#MUSIC: 0075_stage.png")
 
     def test_editing_special_type_back_to_track_updates_the_saved_keyword(self):
         row = parse_slideshow_control_line("#MapAfter: 0075_stage.png")
@@ -112,6 +225,13 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             changed = update_control_special_map_entries(path, {"0001_old.png": "0001_new.png"})
             self.assertEqual(changed, 1)
             self.assertEqual(path.read_text(), "#MapBefore: 0001_new.png\n#MapAfter: 0002_old.png\n")
+
+    def test_special_map_filename_update_preserves_neighboring_music_directive(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "list.lst"
+            path.write_text("#MUSIC: #JUMP $MORNING\n#MapBefore: 0001_old.png\n", encoding="utf-8")
+            update_control_special_map_entries(path, {"0001_old.png": "0001_new.png"})
+            self.assertEqual(path.read_text(), "#MUSIC: #JUMP $MORNING\n#MapBefore: 0001_new.png\n")
 
     def test_merged_adjacent_media_creates_special_section_without_moving_existing_rows(self):
         track = TrackInfo(
