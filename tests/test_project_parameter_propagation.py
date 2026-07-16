@@ -20,11 +20,13 @@ class ProjectParameterPropagationTests(unittest.TestCase):
                 geocode_timeout_seconds=17,
                 geocode_pacing_min_seconds=2,
                 geocode_pacing_max_seconds=4,
+                infer_gps_from_tracks=False,
             )
         self.assertEqual(params.distance, 275.0)
         self.assertEqual(params.geocode_timeout_seconds, 17.0)
         self.assertEqual(params.geocode_pacing_min_seconds, 2.0)
         self.assertEqual(params.geocode_pacing_max_seconds, 4.0)
+        self.assertFalse(params.infer_gps_from_tracks)
 
     def test_geolocation_pacing_rejects_reversed_range(self):
         with tempfile.TemporaryDirectory() as temp_dir:

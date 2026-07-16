@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-PARAMETER_SCHEMA_VERSION = 1
+PARAMETER_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -32,7 +32,7 @@ def _choice(*items: tuple[str, str]) -> tuple[tuple[str, str], ...]:
 
 PARAMETER_SPECS = (
     ParameterSpec("slideshow.media_duration_seconds", "Slide Show", "Media duration", 3.0, "float", "Minimum display time for a photo in automatic playback.", 0.1, 3600.0, unit="s"),
-    ParameterSpec("slideshow.transition", "Slide Show", "Transition", "blend", "choice", "Transition used between standard slide-show media.", choices=_choice(("blend", "Blend"), ("fade", "Fade"), ("switch", "Switch"), ("expand", "Expand"), ("collage", "Collage"), ("quad", "Quad"), ("random", "Random"))),
+    ParameterSpec("slideshow.transition", "Slide Show", "Initial style", "time_lapse", "choice", "Initial playback style. Use t/T during playback to cycle through all styles.", choices=_choice(("time_lapse", "Time-Lapse"), ("blend", "Blend"), ("fade", "Fade"), ("switch", "Switch"), ("expand", "Expand"), ("collage", "Collage"), ("quad", "Quad"), ("random", "Random"))),
     ParameterSpec("slideshow.transition_duration_ms", "Slide Show", "Transition duration", 700, "int", "Duration of animated image transitions.", 0, 10000, advanced=True, unit="ms"),
     ParameterSpec("slideshow.background_color", "Slide Show", "Background color", "#000000", "color", "Color behind maps and media."),
     ParameterSpec("slideshow.font_color", "Slide Show", "Font color", "#FFFFFF", "color", "Color used for slide-show text overlays."),
@@ -42,7 +42,6 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.arrow_scale", "Slide Show", "Arrow scale", 1.0, "float", "Scale factor for the direction arrow; zero hides it.", 0.0, 10.0),
     ParameterSpec("slideshow.clock", "Slide Show", "Show clock", True, "bool", "Show the analog clock when timing is available."),
     ParameterSpec("slideshow.place_names", "Slide Show", "Show place names", True, "bool", "Show reverse-geocoded place names."),
-    ParameterSpec("slideshow.start_mode", "Slide Show", "Default show", "time_lapse", "choice", "Slide-show type selected by default in the main window.", choices=_choice(("time_lapse", "Time-Lapse"), ("standard", "Standard"))),
     ParameterSpec("slideshow.fullscreen", "Slide Show", "Fullscreen", "auto", "choice", "Choose automatic, always-on, or windowed startup.", choices=_choice(("auto", "Auto"), ("on", "On"), ("off", "Off"))),
     ParameterSpec("slideshow.window_mode", "Slide Show", "Window mode", "auto", "choice", "Automatic uses one window on one screen and a separate overview window when multiple screens are available.", choices=_choice(("auto", "Automatic"), ("single", "Single window"), ("multiple", "Separate overview window"))),
     ParameterSpec("slideshow.track_map_before_media", "Slide Show", "Track map before each medium", False, "bool", "In single-window Standard playback, briefly show the marked track map before every photo or video. The stage map is always shown once at the beginning of its stage."),
@@ -53,6 +52,7 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.collage_size_range", "Slide Show", "Collage size range", "33-66", "range", "Minimum and maximum collage image size in percent, for example 33-66.", unit="%"),
     ParameterSpec("slideshow.collage_max_images", "Slide Show", "Maximum collage images", 9, "int", "Clear the collage after this many images.", 1, 100),
 
+    ParameterSpec("audio.enabled", "Audio", "Background music", False, "bool", "Enable the optional background-music source for this Adventure."),
     ParameterSpec("audio.crossfade_seconds", "Audio", "Crossfade duration", 2.0, "float", "Fade duration for normal music changes, marker jumps, pause, and resume.", 0.0, 30.0, unit="s"),
 
     ParameterSpec("timelapse.stage_duration_seconds", "Time-Lapse", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s"),
@@ -60,20 +60,25 @@ PARAMETER_SPECS = (
     ParameterSpec("timelapse.overview_as_media", "Time-Lapse", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage."),
     ParameterSpec("timelapse.marker_style", "Time-Lapse", "Moving marker", "pilgrim", "choice", "Show a walking pilgrim or the traditional arrow at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("arrow", "Arrow"))),
 
-    ParameterSpec("trackmaps.ordering", "Track Maps", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
-    ParameterSpec("trackmaps.variant", "Track Maps", "Map variant", "time_lapse", "choice", "Variant preferred by Create, Update, and View.", choices=_choice(("standard", "Standard"), ("time_lapse", "Time-Lapse"))),
-    ParameterSpec("trackmaps.image_size", "Track Maps", "Image size", "1920x1080", "image_size", "Output map dimensions in pixels."),
-    ParameterSpec("trackmaps.zoom", "Track Maps", "Map zoom", 15, "int", "Requested basemap zoom level.", 0, 22),
-    ParameterSpec("trackmaps.route_width", "Track Maps", "Route width", 4.0, "float", "Width of the plotted route line.", 0.1, 50.0),
-    ParameterSpec("trackmaps.route_color", "Track Maps", "Route color", "#0000FF", "color", "Color of the plotted route."),
-    ParameterSpec("trackmaps.endpoint_color", "Track Maps", "Endpoint color", "#FFFFFF", "color", "Color of start/end point dots."),
-    ParameterSpec("trackmaps.endpoint_size", "Track Maps", "Endpoint size", 0.0, "float", "Size of start/end dots; zero hides them.", 0.0, 500.0),
-    ParameterSpec("trackmaps.background_color", "Track Maps", "Background color", "#000000", "color", "Background outside the map axes."),
-    ParameterSpec("trackmaps.title_color", "Track Maps", "Title color", "#FFFFFF", "color", "Track map title and subtitle color."),
-    ParameterSpec("trackmaps.font_factor", "Track Maps", "Font factor", 2.2, "float", "Multiplier for automatically selected map label sizes.", 0.1, 10.0),
-    ParameterSpec("trackmaps.overview_labels", "Track Maps", "Overview labels", "none", "choice", "Labels printed on the overview map.", choices=_choice(("none", "None"), ("default", "Track, date, length"))),
-    ParameterSpec("trackmaps.remove_name_prefix", "Track Maps", "Remove name prefix", "", "text", "Remove this prefix from track names when displaying them."),
-    ParameterSpec("trackmaps.edge_margin_fraction", "Track Maps", "Time-Lapse edge margin", 0.05, "fraction", "Minimum route distance from the plotting-area edge.", 0.0, 0.49, advanced=True, unit="%"),
+    ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
+    ParameterSpec("trackmaps.route_source", "Map Generation", "Journey source", "automatic", "choice", "Use GPX tracks when available, require GPX tracks, or build date stages from media locations.", choices=_choice(("automatic", "Automatic"), ("gpx", "GPX tracks"), ("media", "Media locations"))),
+    ParameterSpec("trackmaps.gpx_overlay", "Map Generation", "GPX route display", "line", "choice", "Draw the measured GPX route dynamically or hide it.", choices=_choice(("line", "Line"), ("hidden", "Hidden"))),
+    ParameterSpec("trackmaps.media_overlay", "Map Generation", "Media route display", "dots", "choice", "Show measured photo positions as dots, connect them by an estimated line, or hide them.", choices=_choice(("dots", "Photo dots"), ("interpolated", "Interpolated line"), ("hidden", "Hidden"))),
+    ParameterSpec("trackmaps.dynamic_header", "Map Generation", "Show map header", True, "bool", "Draw map titles and dates dynamically so their appearance can be changed without rebuilding the basemap."),
+    ParameterSpec("trackmaps.track_title", "Map Generation", "Track title", "endpoint_places", "choice", "Use reverse-geocoded start and end places for GPX-stage titles, with the GPX track name as fallback, or always use the GPX track name.", choices=_choice(("endpoint_places", "Start - destination"), ("track_name", "GPX track name"))),
+    ParameterSpec("trackmaps.image_size", "Map Generation", "Image size", "1920x1080", "image_size", "Output map dimensions in pixels."),
+    ParameterSpec("trackmaps.zoom", "Map Generation", "Map zoom", 16, "int", "Requested basemap zoom level.", 0, 22),
+    ParameterSpec("trackmaps.route_width", "Map Generation", "Route width", 4.0, "float", "Width of the plotted route line.", 0.1, 50.0),
+    ParameterSpec("trackmaps.route_color", "Map Generation", "Route color", "#0000FF", "color", "Color of the plotted route."),
+    ParameterSpec("trackmaps.endpoint_color", "Map Generation", "Endpoint color", "#FFFFFF", "color", "Color of start/end point dots."),
+    ParameterSpec("trackmaps.endpoint_size", "Map Generation", "Endpoint size", 0.0, "float", "Size of start/end dots; zero hides them.", 0.0, 500.0),
+    ParameterSpec("trackmaps.media_point_color", "Map Generation", "Media point color", "#0066FF", "color", "Color used for media-derived location dots and estimated routes."),
+    ParameterSpec("trackmaps.background_color", "Map Generation", "Background color", "#000000", "color", "Background outside the map axes."),
+    ParameterSpec("trackmaps.title_color", "Map Generation", "Title color", "#FFFFFF", "color", "Track map title and subtitle color."),
+    ParameterSpec("trackmaps.font_factor", "Map Generation", "Font factor", 2.2, "float", "Multiplier for automatically selected map label sizes.", 0.1, 10.0),
+    ParameterSpec("trackmaps.overview_labels", "Map Generation", "Overview labels", "none", "choice", "Labels printed on the overview map.", choices=_choice(("none", "None"), ("default", "Track, date, length"))),
+    ParameterSpec("trackmaps.remove_name_prefix", "Map Generation", "Remove name prefix", "", "text", "Remove this prefix from track names when displaying them."),
+    ParameterSpec("trackmaps.edge_margin_fraction", "Map Generation", "Time-Lapse edge margin", 0.05, "fraction", "Minimum route distance from the plotting-area edge.", 0.0, 0.49, advanced=True, unit="%"),
 
     ParameterSpec("gpx.fallback_walking_speed_kmh", "GPX Processing", "Fallback walking speed", 3.5, "float", "Speed used when missing timestamps cannot be anchored.", 0.1, 50.0, unit="km/h"),
     ParameterSpec("gpx.horizontal_smoothing_distance_m", "GPX Processing", "Horizontal smoothing", 10.0, "float", "Smooth horizontal GPS coordinates over this route distance before spacing and length calculations. Set to zero to disable.", 0.0, 10000.0, unit="m"),
@@ -96,7 +101,8 @@ PARAMETER_SPECS = (
     ParameterSpec("pdf.track_zoom", "PDF Export", "Track zoom", 14, "int", "Tile zoom for PDF track maps.", 0, 22),
     ParameterSpec("pdf.maximum_map_tiles", "PDF Export", "Maximum PDF map tiles", 24, "int", "Maximum tile count for one embedded PDF map.", 1, 1000, advanced=True),
 
-    ParameterSpec("locations.reuse_radius_m", "Locations", "Place-name search radius", 150.0, "float", "GPS positions within this radius reuse the same place name. This reduces map lookups and speeds up Add Place Names.", 0.0, 100000.0, unit="m"),
+    ParameterSpec("locations.add_place_names", "Locations", "Add place names", True, "bool", "Add readable place names while media metadata is prepared or updated."),
+    ParameterSpec("locations.reuse_radius_m", "Locations", "Place-name search radius", 150.0, "float", "GPS positions within this radius reuse the same place name. This reduces map lookups and speeds up place-name extraction.", 0.0, 100000.0, unit="m"),
     ParameterSpec("locations.timeout_seconds", "Locations", "Request timeout", 10.0, "float", "Maximum wait for one Apple reverse-geocoding request.", 1.0, 300.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_min_seconds", "Locations", "Minimum request spacing", 1.0, "float", "Minimum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_max_seconds", "Locations", "Maximum request spacing", 5.0, "float", "Maximum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
@@ -242,8 +248,29 @@ def validate_parameters(values: dict[str, Any]) -> dict[str, str]:
 
 
 def normalize_parameters(raw: Any) -> dict[str, Any]:
+    source_version = raw.get("version", 1) if isinstance(raw, dict) else 1
     values = raw.get("values", {}) if isinstance(raw, dict) and isinstance(raw.get("values"), dict) else raw
     values = values if isinstance(values, dict) else {}
+    values = dict(values)
+    if "slideshow.start_mode" in values:
+        start_mode = str(values.get("slideshow.start_mode") or "").strip().casefold()
+        if start_mode == "time_lapse":
+            values["slideshow.transition"] = "time_lapse"
+        elif "slideshow.transition" not in values:
+            values["slideshow.transition"] = "blend"
+        values.pop("slideshow.start_mode", None)
+    try:
+        legacy_schema = int(source_version or 1) < 2
+    except (TypeError, ValueError):
+        legacy_schema = True
+    if legacy_schema and str(values.get("trackmaps.media_point_color", "")).upper() == "#FF8C00":
+        values["trackmaps.media_point_color"] = "#0066FF"
+    try:
+        pre_zoom_16_schema = int(source_version or 1) < 8
+    except (TypeError, ValueError):
+        pre_zoom_16_schema = True
+    if pre_zoom_16_schema and values.get("trackmaps.zoom") == 15:
+        values["trackmaps.zoom"] = 16
     normalized = default_parameters()
     for spec in PARAMETER_SPECS:
         if spec.key not in values:
@@ -265,9 +292,29 @@ def changed_parameter_keys(before: dict[str, Any], after: dict[str, Any]) -> set
 
 
 def map_affecting_parameter_keys() -> frozenset[str]:
+    overlay_only = {
+        "trackmaps.gpx_overlay",
+        "trackmaps.media_overlay",
+        "trackmaps.dynamic_header",
+        "trackmaps.track_title",
+        "trackmaps.route_width",
+        "trackmaps.route_color",
+        "trackmaps.endpoint_color",
+        "trackmaps.endpoint_size",
+        "trackmaps.media_point_color",
+        "trackmaps.title_color",
+        "trackmaps.font_factor",
+        "trackmaps.overview_labels",
+    }
     return frozenset(
         {
-            *(spec.key for spec in PARAMETER_SPECS if spec.section == "Track Maps" and spec.key != "trackmaps.variant"),
+            *(
+                spec.key
+                for spec in PARAMETER_SPECS
+                if spec.section == "Map Generation"
+                and spec.key not in overlay_only
+                and spec.key != "trackmaps.route_source"
+            ),
             "gpx.fallback_walking_speed_kmh",
             "gpx.horizontal_smoothing_distance_m",
             "gpx.minimum_point_spacing_m",

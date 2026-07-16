@@ -48,6 +48,17 @@ class AudioPlaylistTests(unittest.TestCase):
         self.assertEqual(directive.actions[3].value, "Album/01 Auf,Seele.mp3")
         self.assertEqual(directive.actions[4].value, 7)
 
+    def test_music_directive_accepts_quoted_path_with_spaces(self):
+        directive = parse_music_directive(
+            '#MUSIC: "Album Name/Song Number One.mp3"'
+        )
+        self.assertEqual(len(directive.actions), 1)
+        self.assertEqual(directive.actions[0].kind, "target_path")
+        self.assertEqual(
+            directive.actions[0].value,
+            "Album Name/Song Number One.mp3",
+        )
+
     def test_generic_loop_and_bad_volume_are_rejected(self):
         with self.assertRaises(MusicSyntaxError):
             parse_music_directive("#MUSIC: #LOOP")

@@ -15,6 +15,7 @@ from GPSTrackShow import (
     GPSTrackShowApp,
     PhotoListEntry,
     TimeLapseStage,
+    adjacent_stage_map_index,
     align_datetime_timezone,
     build_time_lapse_media_queue,
     format_place_for_time_lapse,
@@ -34,6 +35,18 @@ from track_timing_utils import haversine_km, repair_timed_points, timed_points_p
 
 
 class TrackTimingTests(unittest.TestCase):
+    def test_stage_navigation_uses_media_maps_without_gpx_tracks(self):
+        lines = [
+            "#Datum: Monday, 15.07.2024",
+            "#MediaMap: trip-media-2024-07-15.png",
+            "one.jpeg | 09:00 | 50.0, 7.0 | Cologne",
+            "#Datum: Tuesday, 16.07.2024",
+            "#MediaMap: trip-media-2024-07-16.png",
+            "two.jpeg | 10:00 | 50.1, 7.1 | Bonn",
+        ]
+        self.assertEqual(adjacent_stage_map_index(lines, 2, True), 4)
+        self.assertEqual(adjacent_stage_map_index(lines, 5, False), 1)
+
     def test_adjacent_day_map_directives_remain_distinct(self):
         before = parse_map_directive("#MapBefore: 0001_stage.png")
         normal = parse_map_directive("#Map: 0001_stage.png")
@@ -143,7 +156,7 @@ class TrackTimingTests(unittest.TestCase):
     def test_time_lapse_metric_and_place_rows_are_compact(self):
         self.assertEqual(
             format_time_lapse_metrics(1234.4, 12.34, 456.7),
-            ("Total traveled: 1234 km", "Stage traveled: 12,3 km", "Height 457 m"),
+            ("Total traveled: 1234 km", "Stage traveled: 12,3 km", "Height: 457 m"),
         )
         self.assertEqual(
             format_place_for_time_lapse("Köln-Innenstadt (Nordrhein-Westfalen), Dom"),
@@ -221,6 +234,28 @@ class TrackTimingTests(unittest.TestCase):
         self.assertEqual(app.playlist_index, 2)
         self.assertEqual(app.resume_media_index_pending, 4)
         self.assertEqual(primed, [2])
+
+    def test_time_lapse_resume_starts_music_directive_at_exact_row(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(resume_index=4, start_track=1)
+        app.playlist_lines = [
+            "#Overviewmap: overview.png",
+            "#Datum: 01.01.2024",
+            "#Map: stage.png",
+            "photo.jpeg",
+            "#MUSIC: #ON, $STAGE",
+            "next.jpeg",
+        ]
+        app.time_lapse_active = True
+        app.resume_media_index_pending = None
+        app.resume_standard_map_index_pending = None
+        app.resume_start_pending = True
+        primed = []
+        app._prime_context_before_index = primed.append
+        app._apply_start_track()
+        self.assertEqual(app.playlist_index, 4)
+        self.assertIsNone(app.resume_media_index_pending)
+        self.assertEqual(primed, [4])
 
     def test_iso_timestamp_and_metadata_payload_are_parsed(self):
         first = "2020-10-17T11:00:00+00:00"

@@ -10,8 +10,16 @@ from typing import Optional
 
 RectTuple = tuple[float, float, float, float]
 CORNER_ORDER = ("top_right", "top_left", "bottom_right", "bottom_left")
+PLACEMENT_ORDER = CORNER_ORDER + (
+    "center_left",
+    "center",
+    "center_right",
+    "top_center",
+    "bottom_center",
+)
 TIME_LAPSE_SUFFIX = "-timelapse"
-MEDIA_CLEAR_BOX_VERSION = 1
+MEDIA_CLEAR_BOX_VERSION = 3
+MEDIA_CLEAR_BOX_COMPATIBLE_VERSIONS = frozenset({1, 2, MEDIA_CLEAR_BOX_VERSION})
 MEDIA_CLEAR_BOX_COORDINATE_SPACE = "image_fraction_bottom_left"
 DEFAULT_TRACK_EDGE_MARGIN_FRACTION = 0.05
 DEFAULT_GRID_LONG_AXIS = 192
@@ -97,11 +105,13 @@ def clear_corner_rect_options(
     placement_rect: RectTuple,
     route_points: list[tuple[float, float]],
     grid_long_axis: int = DEFAULT_GRID_LONG_AXIS,
+    *,
+    connect_points: bool = True,
 ) -> dict[str, list[RectTuple]]:
-    """Return route-free width/height frontiers anchored at every corner."""
+    """Return route-free width/height frontiers for all placement anchors."""
     x, y, width, height = placement_rect
-    if len(route_points) < 2 or width <= 1.0 or height <= 1.0:
-        return {corner: [placement_rect] for corner in CORNER_ORDER}
+    if not route_points or width <= 1.0 or height <= 1.0:
+        return {position: [placement_rect] for position in PLACEMENT_ORDER}
     grid_long_axis = max(32, int(grid_long_axis))
     if width >= height:
         columns = grid_long_axis
@@ -112,7 +122,12 @@ def clear_corner_rect_options(
     cell_width, cell_height = width / columns, height / rows
     sample_step = max(0.5, min(cell_width, cell_height) * 0.45)
     occupied: set[tuple[int, int]] = set()
-    for start, end in zip(route_points, route_points[1:]):
+    segments = (
+        zip(route_points, route_points[1:])
+        if connect_points and len(route_points) >= 2
+        else ((point, point) for point in route_points)
+    )
+    for start, end in segments:
         segment_length = math.hypot(end[0] - start[0], end[1] - start[1])
         sample_count = max(1, math.ceil(segment_length / sample_step))
         for sample_index in range(sample_count + 1):
@@ -129,23 +144,54 @@ def clear_corner_rect_options(
                     if 0 <= marked_column < columns and 0 <= marked_row < rows:
                         occupied.add((marked_column, marked_row))
 
+    occupancy = [[0] * columns for _ in range(rows)]
+    for occupied_column, occupied_row in occupied:
+        occupancy[occupied_row][occupied_column] = 1
+    prefix = [[0] * (columns + 1) for _ in range(rows + 1)]
+    for row in range(rows):
+        running = 0
+        for column in range(columns):
+            running += occupancy[row][column]
+            prefix[row + 1][column + 1] = prefix[row][column + 1] + running
+
+    def occupied_count(left: int, bottom: int, rect_width: int, rect_height: int) -> int:
+        right, top = left + rect_width, bottom + rect_height
+        return (
+            prefix[top][right]
+            - prefix[bottom][right]
+            - prefix[top][left]
+            + prefix[bottom][left]
+        )
+
+    def grid_origin(position: str, rect_width: int, rect_height: int) -> tuple[int, int]:
+        if position.endswith("left"):
+            left = 0
+        elif position.endswith("right"):
+            left = columns - rect_width
+        else:
+            left = (columns - rect_width) // 2
+        if position.startswith("top"):
+            bottom = rows - rect_height
+        elif position.startswith("bottom"):
+            bottom = 0
+        else:
+            bottom = (rows - rect_height) // 2
+        return left, bottom
+
     result: dict[str, list[RectTuple]] = {}
-    for corner in CORNER_ORDER:
-        from_right = corner.endswith("right")
-        from_top = corner.startswith("top")
-        nearest_by_column = [rows] * columns
-        for occupied_column, occupied_row in occupied:
-            distance = rows - 1 - occupied_row if from_top else occupied_row
-            nearest_by_column[occupied_column] = min(nearest_by_column[occupied_column], distance)
-        clear_height = rows
+    for position in PLACEMENT_ORDER:
         cell_options: list[tuple[int, int]] = []
-        for horizontal_distance in range(columns):
-            column = columns - 1 - horizontal_distance if from_right else horizontal_distance
-            clear_height = min(clear_height, nearest_by_column[column])
-            if clear_height <= 0:
+        for width_cells in range(1, columns + 1):
+            maximum_height = 0
+            for height_cells in range(1, rows + 1):
+                left, bottom = grid_origin(position, width_cells, height_cells)
+                if occupied_count(left, bottom, width_cells, height_cells):
+                    break
+                maximum_height = height_cells
+            if maximum_height <= 0:
                 continue
-            option = (horizontal_distance + 1, clear_height)
-            if cell_options and cell_options[-1][1] == clear_height:
+            option = (width_cells, maximum_height)
+            if cell_options and cell_options[-1][1] == maximum_height:
                 cell_options[-1] = option
             else:
                 cell_options.append(option)
@@ -155,10 +201,11 @@ def clear_corner_rect_options(
         for width_cells, height_cells in cell_options:
             clear_width = max(1.0, width_cells * cell_width)
             clear_height_value = max(1.0, height_cells * cell_height)
-            clear_x = x + width - clear_width if from_right else x
-            clear_y = y + height - clear_height_value if from_top else y
+            left, bottom = grid_origin(position, width_cells, height_cells)
+            clear_x = x + left * cell_width
+            clear_y = y + bottom * cell_height
             rect_options.append((clear_x, clear_y, clear_width, clear_height_value))
-        result[corner] = rect_options
+        result[position] = rect_options
     return result
 
 
@@ -166,9 +213,16 @@ def largest_clear_corner_rects(
     placement_rect: RectTuple,
     route_points: list[tuple[float, float]],
     grid_long_axis: int = DEFAULT_GRID_LONG_AXIS,
+    *,
+    connect_points: bool = True,
 ) -> dict[str, RectTuple]:
-    """Return the largest-area member of every corner's clear frontier."""
-    options = clear_corner_rect_options(placement_rect, route_points, grid_long_axis)
+    """Return the largest-area member of every placement frontier."""
+    options = clear_corner_rect_options(
+        placement_rect,
+        route_points,
+        grid_long_axis,
+        connect_points=connect_points,
+    )
     return {corner: max(rects, key=lambda rect: rect[2] * rect[3]) for corner, rects in options.items()}
 
 
@@ -185,11 +239,13 @@ def best_media_corner_layout(
     best_content: RectTuple = best_outer
     best_area = -1.0
     best_minimum_ratio = -1.0
-    for corner in CORNER_ORDER:
-        corner_options = clear_rects.get(corner, best_outer)
-        if isinstance(corner_options, tuple):
-            corner_options = [corner_options]
-        for clear_x, clear_y, clear_width, clear_height in corner_options:
+    for position in PLACEMENT_ORDER:
+        position_options = clear_rects.get(position)
+        if position_options is None:
+            continue
+        if isinstance(position_options, tuple):
+            position_options = [position_options]
+        for clear_x, clear_y, clear_width, clear_height in position_options:
             provisional_width, provisional_height = aspect_fit_size(
                 media_width, media_height, max(1.0, clear_width), max(1.0, clear_height)
             )
@@ -202,8 +258,18 @@ def best_media_corner_layout(
                 max(1.0, clear_height - frame * 2.0),
             )
             framed_width, framed_height = draw_width + frame * 2.0, draw_height + frame * 2.0
-            outer_x = clear_x if corner.endswith("left") else clear_x + clear_width - framed_width
-            outer_y = clear_y if corner.startswith("bottom") else clear_y + clear_height - framed_height
+            if position.endswith("left"):
+                outer_x = clear_x
+            elif position.endswith("right"):
+                outer_x = clear_x + clear_width - framed_width
+            else:
+                outer_x = clear_x + (clear_width - framed_width) / 2.0
+            if position.startswith("bottom"):
+                outer_y = clear_y
+            elif position.startswith("top"):
+                outer_y = clear_y + clear_height - framed_height
+            else:
+                outer_y = clear_y + (clear_height - framed_height) / 2.0
             outer = (outer_x, outer_y, framed_width, framed_height)
             content = (outer_x + frame, outer_y + frame, draw_width, draw_height)
             area = draw_width * draw_height
@@ -211,7 +277,7 @@ def best_media_corner_layout(
             window_long_dimension = window_size[0] if media_width >= media_height else window_size[1]
             minimum_ratio = min(1.0, long_dimension / max(1.0, window_long_dimension * min_fraction))
             if area > best_area or (math.isclose(area, best_area) and minimum_ratio > best_minimum_ratio):
-                best_corner, best_outer, best_content, best_area = corner, outer, content, area
+                best_corner, best_outer, best_content, best_area = position, outer, content, area
                 best_minimum_ratio = minimum_ratio
     return best_corner, best_outer, best_content
 
@@ -262,11 +328,19 @@ def optimized_track_extent(
     axes_box: tuple[float, float, float, float] | list[float],
     margin_fraction: float = DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
     grid_long_axis: int = DEFAULT_GRID_LONG_AXIS,
+    *,
+    connect_points: bool = True,
 ) -> tuple[tuple[float, float, float, float], str, tuple[float, float], dict[str, list[RectTuple]]]:
     """Choose the legal extreme shift with the largest free corner rectangle."""
     if len(projected_points) < 2:
         options = clear_box_options_for_extent(
-            projected_points, standard_extent, image_size, axes_box, margin_fraction, grid_long_axis
+            projected_points,
+            standard_extent,
+            image_size,
+            axes_box,
+            margin_fraction,
+            grid_long_axis,
+            connect_points=connect_points,
         )
         return standard_extent, CORNER_ORDER[0], (0.0, 0.0), options
     standard_center = (
@@ -274,7 +348,13 @@ def optimized_track_extent(
         (standard_extent[2] + standard_extent[3]) / 2.0,
     )
     centered_options = clear_box_options_for_extent(
-        projected_points, standard_extent, image_size, axes_box, margin_fraction, grid_long_axis
+        projected_points,
+        standard_extent,
+        image_size,
+        axes_box,
+        margin_fraction,
+        grid_long_axis,
+        connect_points=connect_points,
     )
     centered_corner = max(
         CORNER_ORDER,
@@ -291,7 +371,13 @@ def optimized_track_extent(
     for order, corner in enumerate(CORNER_ORDER):
         extent = extent_with_route_at_corner_extreme(standard_extent, projected_points, corner, margin_fraction)
         options = clear_box_options_for_extent(
-            projected_points, extent, image_size, axes_box, margin_fraction, grid_long_axis
+            projected_points,
+            extent,
+            image_size,
+            axes_box,
+            margin_fraction,
+            grid_long_axis,
+            connect_points=connect_points,
         )
         maximum = max(options[corner], key=lambda rect: rect[2] * rect[3])
         center = ((extent[0] + extent[1]) / 2.0, (extent[2] + extent[3]) / 2.0)
@@ -309,13 +395,20 @@ def clear_box_options_for_extent(
     axes_box: tuple[float, float, float, float] | list[float],
     margin_fraction: float = DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
     grid_long_axis: int = DEFAULT_GRID_LONG_AXIS,
+    *,
+    connect_points: bool = True,
 ) -> dict[str, list[RectTuple]]:
     """Calculate all route-free corner frontiers in full-image pixels."""
     width, height = image_size
     axes_rect = (axes_box[0] * width, axes_box[1] * height, axes_box[2] * width, axes_box[3] * height)
     placement_rect = inset_rect(axes_rect, margin_fraction)
     points = projected_route_pixels(projected_points, extent, image_size, axes_box)
-    return clear_corner_rect_options(placement_rect, points, grid_long_axis)
+    return clear_corner_rect_options(
+        placement_rect,
+        points,
+        grid_long_axis,
+        connect_points=connect_points,
+    )
 
 
 def _normalized_rect(rect: RectTuple, image_size: tuple[float, float]) -> dict[str, float]:
@@ -337,10 +430,10 @@ def build_media_clear_boxes_metadata(
 ) -> dict:
     """Serialize clear-box frontiers in full-image normalized coordinates."""
     corners = {}
-    for corner in CORNER_ORDER:
-        frontier = options.get(corner) or [(0.0, 0.0, 1.0, 1.0)]
+    for position in PLACEMENT_ORDER:
+        frontier = options.get(position) or [(0.0, 0.0, 1.0, 1.0)]
         maximum = max(frontier, key=lambda rect: rect[2] * rect[3])
-        corners[corner] = {
+        corners[position] = {
             "maximum": _normalized_rect(maximum, image_size),
             "frontier": [_normalized_rect(rect, image_size) for rect in frontier],
         }
@@ -393,8 +486,8 @@ def cached_clear_box_options(
         return None
     image_x, image_y, image_width, image_height = image_rect
     result: dict[str, list[RectTuple]] = {}
-    for corner in CORNER_ORDER:
-        entry = corners.get(corner)
+    for position in PLACEMENT_ORDER:
+        entry = corners.get(position)
         frontier = entry.get("frontier") if isinstance(entry, dict) else None
         if not isinstance(frontier, list) or not frontier:
             return None
@@ -410,5 +503,5 @@ def cached_clear_box_options(
             if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > 1.000001 or y + height > 1.000001:
                 return None
             converted.append((image_x + x * image_width, image_y + y * image_height, width * image_width, height * image_height))
-        result[corner] = converted
+        result[position] = converted
     return result

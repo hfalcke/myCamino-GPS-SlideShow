@@ -140,19 +140,21 @@ class AdventureFileTests(unittest.TestCase):
                 "#MapAfter: 0001_Old.png\n"
                 "photo.jpeg | 12:00 | - | -\n"
             )
-            (directory / "Old.playlist").write_text("$EVENING\nsong.m4a\n")
+            audio_dir = directory / "audio"
+            audio_dir.mkdir()
+            (audio_dir / "Old.playlist").write_text("$EVENING\nsong.m4a\n")
             (track_dir / "0001_Old.png").write_bytes(b"map")
             payload = adventure_payload(directory, old_name)
-            payload["music_source"] = "."
-            payload["music_playlist"] = "Old.playlist"
+            payload["music_source"] = "audio"
+            payload["music_playlist"] = "audio/Old.playlist"
             atomic_write_json(source_adv, payload)
 
             _target_adv, copied = rename_or_copy_adventure(
                 source_adv, payload, new_name, "copy", include_related=True
             )
 
-            self.assertEqual(copied["music_playlist"], "New.playlist")
-            self.assertTrue((directory / "New.playlist").is_file())
+            self.assertEqual(copied["music_playlist"], "audio/New.playlist")
+            self.assertTrue((audio_dir / "New.playlist").is_file())
             copied_control = (directory / "New-sorted.lst").read_text()
             self.assertIn("#MUSIC: #JUMP $EVENING", copied_control)
             self.assertIn("#MapAfter: 0001_New.png", copied_control)

@@ -35,20 +35,25 @@ from map_provider_utils import (
     contextily_request_timeout,
     provider_display_name,
 )
+from map_overlay import MAP_CONTENT_VERSION, json_overlay_geometry
 from track_timing_utils import timed_points_payload
 from track_map_layout_utils import (
     DEFAULT_GRID_LONG_AXIS,
     DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+    MEDIA_CLEAR_BOX_COMPATIBLE_VERSIONS,
+    MEDIA_CLEAR_BOX_VERSION,
     build_media_clear_boxes_metadata,
     clear_box_options_for_extent,
     optimized_track_extent,
     time_lapse_track_map_name,
+    track_map_variant_names,
 )
 
 
 GPX_NS = {"gpx": "http://www.topografix.com/GPX/1/1"}
 EARLIEST_UNKNOWN = datetime.max.replace(tzinfo=timezone.utc)
 DEFAULT_IMAGE_SIZE = (1600, 1200)
+STAGE_HEADER_HEIGHT_SCALE = 1.25
 
 
 # AI prompt: "Write a function that parses GPX/ISO timestamps, handles trailing Z,
@@ -957,7 +962,9 @@ def extent_for_image(all_x, all_y, image_size):
     )
 
 
-MINIMUM_MAP_SHORT_DIMENSION_M = 10_000.0
+# This fills a 1920x1080 plotting area's short axis at tile zoom 16 closely
+# enough to avoid tile enlargement while retaining substantially more detail.
+MINIMUM_MAP_SHORT_DIMENSION_M = 2_250.0
 
 
 def extent_with_minimum_short_dimension(
@@ -1067,7 +1074,8 @@ def draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size
         ys,
         color=line_color,
         linewidth=line_width,
-        solid_capstyle="butt",
+        solid_capstyle="round",
+        solid_joinstyle="round",
         zorder=3,
     )
     if dot_size > 0:
@@ -1230,6 +1238,8 @@ def render_track_plot(
     map_request_timeout_seconds=12.0,
     minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
     media_map_date=None,
+    background_only=True,
+    media_map_title="",
 ):
     """Render one overview or one single-track plot."""
     try:
@@ -1254,24 +1264,40 @@ def render_track_plot(
     fig.patch.set_facecolor(background_color)
     if overview_mode:
         header_font_size = max(label_font_size(len(tracks)) * font_factor + 2.0, 10.0)
-        header_height_px = header_font_size * dpi / 72.0
-        top_margin_px = 0.05 * header_height_px
+        # The overview is a complete basemap. Titles are drawn at playback time
+        # so the Intro can use the same image without a duplicated heading.
         side_margin_px = 2.0
         bottom_margin_px = 2.0
-        header_bottom_px = height_px - top_margin_px - header_height_px
+        top_margin_px = 2.0
         axes_box = [
             side_margin_px / width_px,
             bottom_margin_px / height_px,
             1.0 - (2.0 * side_margin_px / width_px),
-            max(0.60, (header_bottom_px - bottom_margin_px) / height_px),
+            1.0 - ((top_margin_px + bottom_margin_px) / height_px),
         ]
     elif media_map_date is not None:
         title_font_size = max(label_font_size(1) * font_factor + 2.0, 10.0)
+        subtitle_font_size = max(label_font_size(1) * font_factor, 9.0)
         title_height_px = title_font_size * dpi / 72.0
-        top_margin_px = 0.05 * title_height_px
+        subtitle_height_px = (
+            subtitle_font_size * dpi / 72.0
+            if str(media_map_title).strip()
+            else 0.0
+        )
+        heading_total_px = title_height_px + subtitle_height_px
+        line_gap_px = 0.05 * heading_total_px if subtitle_height_px else 0.0
+        top_margin_px = 0.05 * heading_total_px
+        reserved_header_px = (
+            top_margin_px
+            + title_height_px
+            + line_gap_px
+            + subtitle_height_px
+        ) * STAGE_HEADER_HEIGHT_SCALE
         side_margin_px = 2.0
         bottom_margin_px = 2.0
-        heading_bottom_px = height_px - top_margin_px - title_height_px
+        heading_bottom_px = (
+            height_px - reserved_header_px
+        )
         axes_box = [
             side_margin_px / width_px,
             bottom_margin_px / height_px,
@@ -1286,14 +1312,16 @@ def render_track_plot(
         heading_total_px = title_height_px + subtitle_height_px
         line_gap_px = 0.05 * heading_total_px
         top_margin_px = 0.05 * heading_total_px
+        reserved_header_px = (
+            top_margin_px
+            + title_height_px
+            + line_gap_px
+            + subtitle_height_px
+        ) * STAGE_HEADER_HEIGHT_SCALE
         side_margin_px = 2.0
         bottom_margin_px = 2.0
         heading_bottom_px = (
-            height_px
-            - top_margin_px
-            - title_height_px
-            - line_gap_px
-            - subtitle_height_px
+            height_px - reserved_header_px
         )
         axes_box = [
             side_margin_px / width_px,
@@ -1323,6 +1351,7 @@ def render_track_plot(
             axes_box,
             track_edge_margin_fraction,
             DEFAULT_GRID_LONG_AXIS,
+            connect_points=media_map_date is None,
         )
     else:
         selected_extent = standard_extent
@@ -1340,37 +1369,62 @@ def render_track_plot(
     auto_font_size = label_font_size(len(tracks))
     actual_font_size = max(1.0, auto_font_size * font_factor)
 
+    header_lines = []
     if overview_mode:
+        header_lines = [str(overview_header)] if str(overview_header).strip() else []
         header_font_size = max(actual_font_size + 2.0, 10.0)
         header_height_frac = (header_font_size * dpi / 72.0) / height_px
         header_y = 1.0 - (0.05 * header_height_frac)
-        fig.text(
-            0.5,
-            header_y,
-            overview_header,
-            ha="center",
-            va="top",
-            fontsize=header_font_size,
-            fontweight="bold",
-            color=title_color,
-        )
+        if not background_only:
+            fig.text(
+                0.5,
+                header_y,
+                overview_header,
+                ha="center",
+                va="top",
+                fontsize=header_font_size,
+                fontweight="bold",
+                color=title_color,
+            )
     elif media_map_date is not None:
         title_font_size = max(actual_font_size + 2.0, 10.0)
+        subtitle_font_size = max(actual_font_size, 9.0)
         title_height_frac = (title_font_size * dpi / 72.0) / height_px
-        title_y = 1.0 - (0.05 * title_height_frac)
         date_label = media_map_date.strftime("%d.%m.%Y") if hasattr(media_map_date, "strftime") else str(media_map_date)
-        fig.text(
-            0.5,
-            title_y,
-            date_label,
-            ha="center",
-            va="top",
-            fontsize=title_font_size,
-            fontweight="bold",
-            color=title_color,
-        )
+        stage_title = str(media_map_title or "").strip()
+        header_lines = [line for line in (stage_title, date_label) if line]
+        if stage_title:
+            subtitle_height_frac = (subtitle_font_size * dpi / 72.0) / height_px
+            line_gap_frac = 0.05 * (title_height_frac + subtitle_height_frac)
+            title_y = 1.0 - (0.05 * (title_height_frac + subtitle_height_frac))
+            subtitle_y = title_y - title_height_frac - line_gap_frac
+        else:
+            title_y = 1.0 - (0.05 * title_height_frac)
+            subtitle_y = None
+        if not background_only:
+            fig.text(
+                0.5,
+                title_y,
+                stage_title or date_label,
+                ha="center",
+                va="top",
+                fontsize=title_font_size,
+                fontweight="bold",
+                color=title_color,
+            )
+            if subtitle_y is not None:
+                fig.text(
+                    0.5,
+                    subtitle_y,
+                    date_label,
+                    ha="center",
+                    va="top",
+                    fontsize=subtitle_font_size,
+                    color=title_color,
+                )
     else:
         title_line, subtitle_line = single_track_heading(tracks[0])
+        header_lines = [line for line in (title_line, subtitle_line) if str(line).strip()]
         title_font_size = max(actual_font_size + 2.0, 10.0)
         subtitle_font_size = max(actual_font_size, 9.0)
         title_height_frac = (title_font_size * dpi / 72.0) / height_px
@@ -1378,25 +1432,26 @@ def render_track_plot(
         line_gap_frac = 0.05 * (title_height_frac + subtitle_height_frac)
         title_y = 1.0 - ((0.05 * (title_font_size * dpi / 72.0 + subtitle_font_size * dpi / 72.0)) / height_px)
         subtitle_y = title_y - title_height_frac - line_gap_frac
-        fig.text(
-            0.5,
-            title_y,
-            title_line,
-            ha="center",
-            va="top",
-            fontsize=title_font_size,
-            fontweight="bold",
-            color=title_color,
-        )
-        fig.text(
-            0.5,
-            subtitle_y,
-            subtitle_line,
-            ha="center",
-            va="top",
-            fontsize=subtitle_font_size,
-            color=title_color,
-        )
+        if not background_only:
+            fig.text(
+                0.5,
+                title_y,
+                title_line,
+                ha="center",
+                va="top",
+                fontsize=title_font_size,
+                fontweight="bold",
+                color=title_color,
+            )
+            fig.text(
+                0.5,
+                subtitle_y,
+                subtitle_line,
+                ha="center",
+                va="top",
+                fontsize=subtitle_font_size,
+                color=title_color,
+            )
 
     ax.set_xlim(min_x, max_x)
     ax.set_ylim(min_y, max_y)
@@ -1422,12 +1477,12 @@ def render_track_plot(
             f"Could not download the {provider_name} basemap. "
             "Please check the internet connection or try again later; the map server may have timed out."
         ) from exc
-    if media_map_date is None:
+    if media_map_date is None and not background_only:
         for track_segments in projected_track_segments:
             for projected_points in track_segments:
                 if projected_points:
                     draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size)
-    if overview_mode:
+    if overview_mode and not background_only:
         add_overview_markers(ax, projected_tracks, height_px, dpi, line_color)
         add_overview_labels(
             ax,
@@ -1438,12 +1493,25 @@ def render_track_plot(
             line_color,
             overview_label_items,
         )
-    if not overview_mode and media_map_date is None and projected_tracks and projected_tracks[0]:
+    if not background_only and not overview_mode and media_map_date is None and projected_tracks and projected_tracks[0]:
         add_single_track_markers(ax, projected_tracks[0], height_px, dpi, line_color)
     ax.axis("off")
     fig.savefig(output_path, dpi=dpi, facecolor=background_color, bbox_inches=None, pad_inches=0)
     plt.close(fig)
     metadata = {
+        "map_content_version": MAP_CONTENT_VERSION,
+        "background_only": bool(background_only),
+        "stage_kind": "overview" if overview_mode else ("media_stage" if media_map_date is not None else "gpx_track"),
+        "header_lines": header_lines,
+        "overlay_defaults": {
+            "gpx_mode": "line",
+            "media_mode": "dots",
+            "line_color": line_color,
+            "line_width": float(line_width),
+            "dot_color": dot_color,
+            "dot_size": float(dot_size),
+            "title_color": title_color,
+        },
         "crs": "EPSG:3857",
         "image_size_px": {"width": width_px, "height": height_px},
         "axes_box_fraction": {
@@ -1465,6 +1533,55 @@ def render_track_plot(
             float(minimum_short_dimension_m) if not overview_mode else None
         ),
     }
+    if overview_mode:
+        runtime_line_height = max(
+            0.035,
+            min(0.08, (header_font_size * 1.35 * dpi / 72.0) / height_px),
+        )
+        title_height = runtime_line_height
+        stage_height = min(0.18, 2.0 * runtime_line_height)
+        metadata["overview_title_box_fraction"] = {
+            "left": 0.0,
+            "bottom": 1.0 - title_height,
+            "width": 1.0,
+            "height": title_height,
+        }
+        metadata["stage_header_box_fraction"] = {
+            "left": 0.0,
+            "bottom": 1.0 - stage_height,
+            "width": 1.0,
+            "height": stage_height,
+        }
+    geometry_segments = []
+    for track_index, _track_segments in enumerate(projected_track_segments):
+        # Store geographic rather than projected points so every renderer uses
+        # the sidecar projection metadata consistently.
+        raw_segments = tracks[track_index].get("segments", []) if track_index < len(tracks) else []
+        if raw_segments:
+            geometry_segments.append(raw_segments)
+        elif track_index < len(tracks):
+            geometry_segments.append(tracks[track_index].get("points", []))
+    flattened_segments = []
+    for item in geometry_segments:
+        if item and isinstance(item[0], (list, tuple)) and len(item[0]) >= 2 and isinstance(item[0][0], (int, float)):
+            flattened_segments.append(item)
+        else:
+            flattened_segments.extend(item)
+    metadata["overlay_geometry"] = json_overlay_geometry(
+        flattened_segments,
+        geometry_kind="media_points" if media_map_date is not None else ("overview_tracks" if overview_mode else "gpx_track"),
+        estimated=media_map_date is not None,
+    )
+    if overview_mode and overview_label_items:
+        metadata["overview_dynamic_labels"] = [
+            {
+                "lat": float(track["points"][len(track["points"]) // 2][0]),
+                "lon": float(track["points"][len(track["points"]) // 2][1]),
+                "text": "\n".join(overview_label_lines(track, overview_label_items)),
+            }
+            for track in tracks
+            if track.get("points")
+        ]
     if not overview_mode:
         if media_clear_options is None:
             media_clear_options = clear_box_options_for_extent(
@@ -1474,6 +1591,7 @@ def render_track_plot(
                 axes_box,
                 track_edge_margin_fraction,
                 DEFAULT_GRID_LONG_AXIS,
+                connect_points=media_map_date is None,
             )
         metadata.update(
             {
@@ -1488,6 +1606,8 @@ def render_track_plot(
         metadata.update(
             {
                 "map_kind": "media",
+                "track_name": str(media_map_title or "").strip(),
+                "media_stage_name": str(media_map_title or "").strip(),
                 "media_map_date": media_map_date.isoformat() if hasattr(media_map_date, "isoformat") else str(media_map_date),
                 "media_points": [
                     build_coordinate_point(point[0], point[1])
@@ -1505,6 +1625,8 @@ def render_media_location_map(
     media_date: date,
     output_path,
     *,
+    media_points=None,
+    stage_name="",
     zoom_level=15,
     image_size=DEFAULT_IMAGE_SIZE,
     font_factor=1.0,
@@ -1532,10 +1654,13 @@ def render_media_location_map(
     output = Path(output_path).expanduser().resolve(strict=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     pseudo_track = {
-        "name": "",
+        "name": str(stage_name or "").strip(),
         "time": datetime.combine(media_date, datetime.min.time()).replace(tzinfo=timezone.utc),
         "points": points,
     }
+    # Rendering may normalize the temporary geometry in place. Map identity
+    # must describe the original media coordinates shared with the control file.
+    media_fingerprint = media_coordinates_fingerprint(media_date, points)
     effective_zoom, actual_font_size, metadata = render_track_plot(
         [pseudo_track],
         zoom_level,
@@ -1561,17 +1686,31 @@ def render_media_location_map(
         map_request_timeout_seconds=map_request_timeout_seconds,
         minimum_short_dimension_m=minimum_short_dimension_m,
         media_map_date=media_date,
+        media_map_title=stage_name,
     )
     media_clear_options = metadata.pop("media_clear_box_options", None)
-    media_fingerprint = media_coordinates_fingerprint(media_date, points)
+    rich_media_points = list(media_points) if isinstance(media_points, (list, tuple)) else [
+        build_coordinate_point(latitude, longitude) for latitude, longitude in points
+    ]
     metadata.update(
         {
             "output_image": str(output),
             "output_metadata": str(output.with_suffix(".json")),
             "media_fingerprint": media_fingerprint,
             "track_fingerprint": media_fingerprint,
+            "track_name": str(stage_name or "").strip(),
+            "media_stage_name": str(stage_name or "").strip(),
+            "media_points": rich_media_points,
+            "overlay_geometry": json_overlay_geometry(
+                [rich_media_points], geometry_kind="media_points", estimated=True
+            ),
         }
     )
+    if str(stage_name or "").strip():
+        metadata.setdefault(
+            "header_lines",
+            [str(stage_name).strip(), media_date.strftime("%d.%m.%Y")],
+        )
     if isinstance(adventure_render_parameters, dict):
         metadata["adventure_render_parameters"] = dict(adventure_render_parameters)
     if media_clear_options is not None:
@@ -1593,6 +1732,101 @@ def render_media_location_map(
     }
 
 
+def render_media_overview_map(
+    coordinates,
+    output_path,
+    *,
+    media_points=None,
+    header="",
+    zoom_level=8,
+    image_size=DEFAULT_IMAGE_SIZE,
+    font_factor=1.0,
+    use_esri=False,
+    background_color="black",
+    title_color="white",
+    map_provider="osm",
+    custom_map_url="",
+    custom_map_attribution="",
+    maximum_map_zoom=19,
+    map_request_timeout_seconds=12.0,
+    adventure_render_parameters=None,
+):
+    """Render one shared overview basemap for a media-only Adventure."""
+    points = [
+        (float(latitude), float(longitude))
+        for latitude, longitude in coordinates
+        if latitude is not None and longitude is not None
+    ]
+    if not points:
+        raise ValueError("A media overview map requires at least one GPS coordinate.")
+    output = Path(output_path).expanduser().resolve(strict=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pseudo_track = {"name": "", "time": None, "points": points}
+    effective_zoom, actual_font_size, metadata = render_track_plot(
+        [pseudo_track],
+        zoom_level,
+        image_size,
+        font_factor,
+        use_esri,
+        str(output),
+        "blue",
+        0.0,
+        "white",
+        0.0,
+        background_color,
+        title_color,
+        [],
+        header,
+        True,
+        map_provider=map_provider,
+        custom_map_url=custom_map_url,
+        custom_map_attribution=custom_map_attribution,
+        maximum_map_zoom=maximum_map_zoom,
+        map_request_timeout_seconds=map_request_timeout_seconds,
+        background_only=True,
+    )
+    fingerprint = media_overview_fingerprint(points)
+    metadata.update(
+        {
+            "stage_kind": "media_stage",
+            "map_kind": "media_overview",
+            "header_lines": [str(header)] if str(header).strip() else [],
+            "media_points": list(media_points) if isinstance(media_points, (list, tuple)) else [
+                build_coordinate_point(latitude, longitude) for latitude, longitude in points
+            ],
+            "media_fingerprint": fingerprint,
+            "track_fingerprint": fingerprint,
+            "output_image": str(output),
+            "output_metadata": str(output.with_suffix(".json")),
+        }
+    )
+    metadata["overlay_geometry"] = json_overlay_geometry(
+        [metadata["media_points"]], geometry_kind="media_points", estimated=True
+    )
+    if isinstance(adventure_render_parameters, dict):
+        metadata["adventure_render_parameters"] = dict(adventure_render_parameters)
+    metadata.update(image_origin_metadata(metadata))
+    write_plot_metadata(metadata, output.with_suffix(".json"))
+    return {
+        "output_image": output,
+        "output_metadata": output.with_suffix(".json"),
+        "effective_zoom": effective_zoom,
+        "font_size": actual_font_size,
+        "metadata": metadata,
+    }
+
+
+def media_overview_fingerprint(coordinates) -> str:
+    """Return the stable ordered-coordinate fingerprint for a media overview."""
+    return hashlib.sha256(
+        "|".join(
+            f"{float(latitude):.8f},{float(longitude):.8f}"
+            for latitude, longitude in coordinates
+            if latitude is not None and longitude is not None
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def media_coordinates_fingerprint(media_date: date, coordinates) -> str:
     """Return the stable fingerprint shared by media-map creation and status checks."""
     payload = media_date.isoformat() + "|" + "|".join(
@@ -1600,6 +1834,52 @@ def media_coordinates_fingerprint(media_date: date, coordinates) -> str:
         for latitude, longitude in coordinates
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def media_coordinates_fingerprint_matches(saved_fingerprint, media_date, coordinates) -> bool:
+    """Accept exact sidecar coordinates and their six-decimal control-file form."""
+    saved = str(saved_fingerprint or "")
+    if saved == media_coordinates_fingerprint(media_date, coordinates):
+        return True
+    rounded_coordinates = [
+        (round(float(latitude), 6), round(float(longitude), 6))
+        for latitude, longitude in coordinates
+    ]
+    return saved == media_coordinates_fingerprint(media_date, rounded_coordinates)
+
+
+def media_map_metadata_matches_coordinates(metadata, media_date, coordinates) -> bool:
+    """Accept equivalent media-map geometry even when equal-time rows reordered."""
+    if not isinstance(metadata, dict):
+        return False
+    clear_boxes = metadata.get("media_clear_boxes")
+    if (
+        not isinstance(clear_boxes, dict)
+        or clear_boxes.get("version") not in MEDIA_CLEAR_BOX_COMPATIBLE_VERSIONS
+    ):
+        return False
+    if media_coordinates_fingerprint_matches(
+        metadata.get("media_fingerprint"),
+        media_date,
+        coordinates,
+    ):
+        return True
+    saved_points = metadata.get("media_points")
+    if not isinstance(saved_points, list):
+        return False
+    try:
+        saved_coordinates = sorted(
+            (round(float(point["lat"]), 6), round(float(point["lon"]), 6))
+            for point in saved_points
+            if isinstance(point, dict)
+        )
+        current_coordinates = sorted(
+            (round(float(latitude), 6), round(float(longitude), 6))
+            for latitude, longitude in coordinates
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return saved_coordinates == current_coordinates
 
 
 # AI prompt: "Write argparse setup for a standalone GPX track CLI with positional
@@ -1825,6 +2105,13 @@ def build_argument_parser():
         default=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
         help="Minimum track margin inside the map axes for time-lapse layouts (default: 0.05).",
     )
+    parser.add_argument(
+        "--bake-overlays",
+        action="store_false",
+        dest="background_only",
+        default=True,
+        help="Bake routes and headers into PNG files instead of drawing them dynamically.",
+    )
     return parser
 
 
@@ -2020,11 +2307,17 @@ def prepare_run_context(args):
     }
 
 
-def execute_run_context(context, print_table_output=True):
+def execute_run_context(context, print_table_output=True, write_summary=True):
     """Write tables and plots for a prepared run context."""
     args = context["args"]
     gpx_path = context["gpx_path"]
     tracks = context["tracks"]
+    cancel_event = getattr(args, "cancel_event", None)
+    render_progress_callback = getattr(args, "render_progress_callback", None)
+
+    def check_render_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("GPX map rendering cancelled")
     if not tracks:
         if print_table_output:
             print("No tracks found.")
@@ -2065,7 +2358,7 @@ def execute_run_context(context, print_table_output=True):
         )
         if args.verbose:
             print(f"PDF gespeichert: {context['pdf_output_path']}")
-    if not args.nojson:
+    if not args.nojson and write_summary:
         table_summary = build_table_summary_data(
             gpx_path,
             tracks,
@@ -2084,6 +2377,9 @@ def execute_run_context(context, print_table_output=True):
     created_track_plot_paths = []
 
     if args.plot_overview:
+        check_render_cancelled()
+        if render_progress_callback is not None:
+            render_progress_callback(0, max(len(context["track_plot_paths"]), 1), "Overview")
         effective_zoom, actual_font_size, overview_metadata = render_track_plot(
             tracks,
             args.zoom,
@@ -2105,6 +2401,7 @@ def execute_run_context(context, print_table_output=True):
             custom_map_attribution=args.custom_map_attribution,
             maximum_map_zoom=args.maximum_map_zoom,
             map_request_timeout_seconds=args.map_request_timeout_seconds,
+            background_only=getattr(args, "background_only", True),
         )
         render_parameters = getattr(args, "adventure_overview_render_parameters", None)
         if not isinstance(render_parameters, dict):
@@ -2172,11 +2469,40 @@ def execute_run_context(context, print_table_output=True):
                 )
 
     if args.plot_tracks:
-        for plot_info in context["track_plot_paths"]:
+        total_plots = len(context["track_plot_paths"])
+        for plot_index, plot_info in enumerate(context["track_plot_paths"], start=1):
+            check_render_cancelled()
             number = plot_info["track_number"]
             track = next(track for track in tracks if track["table_number"] == number)
             track_output_path = plot_info["output_image"]
             metadata_output_path = plot_info["output_metadata"]
+            preserved_endpoint_places = None
+            for variant_name in track_map_variant_names(
+                Path(track_output_path).name,
+                prefer_time_lapse=False,
+            ):
+                candidate_path = Path(metadata_output_path).with_name(
+                    Path(variant_name).with_suffix(".json").name
+                )
+                if not candidate_path.is_file():
+                    continue
+                try:
+                    existing_metadata = read_plot_metadata(candidate_path)
+                except Exception:
+                    continue
+                if (
+                    isinstance(existing_metadata, dict)
+                    and existing_metadata.get("track_fingerprint")
+                    == track.get("track_fingerprint")
+                    and isinstance(
+                        existing_metadata.get("track_endpoint_places"),
+                        dict,
+                    )
+                ):
+                    preserved_endpoint_places = dict(
+                        existing_metadata["track_endpoint_places"]
+                    )
+                    break
             effective_zoom, actual_font_size, plot_metadata = render_track_plot(
                 [track],
                 args.zoom,
@@ -2200,6 +2526,7 @@ def execute_run_context(context, print_table_output=True):
                 args.custom_map_attribution,
                 args.maximum_map_zoom,
                 args.map_request_timeout_seconds,
+                background_only=getattr(args, "background_only", True),
             )
             render_parameters = getattr(args, "adventure_render_parameters", None)
             if isinstance(render_parameters, dict):
@@ -2259,10 +2586,16 @@ def execute_run_context(context, print_table_output=True):
                     track.get("track_fingerprint"),
                     DEFAULT_GRID_LONG_AXIS,
                 )
+            if preserved_endpoint_places is not None:
+                plot_metadata["track_endpoint_places"] = (
+                    preserved_endpoint_places
+                )
             if not args.nojson:
                 plot_metadata.update(image_origin_metadata(plot_metadata))
                 write_plot_metadata(plot_metadata, metadata_output_path)
             created_track_plot_paths.append(track_output_path)
+            if render_progress_callback is not None:
+                render_progress_callback(plot_index, max(total_plots, 1), track["name"])
             if args.verbose:
                 if args.nojson:
                     print(
@@ -2290,6 +2623,119 @@ def execute_run_context(context, print_table_output=True):
         }
     )
     return result
+
+
+def execute_map_variants_from_context(
+    context,
+    *,
+    selected_track_numbers,
+    plot_overview=False,
+    map_layouts=("standard", "time-lapse"),
+    render_parameters_by_layout=None,
+    progress_callback=None,
+):
+    """Render paired map variants from one already prepared GPX context."""
+    layouts = tuple(
+        layout
+        for layout in (str(value) for value in map_layouts)
+        if layout in {"standard", "time-lapse"}
+    )
+    layouts = tuple(dict.fromkeys(layouts)) or ("standard", "time-lapse")
+    selected = [
+        int(number)
+        for number in selected_track_numbers
+        if any(int(track["table_number"]) == int(number) for track in context["tracks"])
+    ]
+    base_args = context["args"]
+    summary_args = argparse.Namespace(**vars(base_args))
+    summary_args.plot_overview = False
+    summary_args.plot_tracks = None
+    summary_context = dict(context)
+    summary_context["args"] = summary_args
+    summary_context["selected_numbers"] = []
+    summary_context["track_plot_paths"] = []
+    execute_run_context(
+        summary_context,
+        print_table_output=False,
+        write_summary=True,
+    )
+
+    created_paths = []
+    completed = 0
+    total = int(bool(plot_overview)) + len(selected) * len(layouts)
+    total = max(total, 1)
+    if plot_overview:
+        overview_args = argparse.Namespace(**vars(base_args))
+        overview_args.plot_overview = True
+        overview_args.plot_tracks = None
+        overview_context = dict(context)
+        overview_context["args"] = overview_args
+        overview_context["selected_numbers"] = []
+        overview_context["track_plot_paths"] = []
+        result = execute_run_context(
+            overview_context,
+            print_table_output=False,
+            write_summary=False,
+        )
+        if result.get("overview_created"):
+            created_paths.append(str(context["overview_path"]))
+        completed += 1
+        if progress_callback is not None:
+            progress_callback(completed, total, "Overview", "overview")
+
+    safe_base = sanitize_filename_component(context["output_base"])
+    number_width = max(4, len(str(len(context["tracks"]))))
+    for track_number in selected:
+        track = next(
+            track for track in context["tracks"]
+            if int(track["table_number"]) == track_number
+        )
+        canonical_name = (
+            f"{track_number:0{number_width}d}_"
+            f"{sanitize_filename_component(track['name'])}_"
+            f"{safe_base}.png"
+        )
+        for layout in layouts:
+            args = argparse.Namespace(**vars(base_args))
+            args.plot_overview = False
+            args.plot_tracks = str(track_number)
+            args.map_layout = layout
+            if isinstance(render_parameters_by_layout, dict):
+                parameters = render_parameters_by_layout.get(layout)
+                if isinstance(parameters, dict):
+                    args.adventure_render_parameters = parameters
+            filename = (
+                time_lapse_track_map_name(canonical_name)
+                if layout == "time-lapse"
+                else canonical_name
+            )
+            output_path = os.path.join(context["output_dir"], filename)
+            variant_context = dict(context)
+            variant_context["args"] = args
+            variant_context["selected_numbers"] = [track_number]
+            variant_context["track_plot_paths"] = [
+                {
+                    "track_number": track_number,
+                    "track_name": track["name"],
+                    "output_image": output_path,
+                    "output_metadata": os.path.splitext(output_path)[0] + ".json",
+                }
+            ]
+            result = execute_run_context(
+                variant_context,
+                print_table_output=False,
+                write_summary=False,
+            )
+            created_paths.extend(result.get("created_track_plot_paths", []))
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total, track["name"], layout)
+    return {
+        "created_paths": created_paths,
+        "overview_created": bool(plot_overview),
+        "completed": completed,
+        "total": total,
+    }
 
 
 def namespace_from_options(gpx_file, **overrides):
@@ -2334,11 +2780,14 @@ def namespace_from_options(gpx_file, **overrides):
         fallback_walking_speed_kmh=3.5,
         map_layout="standard",
         track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
+        background_only=True,
         create_output_dir=True,
         adventure_render_parameters=None,
         adventure_overview_render_parameters=None,
         adventure_processing_parameters=None,
         track_processing_callback=None,
+        cancel_event=None,
+        render_progress_callback=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)

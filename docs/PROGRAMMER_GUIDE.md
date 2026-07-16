@@ -5,6 +5,10 @@ and video slide show from one adventure: a project directory, one combined GPX
 track file, imported media, generated map images, geolocation metadata, and a
 slide-show control list.
 
+Deferred provider and workflow ideas are recorded in
+[`FUTURE_ENHANCEMENTS.md`](FUTURE_ENHANCEMENTS.md) so they are not confused
+with currently implemented behavior.
+
 The active source files are:
 
 - `GPSTrackShowGUI.py`: main Cocoa GUI for creating and managing an adventure.
@@ -86,8 +90,8 @@ The sections are:
 
 - Adventure
 - GPX Files
-- Track Maps
 - Photos and Video Clips
+- Map Generation
 - Slide Show Control File
 - Start Slide Show
 - Show-type selector, Start/PDF/Quit controls, status line, and progress
@@ -97,9 +101,12 @@ Each section has a non-editable status checkbox. It is used as a visual
 completion indicator:
 
 - Adventure: project directory exists.
-- GPX Files: at least one GPX file exists.
-- Track Maps: overview and all expected track maps exist and are current.
-- Photos and Video Clips: at least one supported media file exists.
+- GPX Files: the user explicitly accepted a usable GPX source or selected
+  media-only mode.
+- Map Generation: overview plus all Standard and Time-Lapse stage maps exist and
+  are current.
+- Photos and Video Clips: supported media exists and the user explicitly
+  accepted the project folder as the collection.
 - Slide Show Control File: control file exists and contains at least one image
   or video.
 
@@ -110,12 +117,38 @@ otherwise the bubble and colored marks can disagree. The pure helpers in
 stage, and calculate an in-window bubble placement suitable for unit tests.
 
 New Adventures save `workflow_assistant.enabled`,
-`workflow_assistant.place_names_completed`, and
-`workflow_assistant.slideshow_started`. Loading an older format-2 Adventure
-without this optional object treats the two action markers as complete while
-still evaluating file-backed readiness. A successful Add Place Names run sets
-a transient pending flag; only saving the changed control table commits the
-marker. A successful player process launch commits the slideshow marker.
+`journey_source_confirmed`, `media_confirmed`, `metadata_prepared`,
+`place_names_requested`, `place_names_completed`, and `slideshow_started`.
+Missing newer fields in an existing Adventure normalize as confirmed to avoid
+restarting onboarding. `detected_gpx_choices(...)` supplies the two explicit
+journey-source decisions, independent of how many GPX files are already in the
+folder. The retained bubble renders choices as mutually exclusive radio rows plus action controls;
+the controller dispatches them without opening a modal onboarding wizard.
+The media stage uses three radio rows and one Continue action. Place-name
+selection is not a separate assistant stage: `locations.add_place_names` is
+shown in the Photos and Video Clips section and defaults to true.
+The explicit **No GPX file - use only photos** checkbox lives in the main GPX section and
+persists through `trackmaps.route_source = "media"`; it is intentionally not an
+assistant-only choice.
+
+Music has an independent compact section. `audio.enabled` defaults to false
+for new Adventures and controls whether music arguments are passed to the
+player. The GUI always creates `<project>/audio` and uses it as
+`music_source`; the selected `.playlist` file must be a direct child of that
+directory. The small Help link beside No Music calls the same retained
+`showMusicDirectiveHelp_()` controller used when a `MUS` row is edited, so the
+main window and control-file editor cannot develop different command
+references. Loading an older Adventure without `audio.enabled` enables music
+only when that Adventure already references a music source.
+
+Guided metadata preparation wraps `discover_media_update_candidates(...)`,
+`analyze_control_file_updates(...)`, and `commit_control_file_update_plan(...)`
+with no active control file. It therefore reuses valid sidecars and writes only
+missing, invalid, legacy-unsigned, or signature-changed metadata. The guided
+control/assets worker stages the list, generates the compact GPX summary when
+needed, requests both map layouts, and atomically installs the list. Map errors
+are accumulated in `media_map_options["map_failures"]`; a valid list remains
+installed while map readiness stays incomplete.
 
 ## Adventure Files
 
@@ -138,7 +171,10 @@ flush it. `atomic_write_json(...)` writes and fsyncs a temporary sibling before
 `track_map_base` are authoritative. Adventure-name edits are never autosaved
 as ordinary text changes; committing them invokes Rename/Copy/Cancel.
 
-`slideshow.start_mode` stores the preferred Standard or Time-Lapse selection.
+`slideshow.transition` stores the initial playback style and now includes
+`time_lapse`. Schema-5 Adventures containing `slideshow.start_mode` are
+normalized once: Time-Lapse becomes `slideshow.transition=time_lapse`, while
+Standard retains its stored standard transition.
 `slideshow.window_mode` stores `auto`, `single`, or `multiple`. Automatic mode
 resolves against `NSScreen.screens()` in the player: one screen uses one window
 and two or more screens create the separate overview window. Legacy
@@ -146,6 +182,44 @@ and two or more screens create the separate overview window. Legacy
 the former enabled default becomes `auto`, while disabled becomes `single`.
 `slideshow.track_map_before_media` defaults to false and controls the optional
 single-window Standard preview of a marked track map before every medium.
+
+The main GUI reuses one retained Adventure Processing window across
+`assistant_metadata`, `automatic_maps`, manual map generation, control
+creation, and control update.
+`_continue_adventure_processing(...)` ends a phase without releasing the
+window or clearing its text; the next `_prepare_geolocations_window(...)`
+appends a heading and updates the title. Completed sidecars and maps remain
+installed if a later phase is cancelled or fails. The output `NSTextView` has
+all automatic spelling and replacement services disabled. Worker output is
+queued asynchronously through `GeoLocationsOutputWriter`; do not make those
+line callbacks synchronous because AppKit text checking can otherwise create
+a main-thread/background-operation mutex cycle during long place-name runs.
+Track start/end place enrichment atomically checkpoints both map variants after
+each completed track, so cancelling or terminating a long tour resumes from the
+next unfinished endpoint rather than discarding the complete pass.
+Project status compares both current map variants against the active track
+fingerprint and `locations.reuse_radius_m`. Missing start/end entries are
+reported in both metadata and map status, mark **Update Metadata Extraction**
+with an asterisk, and make the Assistant metadata stage incomplete without
+marking otherwise valid map pixels stale.
+
+`GPSTrackShow.py` preparses map blocks with `parse_stage_descriptors(...)`.
+`PlaybackPhase` records Intro information, clean Intro overview, Stage Map,
+marked Stage Overview, Media, and Time-Lapse states. Resume files version 2
+store the stage, phase, medium position, style, and Time-Lapse progress rather
+than depending on retained rendered-image history.
+
+The optional Adventure `title_image` is resolved project-relatively by the GUI
+and passed as `--adventure-title-image`. An absent value deliberately falls
+back to the first still image in the control file. The Intro information layout
+measures its wrapped description and optional image before choosing its height,
+but draws no background panel. It uses black text with a light shadow and an
+AppKit drop shadow for the title image. Images are aspect-fitted to at most 35%
+of both screen dimensions. Intro
+information and clean-overview phases use `SWITCH`, keeping the identical
+basemap visible instead of fading through the slideshow background. In
+dual-window mode the map presenter receives the clean Tour Overview throughout
+both Intro phases.
 
 Stored values include:
 
@@ -158,8 +232,9 @@ Stored values include:
 - `time_lapse_media_min_fraction` (currently stored with a default of `0.5`;
   the legacy `time_lapse_media_max_fraction` key is accepted while loading)
 - description and other GUI state that belongs to the adventure
-- optional `music_source` and `music_playlist` paths; paths inside the project
-  are stored relative and external paths are absolute
+- fixed project-relative `music_source` (`audio`) and an optional
+  `music_playlist` path directly inside that folder; both are stored relative
+  to the project
 - `parameters`: a versioned object containing normalized values from the
   central registry
 
@@ -203,7 +278,7 @@ and computes length/ascent/descent from the resulting geometry.
 
 Consumers must not recalculate point-to-point geometry independently.
 `GPXEditor.py`, `gpx_tracks_table.py`, `gpxlist.py`, `track_timing_utils.py`,
-PDF output, Track Maps, and slideshow timing all use the shared output.
+PDF output, generated maps, and slideshow timing all use the shared output.
 `elevation_metrics.py` remains only as a compatibility re-export. Editor caches
 are keyed by the semantic track fingerprint and complete processing-parameter
 signature; XML edits invalidate only the affected track. Parameter changes are
@@ -215,7 +290,7 @@ rejection counts, segment-preserving geometry, processed elevation, and timed
 points. Retained point records also preserve explicit horizontal/vertical
 uncertainty, HDOP, VDOP, PDOP, satellite count, and fix type when present; PDOP,
 satellites, and fix are metadata only in this version. Every processing option is also part of GUI freshness signatures, so
-changing a threshold or kernel marks summaries and Track Maps for Update.
+changing a threshold or kernel marks summaries and generated maps as stale.
 
 When a project directory is selected, the GUI creates it if needed, discovers
 all valid `.adv` files, and loads the newest one. Adventure, GPX, and control
@@ -271,24 +346,31 @@ The GUI deliberately tolerates legacy plot file names when detecting existing
 plots. Matching code normalizes track plot names so old zero-padding variants
 are not counted as missing duplicates.
 
-Track Maps buttons:
+Map Generation controls:
 
-- `Create`: render the shared overview plus every map of the variant selected
-  by `for Time-Lapse`. It confirms before overwriting existing images.
-- `Update`: open the selection window with missing/stale maps marked by `*`,
-  preselected, and copied into the range field.
-- `for Time-Lapse`: selects `map_layout="time-lapse"`; unchecked selects
-  `map_layout="standard"`. It is persisted as `track_maps_for_time_lapse`.
-- `View`: open the preferred variant for every track, with the other variant as
-  fallback.
+- The default requested basemap zoom is 16. Compact stage maps retain a
+  2.25-km minimum short dimension so zoom-16 tiles are not enlarged at the
+  default 1920x1080 output size.
+
+- `Generate and Update Maps`: opens one logical-stage selection with
+  missing/stale rows marked by `*` and preselected. Each selected stage renders
+  Standard followed immediately by Time-Lapse from one prepared GPX context.
+- `View`: opens the overview followed by Standard and Time-Lapse maps paired
+  per stage.
 - folder icon: open `trackimages/` in Finder.
 
-Before rendering, obsolete numbered track-map `.png` and `.json` files are
-removed if they no longer match any current GPX track. Both valid variants are
-retained. The cleanup intentionally does not remove the overview image, summary
-JSON, or unrelated files.
+Automatic generation uses the same `ProjectMapPlan` after media metadata
+preparation and again as a final control-file creation preflight. It renders
+only missing/stale assets. Manual selection can force regeneration of current
+stages.
 
-Plot creation runs on a background thread. The GUI shows a Cancel button that
+Before rendering, obsolete numbered map `.png` and `.json` files are removed
+if they no longer match any current GPX track. Obsolete media-stage maps are
+removed only within the active Adventure's sanitized `<base>-media-...` family.
+Both valid variants are retained. Cleanup intentionally does not remove the
+overview image, summary JSON, other Adventure families, or unrelated files.
+
+Map generation runs on a background thread. The GUI shows a Cancel button that
 sets an event. Cancellation is cooperative and stops after the current image.
 Each created image is pushed into the plot viewer immediately.
 
@@ -318,6 +400,53 @@ The normal Create action calls `GetGeoLocations.py` with equivalent options:
 - `tracks=<projectdir>/trackimages/<projectname>-summary.json`
 - track-order sorting based on the GUI track ordering selection
 
+Create and Update Control File enable lazy media GPS inference. The compact track
+summary supplies only each stage's start/end time, name, fingerprint, and Track
+Map filenames. `LazyTrackGpsResolver` performs this inexpensive interval check
+before opening any detailed sidecar. Only a media timestamp inside exactly one
+valid interval can proceed. Its matching Standard Track Map sidecar is loaded
+on demand, with the Time-Lapse sidecar as fallback, and must have the current
+track fingerprint and valid monotonic `timed_track_points`. The parsed timeline
+is cached once per track and surrounding points are found with binary search.
+The resolver never reparses the GPX file and never extrapolates beyond a stage.
+At a `<trkseg>` boundary it selects the nearer endpoint instead of
+interpolating across the gap.
+
+New media sidecars use one GPS-independent timestamp-selection path. Embedded
+ExifTool fields are authoritative in this order: `DateTimeOriginal`, then the
+camera/container-key `CreationDate`. If those are absent, `GPSDateTime` or
+`GPSDateStamp` plus `GPSTimeStamp` is interpreted as UTC and normalized to local
+time. Generic track `MediaCreateDate` and `CreateDate` follow because exports
+can replace them. Only then does processing fall back to Spotlight
+content/filesystem creation dates and finally filesystem birth/modification
+time. Debug processing uses the identical order and records the selected source.
+
+Inferred sidecars contain `gps_source: track_time_interpolation` and a nested
+`gps_inference` object with the track identity/fingerprint, bounding times,
+fraction, timing-estimation flag, and source map sidecar. Embedded GPS always
+wins. A changed fingerprint causes only inferred GPS to be revalidated; a
+changed coordinate clears its old reverse-geocoded place so metadata
+maintenance can resolve it again. Place-name writes must preserve this
+provenance.
+
+The place-name phase of Update Metadata Extraction is a dedicated sidecar-only
+pass. It validates the
+extension-aware sidecar, reverse-geocodes only coordinates already stored
+there, and patches only place-related fields. It does not create a temporary
+control list, read a compact track summary, open Track Map sidecars, parse GPX,
+or call Spotlight/ExifTool. Missing, malformed, ownership-mismatched,
+invalid-date, and GPS-less sidecars are counted and skipped. The writer starts
+from the original JSON object, preserving GPS inference provenance and unknown
+future fields.
+
+The media browser is also a strict sidecar consumer. It opens directly without
+a `GetGeoLocations.py` worker. `validate_media_sidecar(...)` supplies the
+shared `available`, `missing`, or `invalid` state; unavailable metadata leaves
+date, GPS, and place blank, with no filesystem timestamp fallback. Merge New
+Media remains the intentional writer for selected missing/invalid rows and
+passes the current summary separately from `merge_tracks`, allowing position
+inference without turning the operation into Track Map synchronization.
+
 Created files in the project directory:
 
 - `<projectname>.lst`: unsorted/intermediate list
@@ -339,7 +468,7 @@ Merge actions use:
 Merge logic should avoid duplicate media and duplicate track maps. Track map
 duplicate detection must normalize legacy/new track plot numbering.
 
-Initial sorting and Merge New Media share `assign_adjacent_day_track(...)`.
+Initial sorting and Update Control File share `assign_adjacent_day_track(...)`.
 Only media dates without an exact-date track are considered. GPS media must be
 within `0.5 * track_length` of the next track's start (`before`) or previous
 track's end (`after`); media without GPS is accepted by date. Candidate ties
@@ -355,8 +484,9 @@ Media-only maps are written to `trackimages` as
 `<control-base>-media-YYYY-MM-DD-timelapse.png` for Time-Lapse, with matching
 JSON sidecars. The control file always keeps the canonical Standard filename;
 playback resolves the preferred variant with fallback exactly like a track map.
-They use the same map provider and rendering parameters as track maps, contain
-a date-only header, and store `map_kind: media`, all media coordinates,
+They use the same map provider and rendering parameters as track maps. Their
+header contains the date and, when available, a stage name derived from the
+first and last resolved media place. They store `map_kind: media`, all media coordinates,
 normalized clear boxes, and coordinate-to-pixel metadata. Per-track and media-only map extents
 have a fixed 10 km minimum short dimension. This value is a conservative lower
 bound derived from the smaller dimensions of the existing Santiago standard
@@ -368,23 +498,27 @@ Time-Lapse media maps call the same `optimized_track_extent(...)` and clear-box
 functions as track maps, passing time-ordered media coordinates in place of GPX
 points. Standard media maps use the same centered extent as Standard track
 maps. `render_media_map_specs(...)` is the only variant-aware media-map render
-path and is shared by initial control-file creation, Merge New Media, and Track
-Maps Create/Update. Merge classification calls `build_control_sections(...)`,
+path and is shared by initial control-file creation, Update Control File, and
+automatic/manual Map Generation. Merge classification calls
+`build_control_sections(...)`,
 so exact-date, adjacent-day, and remaining-media passes cannot drift from
 initial creation.
 
-The GUI also performs a preflight sync check for the slide-show control file:
+The GUI and update review use the shared side-effect-free
+`analyze_track_map_reference_updates(...)` preflight for:
 
 - current track maps missing from the control file
 - old `#Overviewmap:` or `#Map:` entries that no longer match the current track
   summary
 - map entries whose files no longer exist
 
-The Slide Show Control File status line reports these problems. The
-`Sync Track Maps` button shows the exact canonical maps to insert and old entries to remove,
-then performs removal and insertion in a temporary sibling list. The active
-control file is replaced atomically only after the complete merge succeeds;
-cancelled or failed merges leave it unchanged. The reusable Cocoa table window
+The Slide Show Control File status line reports these problems.
+`analyze_control_file_updates(...)` parses the control file and summary once
+and combines a `TrackMapReferenceUpdatePlan` with the selective media plan.
+`commit_control_file_update_plan(...)` applies required map corrections first,
+then approved media changes to the same in-memory model, stages sidecars and
+affected media maps, and atomically replaces the control file last. Cancelled
+or failed updates leave it unchanged. The reusable Cocoa table window
 is retained and hidden on close so reopening it never addresses a released
 Objective-C window.
 
@@ -488,13 +622,13 @@ as its table is ready, including empty-input, failure, cancellation, and close
 paths. Merely raising an existing editor never pauses status processing.
 
 The asynchronous status refresh creates one `gpx_tracks_table` preparation
-context and derives both the GPX summary label and Track Map freshness from
+context and derives both the GPX summary label and map freshness from
 its tracks. Do not add a separate `_format_gpx_summary(...)` traversal to that
 path; synchronous callers may continue to use it directly.
 
 The editor must return the most recently saved GPX path. The main GUI then
 updates the GPX field, refreshes GPX statistics, regenerates the track summary
-JSON, refreshes Track Maps status, and refreshes the control-file track-map
+JSON, refreshes Map Generation status, and refreshes the control-file track-map
 sync status.
 
 The main GUI's `PDF Summary` button calls
@@ -608,10 +742,11 @@ atomically and removes the active recovery file.
 30 seconds. In time-lapse mode, the existing `--duration` setting is the
 minimum display time for media. Timed media is
 scheduled from its extension-aware media sidecar; untimed media remains in list
-order at the end of its stage. `T` switches between normal and time-lapse mode
-without intentionally skipping a media row. Entering time-lapse cancels the
-standard continuation timer and presenter transitions, then hides every
-standard content layer so both modes cannot animate concurrently.
+order at the end of its stage. Lowercase `t` cycles forward and uppercase `T`
+backward through Time-Lapse and Standard transition styles without
+intentionally skipping a media row. Entering Time-Lapse cancels the standard
+continuation timer and presenter transitions, then hides every standard
+content layer so both modes cannot animate concurrently.
 
 With no map presenter, a fresh Time-Lapse stage first displays the overview in
 the stage view as a framed medium for `--duration`, then starts route motion.
@@ -620,8 +755,12 @@ track points through the overview sidecar coordinates before the rendered
 overview is scaled into its media frame, preserving the route highlight.
 `timelapse.overview_as_media=false` or `--time-lapse-overview-fullscreen`
 retains the former full-window presentation. A resumed stage starts at its
-saved progress without replaying that overview. Standard
-single-window playback retains the overview, track-map, media sequence. The
+saved progress without replaying that overview. Standard single-window
+playback uses Stage Map, marked Tour Overview, and media. The overview PNG is a
+full-tile basemap; `_handle_overview(...)` suppresses its generic header, while
+`draw_overview_overlay(...)` adds the active stage header with a black runtime
+background. Time-Lapse overview media uses the same renderer without that
+background. The
 shared transition-completion guard explicitly permits the temporary Time-Lapse
 overview callback while rejecting stale Standard callbacks.
 
@@ -637,15 +776,17 @@ extreme extent shifts and use the `-timelapse` filename suffix. The shared
 overview is never variant-specific.
 
 `track_map_layout_utils.py` owns variant naming, obstruction rasterization,
-corner frontiers, extent optimization, cache validation, and normalized/view
-coordinate conversion. Plot sidecars store `media_clear_boxes` version 1 in
-`image_fraction_bottom_left` coordinates. Each corner contains a largest-area
-`maximum` and a Pareto `frontier`, together with image size, margin, grid size,
-and track fingerprint. The player validates those fields and converts the
-normalized rectangles into the current aspect-fit image rectangle. Legacy,
-malformed, stale, or wrong-size caches fall back to the same shared runtime
-calculation. Every medium is aspect-fitted against the frontier member that
-produces the largest display area.
+placement frontiers, extent optimization, cache validation, and normalized/view
+coordinate conversion. Plot sidecars store `media_clear_boxes` version 3 in
+`image_fraction_bottom_left` coordinates. The cache covers the four corners
+plus center-left, center, center-right, top-center, and bottom-center. Each
+position contains a largest-area `maximum` and a width/height `frontier`,
+together with image size, margin, grid size, and track fingerprint. The player
+validates those fields and converts the normalized rectangles into the current
+aspect-fit image rectangle. Legacy, malformed, stale, or wrong-size caches fall
+back to the same shared nine-position runtime calculation. Every medium is
+aspect-fitted against the frontier member that produces the largest display
+area.
 
 Canonical `#Map:` control rows continue to name the Standard file. Standard
 playback resolves Standard then Time-Lapse; Time-Lapse playback resolves the
@@ -676,10 +817,11 @@ track-point time. Once progress reaches the track endpoint,
 `time_lapse_clock_datetime(...)` advances it to the current medium's later
 capture timestamp while leaving the marker at the endpoint. The view draws the
 current medium's reverse-geocoded place in
-one line across the bottom 5% of the aspect-fit map and draws total distance,
-stage distance, and elevation as three right-aligned header lines. These text
-layers are drawn directly by the retained view and do not allocate per-frame
-overlay images.
+the enlarged stage header with the same font size as the optional date subtitle
+and draws total distance, stage distance, and elevation as three right-aligned
+header lines. When a usable clock is active, the dynamic GPX heading omits its
+duplicate date. These text layers are drawn directly by the retained view and
+do not allocate per-frame overlay images.
 
 ### Slide-Show Resume Protocol
 
@@ -701,6 +843,13 @@ reopens the exact media/map row; Time-Lapse reconstructs the containing stage,
 marker progress, and visible medium. Edited or replaced control files invalidate
 the stored position safely.
 
+The control-table **Start Slide Show Here** action constructs a transient
+resume payload with the selected model-row index and exact line text. It passes
+that payload through the same `--resume-index` path without replacing the
+Adventure's saved Continue position before launch. Time-Lapse rewinds media
+rows to their owning map, but starts non-display directives such as `#Datum:`
+and `#MUSIC:` at their exact row so they execute normally.
+
 `track_timing_utils.py` is the single timestamp-repair policy shared by the
 GPX editor, `gpx_tracks_table.py`, and the player. It preserves usable GPX
 times, interpolates missing intervals by cumulative distance, and falls back to
@@ -714,8 +863,8 @@ cumulative stage distance in kilometres. Use
 matching current sidecars without rerendering a PNG. It verifies the existing
 track fingerprint first and reports unsafe matches instead of guessing. This is
 an explicit one-time migration or maintenance API; it is not called when the
-slide show starts. Track Maps Create and Update write the complete payload as
-part of normal map generation, while the player remains read-only and falls
+slide show starts. Automatic and manual Map Generation write the complete
+payload as part of normal map generation, while the player remains read-only and falls
 back to in-memory distance-based timing for legacy or foreign sidecars.
 
 The Adventure settings window now persists the global slide-show parameters in
@@ -796,6 +945,86 @@ Common sidecar patterns:
 Plot sidecars include enough information to map latitude/longitude to image
 pixels. Media sidecars include filename, datetime, GPS, place, and extraction
 debug/status fields.
+
+### Dynamic Map Overlays
+
+`map_overlay.py` is the renderer-independent boundary between generated
+basemaps and visible route information. `MapOverlayScene` normalizes GPX
+segments, media points, overlay mode, and header lines. It deliberately has no
+AppKit, Matplotlib, GPX-parser, or tile-provider dependency.
+
+Map sidecars with `background_only: true` describe
+PNGs containing only basemap pixels and the existing reserved header area.
+Their `overlay_geometry`, `header_lines`, and stage metadata are rendered by:
+
+- `GPSTrackShow.draw_dynamic_map_overlay(...)` for Standard and Time-Lapse
+  playback;
+- the main GUI plot viewer for previews;
+- the PDF Matplotlib path, which uses the same scene semantics while retaining
+  vector lines and text at PDF resolution.
+
+Legacy sidecars are never overdrawn. `map_uses_dynamic_overlays(...)` is the
+single compatibility check. Geometry, extent, provider, zoom, layout, and
+background remain map-affecting; colors, widths, point styles, overview labels,
+track-title choice, and header presentation are runtime overlay parameters.
+Map content version 5 reserves a 25% taller stage header; older background-only
+maps remain display-compatible until regenerated.
+
+`trackmaps.track_title` selects `endpoint_places` (default) or `track_name`.
+`track_header_lines(...)` formats the chosen title and compact
+`DATE · NN.N km - HH:MM h` subtitle, omitting the date when the Time-Lapse
+clock is active. The sidecar-only place-name pass loads the compact track
+summary, resolves each current track's start and end before media, and writes
+`track_endpoint_places.start/end` into both fingerprint-matching map sidecars.
+Map regeneration preserves this object only when the track fingerprint still
+matches, preventing stale endpoint names from moving to edited tracks.
+
+`GetGeoLocations.py` reuses `#MediaMap:` as the first-class media-stage format.
+When no `TracksSummary` is supplied, all dated groups are media stages and
+`create_media_overview_for_records(...)` produces a shared overview from their
+available GPS coordinates. Media map sidecars store ordered `media_points`
+with optional source names and times. No synthetic GPX file is created and GPX
+processing is not invoked. The GUI's Media-only Create/Update/View path reads
+the active control file once and rerenders only its overview and media-map
+specifications.
+
+`render_media_map_specs(...)` accepts either one `map_layout` or a
+`map_layouts=("standard", "time-lapse")` sequence. Guided first creation uses
+the sequence and per-layout render signatures. In Time-Lapse playback,
+`placement_obstacle_points(...)` falls back from animated route points to all
+sidecar `media_points`/`overlay_geometry` points before calculating route-free
+placement rectangles. Adventure parameter schema 2 removes the redundant
+media-dot size; the GUI passes twice `slideshow.marker_radius` as the diameter.
+The old default orange migrates to blue while custom colors are preserved.
+
+`validate_media_sidecar(...)` is the common read boundary for metadata
+consumers. Fresh metadata extraction is restricted to Create, Update Control
+File, explicit sidecar migration, and explicit `--ignorejson` maintenance runs.
+
+Selective media analysis uses `analyze_media_updates(...)`; the public GUI
+workflow wraps it with `analyze_control_file_updates(...)` and commits through
+`commit_control_file_update_plan(...)`.
+`discover_media_update_candidates(...)` first finds imported, missing, invalid,
+legacy-unsigned, and signature-changed media without extracting metadata.
+Analysis is side-effect free and extracts only automatic candidates
+or files deliberately chosen for rechecking. It reads the compact track summary once and
+uses `LazyTrackGpsResolver` without parsing GPX. The commit reuses the normal
+classification functions, ignores unchecked `MediaUpdateItem` objects, stages
+affected media maps, backs up replaced files, and replaces the control file last.
+Legacy verification recommends targeted reverse geocoding only for new or
+changed GPS, or for an existing place whose lookup coordinate is stale; an
+unchanged GPS without a place remains for the place-name phase of Update
+Metadata Extraction.
+
+Newly generated sidecars may contain `source_file_signature` (size and
+nanosecond mtime), `datetime_source`, and `metadata_updated_at`. Reverse
+geocoding writes `place_coordinate`; a place is stale when this coordinate is
+farther from the current GPS than `locations.reuse_radius_m` (150 m by
+default). The same threshold is passed to selective analysis, lazy track-time
+GPS inference, and the sidecar-only place-name pass. Accepted coordinate
+changes retain the place and rewrite `place_coordinate`. Legacy sidecars
+without signatures are extracted once to establish freshness; signed current
+sidecars remain source-of-truth inputs.
 
 ## Developer Notes
 

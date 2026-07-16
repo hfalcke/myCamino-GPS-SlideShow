@@ -23,7 +23,9 @@ from GetGeoLocations import (
     update_control_special_map_entries,
 )
 from GPSTrackShowGUI import (
+    GeoLocationsOutputWriter,
     GPXTrackerController,
+    control_file_update_requires_review,
     control_file_recovery_is_newer,
     control_file_signature,
     control_table_filter_anchor_index,
@@ -34,6 +36,7 @@ from GPSTrackShowGUI import (
     next_control_table_search_position,
     parse_slideshow_control_line,
     serialize_slideshow_control_row,
+    track_endpoint_place_completeness,
     update_slideshow_control_row_cell,
     visible_control_row_indexes,
     write_text_atomic,
@@ -41,6 +44,111 @@ from GPSTrackShowGUI import (
 
 
 class ControlFileTrackSyncTests(unittest.TestCase):
+    def test_track_endpoint_place_completeness_requires_both_map_variants(self):
+        track = {
+            "track_fingerprint": "fingerprint",
+            "first_point": (50.0, 8.0),
+            "last_point": (50.1, 8.1),
+        }
+        complete = {
+            "track_fingerprint": "fingerprint",
+            "track_endpoint_places": {
+                "start": {"latitude": 50.0, "longitude": 8.0, "place": "Start"},
+                "end": {"latitude": 50.1, "longitude": 8.1, "place": "End"},
+            },
+        }
+        incomplete = {
+            "track_fingerprint": "fingerprint",
+            "track_endpoint_places": {
+                "start": {"latitude": 50.0, "longitude": 8.0, "place": "Start"},
+            },
+        }
+        self.assertEqual(
+            track_endpoint_place_completeness(
+                track,
+                [complete, complete],
+                150.0,
+            ),
+            (2, 2),
+        )
+        self.assertEqual(
+            track_endpoint_place_completeness(
+                track,
+                [complete, incomplete],
+                150.0,
+            ),
+            (2, 1),
+        )
+
+    def test_map_summary_flags_missing_endpoint_place_names(self):
+        status = {
+            "overview_exists": True,
+            "overview_out_of_date": False,
+            "track_total": 1,
+            "standard_count": 1,
+            "time_lapse_count": 1,
+            "stale_track_count": 0,
+            "summary_exists": True,
+            "summary_out_of_date": False,
+            "media_map_total": 0,
+            "media_standard_count": 0,
+            "media_time_lapse_count": 0,
+            "media_stale_count": 0,
+            "endpoint_place_missing_count": 2,
+        }
+        summary = GPXTrackerController._format_track_maps_summary_from_status(
+            SimpleNamespace(),
+            status,
+        )
+        self.assertIn("2 track endpoint place names missing", summary)
+        self.assertIn("Update Metadata Extraction", summary)
+
+    def test_music_help_explains_control_rows_playlists_and_albums(self):
+        controller = SimpleNamespace(music_source=None)
+        text = GPXTrackerController._music_directive_help_content(controller)
+        self.assertIn("#MUSIC: Parameters", text)
+        self.assertIn("$LABEL", text)
+        self.assertIn("audio subdirectory", text)
+        self.assertIn("folders containing songs", text)
+
+    def test_processing_output_does_not_wait_synchronously_for_main_thread(self):
+        calls = []
+
+        class Controller:
+            def performSelectorOnMainThread_withObject_waitUntilDone_(
+                self, selector, value, wait
+            ):
+                calls.append((selector, value, wait))
+
+        writer = GeoLocationsOutputWriter(Controller())
+        writer.write("first\nsecond\n")
+        writer.flush()
+        self.assertEqual([value for _selector, value, _wait in calls], ["first", "second"])
+        self.assertTrue(all(wait is False for _selector, _value, wait in calls))
+
+    def test_media_update_review_is_required_only_for_existing_row_moves(self):
+        def plan(*items):
+            return SimpleNamespace(media=SimpleNamespace(items=list(items)))
+
+        metadata_only = SimpleNamespace(
+            apply_update=True,
+            included_count=1,
+            reposition=False,
+        )
+        new_media = SimpleNamespace(
+            apply_update=True,
+            included_count=0,
+            reposition=True,
+        )
+        existing_move = SimpleNamespace(
+            apply_update=True,
+            included_count=1,
+            reposition=True,
+        )
+        self.assertFalse(control_file_update_requires_review(plan(metadata_only)))
+        self.assertFalse(control_file_update_requires_review(plan(new_media)))
+        self.assertTrue(control_file_update_requires_review(plan(existing_move)))
+
     def test_summary_path_is_derived_without_preparing_the_gpx(self):
         with TemporaryDirectory() as temporary:
             project_dir = Path(temporary)

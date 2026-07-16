@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import copy
 from contextlib import redirect_stderr, redirect_stdout
 import json
 import math
@@ -15,11 +17,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from typing import Any, Callable, Optional, TextIO
@@ -29,14 +32,27 @@ from plot_metadata_utils import (
     build_photo_metadata_payload,
     legacy_media_sidecar_path,
     media_sidecar_matches_media,
+    media_file_signature,
+    media_sidecar_freshness,
     media_sidecar_path,
     parse_photo_datetime,
     read_json_data,
     read_photo_metadata,
+    validate_media_sidecar,
     write_photo_metadata,
 )
-from gpx_tracks_table import render_media_location_map
-from track_map_layout_utils import time_lapse_track_map_name
+from gpx_tracks_table import (
+    media_coordinates_fingerprint,
+    media_map_metadata_matches_coordinates,
+    media_overview_fingerprint,
+    render_media_location_map,
+    render_media_overview_map,
+)
+from track_map_layout_utils import (
+    canonical_track_map_name,
+    time_lapse_track_map_name,
+    track_map_variant_names,
+)
 
 
 IMAGE_EXTENSIONS = {
@@ -64,6 +80,7 @@ VIDEO_EXTENSIONS = {
     ".m2ts",
     ".wmv",
 }
+DEFAULT_PLACE_GPS_EQUIVALENCE_M = 150.0
 FILE_FILTERS = {"IMAGE", "VIDEO", "ALL"}
 
 GERMAN_WEEKDAYS = [
@@ -185,6 +202,7 @@ class Params:
     sort_date_sections_by_tracks: bool
     merge_tracks: Optional[Path]
     merge_media: tuple[Path, ...]
+    infer_gps_from_tracks: bool = True
     migrate_media_sidecars: bool = False
     media_map_options: Optional[dict[str, Any]] = None
     progress_callback: Optional[Callable[[int, int, str], None]] = None
@@ -207,6 +225,11 @@ class PhotoRecord:
     geocode_requested: bool
     place_updated: bool
     debug_info: Optional[dict[str, Any]] = None
+    gps_source: Optional[str] = None
+    gps_inference: Optional[dict[str, Any]] = None
+    gps_updated: bool = False
+    raw_metadata: Optional[dict[str, Any]] = None
+    datetime_source: Optional[str] = None
 
 
 @dataclass
@@ -218,6 +241,221 @@ class MediaSidecarMigrationReport:
     regenerated: list[Path]
     preserved: list[tuple[Path, Path]]
     conflicts: list[tuple[Path, Path]]
+
+
+@dataclass
+class SidecarPlaceUpdateReport:
+    """Counts from a sidecar-only reverse-geolocation pass."""
+
+    total: int = 0
+    updated: int = 0
+    already_complete: int = 0
+    missing: int = 0
+    invalid: int = 0
+    gps_less: int = 0
+    failed: int = 0
+    track_endpoints_total: int = 0
+    track_endpoints_updated: int = 0
+    track_endpoints_complete: int = 0
+    track_endpoints_failed: int = 0
+    track_sidecars_updated: int = 0
+
+
+@dataclass
+class MediaUpdateItem:
+    """One selected media file and its proposed incremental update."""
+
+    media_path: Path
+    action: str
+    sidecar_status: str
+    freshness: str
+    included_count: int
+    old_record: Optional[PhotoRecord]
+    new_record: PhotoRecord
+    staged_payload: dict[str, Any]
+    current_section: str
+    proposed_section: str
+    reposition: bool
+    gps_changed: bool
+    place_update_recommended: bool
+    analyzed_media_signature: dict[str, int] = field(default_factory=dict)
+    analyzed_sidecar_signature: Optional[tuple[int, int]] = None
+    sidecar_write_required: bool = False
+    control_conflict: Optional[str] = None
+    control_update_pending: bool = False
+    apply_update: bool = True
+
+
+@dataclass(frozen=True)
+class MediaUpdateCandidate:
+    """One media file selected by the inexpensive update inventory."""
+
+    media_path: Path
+    action: str
+    reason: str
+
+
+@dataclass
+class MediaUpdatePlan:
+    """A side-effect-free preview of selected media updates."""
+
+    project_dir: Path
+    control_file: Optional[Path]
+    tracks_summary_path: Optional[Path]
+    items: list[MediaUpdateItem]
+    tracks_summary: Optional[TracksSummary]
+    sort_date_sections_by_tracks: bool
+    control_signature: Optional[tuple[int, int]] = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TrackMapReferenceUpdatePlan:
+    """Side-effect-free changes needed to align control rows with Track Maps."""
+
+    missing_overview: list[str] = field(default_factory=list)
+    missing_tracks: list[str] = field(default_factory=list)
+    obsolete_overview: list[str] = field(default_factory=list)
+    obsolete_tracks: list[str] = field(default_factory=list)
+    reordered_tracks: list[str] = field(default_factory=list)
+    special_updates: list[tuple[str, str, str]] = field(default_factory=list)
+    summary_available: bool = False
+    summary_current: bool = True
+    warning: Optional[str] = None
+
+    @property
+    def change_count(self) -> int:
+        return (
+            len(self.missing_overview)
+            + len(self.missing_tracks)
+            + len(self.obsolete_overview)
+            + len(self.obsolete_tracks)
+            + len(self.reordered_tracks)
+            + len(self.special_updates)
+        )
+
+
+@dataclass
+class ControlFileUpdatePlan:
+    """Combined Track Map reference and selective media update preview."""
+
+    media: MediaUpdatePlan
+    track_maps: TrackMapReferenceUpdatePlan
+
+
+@dataclass
+class MediaUpdateResult:
+    """Counts produced by one committed selective media update."""
+
+    refreshed_sidecars: int = 0
+    rows_added: int = 0
+    rows_updated: int = 0
+    rows_moved: int = 0
+    control_rows_pending: int = 0
+    media_maps_regenerated: int = 0
+    places_preserved: int = 0
+    places_updated: int = 0
+    gps_inferred: int = 0
+    gps_refreshed: int = 0
+
+
+@dataclass
+class ControlFileUpdateResult:
+    """Result of one combined atomic control-file update."""
+
+    media: MediaUpdateResult = field(default_factory=MediaUpdateResult)
+    map_entries_added: int = 0
+    map_entries_replaced: int = 0
+    map_entries_removed: int = 0
+    map_entries_reordered: int = 0
+
+
+@dataclass
+class ProjectMapPlan:
+    """Shared stage and media-map plan used before and during control creation."""
+
+    records: list[PhotoRecord]
+    sections: list[dict[str, Any]]
+    media_map_specs: list[dict[str, Any]]
+    overview_name: Optional[str]
+    overview_points: list[dict[str, Any]]
+    tracks_summary: Optional[TracksSummary]
+
+
+def discover_media_update_candidates(
+    project_dir: Path | str,
+    *,
+    imported_paths: Optional[list[Path | str] | tuple[Path | str, ...] | set[Path | str]] = None,
+    only_imported: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    detail_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[MediaUpdateCandidate]:
+    """Find clear selective-update candidates without extracting media metadata."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    imported = {
+        Path(path).expanduser().resolve(strict=False)
+        for path in (imported_paths or ())
+    }
+    if only_imported:
+        media_paths = sorted(
+            (
+                path for path in imported
+                if path.parent == project
+                and path.is_file()
+                and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    else:
+        media_paths = sorted(
+            (
+                path.resolve(strict=False)
+                for path in project.iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    candidates: list[MediaUpdateCandidate] = []
+    total = len(media_paths)
+    if progress_callback is not None:
+        progress_callback(0, total, "")
+    for index, media_path in enumerate(media_paths, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        check_cancelled()
+        status, payload, _reason = validate_media_sidecar(media_path)
+        freshness = media_sidecar_freshness(media_path, payload) if status == "available" else status
+        if media_path in imported:
+            action = "repair" if status != "available" else (
+                "refresh" if freshness in {"changed", "unknown"} else "use_sidecar"
+            )
+            candidates.append(MediaUpdateCandidate(media_path, action, "Imported"))
+        elif only_imported:
+            pass
+        elif status in {"missing", "invalid"}:
+            candidates.append(MediaUpdateCandidate(media_path, "repair", status.title()))
+        elif freshness == "changed":
+            candidates.append(MediaUpdateCandidate(media_path, "refresh", "File changed"))
+        elif freshness == "unknown":
+            candidates.append(
+                MediaUpdateCandidate(
+                    media_path,
+                    "refresh",
+                    "Legacy sidecar: extracting metadata once to establish file signature",
+                )
+            )
+            if detail_callback is not None:
+                detail_callback(
+                    f"Legacy sidecar: extracting metadata once to establish file signature: {media_path.name}."
+                )
+        elif detail_callback is not None:
+            detail_callback(
+                f"Skipping {media_path.name}: metadata sidecar is current."
+            )
+        if progress_callback is not None:
+            progress_callback(index, total, media_path.name)
+    return candidates
 
 
 @dataclass(frozen=True)
@@ -232,6 +470,19 @@ class TrackInfo:
     start_longitude: Optional[float] = None
     end_latitude: Optional[float] = None
     end_longitude: Optional[float] = None
+    end_time: Optional[datetime] = None
+    track_name: Optional[str] = None
+    track_fingerprint: Optional[str] = None
+    map_sidecar_paths: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class TrackTimeline:
+    """Validated timed points lazily loaded from one Track Map sidecar."""
+
+    times: tuple[datetime, ...]
+    points: tuple[dict[str, Any], ...]
+    source_path: Path
 
 
 @dataclass(frozen=True)
@@ -373,6 +624,13 @@ def collect_input_parameters(argv: list[str]) -> Params:
         help="Comma-separated image/video files to merge into the existing sorted photolist.",
     )
     parser.add_argument(
+        "--no-track-gps-inference",
+        dest="infer_gps_from_tracks",
+        action="store_false",
+        default=True,
+        help="Do not infer missing media GPS coordinates from timed Track Map sidecars.",
+    )
+    parser.add_argument(
         "--migrate-media-sidecars",
         action="store_true",
         help="Move legacy <stem>.json media sidecars to collision-safe <mediafile>.json names and create missing sidecars.",
@@ -424,6 +682,7 @@ def collect_input_parameters(argv: list[str]) -> Params:
         sort_date_sections_by_tracks=bool(args.sort_date_sections_by_tracks),
         merge_tracks=merge_tracks,
         merge_media=merge_media,
+        infer_gps_from_tracks=bool(args.infer_gps_from_tracks),
         migrate_media_sidecars=bool(args.migrate_media_sidecars),
     )
 
@@ -448,6 +707,7 @@ def params_from_options(
     sort_date_sections_by_tracks: bool = False,
     merge_tracks: Path | str | None = None,
     merge_media: list[Path | str] | tuple[Path | str, ...] | str | None = None,
+    infer_gps_from_tracks: bool = True,
     migrate_media_sidecars: bool = False,
     media_map_options: Optional[dict[str, Any]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -539,6 +799,7 @@ def params_from_options(
         sort_date_sections_by_tracks=bool(sort_date_sections_by_tracks),
         merge_tracks=merge_tracks_path,
         merge_media=merge_media_paths,
+        infer_gps_from_tracks=bool(infer_gps_from_tracks),
         migrate_media_sidecars=bool(migrate_media_sidecars),
         media_map_options=dict(media_map_options) if media_map_options is not None else None,
         progress_callback=progress_callback,
@@ -723,9 +984,12 @@ def read_exiftool_json(file_path: Path) -> Optional[dict[str, Any]]:
         "-GPSLongitude",
         "-GPSPosition",
         "-DateTimeOriginal",
-        "-CreateDate",
-        "-MediaCreateDate",
         "-CreationDate",
+        "-GPSDateTime",
+        "-GPSDateStamp",
+        "-GPSTimeStamp",
+        "-MediaCreateDate",
+        "-CreateDate",
         str(file_path),
     ]
     try:
@@ -842,16 +1106,16 @@ def parse_mdls_datetime(raw_value: str) -> Optional[datetime]:
 
 def get_photo_datetime(file_path: Path) -> datetime:
     """Return the best available photo timestamp."""
+    exif_datetime = read_exiftool_datetime(file_path)
+    if exif_datetime is not None:
+        return exif_datetime
+
     for metadata_key in ("kMDItemContentCreationDate", "kMDItemFSCreationDate"):
         raw_value = read_mdls_raw(file_path, metadata_key)
         if raw_value:
             parsed = parse_mdls_datetime(raw_value)
             if parsed is not None:
                 return parsed
-
-    exif_datetime = read_exiftool_datetime(file_path)
-    if exif_datetime is not None:
-        return exif_datetime
 
     if not is_exiftool_available():
         warn_exiftool_missing_once()
@@ -867,6 +1131,12 @@ def get_photo_datetime_with_debug(file_path: Path) -> tuple[datetime, dict[str, 
     """Return the best timestamp and describe how it was selected."""
     debug_info: dict[str, Any] = {"candidates": []}
 
+    exif_datetime, exif_debug = read_exiftool_datetime_with_debug(file_path)
+    debug_info["exiftool"] = exif_debug
+    if exif_datetime is not None:
+        debug_info["selected_source"] = f"exiftool:{exif_debug.get('selected_source')}"
+        return exif_datetime, debug_info
+
     for metadata_key in ("kMDItemContentCreationDate", "kMDItemFSCreationDate"):
         raw_value = read_mdls_raw(file_path, metadata_key)
         parsed = parse_mdls_datetime(raw_value) if raw_value else None
@@ -880,12 +1150,6 @@ def get_photo_datetime_with_debug(file_path: Path) -> tuple[datetime, dict[str, 
         if parsed is not None:
             debug_info["selected_source"] = metadata_key
             return parsed, debug_info
-
-    exif_datetime, exif_debug = read_exiftool_datetime_with_debug(file_path)
-    debug_info["exiftool"] = exif_debug
-    if exif_datetime is not None:
-        debug_info["selected_source"] = f"exiftool:{exif_debug.get('selected_source')}"
-        return exif_datetime, debug_info
 
     if not is_exiftool_available():
         warn_exiftool_missing_once()
@@ -933,13 +1197,58 @@ def parse_exiftool_datetime(raw_value: object) -> Optional[datetime]:
         return None
 
 
+def parse_exiftool_gps_datetime(raw_value: object) -> Optional[datetime]:
+    """Parse an EXIF GPS timestamp as UTC and normalize it to local time."""
+    if raw_value is None:
+        return None
+    cleaned = str(raw_value).strip()
+    if not cleaned:
+        return None
+    if not re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", cleaned, flags=re.IGNORECASE):
+        cleaned = f"{cleaned}Z"
+    return parse_exiftool_datetime(cleaned)
+
+
+def read_gps_datetime_from_exiftool_metadata(
+    metadata: dict[str, Any],
+) -> tuple[Optional[datetime], Optional[str], object]:
+    """Return a UTC GPS datetime plus its ExifTool source and raw value."""
+    raw_composite = metadata.get("GPSDateTime")
+    parsed = parse_exiftool_gps_datetime(raw_composite)
+    if parsed is not None:
+        return parsed, "GPSDateTime", raw_composite
+
+    raw_date = metadata.get("GPSDateStamp")
+    raw_time = metadata.get("GPSTimeStamp")
+    date_match = re.search(r"(\d{4})[:/-](\d{2})[:/-](\d{2})", str(raw_date or ""))
+    time_parts = re.findall(r"\d+(?:\.\d+)?", str(raw_time or ""))
+    if date_match is None or len(time_parts) < 3:
+        return None, None, {"GPSDateStamp": raw_date, "GPSTimeStamp": raw_time}
+    combined = (
+        f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)} "
+        f"{int(float(time_parts[0])):02d}:{int(float(time_parts[1])):02d}:{float(time_parts[2]):06.3f}Z"
+    )
+    parsed = parse_exiftool_gps_datetime(combined)
+    return parsed, "GPSDateStamp+GPSTimeStamp" if parsed is not None else None, {
+        "GPSDateStamp": raw_date,
+        "GPSTimeStamp": raw_time,
+    }
+
+
 def read_exiftool_datetime(file_path: Path) -> Optional[datetime]:
     """Read the preferred datetime from exiftool metadata."""
     metadata = read_exiftool_json(file_path)
     if not metadata:
         return None
 
-    for key in ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "CreationDate"):
+    for key in ("DateTimeOriginal", "CreationDate"):
+        parsed = parse_exiftool_datetime(metadata.get(key))
+        if parsed is not None:
+            return parsed
+    parsed, _source, _raw = read_gps_datetime_from_exiftool_metadata(metadata)
+    if parsed is not None:
+        return parsed
+    for key in ("MediaCreateDate", "CreateDate"):
         parsed = parse_exiftool_datetime(metadata.get(key))
         if parsed is not None:
             return parsed
@@ -957,7 +1266,33 @@ def read_exiftool_datetime_with_debug(file_path: Path) -> tuple[Optional[datetim
     if not metadata:
         return None, debug_info
 
-    for key in ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "CreationDate"):
+    for key in ("DateTimeOriginal", "CreationDate"):
+        raw_value = metadata.get(key)
+        parsed = parse_exiftool_datetime(raw_value)
+        debug_info["candidates"].append(
+            {
+                "source": key,
+                "raw": raw_value,
+                "parsed": parsed.isoformat() if parsed is not None else None,
+            }
+        )
+        if parsed is not None:
+            debug_info["selected_source"] = key
+            return parsed, debug_info
+
+    gps_datetime, gps_source, gps_raw = read_gps_datetime_from_exiftool_metadata(metadata)
+    debug_info["candidates"].append(
+        {
+            "source": gps_source or "GPSDateTime",
+            "raw": gps_raw,
+            "parsed": gps_datetime.isoformat() if gps_datetime is not None else None,
+        }
+    )
+    if gps_datetime is not None:
+        debug_info["selected_source"] = gps_source
+        return gps_datetime, debug_info
+
+    for key in ("MediaCreateDate", "CreateDate"):
         raw_value = metadata.get(key)
         parsed = parse_exiftool_datetime(raw_value)
         debug_info["candidates"].append(
@@ -973,22 +1308,6 @@ def read_exiftool_datetime_with_debug(file_path: Path) -> tuple[Optional[datetim
 
     debug_info["selected_source"] = "missing"
     return None, debug_info
-
-
-def get_photo_datetime_prefer_exif(file_path: Path) -> datetime:
-    """Return the best timestamp, preferring exiftool metadata."""
-    exif_datetime = read_exiftool_datetime(file_path)
-    if exif_datetime is not None:
-        return exif_datetime
-    return get_photo_datetime(file_path)
-
-
-def get_photo_datetime_prefer_exif_with_debug(file_path: Path) -> tuple[datetime, dict[str, Any]]:
-    """Return the best timestamp, preferring exiftool metadata, with debug info."""
-    exif_datetime, exif_debug = read_exiftool_datetime_with_debug(file_path)
-    if exif_datetime is not None:
-        return exif_datetime, {"selected_source": f"exiftool:{exif_debug.get('selected_source')}", "exiftool": exif_debug}
-    return get_photo_datetime_with_debug(file_path)
 
 
 def placemark_place_details(placemark: object) -> dict[str, Any]:
@@ -1203,6 +1522,35 @@ def parse_track_start_time(raw_value: object) -> Optional[datetime]:
     return None
 
 
+def track_map_sidecar_candidates(
+    item: dict[str, Any],
+    tracks_path: Path,
+    photolist: Path,
+) -> tuple[Path, ...]:
+    """Return Standard then Time-Lapse sidecar candidates for one track."""
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for key in ("track_plot_image_filename", "track_plot_time_lapse_image_filename"):
+        raw_value = item.get(key)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        raw_path = Path(raw_value.strip()).expanduser()
+        if raw_path.is_absolute():
+            image_candidates = [raw_path]
+        else:
+            image_candidates = [
+                photolist.parent / raw_path,
+                tracks_path.parent / raw_path,
+                tracks_path.parent / raw_path.name,
+            ]
+        for image_path in image_candidates:
+            sidecar_path = image_path.with_suffix(".json").resolve(strict=False)
+            if sidecar_path not in seen:
+                seen.add(sidecar_path)
+                result.append(sidecar_path)
+    return tuple(result)
+
+
 def maybe_shorten_output_path(path_text: object, photolist: Path) -> Optional[str]:
     """Shorten a path to basename when it points into the photolist directory."""
     if not isinstance(path_text, str):
@@ -1408,6 +1756,7 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
         if not isinstance(item, dict):
             continue
         start_time = parse_track_start_time(item.get("start_time"))
+        end_time = parse_track_start_time(item.get("end_time"))
         image_name = maybe_shorten_output_path(item.get("track_plot_image_filename"), photolist)
         try:
             original_sequence_number = int(item.get("original_sequence_number", item.get("nr", len(tracks) + 1)))
@@ -1416,6 +1765,14 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
         length_km = _optional_float(item.get("laenge_km", item.get("track_length_km")))
         start_latitude, start_longitude = _coordinate_pair(item.get("start_point"))
         end_latitude, end_longitude = _coordinate_pair(item.get("end_point"))
+        track_name_value = item.get("track_name")
+        track_name = track_name_value.strip() if isinstance(track_name_value, str) and track_name_value.strip() else None
+        fingerprint_value = item.get("track_fingerprint")
+        track_fingerprint = (
+            fingerprint_value.strip()
+            if isinstance(fingerprint_value, str) and fingerprint_value.strip()
+            else None
+        )
         if isinstance(item.get("track_plot_image_filename"), str):
             ignored_photo_names.add(normalize_filename_for_match(str(item["track_plot_image_filename"])))
         if start_time is None or not image_name:
@@ -1430,10 +1787,354 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
                 start_longitude=start_longitude,
                 end_latitude=end_latitude,
                 end_longitude=end_longitude,
+                end_time=end_time,
+                track_name=track_name,
+                track_fingerprint=track_fingerprint,
+                map_sidecar_paths=track_map_sidecar_candidates(item, tracks_path, photolist),
             )
         )
 
     return TracksSummary(overview_image=overview_image, tracks=tracks, ignored_photo_names=ignored_photo_names)
+
+
+class LazyTrackGpsResolver:
+    """Infer media GPS from lazily loaded, fingerprint-matched track timelines."""
+
+    def __init__(
+        self,
+        tracks_summary: Optional[TracksSummary],
+        place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+    ):
+        self.tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
+        self.place_equivalence_m = max(0.0, float(place_equivalence_m))
+        self._timeline_cache: dict[int, Optional[TrackTimeline]] = {}
+        self._reference_records: list[tuple[datetime, float, float, str]] = []
+        self._warned: set[str] = set()
+        self.inferred_count = 0
+        self.refreshed_count = 0
+        self.cleared_count = 0
+
+    @staticmethod
+    def _is_track_inferred(record: PhotoRecord) -> bool:
+        return record.gps_source == "track_time_interpolation"
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        print(f"Warning: {message}", flush=True)
+
+    def _candidate_tracks(self, photo_datetime: datetime) -> list[TrackInfo]:
+        candidates = []
+        for track in self.tracks:
+            if track.end_time is None or track.end_time < track.start_time:
+                continue
+            try:
+                if track.start_time <= photo_datetime <= track.end_time:
+                    candidates.append(track)
+            except TypeError:
+                continue
+        return candidates
+
+    def _remember_reference_record(self, record: PhotoRecord) -> None:
+        """Retain authoritative media GPS as a spatial tie-breaker."""
+        if (
+            record.latitude is None
+            or record.longitude is None
+            or self._is_track_inferred(record)
+        ):
+            return
+        reference = (
+            record.photo_datetime,
+            float(record.latitude),
+            float(record.longitude),
+            record.source_filename,
+        )
+        if reference not in self._reference_records:
+            self._reference_records.append(reference)
+
+    def _track_from_existing_inference(
+        self,
+        record: PhotoRecord,
+        candidates: list[TrackInfo],
+    ) -> Optional[TrackInfo]:
+        if not self._is_track_inferred(record) or not isinstance(record.gps_inference, dict):
+            return None
+        fingerprint = str(record.gps_inference.get("track_fingerprint") or "")
+        matches = [
+            track for track in candidates
+            if fingerprint and track.track_fingerprint == fingerprint
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _track_from_nearby_media(
+        self,
+        photo_datetime: datetime,
+        candidates: list[TrackInfo],
+    ) -> tuple[Optional[TrackInfo], Optional[dict[str, Any]]]:
+        """Resolve overlapping time intervals using nearby authoritative media GPS."""
+        nearby = []
+        for reference in self._reference_records:
+            try:
+                delta_seconds = abs((reference[0] - photo_datetime).total_seconds())
+            except TypeError:
+                continue
+            if delta_seconds <= 2.0 * 60.0 * 60.0:
+                nearby.append((delta_seconds, reference))
+        if not nearby:
+            return None, None
+        nearby.sort(key=lambda item: item[0])
+        nearby = nearby[:4]
+
+        maximum_distance_m = 500.0
+        scored = []
+        for track in candidates:
+            timeline = self._load_timeline(track)
+            if timeline is None:
+                continue
+            distances = []
+            best_reference = None
+            for _delta_seconds, reference in nearby:
+                reference_time, reference_latitude, reference_longitude, reference_name = reference
+                try:
+                    if not (track.start_time <= reference_time <= track.end_time):
+                        continue
+                except (TypeError, AttributeError):
+                    continue
+                position = self._interpolate(timeline, reference_time)
+                if position is None:
+                    continue
+                distance = distance_meters(
+                    position[0],
+                    position[1],
+                    reference_latitude,
+                    reference_longitude,
+                )
+                distances.append(distance)
+                if best_reference is None or distance < best_reference[0]:
+                    best_reference = (distance, reference_name)
+            if distances and best_reference is not None:
+                scored.append((min(distances), track, best_reference[1]))
+
+        eligible = [item for item in scored if item[0] <= maximum_distance_m]
+        if len(eligible) != 1:
+            return None, None
+        distance, track, reference_name = eligible[0]
+        return track, {
+            "track_interval_disambiguated_by": reference_name,
+            "track_interval_disambiguation_distance_m": round(distance, 3),
+        }
+
+    @staticmethod
+    def _parse_timeline(metadata: object, source_path: Path) -> Optional[TrackTimeline]:
+        if not isinstance(metadata, dict):
+            return None
+        raw_points = metadata.get("timed_track_points")
+        if not isinstance(raw_points, list) or len(raw_points) < 2:
+            return None
+        times: list[datetime] = []
+        points: list[dict[str, Any]] = []
+        for raw_point in raw_points:
+            if not isinstance(raw_point, dict):
+                return None
+            try:
+                latitude = float(raw_point["lat"])
+                longitude = float(raw_point["lon"])
+                point_time = normalize_datetime_timezone(datetime.fromisoformat(str(raw_point["time_iso"])))
+                segment_index = int(raw_point.get("segment_index", 0) or 0)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+                return None
+            if times and point_time < times[-1]:
+                return None
+            times.append(point_time)
+            points.append(
+                {
+                    "lat": latitude,
+                    "lon": longitude,
+                    "time": point_time,
+                    "segment_index": segment_index,
+                    "estimated": bool(raw_point.get("estimated", False)),
+                }
+            )
+        return TrackTimeline(tuple(times), tuple(points), source_path)
+
+    def _load_timeline(self, track: TrackInfo) -> Optional[TrackTimeline]:
+        cache_key = track.original_sequence_number
+        if cache_key in self._timeline_cache:
+            return self._timeline_cache[cache_key]
+        timeline = None
+        for sidecar_path in track.map_sidecar_paths:
+            if not sidecar_path.is_file():
+                continue
+            try:
+                metadata = read_json_data(sidecar_path)
+            except (OSError, ValueError, TypeError):
+                continue
+            if not track.track_fingerprint or not isinstance(metadata, dict):
+                continue
+            if metadata.get("track_fingerprint") != track.track_fingerprint:
+                continue
+            timeline = self._parse_timeline(metadata, sidecar_path)
+            if timeline is not None:
+                break
+        self._timeline_cache[cache_key] = timeline
+        if timeline is None:
+            self._warn_once(
+                f"timeline:{cache_key}",
+                f"Track #{cache_key} has no current timed map sidecar; run Generate and Update Maps to infer media GPS.",
+            )
+        return timeline
+
+    @staticmethod
+    def _interpolate(
+        timeline: TrackTimeline,
+        photo_datetime: datetime,
+    ) -> Optional[tuple[float, float, dict[str, Any]]]:
+        index = bisect.bisect_left(timeline.times, photo_datetime)
+        if index < len(timeline.times) and timeline.times[index] == photo_datetime:
+            point = timeline.points[index]
+            return point["lat"], point["lon"], {
+                "before_time_iso": point["time"].isoformat(),
+                "after_time_iso": point["time"].isoformat(),
+                "fraction": 0.0,
+                "timing_estimated": bool(point["estimated"]),
+            }
+        if index <= 0 or index >= len(timeline.times):
+            return None
+        before = timeline.points[index - 1]
+        after = timeline.points[index]
+        elapsed = (after["time"] - before["time"]).total_seconds()
+        if elapsed <= 0:
+            return None
+        fraction = (photo_datetime - before["time"]).total_seconds() / elapsed
+        if before["segment_index"] != after["segment_index"]:
+            selected = before if fraction <= 0.5 else after
+            latitude, longitude = selected["lat"], selected["lon"]
+        else:
+            latitude = before["lat"] + (after["lat"] - before["lat"]) * fraction
+            longitude_delta = ((after["lon"] - before["lon"] + 180.0) % 360.0) - 180.0
+            longitude = ((before["lon"] + longitude_delta * fraction + 180.0) % 360.0) - 180.0
+        return latitude, longitude, {
+            "before_time_iso": before["time"].isoformat(),
+            "after_time_iso": after["time"].isoformat(),
+            "fraction": round(fraction, 9),
+            "timing_estimated": bool(before["estimated"] or after["estimated"]),
+        }
+
+    @staticmethod
+    def _clear_inferred_gps(record: PhotoRecord) -> None:
+        record.latitude = None
+        record.longitude = None
+        record.place = None
+        record.place_details = None
+        record.gps_source = None
+        record.gps_inference = None
+        record.gps_updated = True
+
+    def apply(self, record: PhotoRecord) -> bool:
+        """Apply or refresh track-derived GPS, returning whether metadata changed."""
+        was_inferred = self._is_track_inferred(record)
+        if record.latitude is not None and record.longitude is not None and not was_inferred:
+            self._remember_reference_record(record)
+            return False
+
+        candidates = self._candidate_tracks(record.photo_datetime)
+        disambiguation_details = None
+        if len(candidates) == 1:
+            track = candidates[0]
+        elif len(candidates) > 1:
+            track = self._track_from_existing_inference(record, candidates)
+            if track is None:
+                track, disambiguation_details = self._track_from_nearby_media(
+                    record.photo_datetime,
+                    candidates,
+                )
+            if track is None:
+                self._warn_once(
+                    f"ambiguous:{record.source_filename}:{record.photo_datetime.isoformat()}",
+                    f"{record.source_filename} falls inside multiple track intervals; GPS was not inferred.",
+                )
+        else:
+            track = None
+        if track is None:
+            if was_inferred:
+                self._clear_inferred_gps(record)
+                self.cleared_count += 1
+                return True
+            return False
+
+        previous_fingerprint = ""
+        if was_inferred and isinstance(record.gps_inference, dict):
+            previous_fingerprint = str(record.gps_inference.get("track_fingerprint", ""))
+        if (
+            was_inferred
+            and record.latitude is not None
+            and record.longitude is not None
+            and previous_fingerprint
+            and previous_fingerprint == track.track_fingerprint
+        ):
+            return False
+
+        timeline = self._load_timeline(track)
+        result = self._interpolate(timeline, record.photo_datetime) if timeline is not None else None
+        if result is None:
+            if was_inferred:
+                self._clear_inferred_gps(record)
+                self.cleared_count += 1
+                return True
+            return False
+
+        latitude, longitude, details = result
+        previous_latitude = record.latitude
+        previous_longitude = record.longitude
+        coordinates_changed = (
+            previous_latitude is None
+            or previous_longitude is None
+            or not math.isclose(previous_latitude, latitude, abs_tol=1e-7)
+            or not math.isclose(previous_longitude, longitude, abs_tol=1e-7)
+        )
+        displacement = (
+            math.inf
+            if previous_latitude is None or previous_longitude is None
+            else distance_meters(
+                float(previous_latitude),
+                float(previous_longitude),
+                latitude,
+                longitude,
+            )
+        )
+        if coordinates_changed and displacement > self.place_equivalence_m:
+            record.place = None
+            record.place_details = None
+        record.latitude = latitude
+        record.longitude = longitude
+        record.gps_source = "track_time_interpolation"
+        record.gps_inference = {
+            "track_number": track.original_sequence_number,
+            "track_name": track.track_name,
+            "track_fingerprint": track.track_fingerprint,
+            "track_map_sidecar": timeline.source_path.name,
+            **details,
+        }
+        if disambiguation_details:
+            record.gps_inference.update(disambiguation_details)
+        record.gps_updated = True
+        if was_inferred:
+            self.refreshed_count += 1
+        else:
+            self.inferred_count += 1
+        return True
+
+    def emit_summary(self) -> None:
+        if self.inferred_count or self.refreshed_count or self.cleared_count:
+            print(
+                "Track-time GPS inference: "
+                f"{self.inferred_count} added, {self.refreshed_count} refreshed, "
+                f"{self.cleared_count} cleared.",
+                flush=True,
+            )
 
 
 def allowed_extensions_for_filter(file_filter: str) -> set[str]:
@@ -1642,17 +2343,15 @@ def get_json_path_for_photo(photo_path: Path) -> Path:
 
 def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRecord]:
     """Load cached metadata from a sidecar JSON file."""
-    try:
-        data = read_photo_metadata(json_path)
-    except (OSError, ValueError, TypeError):
+    status, data, _reason = validate_media_sidecar(photo_path, json_path)
+    if status != "available" or not isinstance(data, dict):
         return None
-    if not media_sidecar_matches_media(data, photo_path):
-        return None
+    return record_from_sidecar_payload(data, json_path, photo_path)
 
-    try:
-        photo_datetime = normalize_datetime_timezone(parse_photo_datetime(data.get("datetime_iso")))
-    except (TypeError, ValueError):
-        return None
+
+def record_from_sidecar_payload(data: dict[str, Any], json_path: Path, photo_path: Path) -> PhotoRecord:
+    """Build a normalized record from an already validated media sidecar."""
+    photo_datetime = normalize_datetime_timezone(parse_photo_datetime(data.get("datetime_iso")))
 
     latitude = data.get("latitude")
     longitude = data.get("longitude")
@@ -1676,6 +2375,12 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
     place_value = str(place).strip() if isinstance(place, str) and place.strip() else None
     if place_value is None and isinstance(place_details, dict):
         place_value = build_place_name_from_details(place_details)
+    gps_source = data.get("gps_source")
+    gps_inference = data.get("gps_inference")
+    if not isinstance(gps_source, str) or not gps_source.strip():
+        gps_source = None
+    if not isinstance(gps_inference, dict):
+        gps_inference = None
     return PhotoRecord(
         source_filename=photo_path.name,
         display_filename=json_path.name,
@@ -1690,6 +2395,10 @@ def load_record_from_json(json_path: Path, photo_path: Path) -> Optional[PhotoRe
         geocode_requested=False,
         place_updated=False,
         debug_info={"selected_source": "json"},
+        gps_source=gps_source,
+        gps_inference=gps_inference,
+        raw_metadata=dict(data),
+        datetime_source=str(data.get("datetime_source") or "sidecar"),
     )
 
 
@@ -1710,38 +2419,31 @@ def build_record_from_photo(
 
     if debug:
         latitude, longitude, gps_debug = read_mdls_gps_pair_with_debug(photo_path)
-        used_exif_gps = False
         if latitude is None or longitude is None:
             exif_latitude, exif_longitude, exif_gps_debug = read_exiftool_gps_pair_with_debug(photo_path)
             gps_debug["exiftool"] = exif_gps_debug
             if exif_latitude is not None and exif_longitude is not None:
                 latitude, longitude = exif_latitude, exif_longitude
                 gps_debug["source"] = f"fallback:{exif_gps_debug.get('source')}"
-                used_exif_gps = True
             elif not is_exiftool_available():
                 warn_exiftool_missing_once()
 
-        if used_exif_gps:
-            photo_datetime, datetime_debug = get_photo_datetime_prefer_exif_with_debug(photo_path)
-        else:
-            photo_datetime, datetime_debug = get_photo_datetime_with_debug(photo_path)
+        photo_datetime, datetime_debug = get_photo_datetime_with_debug(photo_path)
         debug_info["datetime"] = datetime_debug
         debug_info["gps"] = gps_debug
     else:
         latitude, longitude = read_mdls_gps_pair(photo_path)
-        used_exif_gps = False
         if latitude is None or longitude is None:
             exif_latitude, exif_longitude = read_exiftool_gps_pair(photo_path)
             if exif_latitude is not None and exif_longitude is not None:
                 latitude, longitude = exif_latitude, exif_longitude
-                used_exif_gps = True
             elif not is_exiftool_available():
                 warn_exiftool_missing_once()
 
-        if used_exif_gps:
-            photo_datetime = get_photo_datetime_prefer_exif(photo_path)
-        else:
-            photo_datetime = get_photo_datetime(photo_path)
+        # Keep timestamp provenance in normal sidecars too. This uses the same
+        # extraction calls as get_photo_datetime(), not a second metadata pass.
+        photo_datetime, datetime_debug = get_photo_datetime_with_debug(photo_path)
+        debug_info["datetime"] = datetime_debug
 
     place = None
     place_details = None
@@ -1777,6 +2479,9 @@ def build_record_from_photo(
     elif debug:
         debug_info["geocode"] = {"requested": False, "place": None}
 
+    datetime_source = None
+    if isinstance(debug_info.get("datetime"), dict):
+        datetime_source = debug_info["datetime"].get("selected_source")
     return PhotoRecord(
         source_filename=photo_path.name,
         display_filename=photo_path.name,
@@ -1791,6 +2496,8 @@ def build_record_from_photo(
         geocode_requested=getclearnames,
         place_updated=False,
         debug_info=debug_info or None,
+        gps_source="embedded" if latitude is not None and longitude is not None else None,
+        datetime_source=str(datetime_source) if datetime_source else None,
     )
 
 
@@ -1814,41 +2521,20 @@ def resolve_place_for_record(
             record.debug_info = debug_info
         return record
 
-    cache_key = (round(record.latitude, GEOCODE_ROUND_DIGITS), round(record.longitude, GEOCODE_ROUND_DIGITS))
     debug_info = dict(record.debug_info or {})
-
-    if cache_key not in geocode_cache:
-        nearby_place, nearby_distance = find_nearby_known_place(
-            record.latitude,
-            record.longitude,
-            known_places,
-            place_distance_m,
-        )
-        if nearby_place is not None:
-            geocode_cache[cache_key] = (nearby_place.place, nearby_place.place_details)
-            if debug:
-                debug_info["geocode"] = {
-                    "cache_key": cache_key,
-                    "reused_known_place": nearby_place.place,
-                    "reused_distance_m": nearby_distance,
-                    "requested": False,
-                }
-        else:
-            if debug:
-                place, place_details, geocode_debug = reverse_geocode_location_details_with_debug(
-                    record.latitude, record.longitude, timeout_seconds=geocode_timeout_seconds
-                )
-                geocode_cache[cache_key] = (place, place_details)
-                debug_info["geocode"] = {"cache_key": cache_key, "requested": True, **geocode_debug}
-            else:
-                geocode_cache[cache_key] = reverse_geocode_location_details(
-                    record.latitude, record.longitude, timeout_seconds=geocode_timeout_seconds
-                )
-            sleep_between_geocode_requests(geocode_pacing_min_seconds, geocode_pacing_max_seconds)
-    elif debug:
-        debug_info["geocode"] = {"cache_key": cache_key, "cached": True, "place": geocode_cache[cache_key][0]}
-
-    new_place, new_place_details = geocode_cache[cache_key]
+    new_place, new_place_details, geocode_debug = resolve_place_for_coordinate(
+        float(record.latitude),
+        float(record.longitude),
+        geocode_cache,
+        known_places,
+        place_distance_m,
+        debug,
+        geocode_timeout_seconds,
+        geocode_pacing_min_seconds,
+        geocode_pacing_max_seconds,
+    )
+    if debug and geocode_debug:
+        debug_info["geocode"] = geocode_debug
     if is_resolved_place_name(new_place):
         record.place = str(new_place)
         record.place_details = new_place_details
@@ -1856,6 +2542,127 @@ def resolve_place_for_record(
     record.geocode_requested = True
     record.debug_info = debug_info or None
     return record
+
+
+def resolve_place_for_coordinate(
+    latitude: float,
+    longitude: float,
+    geocode_cache: dict[
+        tuple[float, float],
+        tuple[Optional[str], Optional[dict[str, Any]]],
+    ],
+    known_places: list[KnownPlace],
+    place_distance_m: float,
+    debug: bool,
+    geocode_timeout_seconds: float = 10.0,
+    geocode_pacing_min_seconds: float = GEOCODE_PACING_MIN_SECONDS,
+    geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
+) -> tuple[Optional[str], Optional[dict[str, Any]], dict[str, Any]]:
+    """Resolve one coordinate using the same cache and radius policy as media."""
+    check_cancelled()
+    cache_key = (
+        round(float(latitude), GEOCODE_ROUND_DIGITS),
+        round(float(longitude), GEOCODE_ROUND_DIGITS),
+    )
+    debug_info: dict[str, Any] = {"cache_key": cache_key}
+    if cache_key not in geocode_cache:
+        nearby_place, nearby_distance = find_nearby_known_place(
+            float(latitude),
+            float(longitude),
+            known_places,
+            place_distance_m,
+        )
+        if nearby_place is not None:
+            geocode_cache[cache_key] = (
+                nearby_place.place,
+                nearby_place.place_details,
+            )
+            debug_info.update(
+                {
+                    "reused_known_place": nearby_place.place,
+                    "reused_distance_m": nearby_distance,
+                    "requested": False,
+                }
+            )
+        else:
+            if debug:
+                place, place_details, request_debug = (
+                    reverse_geocode_location_details_with_debug(
+                        float(latitude),
+                        float(longitude),
+                        timeout_seconds=geocode_timeout_seconds,
+                    )
+                )
+                debug_info.update({"requested": True, **request_debug})
+            else:
+                place, place_details = reverse_geocode_location_details(
+                    float(latitude),
+                    float(longitude),
+                    timeout_seconds=geocode_timeout_seconds,
+                )
+            geocode_cache[cache_key] = (place, place_details)
+            sleep_between_geocode_requests(
+                geocode_pacing_min_seconds,
+                geocode_pacing_max_seconds,
+            )
+    else:
+        debug_info.update(
+            {
+                "cached": True,
+                "place": geocode_cache[cache_key][0],
+            }
+        )
+    place, place_details = geocode_cache[cache_key]
+    return place, place_details, debug_info if debug else {}
+
+
+PLACE_DETAIL_KEYS = ("name", "locality", "subLocality", "administrativeArea", "areasOfInterest")
+
+
+def place_coordinate_for_record(record: PhotoRecord) -> Optional[dict[str, float]]:
+    """Return the coordinate provenance for a resolved place name."""
+    if (
+        not is_resolved_place_name(record.place)
+        or record.latitude is None
+        or record.longitude is None
+    ):
+        return None
+    return {"latitude": float(record.latitude), "longitude": float(record.longitude)}
+
+
+def build_record_sidecar_payload(record: PhotoRecord) -> dict[str, Any]:
+    """Build a refreshed sidecar while retaining unknown future fields."""
+    payload = dict(record.raw_metadata or {})
+    for key in {
+        "source_filename", "photo_path", "datetime_iso", "date_german", "time",
+        "latitude", "longitude", "place", "has_gps", "place_details",
+        "gps_source", "gps_inference", "source_file_signature", "datetime_source",
+        "metadata_updated_at", "place_coordinate", *PLACE_DETAIL_KEYS,
+    }:
+        payload.pop(key, None)
+    try:
+        signature = media_file_signature(record.photo_path)
+    except OSError:
+        signature = None
+    canonical = build_photo_metadata_payload(
+        source_filename=record.source_filename,
+        photo_path=record.photo_path,
+        photo_datetime=record.photo_datetime,
+        latitude=record.latitude,
+        longitude=record.longitude,
+        place=record.place,
+        place_details=record.place_details,
+        source_file_signature=signature,
+        datetime_source=record.datetime_source,
+        metadata_updated_at=datetime.now().astimezone().isoformat(),
+        place_coordinate=place_coordinate_for_record(record),
+    )
+    payload.update(canonical)
+    if record.gps_source:
+        payload["gps_source"] = record.gps_source
+    if isinstance(record.gps_inference, dict):
+        payload["gps_inference"] = record.gps_inference
+    return payload
 
 
 def write_record_json(record: PhotoRecord, protected_json_paths: set[Path]) -> None:
@@ -1868,16 +2675,60 @@ def write_record_json(record: PhotoRecord, protected_json_paths: set[Path]) -> N
     if resolved_json_path in protected_json_paths:
         raise ValueError(f"refusing to overwrite protected JSON file: {record.json_path}")
 
-    payload = build_photo_metadata_payload(
-        source_filename=record.source_filename,
-        photo_path=record.photo_path,
-        photo_datetime=record.photo_datetime,
-        latitude=record.latitude,
-        longitude=record.longitude,
-        place=record.place,
-        place_details=record.place_details,
-    )
+    payload = build_record_sidecar_payload(record)
     write_photo_metadata(payload, record.json_path)
+    record.raw_metadata = payload
+
+
+def write_record_place_fields(record: PhotoRecord) -> None:
+    """Patch only reverse-geocoded place fields in an existing sidecar."""
+    if not isinstance(record.raw_metadata, dict):
+        raise ValueError(f"no validated sidecar payload is available for {record.photo_path.name}")
+    payload = dict(record.raw_metadata)
+    payload["place"] = record.place
+    payload.pop("place_details", None)
+    for key in PLACE_DETAIL_KEYS:
+        payload.pop(key, None)
+    if isinstance(record.place_details, dict):
+        payload["place_details"] = dict(record.place_details)
+        for key in PLACE_DETAIL_KEYS:
+            if key in record.place_details:
+                payload[key] = record.place_details.get(key)
+    place_coordinate = place_coordinate_for_record(record)
+    if place_coordinate is not None:
+        payload["place_coordinate"] = place_coordinate
+    else:
+        payload.pop("place_coordinate", None)
+    write_photo_metadata(payload, record.json_path)
+    record.raw_metadata = payload
+
+
+def record_place_matches_gps(
+    record: PhotoRecord,
+    place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+) -> bool:
+    """Return whether an existing place is known to match the current GPS.
+
+    Sidecars created before coordinate provenance was introduced remain valid;
+    selected media refreshes establish the field without forcing a global
+    reverse-geocoding pass.
+    """
+    if not is_resolved_place_name(record.place):
+        return False
+    payload = record.raw_metadata if isinstance(record.raw_metadata, dict) else {}
+    coordinate = payload.get("place_coordinate")
+    if not isinstance(coordinate, dict):
+        return True
+    old_latitude = _optional_float(coordinate.get("latitude"))
+    old_longitude = _optional_float(coordinate.get("longitude"))
+    if None in {old_latitude, old_longitude, record.latitude, record.longitude}:
+        return False
+    return distance_meters(
+        float(old_latitude),
+        float(old_longitude),
+        float(record.latitude),
+        float(record.longitude),
+    ) <= max(0.0, float(place_equivalence_m))
 
 
 def emit_debug_info(record: PhotoRecord) -> None:
@@ -1959,6 +2810,54 @@ def format_place_text(
     return PLACE_FAILED
 
 
+def primary_stage_place_name(place: Optional[str]) -> Optional[str]:
+    """Return the concise locality portion suitable for a media-stage title."""
+    text = str(place or "").strip()
+    if not text or text in {
+        "-",
+        PLACE_NOT_AVAILABLE,
+        PLACE_NOT_REQUESTED,
+        PLACE_FAILED,
+    }:
+        return None
+    first_line = text.splitlines()[0].strip()
+    locality = first_line.split(",", 1)[0].strip()
+    return locality or None
+
+
+def media_stage_name(records: list[PhotoRecord]) -> str:
+    """Build a stage name from the first and last available media place."""
+    ordered = sorted(
+        records,
+        key=lambda record: (record.photo_datetime, record.source_filename.casefold()),
+    )
+    places = [
+        place_name
+        for record in ordered
+        if (place_name := primary_stage_place_name(record.place)) is not None
+    ]
+    if not places:
+        return ""
+    if places[0].casefold() == places[-1].casefold():
+        return places[0]
+    return f"{places[0]} - {places[-1]}"
+
+
+def control_media_stage_name(entries: list[dict[str, Any]]) -> str:
+    """Build a media-stage name from parsed control rows in saved order."""
+    places = [
+        place_name
+        for entry in entries
+        if entry.get("type") == "media"
+        and (place_name := primary_stage_place_name(entry.get("place"))) is not None
+    ]
+    if not places:
+        return ""
+    if places[0].casefold() == places[-1].casefold():
+        return places[0]
+    return f"{places[0]} - {places[-1]}"
+
+
 def build_unsorted_output_line(record: PhotoRecord, include_update_marker: bool = False) -> str:
     """Build the immediate output line for one record."""
     date_text = format_german_date(record.photo_datetime)
@@ -2012,6 +2911,8 @@ def build_control_sections(
     tracks_summary: Optional[TracksSummary],
     sort_date_sections_by_tracks: bool,
     media_map_filenames: Optional[dict[date, str]] = None,
+    *,
+    include_empty_track_sections: bool = False,
 ) -> list[dict[str, Any]]:
     """Build ordered normal, adjacent-day, and leftover date sections."""
     tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
@@ -2063,12 +2964,12 @@ def build_control_sections(
         }
         for relation in ("before", "normal", "after"):
             if relation == "normal":
-                if track_day in exact_records:
+                if include_empty_track_sections or track_day in exact_records:
                     group_sections.append(
                         {
                             "date": track_day,
                             "maps": [("Map", track.track_plot_image_filename) for track in day_tracks],
-                            "records": sorted_media(exact_records[track_day]),
+                            "records": sorted_media(exact_records.get(track_day, [])),
                             "relation": None,
                         }
                     )
@@ -2201,41 +3102,129 @@ def render_media_map_specs(
     specs: list[dict[str, Any]],
     sorted_output_path: Path,
     options: Optional[dict[str, Any]],
+    output_writer=None,
 ) -> list[Path]:
     """Render media-map specifications through one shared variant-aware path."""
     if options is None:
         return []
+    if options.get("skip_rendering"):
+        return []
     output_dir = Path(options.get("output_dir") or (sorted_output_path.parent / "trackimages"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    map_layout = str(options.get("map_layout", "standard"))
+    requested_layouts = options.get("map_layouts")
+    if isinstance(requested_layouts, (list, tuple)):
+        map_layouts = tuple(
+            layout for layout in (str(value) for value in requested_layouts) if layout in {"standard", "time-lapse"}
+        )
+    else:
+        map_layouts = (str(options.get("map_layout", "standard")),)
+    map_layouts = tuple(dict.fromkeys(map_layouts)) or ("standard",)
     render_options = {
         key: value
         for key, value in options.items()
-        if key not in {"output_dir", "filename_base"}
+        if key not in {
+            "output_dir",
+            "filename_base",
+            "map_layouts",
+            "map_failures",
+            "skip_rendering",
+            "continue_on_map_error",
+            "adventure_render_parameters_by_layout",
+            "adventure_overview_render_parameters",
+            "only_missing_or_stale",
+        }
     }
     rendered = []
+    failures = options.setdefault("map_failures", []) if options.get("continue_on_map_error") else None
+    stop_after_failure = False
     for spec in specs:
-        check_cancelled()
-        output_name = media_map_output_filename(spec["filename"], map_layout)
-        print(f"Creating {map_layout} media location map: {output_name}")
-        render_media_location_map(
-            spec["coordinates"],
-            spec["date"],
-            output_dir / output_name,
-            **render_options,
-        )
-        rendered.append((output_dir / output_name).resolve(strict=False))
+        if stop_after_failure:
+            break
+        for map_layout in map_layouts:
+            check_cancelled()
+            output_name = media_map_output_filename(spec["filename"], map_layout)
+            output_path = output_dir / output_name
+            layout_options = dict(render_options)
+            layout_options["map_layout"] = map_layout
+            signatures = options.get("adventure_render_parameters_by_layout")
+            if isinstance(signatures, dict) and isinstance(signatures.get(map_layout), dict):
+                layout_options["adventure_render_parameters"] = signatures[map_layout]
+            if options.get("only_missing_or_stale") and media_map_variant_is_current(
+                output_path,
+                spec,
+                map_layout,
+                layout_options.get("adventure_render_parameters"),
+            ):
+                print(
+                    f"Keeping current {map_layout} media location map: {output_name}",
+                    file=output_writer,
+                )
+                continue
+            print(
+                f"Creating {map_layout} media location map: {output_name}",
+                file=output_writer,
+            )
+            try:
+                render_media_location_map(
+                    spec["coordinates"],
+                    spec["date"],
+                    output_path,
+                    media_points=spec.get("media_points"),
+                    stage_name=spec.get("stage_name", ""),
+                    **layout_options,
+                )
+            except Exception as exc:
+                if failures is None:
+                    raise
+                failures.append({"filename": output_name, "error": str(exc)})
+                options["skip_rendering"] = True
+                print(
+                    f"Could not create {output_name}: {exc}",
+                    file=output_writer,
+                    flush=True,
+                )
+                stop_after_failure = True
+                break
+            rendered.append((output_dir / output_name).resolve(strict=False))
     return rendered
 
 
-def create_media_maps_for_sections(
+def media_map_variant_is_current(
+    output_path: Path,
+    spec: dict[str, Any],
+    map_layout: str,
+    expected_parameters: Optional[dict[str, Any]],
+) -> bool:
+    """Return whether one media-map variant matches geometry and render settings."""
+    if not output_path.is_file():
+        return False
+    try:
+        metadata = read_json_data(output_path.with_suffix(".json"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    if not media_map_metadata_matches_coordinates(
+        metadata,
+        spec["date"],
+        spec["coordinates"],
+    ):
+        return False
+    if str(metadata.get("map_layout", "standard")) != str(map_layout):
+        return False
+    if isinstance(expected_parameters, dict):
+        return metadata.get("adventure_render_parameters") == expected_parameters
+    return True
+
+
+def media_map_specs_for_sections(
     sections: list[dict[str, Any]],
     sorted_output_path: Path,
     options: Optional[dict[str, Any]],
-) -> dict[date, str]:
-    """Render location maps for leftover date sections that contain GPS media."""
+) -> tuple[list[dict[str, Any]], dict[date, str]]:
+    """Build deterministic media-map specifications without rendering them."""
     if options is None:
-        return {}
+        return [], {}
     filename_base = options.get("filename_base")
     filenames: dict[date, str] = {}
     specs = []
@@ -2251,22 +3240,270 @@ def create_media_maps_for_sections(
         if not coordinates:
             continue
         filename = media_map_filename(sorted_output_path, section["date"], filename_base)
-        specs.append({"date": section["date"], "filename": filename, "coordinates": coordinates})
+        specs.append(
+            {
+                "date": section["date"],
+                "filename": filename,
+                "coordinates": coordinates,
+                "stage_name": media_stage_name(section["records"]),
+                "media_points": [
+                    {
+                        "lat": record.latitude,
+                        "lon": record.longitude,
+                        "time_iso": record.photo_datetime.isoformat(),
+                        "source_name": record.photo_path.name,
+                    }
+                    for record in section["records"]
+                    if record.latitude is not None and record.longitude is not None
+                ],
+            }
+        )
         filenames[section["date"]] = filename
+    return specs, filenames
+
+
+def create_media_maps_for_sections(
+    sections: list[dict[str, Any]],
+    sorted_output_path: Path,
+    options: Optional[dict[str, Any]],
+) -> dict[date, str]:
+    """Render location maps for leftover date sections that contain GPS media."""
+    if options is None:
+        return {}
+    specs, filenames = media_map_specs_for_sections(
+        sections,
+        sorted_output_path,
+        options,
+    )
     render_media_map_specs(specs, sorted_output_path, options)
     return filenames
+
+
+def create_media_overview_for_records(
+    records: list[PhotoRecord],
+    sorted_output_path: Path,
+    options: Optional[dict[str, Any]],
+    output_writer=None,
+) -> Optional[str]:
+    """Create the shared overview used by a media-only Adventure."""
+    if options is None:
+        return None
+    media_points = [
+        {
+            "lat": record.latitude,
+            "lon": record.longitude,
+            "time_iso": record.photo_datetime.isoformat(),
+            "source_name": record.photo_path.name,
+        }
+        for record in records
+        if record.latitude is not None and record.longitude is not None
+    ]
+    if not media_points:
+        return None
+    output_dir = Path(options.get("output_dir") or (sorted_output_path.parent / "trackimages"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename_base = str(options.get("filename_base") or sorted_output_path.stem.removesuffix("-sorted"))
+    output_name = f"{filename_base}.png"
+    if options.get("skip_rendering") or options.get("map_failures"):
+        return output_name
+    output_path = output_dir / output_name
+    expected_parameters = options.get(
+        "adventure_overview_render_parameters",
+        options.get("adventure_render_parameters"),
+    )
+    if options.get("only_missing_or_stale") and media_overview_is_current(
+        output_path,
+        media_points,
+        expected_parameters,
+    ):
+        print(f"Keeping current media overview: {output_name}", file=output_writer)
+        return output_name
+    print(f"Creating media Tour Overview: {output_name}", file=output_writer)
+    render_media_overview_map(
+        [(point["lat"], point["lon"]) for point in media_points],
+        output_path,
+        media_points=media_points,
+        header=filename_base,
+        zoom_level=int(options.get("zoom_level", 8)),
+        image_size=tuple(options.get("image_size", (1600, 1200))),
+        font_factor=float(options.get("font_factor", 1.0)),
+        use_esri=bool(options.get("use_esri", False)),
+        background_color=str(options.get("background_color", "black")),
+        title_color=str(options.get("title_color", "white")),
+        map_provider=str(options.get("map_provider", "osm")),
+        custom_map_url=str(options.get("custom_map_url", "")),
+        custom_map_attribution=str(options.get("custom_map_attribution", "")),
+        maximum_map_zoom=int(options.get("maximum_map_zoom", 19)),
+        map_request_timeout_seconds=float(options.get("map_request_timeout_seconds", 12.0)),
+        adventure_render_parameters=options.get("adventure_overview_render_parameters", options.get("adventure_render_parameters")),
+    )
+    return output_name
+
+
+def media_overview_is_current(
+    output_path: Path,
+    media_points: list[dict[str, Any]],
+    expected_parameters: Optional[dict[str, Any]],
+) -> bool:
+    """Return whether the shared media overview matches its points and settings."""
+    if not output_path.is_file():
+        return False
+    try:
+        metadata = read_json_data(output_path.with_suffix(".json"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    expected_fingerprint = media_overview_fingerprint(
+        [(point["lat"], point["lon"]) for point in media_points]
+    )
+    if str(metadata.get("media_fingerprint", "")) != expected_fingerprint:
+        return False
+    if isinstance(expected_parameters, dict):
+        return metadata.get("adventure_render_parameters") == expected_parameters
+    return True
+
+
+def build_project_map_plan(
+    records: list[PhotoRecord],
+    sorted_output_path: Path,
+    tracks_summary: Optional[TracksSummary],
+    sort_date_sections_by_tracks: bool,
+    media_map_options: Optional[dict[str, Any]],
+) -> ProjectMapPlan:
+    """Build one deterministic stage plan shared by maps and control output."""
+    sections = build_control_sections(
+        records,
+        tracks_summary,
+        sort_date_sections_by_tracks,
+        include_empty_track_sections=True,
+    )
+    specs, filenames = media_map_specs_for_sections(
+        sections,
+        sorted_output_path,
+        media_map_options,
+    )
+    if filenames:
+        sections = build_control_sections(
+            records,
+            tracks_summary,
+            sort_date_sections_by_tracks,
+            filenames,
+            include_empty_track_sections=True,
+        )
+    overview_points = [
+        {
+            "lat": record.latitude,
+            "lon": record.longitude,
+            "time_iso": record.photo_datetime.isoformat(),
+            "source_name": record.photo_path.name,
+        }
+        for record in records
+        if record.latitude is not None and record.longitude is not None
+    ]
+    overview_name = None
+    if tracks_summary and tracks_summary.overview_image:
+        overview_name = tracks_summary.overview_image
+    elif overview_points and media_map_options is not None:
+        filename_base = str(
+            media_map_options.get("filename_base")
+            or sorted_output_path.stem.removesuffix("-sorted")
+        )
+        overview_name = f"{filename_base}.png"
+    return ProjectMapPlan(
+        records=list(records),
+        sections=sections,
+        media_map_specs=specs,
+        overview_name=overview_name,
+        overview_points=overview_points,
+        tracks_summary=tracks_summary,
+    )
+
+
+def render_project_map_plan(
+    plan: ProjectMapPlan,
+    sorted_output_path: Path,
+    media_map_options: Optional[dict[str, Any]],
+    output_writer=None,
+) -> list[Path]:
+    """Render the media portion of a shared project map plan."""
+    rendered = render_media_map_specs(
+        plan.media_map_specs,
+        sorted_output_path,
+        media_map_options,
+        output_writer=output_writer,
+    )
+    if plan.tracks_summary is None or not plan.tracks_summary.tracks:
+        create_media_overview_for_records(
+            plan.records,
+            sorted_output_path,
+            media_map_options,
+            output_writer=output_writer,
+        )
+    return rendered
+
+
+def project_map_plan_from_sidecars(
+    project_dir: Path | str,
+    sorted_output_path: Path | str,
+    *,
+    tracks_summary_path: Path | str | None = None,
+    sort_date_sections_by_tracks: bool = False,
+    media_map_options: Optional[dict[str, Any]] = None,
+    infer_gps_from_tracks: bool = True,
+    place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+) -> ProjectMapPlan:
+    """Load valid media sidecars and build a map plan without extracting metadata."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    output = Path(sorted_output_path).expanduser().resolve(strict=False)
+    tracks_summary = load_tracks_summary(
+        Path(tracks_summary_path).expanduser().resolve(strict=False)
+        if tracks_summary_path is not None
+        else None,
+        output,
+    )
+    media_files = exclude_tracks_images(
+        list_photo_files(project, "ALL"),
+        tracks_summary,
+    )
+    resolver = (
+        LazyTrackGpsResolver(tracks_summary, place_equivalence_m)
+        if infer_gps_from_tracks and tracks_summary is not None
+        else None
+    )
+    records = []
+    for media_path in media_files:
+        record = load_record_from_json(get_json_path_for_photo(media_path), media_path)
+        if record is None:
+            continue
+        if resolver is not None and resolver.apply(record):
+            write_record_json(record, set())
+        records.append(record)
+    if resolver is not None:
+        resolver.emit_summary()
+    return build_project_map_plan(
+        records,
+        output,
+        tracks_summary,
+        sort_date_sections_by_tracks,
+        media_map_options,
+    )
 
 
 def add_media_maps_to_control_entries(
     entries: list[dict[str, Any]],
     sorted_output_path: Path,
     options: Optional[dict[str, Any]],
+    affected_dates: Optional[set[date]] = None,
 ) -> int:
-    """Create and insert maps for mapless date sections in a merged list."""
+    """Reconcile media maps for mapless date sections in a merged list."""
     if options is None:
         return 0
     inserted = 0
     for header_index, end_index in reversed(_control_section_ranges(entries)):
+        media_day = entries[header_index].get("date")
+        if affected_dates is not None and media_day not in affected_dates:
+            continue
         section_entries = entries[header_index + 1 : end_index]
         if any(entry.get("type") in {"map", "map_before", "map_after"} for entry in section_entries):
             continue
@@ -2275,8 +3512,9 @@ def add_media_maps_to_control_entries(
             None,
         )
         coordinates = control_media_coordinates(section_entries)
-        media_day = entries[header_index].get("date")
         if not coordinates or not isinstance(media_day, date):
+            if existing_media_map is not None:
+                entries.remove(existing_media_map)
             continue
         filename = (
             str(existing_media_map.get("name"))
@@ -2296,7 +3534,7 @@ def add_media_maps_to_control_entries(
         )
         inserted += 1
     render_media_map_specs(
-        media_map_specs_from_control_entries(entries),
+        media_map_specs_from_control_entries(entries, affected_dates=affected_dates),
         sorted_output_path,
         options,
     )
@@ -2320,11 +3558,41 @@ def control_media_coordinates(entries: list[dict[str, Any]]) -> list[tuple[float
     return coordinates
 
 
-def media_map_specs_from_control_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def control_media_points(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ordered, named and timed media points from control rows."""
+    result = []
+    for entry in entries:
+        if entry.get("type") != "media":
+            continue
+        parts = [part.strip() for part in str(entry.get("line", "")).split("|")]
+        if len(parts) < 3 or "," not in parts[2]:
+            continue
+        try:
+            latitude_text, longitude_text = parts[2].split(",", 1)
+            point = {
+                "lat": float(latitude_text),
+                "lon": float(longitude_text),
+                "source_name": str(entry.get("name") or parts[0]),
+            }
+        except ValueError:
+            continue
+        timestamp = entry.get("datetime")
+        if isinstance(timestamp, datetime):
+            point["time_iso"] = timestamp.isoformat()
+        result.append(point)
+    return result
+
+
+def media_map_specs_from_control_entries(
+    entries: list[dict[str, Any]],
+    affected_dates: Optional[set[date]] = None,
+) -> list[dict[str, Any]]:
     """Return canonical media-map render specifications from parsed control rows."""
     specs = []
     for header_index, end_index in _control_section_ranges(entries):
         media_day = entries[header_index].get("date")
+        if affected_dates is not None and media_day not in affected_dates:
+            continue
         section_entries = entries[header_index + 1 : end_index]
         media_map_entry = next(
             (entry for entry in section_entries if entry.get("type") == "media_map"),
@@ -2340,6 +3608,8 @@ def media_map_specs_from_control_entries(entries: list[dict[str, Any]]) -> list[
                 "date": media_day,
                 "filename": str(media_map_entry.get("name", "")).strip(),
                 "coordinates": coordinates,
+                "stage_name": control_media_stage_name(section_entries),
+                "media_points": control_media_points(section_entries),
             }
         )
     return [spec for spec in specs if spec["filename"]]
@@ -2353,22 +3623,32 @@ def write_sorted_output(
     media_map_options: Optional[dict[str, Any]] = None,
 ) -> None:
     """Write the grouped sorted list after collecting all records."""
-    sections = build_control_sections(records, tracks_summary, sort_date_sections_by_tracks)
-    media_map_filenames = create_media_maps_for_sections(sections, sorted_output_path, media_map_options)
-    if media_map_filenames:
-        sections = build_control_sections(
-            records,
-            tracks_summary,
-            sort_date_sections_by_tracks,
-            media_map_filenames,
+    plan = build_project_map_plan(
+        records,
+        sorted_output_path,
+        tracks_summary,
+        sort_date_sections_by_tracks,
+        media_map_options,
+    )
+    media_overview = plan.overview_name
+    try:
+        render_project_map_plan(plan, sorted_output_path, media_map_options)
+    except Exception as exc:
+        if not (media_map_options and media_map_options.get("continue_on_map_error")):
+            raise
+        media_map_options.setdefault("map_failures", []).append(
+            {"filename": "project maps", "error": str(exc)}
         )
+        print(f"Could not create project maps: {exc}", flush=True)
     sorted_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sorted_output_path.open("w", encoding="utf-8") as output_file:
         if tracks_summary and tracks_summary.overview_image:
             output_file.write(f"#Overviewmap: {tracks_summary.overview_image}\n")
+        elif media_overview:
+            output_file.write(f"#Overviewmap: {media_overview}\n")
 
-        for section in sections:
+        for section in plan.sections:
             date_datetime = datetime.combine(section["date"], datetime.min.time()).replace(tzinfo=LOCAL_TIMEZONE)
             output_file.write(f"#Datum: {format_german_date(date_datetime)}\n")
             for keyword, filename in section["maps"]:
@@ -2443,7 +3723,14 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
         else:
             parts = [part.strip() for part in content.split("|")]
             if parts:
-                entry.update({"type": "media", "name": parts[0], "date": current_date})
+                entry.update(
+                    {
+                        "type": "media",
+                        "name": parts[0],
+                        "date": current_date,
+                        "place": parts[3] if len(parts) > 3 else "",
+                    }
+                )
                 if len(parts) > 1 and current_date is not None:
                     try:
                         parsed_time = datetime.strptime(parts[1], "%H:%M").time()
@@ -2591,6 +3878,69 @@ def ensure_date_section(
     return insert_at, insert_at + 1
 
 
+def _date_section_bounds_containing(
+    entries: list[dict[str, Any]],
+    entry_index: int,
+) -> tuple[int, int]:
+    """Return the date-section bounds containing one parsed entry."""
+    start = entry_index
+    while start > 0 and entries[start].get("type") != "date":
+        start -= 1
+    if entries[start].get("type") != "date":
+        start = entry_index
+    end = len(entries)
+    for index in range(entry_index + 1, len(entries)):
+        if entries[index].get("type") == "date":
+            end = index
+            break
+    return start, end
+
+
+def _track_relative_section_insert_index(
+    entries: list[dict[str, Any]],
+    track: TrackInfo,
+    tracks_summary: TracksSummary,
+    sort_date_sections_by_tracks: bool,
+) -> Optional[int]:
+    """Place a missing stage beside its nearest existing canonical stage."""
+    ordered_tracks = sorted(
+        tracks_summary.tracks,
+        key=(
+            (lambda item: (item.original_sequence_number, item.start_time))
+            if sort_date_sections_by_tracks
+            else (lambda item: (item.start_time, item.original_sequence_number))
+        ),
+    )
+    order = {
+        _canonical_control_track_map_name(item.track_plot_image_filename): index
+        for index, item in enumerate(ordered_tracks)
+        if item.track_plot_image_filename
+    }
+    target_key = _canonical_control_track_map_name(track.track_plot_image_filename)
+    target_order = order.get(target_key)
+    if target_order is None:
+        return None
+
+    existing = []
+    for index, entry in enumerate(entries):
+        if entry.get("type") != "map" or not entry.get("name"):
+            continue
+        entry_order = order.get(_canonical_control_track_map_name(str(entry["name"])))
+        if entry_order is not None:
+            existing.append((entry_order, index))
+    predecessors = [item for item in existing if item[0] < target_order]
+    if predecessors:
+        _order, entry_index = max(predecessors, key=lambda item: item[0])
+        _start, end = _date_section_bounds_containing(entries, entry_index)
+        return end
+    successors = [item for item in existing if item[0] > target_order]
+    if successors:
+        _order, entry_index = min(successors, key=lambda item: item[0])
+        start, _end = _date_section_bounds_containing(entries, entry_index)
+        return start
+    return None
+
+
 def insert_map_entry(
     entries: list[dict[str, Any]],
     track: TrackInfo,
@@ -2599,7 +3949,35 @@ def insert_map_entry(
 ) -> None:
     """Insert one missing #Map line into its date section."""
     day = track.start_time.date()
-    header_index, end_index = ensure_date_section(entries, day, tracks_summary, sort_date_sections_by_tracks)
+    header_index, end_index = find_date_section(entries, day)
+    if header_index is None:
+        insert_at = _track_relative_section_insert_index(
+            entries,
+            track,
+            tracks_summary,
+            sort_date_sections_by_tracks,
+        )
+        if insert_at is None:
+            header_index, end_index = ensure_date_section(
+                entries,
+                day,
+                tracks_summary,
+                sort_date_sections_by_tracks,
+            )
+        else:
+            date_datetime = datetime.combine(day, datetime.min.time()).astimezone()
+            label = format_german_date(date_datetime)
+            entries.insert(
+                insert_at,
+                {
+                    "line": f"#Datum: {label}",
+                    "type": "date",
+                    "date": day,
+                    "date_label": label,
+                    "name": label,
+                },
+            )
+            header_index, end_index = insert_at, insert_at + 1
     insert_at = header_index + 1
     for index in range(header_index + 1, end_index):
         if entries[index].get("type") == "map":
@@ -2607,13 +3985,14 @@ def insert_map_entry(
             continue
         if entries[index].get("type") == "media":
             break
+    image_name = Path(track.track_plot_image_filename).name
     entries.insert(
         insert_at,
         {
-            "line": f"#Map: {track.track_plot_image_filename}",
+            "line": f"#Map: {image_name}",
             "type": "map",
             "date": day,
-            "name": track.track_plot_image_filename,
+            "name": image_name,
         },
     )
 
@@ -2839,11 +4218,989 @@ def insert_classified_media_entry(
     _insert_media_in_section(entries, insert_at, insert_at + 1, record)
 
 
-def record_for_merge_media(params: Params, media_path: Path) -> PhotoRecord:
+def _media_record_gps_distance(
+    old_record: Optional[PhotoRecord],
+    new_record: PhotoRecord,
+) -> Optional[float]:
+    """Return GPS displacement, or None when both records have no GPS."""
+    old_pair = None if old_record is None else (old_record.latitude, old_record.longitude)
+    new_pair = (new_record.latitude, new_record.longitude)
+    if old_pair == (None, None) and new_pair == (None, None):
+        return None
+    if old_pair is None or None in old_pair or None in new_pair:
+        return math.inf
+    return distance_meters(float(old_pair[0]), float(old_pair[1]), float(new_pair[0]), float(new_pair[1]))
+
+
+def _control_media_record(entry: dict[str, Any], media_path: Path) -> Optional[PhotoRecord]:
+    """Build a comparison-only record from one saved control-file media row."""
+    timestamp = entry.get("datetime")
+    if not isinstance(timestamp, datetime):
+        return None
+    parts = [part.strip() for part in str(entry.get("line", "")).split("|")]
+    latitude = None
+    longitude = None
+    if len(parts) > 2 and "," in parts[2] and parts[2] != GPS_NOT_AVAILABLE:
+        try:
+            latitude_text, longitude_text = parts[2].split(",", 1)
+            latitude = float(latitude_text)
+            longitude = float(longitude_text)
+        except ValueError:
+            latitude = None
+            longitude = None
+    place = str(entry.get("place", "") or "").strip()
+    if not is_resolved_place_name(place):
+        place = None
+    return PhotoRecord(
+        source_filename=media_path.name,
+        display_filename=media_path.name,
+        photo_path=media_path,
+        json_path=media_sidecar_path(media_path),
+        photo_datetime=timestamp,
+        latitude=latitude,
+        longitude=longitude,
+        place=place,
+        place_details=None,
+        source="control_file",
+        geocode_requested=False,
+        place_updated=False,
+        debug_info={"selected_source": "control_file"},
+        gps_source="control_file" if latitude is not None and longitude is not None else None,
+        datetime_source="control_file",
+    )
+
+
+def _control_section_description(entries: list[dict[str, Any]], entry_index: int) -> str:
+    """Return a compact human-readable description of one control section."""
+    entry = entries[entry_index]
+    day = entry.get("date")
+    prefix = day.isoformat() if isinstance(day, date) else "No date"
+    header_index = None
+    end_index = len(entries)
+    for start, end in _control_section_ranges(entries):
+        if start < entry_index < end:
+            header_index, end_index = start, end
+            break
+    if header_index is None:
+        return prefix
+    map_entry = next(
+        (
+            candidate
+            for candidate in entries[header_index + 1 : end_index]
+            if candidate.get("type") in {"map", "map_before", "map_after", "media_map"}
+        ),
+        None,
+    )
+    if map_entry is None:
+        return f"{prefix} - Media section"
+    relation = {
+        "map": "Track",
+        "map_before": "Day before",
+        "map_after": "Day after",
+        "media_map": "Media map",
+    }.get(str(map_entry.get("type")), "Map")
+    return f"{prefix} - {relation}"
+
+
+def _proposed_media_section(
+    record: PhotoRecord,
+    tracks_summary: Optional[TracksSummary],
+    sort_date_sections_by_tracks: bool,
+) -> str:
+    sections = build_control_sections([record], tracks_summary, sort_date_sections_by_tracks)
+    if not sections:
+        return record.photo_datetime.date().isoformat()
+    section = sections[0]
+    maps = section.get("maps", [])
+    relation = "Media section"
+    if maps:
+        relation = {
+            "Map": "Track",
+            "MapBefore": "Day before",
+            "MapAfter": "Day after",
+            "MediaMap": "Media map",
+        }.get(str(maps[0][0]), str(maps[0][0]))
+    return f"{section['date'].isoformat()} - {relation}"
+
+
+def _control_track_map_file_exists(project_dir: Path, filename: str) -> bool:
+    """Return whether a canonical or alternate Track Map variant exists."""
+    name = Path(str(filename)).name
+    names = track_map_variant_names(name, prefer_time_lapse=False) if re.match(r"^\d+_", name) else [name]
+    return any(
+        candidate.exists() and candidate.is_file()
+        for candidate_name in names
+        for candidate in (project_dir / candidate_name, project_dir / "trackimages" / candidate_name)
+    )
+
+
+def _canonical_control_track_map_name(filename: str) -> str:
+    canonical = canonical_track_map_name(Path(str(filename)).name)
+    return normalize_track_plot_filename_for_match(canonical)
+
+
+def analyze_track_map_reference_updates(
+    project_dir: Path | str,
+    control_file: Path | str,
+    tracks_summary_path: Optional[Path | str],
+    *,
+    control_entries: Optional[list[dict[str, Any]]] = None,
+    tracks_summary: Optional[TracksSummary] = None,
+    summary_current: bool = True,
+    sort_date_sections_by_tracks: bool = False,
+) -> TrackMapReferenceUpdatePlan:
+    """Compare control-file Track Map directives with one current summary."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    control_path = Path(control_file).expanduser().resolve(strict=False)
+    summary_path = (
+        Path(tracks_summary_path).expanduser().resolve(strict=False)
+        if tracks_summary_path is not None else None
+    )
+    plan = TrackMapReferenceUpdatePlan(summary_current=bool(summary_current))
+    if not control_path.is_file():
+        plan.warning = "No slide show control file is available."
+        return plan
+    if summary_path is None or not summary_path.is_file():
+        plan.warning = "Track summary missing; run Generate and Update Maps first."
+        return plan
+    if tracks_summary is None:
+        tracks_summary = load_tracks_summary(summary_path, control_path)
+    if tracks_summary is None:
+        plan.warning = "Track summary is invalid; run Generate and Update Maps first."
+        return plan
+    plan.summary_available = True
+    if not summary_current:
+        plan.warning = "Maps or their summary are not current; run Generate and Update Maps first."
+        return plan
+    if control_entries is None:
+        control_entries = parse_control_file_entries(
+            control_path.read_text(encoding="utf-8").splitlines()
+        )
+
+    existing_names = {
+        normalize_filename_for_match(str(entry.get("name", "")))
+        for entry in control_entries if entry.get("name")
+    }
+    existing_map_keys = {
+        (
+            _canonical_control_track_map_name(str(entry.get("name", ""))),
+            entry.get("date"),
+        )
+        for entry in control_entries
+        if entry.get("type") == "map" and entry.get("name")
+    }
+    expected_map_names = {
+        _canonical_control_track_map_name(Path(track.track_plot_image_filename).name)
+        for track in tracks_summary.tracks if track.track_plot_image_filename
+    }
+    expected_map_dates: dict[str, set[date]] = {}
+    for track in tracks_summary.tracks:
+        if not track.track_plot_image_filename:
+            continue
+        key = _canonical_control_track_map_name(track.track_plot_image_filename)
+        expected_map_dates.setdefault(key, set()).add(track.start_time.date())
+    expected_by_number = {
+        int(track.original_sequence_number): Path(track.track_plot_image_filename).name
+        for track in tracks_summary.tracks if track.track_plot_image_filename
+    }
+    if tracks_summary.overview_image:
+        overview_filename = Path(tracks_summary.overview_image).name
+        overview_name = normalize_filename_for_match(overview_filename)
+        if (
+            overview_name not in existing_names
+            and _control_track_map_file_exists(project, overview_filename)
+        ):
+            plan.missing_overview.append(overview_filename)
+    for track in tracks_summary.tracks:
+        image_name = Path(track.track_plot_image_filename).name
+        if not image_name or not _control_track_map_file_exists(project, image_name):
+            continue
+        expected_key = (_canonical_control_track_map_name(image_name), track.start_time.date())
+        if expected_key not in existing_map_keys:
+            plan.missing_tracks.append(image_name)
+
+    expected_overview = (
+        normalize_filename_for_match(Path(tracks_summary.overview_image).name)
+        if tracks_summary.overview_image else None
+    )
+    for entry in control_entries:
+        entry_type = entry.get("type")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            continue
+        if entry_type == "overview":
+            if (
+                normalize_filename_for_match(name) != expected_overview
+                or not _control_track_map_file_exists(project, name)
+            ):
+                plan.obsolete_overview.append(name)
+        elif entry_type == "map":
+            normalized_map = _canonical_control_track_map_name(name)
+            if (
+                normalized_map not in expected_map_names
+                or entry.get("date") not in expected_map_dates.get(normalized_map, set())
+                or not _control_track_map_file_exists(project, name)
+            ):
+                plan.obsolete_tracks.append(name)
+        elif entry_type in {"map_before", "map_after"}:
+            normalized = _canonical_control_track_map_name(name)
+            number_match = re.match(r"^0*(\d+)_", Path(name).name)
+            entry_date = entry.get("date")
+            date_candidates = []
+            if entry_date is not None:
+                target_date = entry_date + timedelta(
+                    days=1 if entry_type == "map_before" else -1
+                )
+                date_candidates = [
+                    track for track in tracks_summary.tracks
+                    if track.start_time.date() == target_date
+                    and track.track_plot_image_filename
+                ]
+            replacement = None
+            if len(date_candidates) == 1:
+                replacement = Path(date_candidates[0].track_plot_image_filename).name
+            elif date_candidates and number_match:
+                old_number = int(number_match.group(1))
+                replacement = next(
+                    (
+                        Path(track.track_plot_image_filename).name for track in date_candidates
+                        if track.original_sequence_number == old_number
+                    ),
+                    Path(date_candidates[0].track_plot_image_filename).name,
+                )
+            elif date_candidates:
+                replacement = Path(date_candidates[0].track_plot_image_filename).name
+            elif entry_date is None and number_match:
+                replacement = expected_by_number.get(int(number_match.group(1)))
+            if (
+                replacement
+                and normalized == _canonical_control_track_map_name(replacement)
+                and _control_track_map_file_exists(project, name)
+            ):
+                continue
+            if replacement and _control_track_map_file_exists(project, replacement):
+                plan.special_updates.append((name, replacement, str(entry_type)))
+            else:
+                plan.obsolete_tracks.append(name)
+
+    ordered_tracks = sorted(
+        tracks_summary.tracks,
+        key=(
+            (lambda item: (item.original_sequence_number, item.start_time))
+            if sort_date_sections_by_tracks
+            else (lambda item: (item.start_time, item.original_sequence_number))
+        ),
+    )
+    expected_order = {
+        _canonical_control_track_map_name(track.track_plot_image_filename): index
+        for index, track in enumerate(ordered_tracks)
+        if track.track_plot_image_filename
+    }
+    map_rows = []
+    for index, entry in enumerate(control_entries):
+        if entry.get("type") != "map" or not entry.get("name"):
+            continue
+        key = _canonical_control_track_map_name(str(entry["name"]))
+        if key in expected_order:
+            map_rows.append((index, expected_order[key], str(entry["name"])))
+    if map_rows:
+        tails: list[int] = []
+        predecessors = [-1] * len(map_rows)
+        tail_indexes: list[int] = []
+        for row_index, (_entry_index, rank, _name) in enumerate(map_rows):
+            position = bisect.bisect_left(tails, rank)
+            if position == len(tails):
+                tails.append(rank)
+                tail_indexes.append(row_index)
+            else:
+                tails[position] = rank
+                tail_indexes[position] = row_index
+            if position > 0:
+                predecessors[row_index] = tail_indexes[position - 1]
+        longest_indexes = set()
+        cursor = tail_indexes[-1]
+        while cursor >= 0:
+            longest_indexes.add(cursor)
+            cursor = predecessors[cursor]
+        for row_index, (entry_index, _rank, name) in enumerate(map_rows):
+            if row_index in longest_indexes:
+                continue
+            section_start, section_end = _date_section_bounds_containing(
+                control_entries,
+                entry_index,
+            )
+            section = control_entries[section_start:section_end]
+            normal_maps = [item for item in section if item.get("type") == "map"]
+            media_rows = [item for item in section if item.get("type") == "media"]
+            if len(normal_maps) == 1 and not media_rows:
+                plan.reordered_tracks.append(name)
+    return plan
+
+
+def analyze_media_updates(
+    project_dir: Path | str,
+    media_paths: list[Path | str] | tuple[Path | str, ...],
+    *,
+    control_file: Optional[Path | str] = None,
+    tracks_summary_path: Optional[Path | str] = None,
+    actions: Optional[dict[str, str]] = None,
+    sort_date_sections_by_tracks: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    detail_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    control_entries: Optional[list[dict[str, Any]]] = None,
+    tracks_summary: Optional[TracksSummary] = None,
+    control_signature: Optional[tuple[int, int]] = None,
+    place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+) -> MediaUpdatePlan:
+    """Analyze selected media without changing sidecars or the control file."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    control_path = Path(control_file).expanduser().resolve(strict=False) if control_file else None
+    summary_path = Path(tracks_summary_path).expanduser().resolve(strict=False) if tracks_summary_path else None
+    entries = list(control_entries or [])
+    if control_path is not None and control_path.is_file():
+        if control_signature is None:
+            control_stat = control_path.stat()
+            control_signature = (int(control_stat.st_size), int(control_stat.st_mtime_ns))
+        if control_entries is None:
+            entries = parse_control_file_entries(control_path.read_text(encoding="utf-8").splitlines())
+    if tracks_summary is None and summary_path and summary_path.is_file():
+        tracks_summary = load_tracks_summary(summary_path, control_path or project)
+    place_equivalence_m = max(0.0, float(place_equivalence_m))
+    gps_resolver = (
+        LazyTrackGpsResolver(tracks_summary, place_equivalence_m)
+        if tracks_summary is not None
+        else None
+    )
+    media_entry_indexes: dict[str, list[int]] = {}
+    for entry_index, entry in enumerate(entries):
+        if entry.get("type") != "media":
+            continue
+        normalized_entry_name = normalize_filename_for_match(str(entry.get("name", "")))
+        media_entry_indexes.setdefault(normalized_entry_name, []).append(entry_index)
+        if gps_resolver is not None:
+            reference_path = project / Path(str(entry.get("name", ""))).name
+            reference_record = _control_media_record(entry, reference_path)
+            if reference_record is not None:
+                gps_resolver._remember_reference_record(reference_record)
+    selected_actions = {normalize_filename_for_match(key): str(value) for key, value in (actions or {}).items()}
+    results: list[MediaUpdateItem] = []
+    warnings: list[str] = []
+    paths = [Path(path).expanduser().resolve(strict=False) for path in media_paths]
+    for index, media_path in enumerate(paths, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        check_cancelled()
+        if progress_callback is not None:
+            progress_callback(index - 1, len(paths), media_path.name)
+        if media_path.parent != project or not media_path.is_file():
+            warning = f"Skipped {media_path}: not an existing project media file."
+            warnings.append(warning)
+            if detail_callback is not None:
+                detail_callback(warning)
+            continue
+        status, old_payload, reason = validate_media_sidecar(media_path)
+        analyzed_media_signature = media_file_signature(media_path)
+        sidecar_path = media_sidecar_path(media_path)
+        if sidecar_path.is_file():
+            sidecar_stat = sidecar_path.stat()
+            analyzed_sidecar_signature = (int(sidecar_stat.st_size), int(sidecar_stat.st_mtime_ns))
+        else:
+            analyzed_sidecar_signature = None
+        freshness = media_sidecar_freshness(media_path, old_payload) if status == "available" else status
+        old_record = (
+            record_from_sidecar_payload(old_payload, media_sidecar_path(media_path), media_path)
+            if status == "available" and isinstance(old_payload, dict)
+            else None
+        )
+        normalized_name = normalize_filename_for_match(media_path.name)
+        occurrences = list(media_entry_indexes.get(normalized_name, ()))
+        control_record = (
+            _control_media_record(entries[occurrences[0]], media_path)
+            if len(occurrences) == 1
+            else None
+        )
+        comparison_record = copy.deepcopy(old_record or control_record)
+        action = selected_actions.get(normalized_name)
+        if action not in {"use_sidecar", "refresh", "repair", "skip"}:
+            if status != "available":
+                action = "repair"
+            elif freshness == "changed" or occurrences:
+                action = "refresh"
+            else:
+                action = "use_sidecar"
+        if action == "skip":
+            continue
+        if action == "use_sidecar" and old_record is None:
+            action = "repair"
+
+        sidecar_write_required = action in {"refresh", "repair"}
+        if action in {"refresh", "repair"}:
+            new_record = build_record_from_photo(media_path, False, {}, [], 0.0, True)
+            new_record.raw_metadata = dict(old_payload or {})
+        else:
+            new_record = old_record
+            assert new_record is not None
+
+        if gps_resolver is not None and gps_resolver.apply(new_record):
+            sidecar_write_required = True
+        if detail_callback is not None:
+            local_datetime = (
+                new_record.photo_datetime.astimezone()
+                if new_record.photo_datetime.tzinfo is not None
+                else new_record.photo_datetime
+            )
+            date_text = local_datetime.isoformat(sep=" ", timespec="seconds")
+            gps_text = (
+                f"{new_record.latitude:.6f}, {new_record.longitude:.6f}"
+                if new_record.latitude is not None
+                and new_record.longitude is not None
+                else "not available"
+            )
+            verb = "Using" if action == "use_sidecar" else "Extracted"
+            detail_callback(
+                f"{verb} {media_path.name}: date {date_text}; GPS {gps_text}."
+            )
+            if (
+                new_record.latitude is None
+                and new_record.longitude is None
+                and tracks_summary is None
+            ):
+                detail_callback(
+                    f"{media_path.name}: No embedded GPS; track inference deferred until maps are ready."
+                )
+        displacement = _media_record_gps_distance(comparison_record, new_record)
+        old_has_gps = bool(
+            comparison_record is not None
+            and comparison_record.latitude is not None
+            and comparison_record.longitude is not None
+        )
+        new_has_gps = bool(
+            new_record.latitude is not None and new_record.longitude is not None
+        )
+        gps_changed = (
+            old_has_gps != new_has_gps
+            or (displacement is not None and displacement > place_equivalence_m)
+        )
+        if (
+            comparison_record is not None
+            and not gps_changed
+            and is_resolved_place_name(comparison_record.place)
+        ):
+            new_record.place = comparison_record.place
+            new_record.place_details = comparison_record.place_details
+        elif gps_changed:
+            new_record.place = None
+            new_record.place_details = None
+        place_update_recommended = (
+            new_record.latitude is not None
+            and new_record.longitude is not None
+            and (
+                gps_changed
+                or comparison_record is None
+                or (
+                    old_record is None
+                    and not is_resolved_place_name(comparison_record.place)
+                )
+                or (
+                    old_record is not None
+                    and is_resolved_place_name(old_record.place)
+                    and not record_place_matches_gps(
+                        old_record,
+                        place_equivalence_m,
+                    )
+                )
+            )
+        )
+        staged_payload = build_record_sidecar_payload(new_record) if sidecar_write_required else dict(old_payload or {})
+        current_section = _control_section_description(entries, occurrences[0]) if occurrences else "Not included"
+        proposed_section = _proposed_media_section(new_record, tracks_summary, sort_date_sections_by_tracks)
+        conflict = None
+        if len(occurrences) > 1:
+            conflict = f"{media_path.name} occurs {len(occurrences)} times in the control file"
+            warnings.append(conflict)
+        baseline_day = (
+            comparison_record.photo_datetime.date()
+            if comparison_record is not None
+            else entries[occurrences[0]].get("date")
+            if len(occurrences) == 1
+            else None
+        )
+        placement_changed = bool(
+            baseline_day != new_record.photo_datetime.date()
+            or gps_changed
+        )
+        reposition = bool(
+            occurrences
+            and placement_changed
+            and current_section != proposed_section
+            and conflict is None
+        )
+        results.append(
+            MediaUpdateItem(
+                media_path=media_path,
+                action=action,
+                sidecar_status=status,
+                freshness=freshness,
+                included_count=len(occurrences),
+                old_record=comparison_record,
+                new_record=new_record,
+                staged_payload=staged_payload,
+                current_section=current_section,
+                proposed_section=proposed_section,
+                reposition=reposition,
+                gps_changed=gps_changed,
+                place_update_recommended=place_update_recommended,
+                analyzed_media_signature=analyzed_media_signature,
+                analyzed_sidecar_signature=analyzed_sidecar_signature,
+                sidecar_write_required=sidecar_write_required,
+                control_conflict=conflict or (reason if status == "invalid" else None),
+            )
+        )
+    if progress_callback is not None:
+        progress_callback(len(paths), len(paths), "")
+    if gps_resolver is not None:
+        gps_resolver.emit_summary()
+    return MediaUpdatePlan(
+        project_dir=project,
+        control_file=control_path,
+        tracks_summary_path=summary_path,
+        items=results,
+        tracks_summary=tracks_summary,
+        sort_date_sections_by_tracks=sort_date_sections_by_tracks,
+        control_signature=control_signature,
+        warnings=warnings,
+    )
+
+
+def analyze_control_file_updates(
+    project_dir: Path | str,
+    media_paths: list[Path | str] | tuple[Path | str, ...],
+    *,
+    control_file: Optional[Path | str],
+    tracks_summary_path: Optional[Path | str],
+    actions: Optional[dict[str, str]] = None,
+    sort_date_sections_by_tracks: bool = False,
+    summary_current: bool = True,
+    media_only: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    detail_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+) -> ControlFileUpdatePlan:
+    """Analyze Track Map references and selected media from one control snapshot."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    control_path = Path(control_file).expanduser().resolve(strict=False) if control_file else None
+    summary_path = Path(tracks_summary_path).expanduser().resolve(strict=False) if tracks_summary_path else None
+    entries: list[dict[str, Any]] = []
+    control_signature = None
+    if control_path is not None and control_path.is_file():
+        stat = control_path.stat()
+        control_signature = (int(stat.st_size), int(stat.st_mtime_ns))
+        entries = parse_control_file_entries(control_path.read_text(encoding="utf-8").splitlines())
+    tracks_summary = (
+        load_tracks_summary(summary_path, control_path or project)
+        if summary_path is not None and summary_path.is_file() else None
+    )
+    if media_only:
+        track_plan = TrackMapReferenceUpdatePlan(
+            summary_available=False,
+            summary_current=True,
+        )
+        usable_tracks_summary = None
+    else:
+        track_plan = (
+            analyze_track_map_reference_updates(
+                project,
+                control_path,
+                summary_path,
+                control_entries=entries,
+                tracks_summary=tracks_summary,
+                summary_current=summary_current,
+                sort_date_sections_by_tracks=sort_date_sections_by_tracks,
+            )
+            if control_path is not None
+            else TrackMapReferenceUpdatePlan(warning="No slide show control file is available.")
+        )
+        usable_tracks_summary = tracks_summary if summary_current else None
+    media_plan = analyze_media_updates(
+        project,
+        media_paths,
+        control_file=control_path,
+        tracks_summary_path=summary_path,
+        actions=actions,
+        sort_date_sections_by_tracks=sort_date_sections_by_tracks,
+        progress_callback=progress_callback,
+        detail_callback=detail_callback,
+        cancel_event=cancel_event,
+        control_entries=entries,
+        tracks_summary=usable_tracks_summary,
+        control_signature=control_signature,
+        place_equivalence_m=place_equivalence_m,
+    )
+    if not media_only and not summary_current:
+        warning = "Maps must be generated or updated before media can be added or repositioned."
+        media_plan.warnings.append(warning)
+        for item in media_plan.items:
+            if item.included_count == 0 or item.reposition:
+                item.reposition = False
+                item.control_update_pending = True
+                item.control_conflict = warning
+    return ControlFileUpdatePlan(media=media_plan, track_maps=track_plan)
+
+
+def _write_json_atomic(payload: dict[str, Any], destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", prefix=f".{destination.name}.", suffix=".tmp",
+        dir=destination.parent, delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        json.dump(payload, handle, indent=2, ensure_ascii=True, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temp_path, destination)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _apply_track_map_reference_updates(
+    entries: list[dict[str, Any]],
+    plan: TrackMapReferenceUpdatePlan,
+    tracks_summary: Optional[TracksSummary],
+    sort_date_sections_by_tracks: bool,
+) -> tuple[int, int, int, int]:
+    """Apply one validated Track Map reference plan to parsed control entries."""
+    obsolete_overview = {
+        normalize_filename_for_match(name) for name in plan.obsolete_overview
+    }
+    obsolete_tracks = {
+        normalize_track_plot_filename_for_match(name) for name in plan.obsolete_tracks
+    }
+    kept = []
+    removed = 0
+    for entry in entries:
+        entry_type = entry.get("type")
+        name = str(entry.get("name", "")).strip()
+        remove = (
+            entry_type == "overview"
+            and normalize_filename_for_match(name) in obsolete_overview
+        ) or (
+            entry_type in {"map", "map_before", "map_after"}
+            and normalize_track_plot_filename_for_match(name) in obsolete_tracks
+        )
+        if remove:
+            removed += 1
+        else:
+            kept.append(entry)
+    entries[:] = kept
+
+    reordered_names = {
+        _canonical_control_track_map_name(name) for name in plan.reordered_tracks
+    }
+    reordered_sections = []
+    seen_sections = set()
+    for index, entry in enumerate(entries):
+        if (
+            entry.get("type") != "map"
+            or _canonical_control_track_map_name(str(entry.get("name", "")))
+            not in reordered_names
+        ):
+            continue
+        start, end = _date_section_bounds_containing(entries, index)
+        if (start, end) not in seen_sections:
+            reordered_sections.append((start, end))
+            seen_sections.add((start, end))
+    for start, end in reversed(reordered_sections):
+        del entries[start:end]
+
+    replacements = {
+        normalize_track_plot_filename_for_match(old): new
+        for old, new, _entry_type in plan.special_updates
+    }
+    replaced = 0
+    for entry in entries:
+        if entry.get("type") not in {"map_before", "map_after"}:
+            continue
+        old_name = str(entry.get("name", "")).strip()
+        replacement = replacements.get(normalize_track_plot_filename_for_match(old_name))
+        if replacement is None or replacement == old_name:
+            continue
+        keyword = "MapBefore" if entry.get("type") == "map_before" else "MapAfter"
+        entry["name"] = replacement
+        entry["line"] = f"#{keyword}: {replacement}"
+        replaced += 1
+
+    added = 0
+    if plan.missing_overview:
+        overview_name = plan.missing_overview[0]
+        entries.insert(
+            0,
+            {
+                "line": f"#Overviewmap: {overview_name}",
+                "type": "overview",
+                "date": None,
+                "name": overview_name,
+            },
+        )
+        added += 1
+    if tracks_summary is not None:
+        missing = {
+            _canonical_control_track_map_name(name) for name in plan.missing_tracks
+        }
+        reordered = {
+            _canonical_control_track_map_name(name) for name in plan.reordered_tracks
+        }
+        tracks = sorted(
+            tracks_summary.tracks,
+            key=lambda track: (
+                track.original_sequence_number if sort_date_sections_by_tracks else track.start_time,
+                track.start_time,
+            ),
+        )
+        for track in tracks:
+            track_key = _canonical_control_track_map_name(track.track_plot_image_filename)
+            if track_key not in missing and track_key not in reordered:
+                continue
+            insert_map_entry(entries, track, tracks_summary, sort_date_sections_by_tracks)
+            if track_key in missing:
+                added += 1
+    return added, replaced, removed, len(reordered_sections)
+
+
+def commit_media_update_plan(
+    plan: MediaUpdatePlan,
+    *,
+    update_place_names: bool = True,
+    place_distance_m: float = 0.0,
+    geocode_timeout_seconds: float = 10.0,
+    geocode_pacing_min_seconds: float = GEOCODE_PACING_MIN_SECONDS,
+    geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
+    media_map_options: Optional[dict[str, Any]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    _track_map_plan: Optional[TrackMapReferenceUpdatePlan] = None,
+    _control_update_result: Optional[ControlFileUpdateResult] = None,
+) -> MediaUpdateResult:
+    """Commit an approved selective update, with the control file replaced last."""
+    result = MediaUpdateResult()
+    selected_items = [item for item in plan.items if item.apply_update]
+    control_entries = []
+    if plan.control_file is not None and plan.control_file.is_file():
+        current_stat = plan.control_file.stat()
+        current_signature = (int(current_stat.st_size), int(current_stat.st_mtime_ns))
+        if plan.control_signature is not None and current_signature != plan.control_signature:
+            raise RuntimeError("The control file changed after analysis; analyze the selected media again.")
+        control_entries = parse_control_file_entries(plan.control_file.read_text(encoding="utf-8").splitlines())
+    if _track_map_plan is not None and plan.control_file is not None:
+        added, replaced_count, removed, reordered = _apply_track_map_reference_updates(
+            control_entries,
+            _track_map_plan,
+            plan.tracks_summary,
+            plan.sort_date_sections_by_tracks,
+        )
+        if _control_update_result is not None:
+            _control_update_result.map_entries_added = added
+            _control_update_result.map_entries_replaced = replaced_count
+            _control_update_result.map_entries_removed = removed
+            _control_update_result.map_entries_reordered = reordered
+    affected_dates: set[date] = set()
+    geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]] = {}
+    known_places: list[KnownPlace] = []
+    total = len(selected_items)
+    for index, item in enumerate(selected_items, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        check_cancelled()
+        if media_file_signature(item.media_path) != item.analyzed_media_signature:
+            raise RuntimeError(f"{item.media_path.name} changed after analysis; analyze it again.")
+        current_sidecar = media_sidecar_path(item.media_path)
+        current_sidecar_signature = None
+        if current_sidecar.is_file():
+            current_sidecar_stat = current_sidecar.stat()
+            current_sidecar_signature = (
+                int(current_sidecar_stat.st_size), int(current_sidecar_stat.st_mtime_ns)
+            )
+        if current_sidecar_signature != item.analyzed_sidecar_signature:
+            raise RuntimeError(f"{current_sidecar.name} changed after analysis; analyze it again.")
+        if progress_callback is not None:
+            progress_callback(index - 1, total, item.media_path.name)
+        record = item.new_record
+        old_gps_source = (
+            item.old_record.gps_source
+            if item.old_record is not None
+            else None
+        )
+        if record.gps_source == "track_time_interpolation":
+            if old_gps_source == "track_time_interpolation":
+                if item.sidecar_write_required:
+                    result.gps_refreshed += 1
+            else:
+                result.gps_inferred += 1
+        if item.place_update_recommended and update_place_names:
+            resolve_place_for_record(
+                record, geocode_cache, known_places, place_distance_m, False,
+                geocode_timeout_seconds, geocode_pacing_min_seconds, geocode_pacing_max_seconds,
+            )
+            if record.place_updated and is_resolved_place_name(record.place):
+                item.sidecar_write_required = True
+                result.places_updated += 1
+        elif item.old_record is not None and is_resolved_place_name(record.place):
+            result.places_preserved += 1
+        if item.sidecar_write_required:
+            item.staged_payload = build_record_sidecar_payload(record)
+
+        if item.control_update_pending:
+            result.control_rows_pending += 1
+            continue
+        if not control_entries or item.control_conflict and item.included_count > 1:
+            if item.control_conflict and item.included_count > 1:
+                item.control_update_pending = True
+                result.control_rows_pending += 1
+            continue
+        normalized_name = normalize_filename_for_match(item.media_path.name)
+        occurrences = [
+            entry_index
+            for entry_index, entry in enumerate(control_entries)
+            if entry.get("type") == "media"
+            and normalize_filename_for_match(str(entry.get("name", ""))) == normalized_name
+        ]
+        old_day = control_entries[occurrences[0]].get("date") if len(occurrences) == 1 else None
+        if not occurrences:
+            insert_classified_media_entry(
+                control_entries, record, plan.tracks_summary, plan.sort_date_sections_by_tracks,
+            )
+            affected_dates.add(record.photo_datetime.date())
+            result.rows_added += 1
+        elif len(occurrences) == 1 and item.reposition:
+            control_entries.pop(occurrences[0])
+            insert_classified_media_entry(
+                control_entries, record, plan.tracks_summary, plan.sort_date_sections_by_tracks,
+            )
+            if isinstance(old_day, date):
+                affected_dates.add(old_day)
+            affected_dates.add(record.photo_datetime.date())
+            result.rows_moved += 1
+        elif len(occurrences) == 1 and old_day == record.photo_datetime.date():
+            control_entries[occurrences[0]].update(
+                line=sorted_media_output_line(record),
+                datetime=record.photo_datetime,
+                name=record.source_filename,
+            )
+            if item.gps_changed:
+                affected_dates.add(record.photo_datetime.date())
+            result.rows_updated += 1
+        else:
+            item.control_update_pending = True
+            result.control_rows_pending += 1
+
+    staged_control_text = None
+    staged_map_options = None
+    map_temp_dir = None
+    if control_entries and plan.control_file is not None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        if media_map_options is not None and affected_dates:
+            map_temp_dir = tempfile.TemporaryDirectory(prefix="mycamino-media-maps-")
+            staged_map_options = dict(media_map_options)
+            staged_map_options["output_dir"] = map_temp_dir.name
+            add_media_maps_to_control_entries(
+                control_entries, plan.control_file, staged_map_options, affected_dates=affected_dates,
+            )
+            result.media_maps_regenerated = len(
+                media_map_specs_from_control_entries(control_entries, affected_dates=affected_dates)
+            )
+        staged_control_text = "\n".join(entry["line"] for entry in control_entries) + "\n"
+
+    if cancel_event is not None and cancel_event.is_set():
+        if map_temp_dir is not None:
+            map_temp_dir.cleanup()
+        raise ProcessingCancelled("Aborted.")
+
+    backup_dir = plan.project_dir / ".mycamino-control-backups" / (
+        f"control-update-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    )
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    replaced: list[tuple[Path, Optional[Path]]] = []
+    try:
+        for item in selected_items:
+            if not item.sidecar_write_required:
+                continue
+            destination = media_sidecar_path(item.media_path)
+            backup = None
+            if destination.exists():
+                backup = backup_dir / destination.name
+                shutil.copy2(destination, backup)
+            replaced.append((destination, backup))
+            _write_json_atomic(item.staged_payload, destination)
+            result.refreshed_sidecars += 1
+        if map_temp_dir is not None and media_map_options is not None:
+            destination_dir = Path(str(media_map_options.get("output_dir", "")))
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            for source in Path(map_temp_dir.name).iterdir():
+                destination = destination_dir / source.name
+                backup = None
+                if destination.exists():
+                    backup = backup_dir / source.name
+                    shutil.copy2(destination, backup)
+                replaced.append((destination, backup))
+                os.replace(source, destination)
+        if staged_control_text is not None and plan.control_file is not None:
+            backup = backup_dir / plan.control_file.name
+            shutil.copy2(plan.control_file, backup)
+            replaced.append((plan.control_file, backup))
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=f".{plan.control_file.name}.", suffix=".tmp",
+                dir=plan.control_file.parent, delete=False,
+            ) as handle:
+                temp_control = Path(handle.name)
+                handle.write(staged_control_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_control, plan.control_file)
+    except Exception:
+        for destination, backup in reversed(replaced):
+            if backup is None:
+                destination.unlink(missing_ok=True)
+            elif backup.exists():
+                shutil.copy2(backup, destination)
+        raise
+    finally:
+        if map_temp_dir is not None:
+            map_temp_dir.cleanup()
+    if progress_callback is not None:
+        progress_callback(total, total, "")
+    return result
+
+
+def commit_control_file_update_plan(
+    plan: ControlFileUpdatePlan,
+    **options,
+) -> ControlFileUpdateResult:
+    """Commit Track Map references and selected media as one transaction."""
+    result = ControlFileUpdateResult()
+    result.media = commit_media_update_plan(
+        plan.media,
+        _track_map_plan=plan.track_maps,
+        _control_update_result=result,
+        **options,
+    )
+    return result
+
+
+def record_for_merge_media(
+    params: Params,
+    media_path: Path,
+    gps_resolver: Optional[LazyTrackGpsResolver] = None,
+) -> PhotoRecord:
     """Build or load metadata for one media file being merged."""
     json_path = get_json_path_for_photo(media_path)
     record = None if params.ignorejson else load_record_from_json(json_path, media_path)
     if record is not None:
+        if gps_resolver is not None and gps_resolver.apply(record):
+            write_record_json(record, set())
         return record
     record = build_record_from_photo(
         media_path,
@@ -2853,6 +5210,10 @@ def record_for_merge_media(params: Params, media_path: Path) -> PhotoRecord:
         params.distance,
         params.debug,
     )
+    if gps_resolver is not None:
+        gps_resolver.apply(record)
+        if params.getclearnames and needs_place_repair(record):
+            resolve_place_for_record(record, {}, [], params.distance, params.debug)
     write_record_json(record, set())
     return record
 
@@ -2881,6 +5242,19 @@ def merge_sorted_control_file(params: Params) -> Path:
         if entry.get("type") == "media" and entry.get("name")
     }
     tracks_summary = load_tracks_summary(params.merge_tracks or params.tracks, params.photolist)
+    gps_resolver = (
+        LazyTrackGpsResolver(tracks_summary, params.distance)
+        if params.infer_gps_from_tracks and params.merge_media and tracks_summary is not None
+        else None
+    )
+    if gps_resolver is not None:
+        for entry in entries:
+            if entry.get("type") != "media":
+                continue
+            reference_path = params.photodir / Path(str(entry.get("name", ""))).name
+            reference_record = _control_media_record(entry, reference_path)
+            if reference_record is not None:
+                gps_resolver._remember_reference_record(reference_record)
     inserted_maps = 0
     inserted_media = 0
 
@@ -2918,7 +5292,10 @@ def merge_sorted_control_file(params: Params) -> Path:
             existing_map_names.add(normalized_map_name)
             inserted_maps += 1
 
-    media_records = [record_for_merge_media(params, media_path) for media_path in params.merge_media]
+    media_records = [
+        record_for_merge_media(params, media_path, gps_resolver)
+        for media_path in params.merge_media
+    ]
     for record in sort_records_for_output(media_records, tracks_summary, params.sort_date_sections_by_tracks):
         normalized_name = normalize_filename_for_match(record.source_filename)
         if normalized_name in existing_names or normalized_name in existing_media_names:
@@ -2940,10 +5317,358 @@ def merge_sorted_control_file(params: Params) -> Path:
         f"and {inserted_media} media line(s) into {sorted_output_path}",
         flush=True,
     )
+    if gps_resolver is not None:
+        gps_resolver.emit_summary()
     return sorted_output_path
 
 
-def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMigrationReport]:
+def track_endpoint_entry_matches(
+    entry: object,
+    latitude: float,
+    longitude: float,
+    radius_m: float,
+) -> bool:
+    """Return whether a stored endpoint place still belongs to the endpoint."""
+    if not isinstance(entry, dict) or not is_resolved_place_name(entry.get("place")):
+        return False
+    stored_latitude = _optional_float(entry.get("latitude"))
+    stored_longitude = _optional_float(entry.get("longitude"))
+    if stored_latitude is None or stored_longitude is None:
+        coordinate = entry.get("place_coordinate")
+        if isinstance(coordinate, dict):
+            stored_latitude = _optional_float(coordinate.get("latitude"))
+            stored_longitude = _optional_float(coordinate.get("longitude"))
+    if stored_latitude is None or stored_longitude is None:
+        return False
+    return distance_meters(
+        float(stored_latitude),
+        float(stored_longitude),
+        float(latitude),
+        float(longitude),
+    ) <= max(0.0, float(radius_m))
+
+
+_track_endpoint_entry_matches = track_endpoint_entry_matches
+
+
+def _track_endpoint_entry(
+    latitude: float,
+    longitude: float,
+    place: str,
+    place_details: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the portable endpoint-place payload stored in Track Map sidecars."""
+    entry: dict[str, Any] = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "place": str(place),
+        "place_coordinate": {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+        },
+    }
+    if isinstance(place_details, dict):
+        entry["place_details"] = dict(place_details)
+    return entry
+
+
+def update_track_endpoint_places(
+    tracks_summary: Optional[TracksSummary],
+    params: Params,
+    report: SidecarPlaceUpdateReport,
+    geocode_cache: dict[
+        tuple[float, float],
+        tuple[Optional[str], Optional[dict[str, Any]]],
+    ],
+    known_places: list[KnownPlace],
+    *,
+    progress_offset: int = 0,
+    progress_total: int = 0,
+) -> int:
+    """Resolve GPX start/end places before media and patch matching map sidecars."""
+    if tracks_summary is None:
+        return progress_offset
+    track_payloads: list[tuple[TrackInfo, list[tuple[Path, dict[str, Any]]]]] = []
+    for track in tracks_summary.tracks:
+        payloads = []
+        for sidecar_path in track.map_sidecar_paths:
+            if not sidecar_path.is_file():
+                continue
+            try:
+                payload = read_json_data(sidecar_path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            stored_fingerprint = str(payload.get("track_fingerprint") or "").strip()
+            if (
+                track.track_fingerprint
+                and stored_fingerprint != track.track_fingerprint
+            ):
+                continue
+            payloads.append((sidecar_path, payload))
+        track_payloads.append((track, payloads))
+
+    # Existing endpoint places participate in the same radius-based reuse pool
+    # as existing media places before any network request is made.
+    for _track, payloads in track_payloads:
+        for _path, payload in payloads:
+            places = payload.get("track_endpoint_places")
+            if not isinstance(places, dict):
+                continue
+            for entry in places.values():
+                if not isinstance(entry, dict):
+                    continue
+                latitude = _optional_float(entry.get("latitude"))
+                longitude = _optional_float(entry.get("longitude"))
+                place = entry.get("place")
+                if (
+                    latitude is not None
+                    and longitude is not None
+                    and is_resolved_place_name(place)
+                ):
+                    known_places.append(
+                        KnownPlace(
+                            latitude=float(latitude),
+                            longitude=float(longitude),
+                            place=str(place),
+                            place_details=(
+                                entry.get("place_details")
+                                if isinstance(entry.get("place_details"), dict)
+                                else None
+                            ),
+                        )
+                    )
+
+    progress_index = progress_offset
+    for track, payloads in track_payloads:
+        endpoints = (
+            ("start", track.start_latitude, track.start_longitude),
+            ("end", track.end_latitude, track.end_longitude),
+        )
+        for endpoint_name, latitude, longitude in endpoints:
+            if latitude is None or longitude is None:
+                continue
+            report.track_endpoints_total += 1
+            progress_index += 1
+            label = (
+                f"Track {track.original_sequence_number} "
+                f"{endpoint_name}: {track.track_name or 'unnamed track'}"
+            )
+            if params.progress_callback is not None:
+                params.progress_callback(
+                    progress_index,
+                    max(progress_total, progress_index),
+                    label,
+                )
+            if not payloads:
+                report.track_endpoints_failed += 1
+                print(
+                    f"Skipping {label}: matching Track Map sidecar is missing; "
+                    "run Generate and Update Maps first.",
+                    flush=True,
+                )
+                continue
+            existing_entry = None
+            for _path, payload in payloads:
+                places = payload.get("track_endpoint_places")
+                candidate = places.get(endpoint_name) if isinstance(places, dict) else None
+                if _track_endpoint_entry_matches(
+                    candidate,
+                    float(latitude),
+                    float(longitude),
+                    params.distance,
+                ):
+                    existing_entry = candidate
+                    break
+            if existing_entry is not None and not params.overwrite_reverse_geolocation:
+                report.track_endpoints_complete += 1
+                print(f"Keeping {label}: {existing_entry.get('place')}", flush=True)
+                resolved_entry = dict(existing_entry)
+                resolved_entry["latitude"] = float(latitude)
+                resolved_entry["longitude"] = float(longitude)
+                resolved_entry["place_coordinate"] = {
+                    "latitude": float(latitude),
+                    "longitude": float(longitude),
+                }
+            else:
+                place, place_details, _debug = resolve_place_for_coordinate(
+                    float(latitude),
+                    float(longitude),
+                    geocode_cache,
+                    known_places,
+                    params.distance,
+                    params.debug,
+                    params.geocode_timeout_seconds,
+                    params.geocode_pacing_min_seconds,
+                    params.geocode_pacing_max_seconds,
+                )
+                if not is_resolved_place_name(place):
+                    report.track_endpoints_failed += 1
+                    print(f"No place name found for {label}.", flush=True)
+                    continue
+                resolved_entry = _track_endpoint_entry(
+                    float(latitude),
+                    float(longitude),
+                    str(place),
+                    place_details,
+                )
+                report.track_endpoints_updated += 1
+                known_places.append(
+                    KnownPlace(
+                        latitude=float(latitude),
+                        longitude=float(longitude),
+                        place=str(place),
+                        place_details=place_details,
+                    )
+                )
+                print(f"Updated {label}: {place}", flush=True)
+            for sidecar_path, payload in payloads:
+                endpoint_places = payload.get("track_endpoint_places")
+                endpoint_places = (
+                    dict(endpoint_places)
+                    if isinstance(endpoint_places, dict)
+                    else {}
+                )
+                endpoint_places[endpoint_name] = dict(resolved_entry)
+                payload["track_endpoint_places"] = endpoint_places
+        # Checkpoint completed tracks so an interrupted network/UI run resumes
+        # from the next unfinished endpoint instead of repeating the whole tour.
+        for sidecar_path, payload in payloads:
+            original = read_json_data(sidecar_path)
+            if original == payload:
+                continue
+            _write_json_atomic(payload, sidecar_path)
+            report.track_sidecars_updated += 1
+    return progress_index
+
+
+def update_place_names_from_sidecars(params: Params) -> SidecarPlaceUpdateReport:
+    """Reverse-geocode only GPS coordinates already stored in valid sidecars."""
+    photo_files = filter_photo_files_by_name(
+        select_photo_files(list_photo_files(params.photodir, params.file_filter), params.photos),
+        params.photonames,
+    )
+    report = SidecarPlaceUpdateReport(total=len(photo_files))
+    tracks_summary = (
+        load_tracks_summary(params.tracks, params.photolist)
+        if params.tracks is not None
+        else None
+    )
+    endpoint_total = sum(
+        int(track.start_latitude is not None and track.start_longitude is not None)
+        + int(track.end_latitude is not None and track.end_longitude is not None)
+        for track in (tracks_summary.tracks if tracks_summary is not None else ())
+    )
+    progress_total = report.total + endpoint_total
+    geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]] = {}
+    known_places: list[KnownPlace] = []
+    validated_records: dict[Path, PhotoRecord] = {}
+    sidecar_states: dict[Path, tuple[str, Optional[dict[str, Any]], Optional[str]]] = {}
+
+    for photo_path in photo_files:
+        status, payload, reason = validate_media_sidecar(photo_path)
+        sidecar_states[photo_path] = (status, payload, reason)
+        if status != "available" or not isinstance(payload, dict):
+            continue
+        record = record_from_sidecar_payload(payload, media_sidecar_path(photo_path), photo_path)
+        validated_records[photo_path] = record
+        if (
+            not params.overwrite_reverse_geolocation
+            and record.latitude is not None
+            and record.longitude is not None
+            and record_place_matches_gps(record, params.distance)
+        ):
+            known_places.append(
+                KnownPlace(
+                    latitude=record.latitude,
+                    longitude=record.longitude,
+                    place=str(record.place),
+                    place_details=record.place_details,
+                )
+            )
+
+    if params.progress_callback is not None:
+        params.progress_callback(0, progress_total, "")
+    progress_offset = update_track_endpoint_places(
+        tracks_summary,
+        params,
+        report,
+        geocode_cache,
+        known_places,
+        progress_offset=0,
+        progress_total=progress_total,
+    )
+    for photo_index, photo_path in enumerate(photo_files, start=1):
+        check_cancelled()
+        status, payload, reason = sidecar_states[photo_path]
+        if status == "missing":
+            report.missing += 1
+            print(f"Skipping {photo_path.name}: missing metadata sidecar.", flush=True)
+        elif status != "available" or not isinstance(payload, dict):
+            report.invalid += 1
+            print(f"Skipping {photo_path.name}: invalid metadata sidecar ({reason}).", flush=True)
+        else:
+            record = validated_records[photo_path]
+            if record.latitude is None or record.longitude is None:
+                report.gps_less += 1
+                print(f"Skipping {photo_path.name}: metadata sidecar has no GPS coordinates.", flush=True)
+            elif not params.overwrite_reverse_geolocation and record_place_matches_gps(
+                record,
+                params.distance,
+            ):
+                report.already_complete += 1
+                print(f"Keeping {photo_path.name}: place name already available.", flush=True)
+            else:
+                record = resolve_place_for_record(
+                    record,
+                    geocode_cache,
+                    known_places,
+                    params.distance,
+                    params.debug,
+                    params.geocode_timeout_seconds,
+                    params.geocode_pacing_min_seconds,
+                    params.geocode_pacing_max_seconds,
+                )
+                if record.place_updated and is_resolved_place_name(record.place):
+                    write_record_place_fields(record)
+                    report.updated += 1
+                    known_places.append(
+                        KnownPlace(
+                            latitude=float(record.latitude),
+                            longitude=float(record.longitude),
+                            place=str(record.place),
+                            place_details=record.place_details,
+                        )
+                    )
+                    print(f"Updated {photo_path.name}: {record.place}", flush=True)
+                else:
+                    report.failed += 1
+                    print(f"No place name found for {photo_path.name}.", flush=True)
+        if params.progress_callback is not None:
+            params.progress_callback(
+                progress_offset + photo_index,
+                progress_total,
+                photo_path.name,
+            )
+
+    print(
+        "Place-name sidecar pass: "
+        f"updated {report.updated}, already complete {report.already_complete}, "
+        f"missing {report.missing}, invalid {report.invalid}, "
+        f"without GPS {report.gps_less}, unresolved {report.failed}; "
+        f"track endpoints updated {report.track_endpoints_updated}, "
+        f"already complete {report.track_endpoints_complete}, "
+        f"unresolved {report.track_endpoints_failed}, "
+        f"Track Map sidecars written {report.track_sidecars_updated}.",
+        flush=True,
+    )
+    return report
+
+
+def collect_photo_location_and_dates(
+    params: Params,
+) -> Optional[MediaSidecarMigrationReport | SidecarPlaceUpdateReport]:
     """Process photos, emit live output, cache JSON, and write a sorted list."""
     check_cancelled()
     if params.migrate_media_sidecars:
@@ -2965,7 +5690,14 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
     if params.merge_tracks is not None or params.merge_media:
         merge_sorted_control_file(params)
         return None
+    if params.redo_reverse_geolocation or params.overwrite_reverse_geolocation:
+        return update_place_names_from_sidecars(params)
     tracks_summary = load_tracks_summary(params.tracks, params.photolist)
+    gps_resolver = (
+        LazyTrackGpsResolver(tracks_summary, params.distance)
+        if params.infer_gps_from_tracks and tracks_summary is not None
+        else None
+    )
     photo_files = list_photo_files(params.photodir, params.file_filter)
     photo_files = exclude_tracks_images(photo_files, tracks_summary)
     if params.debug:
@@ -2991,14 +5723,16 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
             check_cancelled()
             json_path = get_json_path_for_photo(photo_path)
             record = None if params.ignorejson else load_record_from_json(json_path, photo_path)
-            if record is not None:
+            record_was_loaded = record is not None
+            if record_was_loaded:
                 record.geocode_requested = params.getclearnames
                 record.place_updated = False
+                record.gps_updated = False
 
             if record is None:
                 record = build_record_from_photo(
                     photo_path,
-                    params.getclearnames or params.redo_reverse_geolocation or params.overwrite_reverse_geolocation,
+                    params.getclearnames,
                     geocode_cache,
                     known_places,
                     params.distance,
@@ -3007,14 +5741,10 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
                     params.geocode_pacing_min_seconds,
                     params.geocode_pacing_max_seconds,
                 )
-                if (params.redo_reverse_geolocation or params.overwrite_reverse_geolocation) and is_resolved_place_name(record.place):
-                    record.place_updated = True
-                if params.redo_reverse_geolocation or params.overwrite_reverse_geolocation:
-                    if record.place_updated:
-                        write_record_json(record, protected_json_paths)
-                else:
-                    write_record_json(record, protected_json_paths)
-            elif params.overwrite_reverse_geolocation and record.latitude is not None and record.longitude is not None:
+            if gps_resolver is not None:
+                gps_resolver.apply(record)
+
+            if record.gps_updated and params.getclearnames and needs_place_repair(record):
                 record = resolve_place_for_record(
                     record,
                     geocode_cache,
@@ -3025,21 +5755,11 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
                     params.geocode_pacing_min_seconds,
                     params.geocode_pacing_max_seconds,
                 )
-                if record.place_updated:
-                    write_record_json(record, protected_json_paths)
-            elif params.redo_reverse_geolocation and needs_place_repair(record):
-                record = resolve_place_for_record(
-                    record,
-                    geocode_cache,
-                    known_places,
-                    params.distance,
-                    params.debug,
-                    params.geocode_timeout_seconds,
-                    params.geocode_pacing_min_seconds,
-                    params.geocode_pacing_max_seconds,
-                )
-                if record.place_updated:
-                    write_record_json(record, protected_json_paths)
+            should_write = record.gps_updated or record.place_updated
+            if not record_was_loaded:
+                should_write = True
+            if should_write:
+                write_record_json(record, protected_json_paths)
 
             if (
                 record.latitude is not None
@@ -3063,6 +5783,9 @@ def collect_photo_location_and_dates(params: Params) -> Optional[MediaSidecarMig
             collected_records.append(record)
             if params.progress_callback is not None:
                 params.progress_callback(photo_index, total_photos, photo_path.name)
+
+    if gps_resolver is not None:
+        gps_resolver.emit_summary()
 
     check_cancelled()
     write_sorted_output(
@@ -3088,7 +5811,7 @@ def run_with_options(
     params = params_from_options(photodir, **overrides)
     previous_cancel_event = RUNTIME_CANCEL_EVENT
     RUNTIME_CANCEL_EVENT = cancel_event
-    result: Optional[MediaSidecarMigrationReport] = None
+    result: Optional[MediaSidecarMigrationReport | SidecarPlaceUpdateReport] = None
     try:
         if stdout is None and stderr is None:
             result = collect_photo_location_and_dates(params)
@@ -3102,7 +5825,8 @@ def run_with_options(
     return {
         "params": params,
         "sorted_output_path": build_sorted_output_path(params.photolist),
-        "migration_report": result,
+        "migration_report": result if isinstance(result, MediaSidecarMigrationReport) else None,
+        "place_update_report": result if isinstance(result, SidecarPlaceUpdateReport) else None,
     }
 
 

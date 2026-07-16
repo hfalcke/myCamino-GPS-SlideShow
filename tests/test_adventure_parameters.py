@@ -24,9 +24,12 @@ class AdventureParameterTests(unittest.TestCase):
         payload = parameter_payload(defaults)
         self.assertEqual(payload["version"], PARAMETER_SCHEMA_VERSION)
         self.assertEqual(payload["values"], defaults)
-        self.assertEqual(defaults["slideshow.start_mode"], "time_lapse")
+        self.assertEqual(defaults["slideshow.transition"], "time_lapse")
+        self.assertNotIn("slideshow.start_mode", defaults)
         self.assertEqual(defaults["slideshow.window_mode"], "auto")
         self.assertFalse(defaults["slideshow.track_map_before_media"])
+        self.assertFalse(defaults["audio.enabled"])
+        self.assertTrue(defaults["locations.add_place_names"])
         self.assertTrue(defaults["timelapse.overview_as_media"])
         self.assertEqual(defaults["gpx.horizontal_smoothing_distance_m"], 10.0)
         self.assertEqual(defaults["gpx.minimum_point_spacing_m"], 10.0)
@@ -35,6 +38,53 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["gpx.maximum_vertical_accuracy_m"], 20.0)
         self.assertEqual(defaults["gpx.maximum_hdop"], 20.0)
         self.assertEqual(defaults["gpx.maximum_vdop"], 20.0)
+        self.assertEqual(defaults["trackmaps.media_point_color"], "#0066FF")
+        self.assertEqual(defaults["trackmaps.track_title"], "endpoint_places")
+        self.assertEqual(defaults["trackmaps.zoom"], 16)
+        self.assertNotIn("trackmaps.media_point_size", defaults)
+        self.assertNotIn("trackmaps.variant", defaults)
+
+    def test_previous_default_map_zoom_migrates_to_sixteen(self):
+        migrated = normalize_parameters(
+            {"version": 7, "values": {"trackmaps.zoom": 15}}
+        )
+        current_custom = normalize_parameters(
+            {"version": PARAMETER_SCHEMA_VERSION, "values": {"trackmaps.zoom": 15}}
+        )
+        self.assertEqual(migrated["trackmaps.zoom"], 16)
+        self.assertEqual(current_custom["trackmaps.zoom"], 15)
+
+    def test_schema_one_default_orange_migrates_but_custom_color_is_preserved(self):
+        migrated = normalize_parameters(
+            {"version": 1, "values": {"trackmaps.media_point_color": "#FF8C00"}}
+        )
+        custom = normalize_parameters(
+            {"version": 1, "values": {"trackmaps.media_point_color": "#00AA00"}}
+        )
+        self.assertEqual(migrated["trackmaps.media_point_color"], "#0066FF")
+        self.assertEqual(custom["trackmaps.media_point_color"], "#00AA00")
+
+    def test_legacy_start_mode_migrates_into_initial_style(self):
+        time_lapse = normalize_parameters(
+            {
+                "version": 5,
+                "values": {
+                    "slideshow.start_mode": "time_lapse",
+                    "slideshow.transition": "fade",
+                },
+            }
+        )
+        standard = normalize_parameters(
+            {
+                "version": 5,
+                "values": {
+                    "slideshow.start_mode": "standard",
+                    "slideshow.transition": "fade",
+                },
+            }
+        )
+        self.assertEqual(time_lapse["slideshow.transition"], "time_lapse")
+        self.assertEqual(standard["slideshow.transition"], "fade")
 
     def test_invalid_loaded_values_fall_back_individually(self):
         normalized = normalize_parameters(

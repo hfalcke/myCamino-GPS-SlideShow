@@ -112,6 +112,7 @@ from gpx_processing import (
 )
 from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
 from map_provider_utils import contextily_provider, contextily_request_timeout, provider_display_name, provider_tile_url
+from map_overlay import MapOverlayScene, normalize_overlay_segments
 from track_timing_utils import timestamps_from_start
 
 
@@ -169,6 +170,124 @@ RECOVERY_PATH = Path(tempfile.gettempdir()) / "myCamino-GPXEditor-recovery.gpx"
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
 
+def _line_outcode(
+    point: tuple[float, float],
+    extent: dict[str, float],
+) -> int:
+    """Return a Cohen-Sutherland outcode for one point."""
+    x_coord, y_coord = point
+    code = 0
+    if x_coord < extent["min_x"]:
+        code |= 1
+    elif x_coord > extent["max_x"]:
+        code |= 2
+    if y_coord < extent["min_y"]:
+        code |= 4
+    elif y_coord > extent["max_y"]:
+        code |= 8
+    return code
+
+
+def _clip_line_to_extent(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    extent: dict[str, float],
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Clip one line segment to an axis-aligned extent."""
+    x0, y0 = start
+    x1, y1 = end
+    while True:
+        start_code = _line_outcode((x0, y0), extent)
+        end_code = _line_outcode((x1, y1), extent)
+        if not (start_code | end_code):
+            return (x0, y0), (x1, y1)
+        if start_code & end_code:
+            return None
+        code = start_code or end_code
+        if code & 8:
+            if y1 == y0:
+                return None
+            x_coord = x0 + (x1 - x0) * (extent["max_y"] - y0) / (y1 - y0)
+            y_coord = extent["max_y"]
+        elif code & 4:
+            if y1 == y0:
+                return None
+            x_coord = x0 + (x1 - x0) * (extent["min_y"] - y0) / (y1 - y0)
+            y_coord = extent["min_y"]
+        elif code & 2:
+            if x1 == x0:
+                return None
+            y_coord = y0 + (y1 - y0) * (extent["max_x"] - x0) / (x1 - x0)
+            x_coord = extent["max_x"]
+        else:
+            if x1 == x0:
+                return None
+            y_coord = y0 + (y1 - y0) * (extent["min_x"] - x0) / (x1 - x0)
+            x_coord = extent["min_x"]
+        if code == start_code:
+            x0, y0 = x_coord, y_coord
+        else:
+            x1, y1 = x_coord, y_coord
+
+
+def visible_simplified_polyline_runs(
+    points: Iterable[tuple[float, float]],
+    extent: dict[str, float],
+    viewport_size: tuple[float, float],
+    tolerance_pixels: float = 0.75,
+) -> list[list[tuple[float, float]]]:
+    """Clip a polyline to the viewport and remove sub-pixel vertices."""
+    sequence = list(points)
+    if len(sequence) < 2:
+        return []
+    raw_runs: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+    for start, end in zip(sequence, sequence[1:]):
+        clipped = _clip_line_to_extent(start, end, extent)
+        if clipped is None:
+            if current:
+                raw_runs.append(current)
+                current = []
+            continue
+        clipped_start, clipped_end = clipped
+        if not current:
+            current = [clipped_start, clipped_end]
+        elif math.isclose(current[-1][0], clipped_start[0], abs_tol=1e-9) and math.isclose(
+            current[-1][1],
+            clipped_start[1],
+            abs_tol=1e-9,
+        ):
+            current.append(clipped_end)
+        else:
+            raw_runs.append(current)
+            current = [clipped_start, clipped_end]
+    if current:
+        raw_runs.append(current)
+
+    span_x = max(float(extent["max_x"]) - float(extent["min_x"]), 1e-12)
+    span_y = max(float(extent["max_y"]) - float(extent["min_y"]), 1e-12)
+    scale_x = max(float(viewport_size[0]), 1.0) / span_x
+    scale_y = max(float(viewport_size[1]), 1.0) / span_y
+    tolerance_squared = max(0.0, float(tolerance_pixels)) ** 2
+    simplified_runs: list[list[tuple[float, float]]] = []
+    for run in raw_runs:
+        if len(run) <= 2 or tolerance_squared <= 0.0:
+            simplified_runs.append(run)
+            continue
+        simplified = [run[0]]
+        last_x, last_y = run[0]
+        for point in run[1:-1]:
+            delta_x = (point[0] - last_x) * scale_x
+            delta_y = (point[1] - last_y) * scale_y
+            if delta_x * delta_x + delta_y * delta_y >= tolerance_squared:
+                simplified.append(point)
+                last_x, last_y = point
+        if run[-1] != simplified[-1]:
+            simplified.append(run[-1])
+        simplified_runs.append(simplified)
+    return [run for run in simplified_runs if len(run) >= 2]
+
+
 def nsstring(value: str) -> NSString:
     return NSString.stringWithString_(value)
 
@@ -206,6 +325,35 @@ def elevation_profile_visible_range(rows: Iterable[dict], x_min: float, x_max: f
     span = maximum - minimum
     margin = span * 0.05 if span > 0.0 else max(5.0, abs(maximum) * 0.05)
     return minimum - margin, maximum + margin
+
+
+def elevation_distance_range_for_map_extent(
+    rows: Iterable[dict],
+    extent: dict[str, float],
+) -> tuple[float, float] | None:
+    """Return the cumulative-distance range occupied by map-visible points."""
+    try:
+        min_x = float(extent["min_x"])
+        max_x = float(extent["max_x"])
+        min_y = float(extent["min_y"])
+        max_y = float(extent["max_y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    distances: list[float] = []
+    for row in rows:
+        try:
+            merc_x, merc_y = lonlat_to_web_mercator(
+                float(row["longitude"]),
+                float(row["latitude"]),
+            )
+            distance = float(row["distance"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if min_x <= merc_x <= max_x and min_y <= merc_y <= max_y:
+            distances.append(distance)
+    if not distances:
+        return None
+    return min(distances), max(distances)
 
 
 def qname(local_name: str) -> str:
@@ -729,15 +877,25 @@ class PlotView(NSView):
         NSBezierPath.fillRect_(bounds)
         self.draw_plot_image(bounds)
         tracks = self.display_tracks()
-        points = [point for track in tracks for point in self.controller.processed_point_infos(track)]
-        if not points:
+        processed_tracks = [
+            (track, self.controller.display_processed_track(track))
+            for track in tracks
+        ]
+        if not any(processed.points for _track, processed in processed_tracks):
             self.draw_text("No track points available.", 20, bounds.size.height - 40, 16)
             return
-        transformer = self._metadata_transformer(points, bounds) or self._point_transformer(points, bounds)
+        transformer = self._metadata_transformer([], bounds)
+        if transformer is None:
+            points = [
+                point
+                for _track, processed in processed_tracks
+                for point in processed.points
+            ]
+            transformer = self._point_transformer(points, bounds)
         if self.plot_info.get("image") is None:
-            for track in tracks:
-                for segment in self.controller.processed_segment_point_infos(track):
-                    self.draw_track(segment, transformer, NSColor.systemBlueColor(), 3.5)
+            for _track, processed in processed_tracks:
+                for segment in processed.segments:
+                    self.draw_track(segment.points, transformer, NSColor.systemBlueColor(), 3.5)
         if self.mode == "overview" and self.show_endpoint_markers:
             self.draw_overview_track_endpoint_dots(transformer)
         self.draw_selected_tracks_overlay(transformer)
@@ -965,17 +1123,30 @@ class PlotView(NSView):
     def draw_track(self, points: list[PointInfo], transformer, color, width):
         if len(points) < 2:
             return
-        path = NSBezierPath.bezierPath()
-        path.setLineWidth_(width)
-        path.setLineJoinStyle_(NSRoundLineJoinStyle)
-        path.setLineCapStyle_(NSRoundLineCapStyle)
-        x, y = transformer(points[0])
-        path.moveToPoint_((x, y))
-        for point in points[1:]:
-            x, y = transformer(point)
-            path.lineToPoint_((x, y))
+        bounds = self.bounds()
+        margin = max(2.0, float(width))
+        extent = {
+            "min_x": -margin,
+            "max_x": float(bounds.size.width) + margin,
+            "min_y": -margin,
+            "max_y": float(bounds.size.height) + margin,
+        }
+        view_points = [transformer(point) for point in points]
+        runs = visible_simplified_polyline_runs(
+            view_points,
+            extent,
+            (float(bounds.size.width), float(bounds.size.height)),
+        )
         color.setStroke()
-        path.stroke()
+        for run in runs:
+            path = NSBezierPath.bezierPath()
+            path.setLineWidth_(width)
+            path.setLineJoinStyle_(NSRoundLineJoinStyle)
+            path.setLineCapStyle_(NSRoundLineCapStyle)
+            path.moveToPoint_(run[0])
+            for point in run[1:]:
+                path.lineToPoint_(point)
+            path.stroke()
 
     def draw_selected_tracks_overlay(self, transformer):
         if self.mode != "overview":
@@ -985,8 +1156,8 @@ class PlotView(NSView):
             return
         tracks = [track for track in self.controller.tracks if track.nr in selected and not track.hidden]
         for track in tracks:
-            for segment in self.controller.processed_segment_point_infos(track):
-                self.draw_track(segment, transformer, NSColor.systemRedColor(), 7.0)
+            for segment in self.controller.display_processed_track(track).segments:
+                self.draw_track(segment.points, transformer, NSColor.systemRedColor(), 7.0)
 
     def draw_overview_endpoint_markers(self, transformer):
         if self.mode != "overview":
@@ -994,7 +1165,7 @@ class PlotView(NSView):
         tracks_with_points = [
             (track, points)
             for track in self.display_tracks()
-            if (points := self.controller.processed_point_infos(track))
+            if (points := self.controller.display_processed_track(track).points)
         ]
         if not tracks_with_points:
             return
@@ -1014,7 +1185,7 @@ class PlotView(NSView):
             return
         selected = set(self.controller.selected_nrs)
         for track in self.display_tracks():
-            points = self.controller.processed_point_infos(track)
+            points = self.controller.display_processed_track(track).points
             if not points:
                 continue
             stroke_color = NSColor.systemRedColor() if track.nr in selected else NSColor.systemBlueColor()
@@ -1031,7 +1202,7 @@ class PlotView(NSView):
         if self.mode != "overview":
             return
         for track in self.display_tracks():
-            points = self.controller.processed_point_infos(track)
+            points = self.controller.display_processed_track(track).points
             if not points:
                 continue
             point = points[len(points) // 2]
@@ -1039,7 +1210,7 @@ class PlotView(NSView):
             self.draw_label_box(str(track.nr), x + 8, y + 8)
 
     def draw_track_start_end_markers(self, track: TrackRecord, transformer):
-        points = self.controller.processed_point_infos(track)
+        points = self.controller.display_processed_track(track).points
         if not points:
             return
         for label, point in (("Start", points[0]), ("End", points[-1])):
@@ -1319,6 +1490,7 @@ class PlotView(NSView):
         if base_extent is not None:
             self.plot_info["base_extent_mercator"] = base_extent
         self.zoom = 1.0
+        self.controller.sync_elevation_profile_to_plot_view(self)
         self.setNeedsDisplay_(True)
 
     def render_extent(self, extent: dict, requested_tile_zoom: int | None = None, status: str = "Rendered OSM viewport."):
@@ -1353,6 +1525,7 @@ class PlotView(NSView):
         self.update_window_title()
         tile_status = new_info.get("status_message")
         self.controller.set_status(f"{status} {tile_status}" if tile_status else status)
+        self.controller.sync_elevation_profile_to_plot_view(self)
         self.setNeedsDisplay_(True)
 
     def rerender_current_map(self):
@@ -1801,7 +1974,7 @@ class ElevationProfileView(NSView):
         track_ranges = {}
         total_distance = 0.0
         for track in self.profile_tracks():
-            processed = self.controller.processed_track(track)
+            processed = self.controller.display_processed_track(track)
             if not processed.points:
                 continue
             start_distance = total_distance
@@ -1813,6 +1986,8 @@ class ElevationProfileView(NSView):
                         "track": track,
                         "index": point.source_index,
                         "point": raw,
+                        "latitude": point.lat,
+                        "longitude": point.lon,
                         "distance": start_distance + point.cumulative_distance_km,
                         "elevation": point.elevation_m,
                     }
@@ -1885,6 +2060,44 @@ class ElevationProfileView(NSView):
             left -= right - total_distance
             right = total_distance
         return max(0.0, left), max(right, min(total_distance, 0.001))
+
+    def sync_to_map_extent(self):
+        """Match the profile distance window to points visible on the map."""
+        metadata = self.plot_view.plot_info.get("metadata") or {}
+        extent = metadata.get("extent_mercator")
+        if not isinstance(extent, dict):
+            return False
+        visible_distances: list[float] = []
+        total_distance = 0.0
+        try:
+            min_x = float(extent["min_x"])
+            max_x = float(extent["max_x"])
+            min_y = float(extent["min_y"])
+            max_y = float(extent["max_y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        for track in self.profile_tracks():
+            processed = self.controller.display_processed_track(track)
+            for point in processed.points:
+                merc_x, merc_y = lonlat_to_web_mercator(point.lon, point.lat)
+                if min_x <= merc_x <= max_x and min_y <= merc_y <= max_y:
+                    visible_distances.append(
+                        total_distance + point.cumulative_distance_km
+                    )
+            total_distance += processed.length_km
+        visible_range = (
+            (min(visible_distances), max(visible_distances))
+            if visible_distances
+            else None
+        )
+        if visible_range is None or total_distance <= 0.0:
+            return False
+        left, right = visible_range
+        span = max(right - left, total_distance / 64.0, 0.001)
+        self.x_center = max(0.0, min((left + right) / 2.0, total_distance))
+        self.x_zoom = max(1.0, min(total_distance / span, 64.0))
+        self.setNeedsDisplay_(True)
+        return True
 
     def draw_axes(self, plot, x_min, x_max, y_min, y_max):
         NSColor.separatorColor().setStroke()
@@ -3736,6 +3949,15 @@ class GPXEditorController(NSObject):
         track.processed_fingerprint = fingerprint
         return track.processed
 
+    def display_processed_track(self, track: TrackRecord) -> ProcessedTrack:
+        """Reuse validated processed geometry during repaint-heavy display paths."""
+        if (
+            track.processed is not None
+            and track.processed_signature == self.processing_parameter_signature()
+        ):
+            return track.processed
+        return self.processed_track(track)
+
     def processed_point_infos(self, track: TrackRecord) -> list[PointInfo]:
         raw_by_index = {point.source_index: point for point in extract_raw_track_points(track.element)}
         infos = []
@@ -4667,6 +4889,7 @@ class GPXEditorController(NSObject):
             window.orderFrontRegardless()
             window.makeFirstResponder_(view)
             window.setTitle_(view.profile_title())
+            view.sync_to_map_extent()
             view.setNeedsDisplay_(True)
             return view
         title = "Overview Elevation Profile" if plot_view.mode == "overview" else "Track Elevation Profile"
@@ -4688,6 +4911,7 @@ class GPXEditorController(NSObject):
         window.makeFirstResponder_(view)
         self.plot_windows.append((window, delegate, view))
         self.register_auxiliary_window(window)
+        view.sync_to_map_extent()
         if plot_view.window() is not None:
             plot_view.window().makeKeyAndOrderFront_(None)
         window.makeKeyAndOrderFront_(None)
@@ -4712,6 +4936,15 @@ class GPXEditorController(NSObject):
         window, view = existing
         window.setTitle_(view.profile_title())
         view.setNeedsDisplay_(True)
+
+    def sync_elevation_profile_to_plot_view(self, plot_view: PlotView):
+        """Synchronize an open profile after the associated map viewport changes."""
+        existing = self.existing_elevation_profile_for_plot_view(plot_view)
+        if existing is None:
+            return
+        window, view = existing
+        window.setTitle_(view.profile_title())
+        view.sync_to_map_extent()
 
     def close_elevation_profile_for_plot_view(self, plot_view: PlotView):
         existing = self.existing_elevation_profile_for_plot_view(plot_view)
@@ -6190,22 +6423,40 @@ class GPXEditorController(NSObject):
                 f"map tile{'s' if missing_basemap_tiles != 1 else ''} skipped."
             )
         selected = {track.nr for track in self.selected_tracks()}
+        route_mode = str(self.project_parameters.get("trackmaps.gpx_overlay", "line"))
+        route_color = str(self.project_parameters.get("trackmaps.route_color", "#0000FF"))
+        route_width = float(self.project_parameters.get("trackmaps.route_width", 4.0))
+        endpoint_color = str(self.project_parameters.get("trackmaps.endpoint_color", "#FFFFFF"))
+        endpoint_size = float(self.project_parameters.get("trackmaps.endpoint_size", 0.0))
         for track in tracks:
-            color = "red" if mode == "overview" and track.nr in selected else "blue"
-            width = 5.5 if color == "red" else 3.6
+            color = "red" if mode == "overview" and track.nr in selected else route_color
+            width = route_width * (1.35 if color == "red" else 1.0)
             processed = self.processed_track(track)
-            for segment in processed.segments:
-                projected = [lonlat_to_web_mercator(point.lon, point.lat) for point in segment.points]
+            scene = MapOverlayScene(
+                stage_kind="gpx_track",
+                mode=route_mode,
+                segments=normalize_overlay_segments(
+                    [
+                        [(point.lat, point.lon) for point in segment.points]
+                        for segment in processed.segments
+                    ]
+                ),
+            )
+            for segment in (scene.segments if scene.mode == "line" else ()):
+                projected = [lonlat_to_web_mercator(point.longitude, point.latitude) for point in segment]
                 if len(projected) < 2:
                     continue
                 xs = [point[0] for point in projected]
                 ys = [point[1] for point in projected]
                 ax.plot(xs, ys, color=color, linewidth=width, solid_capstyle="round", zorder=3)
-                if mode == "overview" and self.pdf_overview_show_endpoint_dots():
-                    ax.scatter([xs[0], xs[-1]], [ys[0], ys[-1]], s=26, c="white", edgecolors=color, linewidths=1.2, zorder=4)
-                if mode == "track" and self.pdf_track_show_endpoint_dots():
-                    ax.scatter([xs[0], xs[-1]], [ys[0], ys[-1]], s=38, c="white", edgecolors="black", linewidths=1.2, zorder=4)
-        self.draw_pdf_start_end_labels(ax, tracks, mode)
+                show_endpoints = endpoint_size > 0 or (
+                    self.pdf_overview_show_endpoint_dots() if mode == "overview" else self.pdf_track_show_endpoint_dots()
+                )
+                if show_endpoints:
+                    size = endpoint_size if endpoint_size > 0 else (26 if mode == "overview" else 38)
+                    ax.scatter([xs[0], xs[-1]], [ys[0], ys[-1]], s=size, c=endpoint_color, edgecolors=color, linewidths=1.2, zorder=4)
+        if route_mode == "line":
+            self.draw_pdf_start_end_labels(ax, tracks, mode)
         if mode == "overview" and self.pdf_overview_show_track_numbers():
             for track in tracks:
                 points = self.processed_track(track).points
@@ -7099,7 +7350,7 @@ class GPXEditorController(NSObject):
         projected = [
             lonlat_to_web_mercator(point.lon, point.lat)
             for track in tracks
-            for point in self.processed_track(track).points
+            for point in self.display_processed_track(track).points
         ]
         if not projected:
             return {"min_x": -1.0, "max_x": 1.0, "min_y": -1.0, "max_y": 1.0}
@@ -7238,13 +7489,24 @@ class GPXEditorController(NSObject):
         if missing_tiles:
             self.cached_map_tile_urls = None
         for track in tracks:
-            for segment in self.processed_track(track).segments:
+            for segment in self.display_processed_track(track).segments:
                 projected = [lonlat_to_web_mercator(point.lon, point.lat) for point in segment.points]
-                if len(projected) < 2:
-                    continue
-                xs = [point[0] for point in projected]
-                ys = [point[1] for point in projected]
-                ax.plot(xs, ys, color="blue", linewidth=4.0, solid_capstyle="butt", zorder=3)
+                for run in visible_simplified_polyline_runs(
+                    projected,
+                    extent,
+                    (width_px, height_px),
+                ):
+                    xs = [point[0] for point in run]
+                    ys = [point[1] for point in run]
+                    ax.plot(
+                        xs,
+                        ys,
+                        color="blue",
+                        linewidth=4.0,
+                        solid_capstyle="round",
+                        solid_joinstyle="round",
+                        zorder=3,
+                    )
         tracks_done = time.perf_counter()
         ax.axis("off")
         png_buffer = io.BytesIO()

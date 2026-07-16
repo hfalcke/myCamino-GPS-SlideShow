@@ -17,15 +17,15 @@ Parameter changes are edited as a draft. **Apply** validates them, updates the c
 
 ## Editable Parameters
 
-- **Slide Show:** default Time-Lapse/Standard show, media duration `3 s`, transition, transition duration, background/font/marker colors, font size `30`, marker radius `6 px`, arrow scale `1.0`, clock, place names, fullscreen mode `Auto/On/Off`, automatic/single/separate overview window mode, optional marked track map before each Standard medium, joined windows, display swap, repeat, manual start, collage range `33-66%`, and maximum collage images `9`.
+- **Slide Show:** initial style (Time-Lapse by default, followed by all standard transitions), media duration `3 s`, transition duration, background/font/marker colors, font size `30`, marker radius `6 px`, arrow scale `1.0`, clock, place names, fullscreen mode `Auto/On/Off`, automatic/single/separate overview window mode, optional marked track map before each Standard medium, joined windows, display swap, repeat, manual start, collage range `33-66%`, and maximum collage images `9`.
 - **Time-Lapse:** stage duration `30 s`, preferred minimum media size `50%`, framed/full-screen single-window overview, and walking-pilgrim/arrow marker style.
-- **Track Maps:** ordering by date/track number, Standard/Time-Lapse map preference, image size `1920x1080`, zoom `15`, route width `4`, route/endpoint/background/title colors, endpoint size `0`, font factor `2.2`, overview labels, removable track-name prefix, and Time-Lapse edge margin `5%`.
+- **Map Generation:** ordering by date/track number, image size `1920x1080`, zoom `15`, route width `4`, route/endpoint/background/title colors, endpoint size `0`, font factor `2.2`, overview labels, removable track-name prefix, and Time-Lapse edge margin `5%`. Standard and Time-Lapse maps are always maintained together.
 - **GPX Processing:** fallback walking speed `3.5 km/h`, horizontal smoothing `10 m`, minimum retained-point spacing `10 m`, elevation smoothing `50 m`, maximum horizontal/vertical error `10/20 m`, maximum HDOP/VDOP `20/20`, GPX Editor autosave interval `300 s`, map padding `8%`, default map zooms, elevation-profile headroom, and maximum interactive map tiles `48`. Zero disables an individual smoothing, spacing, or quality limit.
 - **PDF Export:** document DPI `200`, embedded-map DPI `600`, overview/track zooms `8/14`, and maximum PDF map tiles `24`.
 - **Locations:** known-place reuse radius `150 m`, reverse-geocoding timeout `10 s`, and advanced request pacing `1-5 s`.
 - **Map Service:** OpenStreetMap, Esri, or Custom provider; custom `{z}/{x}/{y}` URL template, attribution, maximum zoom, request timeout `12 s`, and tile-cache retention `24 h`.
 
-Custom providers accept HTTP or HTTPS templates but require `{z}`, `{x}`, and `{y}` plus attribution. The provider is shared by Track Maps and GPX Editor. Apple `CLGeocoder` remains the place-name service because it does not expose a configurable server endpoint.
+Custom providers accept HTTP or HTTPS templates but require `{z}`, `{x}`, and `{y}` plus attribution. The provider is shared by Map Generation and GPX Editor. Apple `CLGeocoder` remains the place-name service because it does not expose a configurable server endpoint.
 
 Internal safety and implementation values remain hidden: memory-watchdog limits, 20-ms animation timing, metadata/cache versions, free-box calculation grid, history depth, and file-format constants.
 

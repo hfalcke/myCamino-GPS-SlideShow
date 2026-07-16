@@ -275,11 +275,14 @@ def rename_or_copy_adventure(
             if source_playlist.exists():
                 target_playlist = source_playlist.with_name(f"{target_base}.playlist")
                 mapping[source_playlist] = target_playlist
-                target_payload["music_playlist"] = (
-                    target_playlist.name
-                    if target_playlist.parent == project_dir.resolve(strict=False)
-                    else str(target_playlist)
-                )
+                try:
+                    target_payload["music_playlist"] = str(
+                        target_playlist.relative_to(
+                            project_dir.resolve(strict=False)
+                        )
+                    )
+                except ValueError:
+                    target_payload["music_playlist"] = str(target_playlist)
         target_payload["gpx_file"] = target_gpx.name
         target_payload["control_file"] = target_control.name
         target_payload["track_map_base"] = target_base

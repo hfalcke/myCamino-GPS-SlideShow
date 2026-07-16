@@ -17,8 +17,13 @@ You can also preload a project:
 
 ```bash
 ./.venv/bin/python GPSTrackShowGUI.py --project-directory /path/to/project
+./.venv/bin/python GPSTrackShowGUI.py /path/to/project
 ./.venv/bin/python GPSTrackShowGUI.py /path/to/project/adventure.adv
 ```
+
+When a project directory is supplied, the GUI loads its most recently modified
+valid Adventure file. If the directory has no Adventure yet, it opens the
+directory as a new project.
 
 ## Basic Workflow
 
@@ -26,30 +31,57 @@ The normal order is:
 
 1. Choose or create the adventure directory.
 2. Enter the adventure title and optional description.
-3. Select or edit the GPX track file.
-4. Create or update track maps.
-5. Import photos and videos.
-6. Create the slide-show control file.
+3. Confirm a detected GPX file, choose other GPX files, or select
+   **no GPX file - use only photos**. One detected file is used directly;
+   several detected files can be joined in the GPX Editor.
+4. Confirm media already in the folder or import photos and videos.
+5. The retained **Adventure Processing** window prepares metadata, optionally
+   adds place names, generates both map variants, and then creates or reviews
+   the control file. It keeps the output from every phase; **Skip** appears only
+   during the slower place-name phase.
+6. Existing edited control files are never replaced automatically. After maps
+   are ready, choose whether to review an Update Control File operation.
 7. Review and edit the control file.
-8. Add place names if desired.
-9. Export a PDF track summary if desired.
-10. Start the slide show.
+8. Export a PDF track summary if desired.
+9. Start the slide show.
+
+Music is an optional section of its own. New Adventures start with
+**No Music** selected, which hides the playlist controls. Every project has a
+fixed `audio` folder. It is created when the project is opened and recreated
+automatically if it was removed. Clear **No Music**, open that folder with the
+folder icon, and copy supported audio files or complete album directories into
+it. The selected playlist is saved with the Adventure.
+
+In the **GPX Files** section, select **No GPX file - use only photos** when the Adventure has
+no recorded GPX track. The GPX filename controls are then hidden and the
+program builds journey stages from GPS positions stored with the photos and
+videos. This choice is saved with the Adventure. If several GPX files are
+selected instead, the GPX Editor joins them into one Adventure file and allows
+individual tracks to be rearranged, split, joined, inspected, plotted, and
+edited.
+
+When exactly one GPX file is already present in a new project folder, the
+Assistant offers that filename as the default. Continue accepts it immediately
+without opening another chooser. Cancelling Choose or the GPX Editor leaves the
+journey source unconfirmed.
 
 Green check marks beside sections show that the minimum required step for that
 section is complete. Red marks show what is still missing.
 
 New Adventures also start with the **Assistant** enabled. Its yellow speech
-bubble points to the next required control in this order: project directory,
-Adventure name, GPX file, Track Maps, media, control file, place names, and the
-first slide-show start. The bubble moves on automatically as each step becomes
-ready. Click its `x`, or clear **Assistant** in the header, to disable it for
-the active Adventure. That choice and the completed action steps are saved
-automatically with the Adventure.
+bubble now contains recommended actions as well as an explanation. It guides
+project directory and name, a GPX choice or the GPX section's explicit
+**No GPX file - use only photos** option, explicit use or
+import of media, smart metadata preparation, combined control/map creation,
+and the first slide-show start. When existing media is found, three radio-style
+rows offer Use Existing Media, Import More, or Not Yet, followed by one
+Continue button. Return activates the recommended choice. Click
+its `x`, or clear **Assistant** in the header, to disable it for the active
+Adventure. Choices and completed steps are saved automatically.
 
-Adventures created before the Assistant was introduced do not repeat the two
-action-only prompts for place names and starting the show. Missing GPX files,
-maps, media, or control files are still detected and can reactivate a relevant
-data step.
+Existing Adventures without the newer confirmation fields are treated as
+already confirmed, so onboarding does not unexpectedly restart. Genuinely
+missing GPX files, maps, media, or control files can still reactivate a step.
 
 ## Adventure Section
 
@@ -71,15 +103,15 @@ Files created:
   `.adv` extension.
 
 The `.adv` file explicitly stores its project directory, GPX filename, active
-`.lst` file, Track Map family, settings, description, import directory, and
+`.lst` file, generated map family, settings, description, import directory, and
 last stopped slide-show position. After creation or loading, every relevant
 change is saved automatically.
 
 In an empty folder, confirm the suggested Adventure name to create the first
 `.adv`. Committing a changed name for an existing Adventure offers **Rename**,
 **Copy**, or **Cancel**. The related-files checkbox is enabled by default and
-renames/copies GPX, control list, overview, summaries, and all standard and
-Time-Lapse Track Maps consistently. Photos and videos remain shared. Turning
+renames/copies GPX, control list, overview, summaries, and all Standard and
+Time-Lapse maps consistently. Photos and videos remain shared. Turning
 the checkbox off intentionally shares GPX, list, and maps; the GUI warns before
 an operation modifies data used by another Adventure. A related-data Rename is
 refused while another Adventure shares those files; use Copy or turn off the
@@ -110,7 +142,7 @@ GPX Processing separates horizontal smoothing (default 10 m), retained-point
 spacing (10 m), and elevation smoothing (50 m). Horizontal/vertical uncertainty
 limits default to 10/20 m, and HDOP/VDOP limits to 20/20. Missing quality data
 is accepted. Setting any individual smoothing, spacing, or quality limit to
-zero disables it. The same processed geometry drives statistics, Track Maps,
+zero disables it. The same processed geometry drives statistics, generated maps,
 PDFs, timing, and Time-Lapse motion; the original GPX points are not rewritten.
 
 The Time-Lapse **Moving marker** setting chooses between the animated walking
@@ -123,10 +155,10 @@ map; the overview map continues to show the traditional arrow.
 
 The Locations radius groups nearby GPS positions under an already determined
 place name. A larger radius reduces the number of lookups and can speed up
-**Add Place Names**, while a smaller radius gives more locally specific names.
+place-name extraction, while a smaller radius gives more locally specific names.
 
-Changing a map-rendering or GPX-filtering setting marks affected Track Maps or
-the track summary as needing Update. Slide-show and place-name settings do not
+Changing a map-rendering or GPX-filtering setting marks affected maps or the
+track summary as needing generation/update. Slide-show and place-name settings do not
 force map recreation. Keyboard changes made while a slide show is running are
 temporary and do not overwrite the saved project settings.
 
@@ -169,23 +201,78 @@ Behavior:
 The summary line shows the number of tracks, track/date range information, how
 many track plot images exist, and whether an overview plot exists.
 
-## Track Maps Section
+## Map Generation Section
 
-Use this section to create and maintain one shared overview plus Standard and
-Time-Lapse map variants for each GPX track.
+Map Generation normally runs automatically after media have been accepted or
+imported and their metadata has been prepared. It maintains one shared overview
+plus Standard and Time-Lapse variants for every required GPX or media stage.
+Only missing or outdated maps are rendered.
+
+Newly created maps separate the downloaded basemap from the route and header.
+The PNG stores the basemap and its reserved header area; the slideshow, map
+viewer, and PDF export draw routes, location dots, endpoints, and titles from
+the matching map information. Therefore changing route colors, line widths,
+point styles, or header visibility in Settings no longer requires downloading
+the basemap again. Maps made by older versions remain usable and keep their
+already printed route until they are updated once.
+
+GPX-stage maps reserve a 25% taller black header. By default their title uses
+the reverse-geocoded start and destination of the track (`PLACE1 - PLACE2`);
+**Settings > Map Generation > Track title** can instead select the GPX track
+name. If either endpoint name is unavailable, the GPX track name is used as a
+safe fallback. The subtitle shows
+`DATE · NN.N km - HH:MM h`. During Time-Lapse, an active clock removes the
+repeated date and leaves `NN.N km - HH:MM h`, with the current place on the
+third line in the same subtitle size.
+
+Under **Settings > Map Generation**, **Journey source** controls how stages are
+formed:
+
+- **Automatic** uses the selected GPX when one is available and otherwise uses
+  media locations.
+- **GPX tracks** requires a GPX file and retains the traditional workflow.
+- **Media locations** groups media by local calendar date even if a GPX file is
+  present.
+
+For media stages, **Media route display** offers **Photo dots**, **Interpolated
+line**, and **Hidden**. Photo dots are the default because they represent
+measured locations. An interpolated line only connects successive photo
+locations and must not be interpreted as a measured walking route.
+
+### Adventures Without a GPX Track
+
+1. In the Assistant choose **no GPX file - use only photos**.
+2. Accept media already in the project folder or import more.
+3. Metadata preparation starts automatically. Keep **Add place names** selected
+   unless you only want metadata; current sidecars are reused and only missing,
+   invalid, legacy, or changed metadata is extracted.
+4. Map Generation starts automatically. Media are grouped by date and the
+   program creates one overview plus Standard and Time-Lapse variants for every
+   located stage.
+5. Choose **Continue** to create the control file.
+6. Start the slide show or choose Later. The initial style defaults to
+   Time-Lapse and can be changed in Settings or during playback.
+
+Media without GPS remain in their date section but do not create a dot. A
+media-derived Time-Lapse stage is static: it shows media positions and the
+current media marker but does not pretend that a measured GPX route exists.
+Media position dots are vivid blue with a white edge and use the same visible
+radius as the moving slide-show marker. If cached free-corner information is
+missing, all media coordinates in the map sidecar are used as placement
+obstacles so framed media avoids the known locations.
 
 Controls:
 
-- Create: recreate the overview and every track map of the selected variant. If
-  current maps already exist, the GUI asks before overwriting them.
-- Update: open a selection window for missing or outdated maps.
-- for Time-Lapse: checked means Create, Update, and View prefer Time-Lapse maps;
-  unchecked means Standard maps.
-- View: view existing map images.
+- Generate and Update Maps: open a selection window with missing or outdated
+  stages preselected. Selecting a current stage deliberately regenerates it.
+  Standard and Time-Lapse variants are always generated together and directly
+  after one another.
+- View Maps: view the overview followed by Standard and Time-Lapse maps paired per
+  stage.
 - Folder icon: open the `trackimages` folder in Finder.
-- Track ordering by: choose `date` or `track number` for generated map order and
-  control-file insertion.
-- Cancel: shown only while map creation is running.
+- Track ordering is configured under **Settings > Map Generation**. Choose
+  `date` or `track number` for generated map order and control-file insertion.
+- Cancel: shown only while map generation is running.
 
 Files created:
 
@@ -195,11 +282,14 @@ Files created:
 - `<projectname>-summary.json`: track summary used later by the control-file
   section.
 - `0001_...png`, `0002_...png`, etc.: centered Standard per-track maps.
-- `0001_...-timelapse.png`, etc.: Time-Lapse maps shifted to leave the largest
-  practical route-free corner for photos and videos.
+- `0001_...-timelapse.png`, etc.: Time-Lapse maps shifted to leave a large
+  practical route-free area for photos and videos.
 - Matching `.json` files: timing, map coordinates, track identity, and cached
-  route-free corner rectangles. The player uses these rectangles directly and
-  recalculates them only when cached data is missing or invalid.
+  route-free placement rectangles. The player compares the four corners with
+  center-left, center, center-right, top-center, and bottom-center, then uses
+  the position that displays each photo or video largest without covering the
+  route. It recalculates the rectangles only when cached data is missing or
+  invalid.
 
 The summary and map sidecar files store per-track fingerprints. This lets the
 GUI decide which maps really need updating after a GPX edit instead of assuming
@@ -207,17 +297,19 @@ all maps are stale whenever the GPX file changes.
 
 When maps are created or updated, obsolete numbered track-map files in
 `trackimages/` are removed if they no longer match any current GPX track. The
-overview, summary, and unrelated files are not removed.
+same check removes obsolete media-stage maps from the active Adventure's map
+family. The overview, summary, other Adventures, and unrelated files are not
+removed.
 
-Update Track Images window:
+Generate and Update Maps window:
 
-- Opens when you press Track Maps Update.
+- Opens when you press **Generate and Update Maps**.
 - Shows overview as number `0` and all tracks as numbered rows.
 - Rows marked with `*` need update.
 - Missing or outdated maps are preselected and listed in the Range field.
-- You can update all images, select rows manually, or type a range such as
+- You can regenerate all maps, select rows manually, or type a range such as
   `1,2,3-6,8`.
-- Manual row selection automatically disables the Create all images checkbox.
+- Manual row selection automatically disables the all-images checkbox.
 
 Plot viewer window:
 
@@ -237,6 +329,24 @@ Controls:
 - Import: choose images and videos to import into the project directory.
 - View: open the project media browser.
 - Folder icon: open project media in Finder.
+- Update Metadata Extraction: refresh only missing, invalid, legacy, or changed
+  companion metadata. The button is separated at the right of the section
+  because it is a maintenance action rather than an import/view action.
+- If current Track Map sidecars are missing start or destination place names,
+  the Photos and Map Generation status lines report the number missing and
+  **Update Metadata Extraction** receives an `*`. Run it again to continue the
+  place-name pass. Completed endpoints are retained and each completed track is
+  saved immediately.
+- Add place names: selected by default; after metadata preparation, obtain
+  readable names for stored GPS positions. For GPX Adventures this resolves
+  each track's start and end first and stores those names with both map
+  variants, then processes the media. These endpoint names provide the default
+  stage titles.
+
+Existing valid place names are retained. If GPS changes sufficiently, its old
+place name is invalidated automatically and can be looked up again. For a
+deliberate complete metadata rebuild, remove that media file's companion
+metadata file in Finder and run **Update Metadata Extraction**.
 
 Files created:
 
@@ -244,16 +354,29 @@ Files created:
 - A file already present under the destination name is reported as
   **Skipping existing** and is not copied or counted as newly imported.
 - Existing files are skipped so duplicates are not imported.
-- Sidecar `.json` files are created later by the Slide Show Control File
-  section or by media browser preparation when needed.
+- Companion metadata files are prepared when media is added and can be refreshed
+  with **Update Metadata Extraction**, **Create**, or **Update Control File**.
+  Opening the media browser never scans the media or creates metadata.
+- When companion metadata is created, the embedded exposure timestamp is
+  preferred: the original photo time first, then the camera-supplied creation
+  time, followed by a GPS timestamp when available. Generic video-track dates,
+  Spotlight, and filesystem dates are used only as fallbacks.
 
 Media browser window:
 
 - Shows media files in the project directory.
-- Columns include included status, type, name, time, GPS, and place.
+- Columns include included status, type, metadata status, name, time, GPS, and
+  place.
+- Metadata status is **Available**, **Missing**, or **Invalid**. Every media file
+  remains visible; date, GPS, and place stay blank when its metadata is not
+  usable.
+- Missing dates are sorted after valid dates. The browser never substitutes a
+  file creation or modification time.
 - Sort rows by clicking a column header.
 - Double-click a row or press View to open the media viewer.
-- In merge mode, select rows and press Merge Selected.
+- The normal **Update Control File** workflow analyzes clear changes automatically.
+  Use **Choose Other Media...** only when you deliberately want to re-read an
+  older or otherwise unchanged file.
 
 Media viewer window:
 
@@ -280,15 +403,30 @@ Controls:
 - Create: run geolocation/metadata processing and create the sorted control
   file.
 - Edit: open the editable control-file table.
-- Add Place Names: reverse-geocode GPS coordinates and add missing place names.
-- Sync Track Maps: update canonical track map lines and adjacent-day map
-  references in an existing control file. It can add missing map lines and
-  remove old map lines that no longer match the current GPX summary or no
-  longer exist. It does not create map images.
-- Merge New Media: choose additional media files and merge them into the
-  existing control file.
+- Update Control File: check Track Map references and media together. It adds,
+  replaces, or removes map references that no longer agree with the current
+  generated maps, finds imported, missing, invalid, legacy, or changed media,
+  and shows one review before writing. It does not render maps; use
+  **Generate and Update Maps** for that.
 
-During Create and Merge New Media, media from a date without its own track can
+During **Create** and **Update Control File**, a photo or video without embedded
+GPS can receive a position from its exposure time. The program first compares
+that time only with the start and end of each stage. If it falls inside exactly
+one stage, the two surrounding timed track points are loaded from the current
+map information and the position is interpolated. Media outside a stage,
+inside overlapping stages, or associated with missing/outdated maps is left
+without GPS rather than guessed. **Generate and Update Maps** makes its timing
+information available again.
+
+The inferred position is saved in the media's companion metadata together
+with the source stage. A real camera GPS position is never replaced. If the
+source track later changes, Create or Update Control File refreshes only positions
+that were previously inferred. Place-name extraction from **Update Metadata
+Extraction** does not scan tracks; it uses the position already stored with
+each medium and obtains a readable place name from it. It also never re-reads
+the media through Spotlight or ExifTool.
+
+During Create and Update Control File, media from a date without its own track can
 be associated with a stage on the next or previous day. With GPS data, the
 location must be within half the stage length of the appropriate start or end
 point. Without GPS data, the date alone is used. The list labels these sections
@@ -303,12 +441,12 @@ their track. Media without any usable position remains in a mapless date
 section. These generated maps are stored in the `trackimages` folder with
 names ending in `-media-YYYY-MM-DD.png`.
 
-Like track maps, location maps can have Standard and Time-Lapse versions. The
-selected **for Time-Lapse** option controls which version Create, Update,
-control-file creation, and Merge New Media produce. Time-Lapse versions shift
+Like track maps, location maps have Standard and Time-Lapse versions. Map
+Generation always maintains both variants together. Time-Lapse versions shift
 the mapped positions at the same scale to maximize useful free space for
-framed media. They appear as **Media locations** in the Track Maps Update list
-and receive an `*` when the selected version is missing or out of date.
+framed media. They appear as **Media locations** in the Generate and Update
+Maps list and receive an `*` when either required version is missing or out of
+date.
 
 In the editor, a location map has type `LOC`. During Time-Lapse playback it is
 a static stage: there is no walking pilgrim, but every displayed image or video
@@ -337,11 +475,12 @@ top left when the editor window is resized.
 Music control uses separate `MUS` rows rather than an extra column. Press
 **Insert Row** or Command-I, choose `MUS` in the Type field, and enter the
 comma-separated commands in **File / Date / Map**. A nonmodal command reference
-opens for a `MUS` row. **Hide Media Rows** temporarily removes only image and
-video rows and then changes to **Show Media Rows**. The selected stage remains
-selected and is scrolled into view when media rows return, making it easy to
-continue editing there. Filtering never changes the saved row order, and
-search uses only visible rows while the filter is active.
+opens for a `MUS` row. The same reference is available from the small **Help**
+link beside **No Music** in the main window. **Hide Media Rows** temporarily
+removes only image and video rows and then changes to **Show Media Rows**. The
+selected stage remains selected and is scrolled into view when media rows
+return, making it easy to continue editing there. Filtering never changes the
+saved row order, and search uses only visible rows while the filter is active.
 
 The compact Type column shows only its short code. Its dropdown menu shows both
 the short type and its meaning, for example `TRK - Track map` and
@@ -379,12 +518,18 @@ or shows statistics such as number of images, videos, track maps, date rows,
 whether an overview map is present, how many images have place names, and the
 last modification date.
 
-Create output window:
+Adventure Processing window:
 
-- Opens during Create, Add Place Names, and merge operations.
-- Shows live output from `GetGeoLocations.py`.
+- Is reused for metadata, place names, map generation, and control-file work.
+- Keeps phase headings and prior output so the whole operation can be followed.
+- Shows the active phase, progress, and current filename in its title.
+- Reports extracted dates/GPS values, skipped files, map work, warnings, and
+  control-file actions.
 - Always scrolls to the latest line.
-- Cancel stops processing when possible.
+- Cancel remains available throughout processing and preserves completed
+  metadata and maps.
+- Skip appears during place-name extraction and omits only that phase for the
+  current run without changing the selected Add place names option.
 - Close becomes available after completion.
 - The progress bar in the main window is shown only while useful.
 
@@ -428,59 +573,100 @@ Table features:
 
 Editing this table is how you fine-tune the final slide-show order.
 
-## Update and Merge Operations
+## Updating The Control File
 
-Sync Track Maps:
+Update Control File:
 
-- Reads the current track summary JSON in `trackimages/`.
-- States which overview/track map lines need to be inserted.
-- States which old map lines no longer match the current tracks or map files.
-- Offers to remove old map lines before merging.
-- Inserts missing overview/track map lines into the existing sorted list.
-- Preserves `Day before`/`Day after` section types while updating their map
-  filenames.
-- Avoids adding the same track map twice.
-- Uses the selected track ordering.
-- Updates a temporary copy first. Cancelling or encountering an error leaves
-  the active control file unchanged.
-
-Merge New Media:
-
-- Opens the media browser.
-- Marks which files are already included in the control file.
-- Lets you select new media files.
-- Creates missing sidecars if needed without overwriting the control file.
-- Inserts selected media where they would have appeared if included originally.
+- Reads the active control file and current Track Map summary once.
+- Reports overview/stage-map references to add, replace, or remove. It
+  preserves `Day before`/`Day after` section types and does not duplicate maps.
+- A map recreated under the same filename needs no reference update.
+- If maps or their summary are outdated, it asks you to run **Generate and
+  Update Maps** first. Metadata can still be refreshed, but track-dependent
+  media placement waits for current map information.
+- Scans for clearly new, changed, or legacy media and analyzes those files immediately.
+  Current files intentionally omitted from the control list are not proposed.
+- Rechecks older sidecars whose freshness is Unknown once. The processing
+  window labels this as `Legacy sidecar: extracting metadata once to establish
+  file signature`. Successful updates add a file signature and metadata source
+  so later scans recognize them as Current.
+- This legacy verification does not reverse-geocode media merely because its
+  unchanged GPS lacks a place name. Use **Update Metadata Extraction** with
+  **Add place names** selected for that separate task.
+- Use **Choose Other Media...** and **Recheck Selected** to inspect a Current
+  file again when you nevertheless suspect its embedded metadata changed.
+- Shows old/new date, GPS, place, and proposed control section before writing;
+  recommended updates are checked and can be disabled per row.
+- Inserts new media and proposes repositioning changed rows through the same
+  classifier used by Create. Repositioning can be rejected per file.
+- Preserves an existing place when GPS remains within the configured
+  **Place-name search radius** (150 m by default). A larger GPS change proposes
+  a targeted place lookup; if declined, stale place fields are cleared so
+  Update Metadata Extraction can fill them later.
+- Applies required Track Map corrections and selected media changes to one
+  staged model. It writes sidecars and affected media maps first, backs up the
+  active control file, and replaces that file last.
 - Creates Day before/Day after sections when the adjacent-date and distance
   rules qualify.
 - Avoids duplicate media entries.
+- Cancel or failure leaves the active project unchanged.
+
+## Music
+
+The Slide Show control file can contain directives of the form
+`#MUSIC: Parameters`. They can jump to a playlist location, play a particular
+piece, select loop behavior, change the internal volume, or switch music off
+and on at that point in the show. Playlists are editable text files and contain
+`$LABEL` entries for songs and albums. You can add your own labels for useful
+jump locations. Music is stored in the project's `audio` subdirectory as
+individual files or album folders. Click **Help** beside **No Music** for the
+complete command reference and the labels currently available in the selected
+playlist.
+
+The Music section contains:
+
+- Audio folder icon: open the project's fixed `audio` folder in Finder. Copy
+  MP3, M4A, AAC, WAV, AIFF, CAF, or FLAC files into it. Subdirectories that
+  contain audio files are treated as albums.
+- Playlist field and Choose: show and select an existing `.playlist` file
+  directly inside the `audio` folder. Without a selected playlist, all audio
+  files play in case-insensitive relative-path order.
+- Create Playlist: choose a new playlist filename in the `audio` folder and
+  write an editable playlist. Each album folder and filename receives a unique
+  short `$LABEL`.
+- Update Playlist: keep existing text and append newly discovered files,
+  grouped by folder, with new unique album and file labels.
+- Edit Playlist: open the active playlist in TextEdit. If no playlist exists
+  yet, it is first created from the supported audio files in the directory.
+- The Adventure stores `audio` as its fixed music source and the explicit
+  selected playlist path.
+  Renaming or copying an Adventure with related files enabled also renames or
+  copies its playlist; the audio recordings themselves remain unchanged.
 
 ## Start Slide Show
 
 The Start Slide Show section contains:
 
-- Music: choose one supported audio file or a directory containing MP3, M4A,
-  AAC, WAV, AIFF, CAF, or FLAC files. One file repeats by itself. A directory
-  is scanned recursively and uses case-insensitive relative-path order unless
-  `<Adventure name>.playlist` is present. Choose creates and initially selects
-  the project's `audio` folder when no source has been selected yet.
-- Create Playlist: write an editable playlist into the selected music
-  directory. Each album folder and filename receives a unique short `$LABEL`.
-  Existing playlists are replaced only after confirmation.
-- Update Playlist: keep existing text and append newly discovered files,
-  grouped by folder, with new unique album and file labels.
-- Edit Playlist: open the active playlist in TextEdit. If no playlist exists
-  yet, it is first created from the supported audio files in the directory.
-- The Adventure stores the selected music source and explicit playlist path.
-  Renaming or copying an Adventure with related files enabled also renames or
-  copies its playlist; the audio recordings themselves remain unchanged.
-
-- Show type: choose **Time-Lapse** or **Standard**. Time-Lapse is selected by
-  default; this preference is saved with the Adventure and can also be set in
-  Settings.
-- Start: launches the selected show from the beginning.
-- Continue: launches the selected show at its last automatically saved
-  position. It is disabled until such a position exists.
+- Start: launches from the beginning using the initial style saved in Settings.
+- Continue: launches at the last automatically saved stage, display phase,
+  medium, and Time-Lapse progress. It is disabled until such a position exists.
+- The initial style defaults to Time-Lapse. During playback, `t` cycles forward
+  and `Shift-t` backward through Time-Lapse, Blend, Fade, Switch, Expand,
+  Collage, Quad, and Random.
+- A fresh Start first shows the Adventure title, date/place/distance summary,
+  description, and title image directly over the Tour Overview without a
+  background panel. The text is black with a light readability shadow, and the
+  title image has a soft drop shadow. Choose the title image below Description
+  in the Adventure section;
+  **Use First** uses the first still image in the control file. The title image
+  is limited to 35% of the screen width and height. Descriptions shorter than
+  five displayed lines are centered. At show startup, the temporary `h` help
+  hint is placed at the bottom. The information disappears without fading the
+  unchanged background map through black, followed by the first Stage Map.
+  Continue and automatic repeat do not replay this introduction.
+- In one-window mode each Standard stage is Stage Map, marked Tour Overview,
+  then media. Cursor navigation crosses stage boundaries in both directions;
+  Command-cursor jumps directly between Stage Maps.
 - Time-Lapse plays each track map as a moving GPS time-lapse. The track map
   becomes the main background, the overview map remains visible on the other
   display when a separate overview window is active, and photos or videos
@@ -495,10 +681,11 @@ The Start Slide Show section contains:
   area. The moving arrow keeps one fixed orientation, perpendicular to the line
   from the stage start to its end. While media is visible, a red dot with a
   white edge marks the route position where it first appeared. Its reverse-
-  geocoded place appears as one shadowed line in the free 5% strip at the
-  bottom of the map. When the clock option is enabled, the analog clock in the
-  upper-left follows the moving GPX marker time throughout the stage rather
-  than showing a fixed media time. The upper-right map header shows total
+  geocoded place appears as a shadowed subtitle in the enlarged map header,
+  using the same size as the date subtitle. When the clock option is enabled,
+  the analog clock in the upper-left follows the moving GPX marker time
+  throughout the stage rather than showing a fixed media time; the separate
+  date subtitle is then omitted. The upper-right map header shows total
   travelled distance, distance within the current stage, and current height.
   Half-transparent black shadows keep all overlay text readable; `c` and `p`
   toggle the clock and place name respectively.
@@ -507,13 +694,21 @@ The Start Slide Show section contains:
   track maps, elevation profiles, and page orientation choices.
 - Quit: auto-save pending Adventure changes and close the main GUI.
 
+The control-file editor also offers **Start Slide Show Here** in the
+right-click menu. It starts at the selected map, media, date, or music row. If
+the table has unsaved edits, choose **Save and Start** first. This is a one-time
+start location; the previously saved Continue position is not replaced until
+the running player later autosaves its actual position.
+
 Window behavior is **Automatic** by default. A computer with one display starts
 with one slide-show window. At the beginning of every new Time-Lapse stage, the
 overview is shown by default as a framed medium over the stage map for the
 current media duration. The current stage route is projected into that smaller
 overview and highlighted there, followed by the animated route. Settings can restore a
 full-screen overview instead. In a Standard show, the single-window sequence is
-overview, stage map, then media. A computer with two or more displays starts
+Stage Map, marked Tour Overview, then media. The marked overview uses a runtime
+black title panel; the Intro uses the same full-tile overview without a
+duplicated baked-in title. A computer with two or more displays starts
 with a separate overview window. Settings can force either Single window or
 Separate overview window regardless of display count.
 
@@ -557,17 +752,21 @@ Common slide-show keys:
 - Left or Up: previous item. In Time-Lapse this first walks backward through
   media in the current stage, then to the previous stage. Previous items are
   reloaded from the control list instead of being retained as large images.
-- Command-Left or Command-Right: jump to the previous or next date section.
+  At the beginning, backward navigation returns through the Tour Overview,
+  Stage Map, and Intro title page. The startup help hint is not shown again
+  during backward navigation.
+- Command-Left or Command-Right: jump to the previous or next map-backed stage,
+  including media-only stages without a GPX track. Command-Left at the first
+  stage returns to the Intro title page.
 - `+` or `-`: change media duration. In Time-Lapse this is a minimum; the
   current image remains visible longer whenever no newer image is due.
 - Command-`+` or Command-`-`: change the active stage time-lapse duration by
   five seconds.
-- `T`: switch exclusively between Standard Slide Show and Time-Lapse at the
-  current stage; the inactive presentation is stopped.
+- `t`: cycle forward through Time-Lapse and the Standard transition styles.
+- `T` (Shift-`t`): cycle backward through the same styles.
 - `w`: switch between one slide-show window and a separate overview window.
   Closing the overview window also returns to one-window playback without
   stopping the show.
-- `t`: choose the normal slide-show transition.
 - `i`: show photo metadata overlay.
 - `c`, `p`, `f`, `d`, and `D`: keep their existing clock, place-name,
   fullscreen, display-swap, and memory-debug functions.
@@ -580,7 +779,7 @@ the main GUI.
 ### Music playlists and directives
 
 A playlist is a plain text file. Blank lines are ignored, paths are relative to
-the selected music directory, and a line such as `$MORNING` labels the next
+the project's `audio` directory, and a line such as `$MORNING` labels the next
 audio file. Several labels may precede one file. Labels are case-insensitive;
 ambiguous extensionless names are skipped with a warning. Subfolders that
 directly contain audio are albums and receive an `$ALB_...` label when a
@@ -627,11 +826,14 @@ the marker stays at the endpoint while the analog clock advances to the capture
 time and date of each displayed medium.
 
 Adjacent-day sections are static in Time-Lapse mode. The related stage map is
-shown first with **Day before** or **Day after**, followed by framed media in
-the available map corners. No pilgrim, arrow, or travelled-distance figures
-are added to this special section. A media GPS position is still marked when
-available, and the overview window continues to highlight the associated
-route. These sections do not count as extra travelled stages.
+shown first with **Day before** or **Day after** in the second header line,
+where the normal track length and duration would appear. If the clock is
+visible, media-only stage headers also omit their separate date line because
+the clock already shows it. Framed media then appears in the available map
+corners. No pilgrim, arrow, or travelled-distance figures are added to this
+special section. A media GPS position is still marked when available, and the
+overview window continues to highlight the associated route. These sections
+do not count as extra travelled stages.
 
 ## Standalone GPX Editor App
 
@@ -663,16 +865,27 @@ Inside `trackimages/`:
 - `0001_...png`, `0002_...png`, etc.: track maps.
 - matching `.json` sidecars for track maps.
 
+Current map sidecars also identify whether the PNG is a background-only map
+and contain the route or ordered media positions used for dynamic drawing.
+For a media-only Adventure, the same folder contains one date map per
+`#MediaMap:` section; a GPX summary file is not required.
+
 ## Troubleshooting
 
 - If the GPX section says no GPX file is available, choose or create a GPX file
-  first.
-- If track maps are missing, use Track Maps Create.
-- If only some track maps are missing or outdated, use Track Maps Update.
-- If the Slide Show Control File status says track map entries are missing or
-  old, use Sync Track Maps.
+  first, or select **Journey source: Media locations** when the Adventure has
+  no measured GPX track.
+- If maps are missing or outdated, use **Generate and Update Maps**. Missing or
+  stale stages are preselected.
+- If the Slide Show Control File status says its references need updating, use
+  Update Control File. If it instead says maps need regeneration, run
+  **Generate and Update Maps** first and then Update Control File.
 - If the control file cannot be created with tracks, check that
   `trackimages/<projectname>-summary.json` exists.
-- If media have no place names, use Add Place Names.
+- If media have GPS metadata but no place names, use Update Metadata Extraction
+  with Add place names selected.
+- If the media browser reports **Missing** or **Invalid** metadata, select the
+  files in Update Control File or use Update Metadata Extraction; place-name
+  extraction does not repair missing media metadata by itself.
 - If the slide show does not start, check that the control file and
   `trackimages/` directory both exist.

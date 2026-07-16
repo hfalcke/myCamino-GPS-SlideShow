@@ -5,11 +5,14 @@ from GPXEditor import (
     GPXEditorController,
     compact_elevation_status,
     compact_xy_status,
+    elevation_distance_range_for_map_extent,
     elevation_profile_visible_range,
     format_inspector_elevation,
     format_inspector_timestamp,
     inspector_table_document_size,
+    lonlat_to_web_mercator,
     normalize_inspector_timestamp_edit,
+    visible_simplified_polyline_runs,
 )
 
 
@@ -43,6 +46,24 @@ class ElevationProfileVisibleRangeTests(unittest.TestCase):
     def test_returns_none_without_visible_elevation(self):
         rows = [{"distance": 2.0, "elevation": None}, {"distance": 5.0, "elevation": 100.0}]
         self.assertIsNone(elevation_profile_visible_range(rows, 0.0, 3.0))
+
+    def test_map_extent_selects_matching_profile_distance_range(self):
+        rows = [
+            {"distance": 0.0, "latitude": 50.0, "longitude": 7.0},
+            {"distance": 5.0, "latitude": 50.1, "longitude": 7.1},
+            {"distance": 10.0, "latitude": 51.0, "longitude": 8.0},
+        ]
+        center_x, center_y = lonlat_to_web_mercator(7.05, 50.05)
+        extent = {
+            "min_x": center_x - 10_000.0,
+            "max_x": center_x + 10_000.0,
+            "min_y": center_y - 10_000.0,
+            "max_y": center_y + 10_000.0,
+        }
+        self.assertEqual(
+            elevation_distance_range_for_map_extent(rows, extent),
+            (0.0, 5.0),
+        )
 
 
 class InspectorValueFormattingTests(unittest.TestCase):
@@ -94,6 +115,37 @@ class InitialLoadCallbackTests(unittest.TestCase):
         self.assertEqual(calls, ["complete"])
         self.assertTrue(controller.initial_load_completion_notified)
         self.assertIsNone(controller.on_initial_load_complete_callback)
+
+
+class PlotPolylinePreparationTests(unittest.TestCase):
+    def test_clips_to_visible_extent_and_removes_subpixel_points(self):
+        points = [
+            (-20.0, 50.0),
+            (0.0, 50.0),
+            (0.02, 50.01),
+            (0.04, 50.02),
+            (50.0, 50.0),
+            (120.0, 50.0),
+        ]
+        runs = visible_simplified_polyline_runs(
+            points,
+            {"min_x": 0.0, "max_x": 100.0, "min_y": 0.0, "max_y": 100.0},
+            (100.0, 100.0),
+        )
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][0], (0.0, 50.0))
+        self.assertEqual(runs[0][-1], (100.0, 50.0))
+        self.assertLess(len(runs[0]), len(points))
+
+    def test_omits_polyline_that_is_entirely_outside_visible_extent(self):
+        self.assertEqual(
+            visible_simplified_polyline_runs(
+                [(-20.0, -20.0), (-10.0, -10.0)],
+                {"min_x": 0.0, "max_x": 100.0, "min_y": 0.0, "max_y": 100.0},
+                (100.0, 100.0),
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":

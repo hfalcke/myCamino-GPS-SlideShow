@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 from datetime import date, datetime
 from pathlib import Path
@@ -16,6 +18,7 @@ from GetGeoLocations import (
     build_control_sections,
     add_media_maps_to_control_entries,
     media_map_output_filename,
+    control_media_stage_name,
     parse_control_file_entries,
     render_media_map_specs,
     write_sorted_output,
@@ -54,6 +57,21 @@ def track(number, value, name=None, length_km=10.0, start=(0.0, 0.0), end=(0.0, 
 
 
 class AdjacentDayAssignmentTests(unittest.TestCase):
+    def test_media_stage_name_uses_first_and_last_available_places(self):
+        entries = [
+            {"type": "media", "place": "-"},
+            {"type": "media", "place": "Cologne (NRW), Cathedral"},
+            {"type": "media", "place": "Bonn (NRW), Rhine"},
+        ]
+        self.assertEqual(control_media_stage_name(entries), "Cologne (NRW) - Bonn (NRW)")
+
+    def test_media_stage_name_collapses_equal_endpoints(self):
+        entries = [
+            {"type": "media", "place": "Cologne, Cathedral"},
+            {"type": "media", "place": "Cologne, Station"},
+        ]
+        self.assertEqual(control_media_stage_name(entries), "Cologne")
+
     def test_day_before_uses_start_and_day_after_uses_end(self):
         stage = track(1, datetime(2024, 7, 15, 8), length_km=10.0, start=(50.0, 8.0), end=(50.1, 8.1))
         before = assign_adjacent_day_track(photo("before.jpg", datetime(2024, 7, 14, 12), 50.0, 8.0), [stage])
@@ -102,6 +120,22 @@ class AdjacentDayAssignmentTests(unittest.TestCase):
         self.assertEqual([item.source_filename for item in sections[0]["records"]], ["far.jpg"])
         self.assertEqual([item.source_filename for item in sections[1]["records"]], ["before.jpg"])
 
+    def test_stage_without_media_still_gets_its_canonical_map_section(self):
+        first = track(1, datetime(2024, 7, 15, 8), "0001_track.png")
+        second = track(2, datetime(2024, 7, 16, 8), "0002_track.png")
+        sections = build_control_sections(
+            [photo("first.jpg", datetime(2024, 7, 15, 10), 0.0, 0.0)],
+            TracksSummary("overview.png", [first, second], set()),
+            True,
+            include_empty_track_sections=True,
+        )
+        normal_sections = [section for section in sections if section["relation"] is None]
+        self.assertEqual(
+            [section["maps"] for section in normal_sections],
+            [[("Map", "0001_track.png")], [("Map", "0002_track.png")]],
+        )
+        self.assertEqual(normal_sections[1]["records"], [])
+
     def test_leftover_date_receives_media_map_directive(self):
         stage = track(1, datetime(2024, 7, 15, 8), "0001_track.png")
         records = [photo("far.jpg", datetime(2024, 7, 12, 10), 10.0, 10.0)]
@@ -119,7 +153,10 @@ class AdjacentDayAssignmentTests(unittest.TestCase):
             root = Path(temporary)
             output = root / "My Trip-sorted.lst"
             record = photo("far.jpg", datetime(2024, 7, 12, 10), 50.0, 7.0)
-            with patch("GetGeoLocations.render_media_location_map") as render:
+            with (
+                patch("GetGeoLocations.render_media_location_map") as render,
+                patch("GetGeoLocations.render_media_overview_map") as render_overview,
+            ):
                 write_sorted_output(
                     [record],
                     output,
@@ -128,7 +165,10 @@ class AdjacentDayAssignmentTests(unittest.TestCase):
                     {"output_dir": root / "trackimages", "filename_base": "My Trip"},
                 )
             self.assertEqual(render.call_count, 1)
-            self.assertIn("#MediaMap: My_Trip-media-2024-07-12.png", output.read_text(encoding="utf-8"))
+            self.assertEqual(render_overview.call_count, 1)
+            text = output.read_text(encoding="utf-8")
+            self.assertIn("#Overviewmap: My Trip.png", text)
+            self.assertIn("#MediaMap: My_Trip-media-2024-07-12.png", text)
 
     def test_media_map_variant_keeps_canonical_control_name(self):
         canonical = "Trip-media-2024-07-12.png"
@@ -162,6 +202,77 @@ class AdjacentDayAssignmentTests(unittest.TestCase):
         self.assertEqual(args[2].name, "Trip-media-2024-07-12-timelapse.png")
         self.assertEqual(kwargs["map_layout"], "time-lapse")
         self.assertEqual(kwargs["track_edge_margin_fraction"], 0.07)
+
+    def test_guided_media_map_rendering_creates_both_variants(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specs = [{
+                "date": date(2024, 7, 12),
+                "filename": "Trip-media-2024-07-12.png",
+                "coordinates": [(50.0, 7.0)],
+            }]
+            with patch("GetGeoLocations.render_media_location_map") as render:
+                render_media_map_specs(
+                    specs,
+                    root / "Trip-sorted.lst",
+                    {
+                        "output_dir": root / "trackimages",
+                        "map_layouts": ("standard", "time-lapse"),
+                    },
+                )
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(
+            [call.args[2].name for call in render.call_args_list],
+            ["Trip-media-2024-07-12.png", "Trip-media-2024-07-12-timelapse.png"],
+        )
+
+    def test_media_map_progress_uses_the_supplied_output_writer(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            writer = StringIO()
+            stdout = StringIO()
+            with patch("GetGeoLocations.render_media_location_map"), redirect_stdout(stdout):
+                render_media_map_specs(
+                    [{
+                        "date": date(2024, 7, 12),
+                        "filename": "Trip-media-2024-07-12.png",
+                        "coordinates": [(50.0, 7.0)],
+                    }],
+                    root / "Trip-sorted.lst",
+                    {
+                        "output_dir": root / "trackimages",
+                        "map_layouts": ("standard", "time-lapse"),
+                    },
+                    output_writer=writer,
+                )
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Creating standard media location map", writer.getvalue())
+        self.assertIn("Creating time-lapse media location map", writer.getvalue())
+
+    def test_guided_map_failure_is_reported_without_raising(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            options = {
+                "output_dir": root / "trackimages",
+                "map_layouts": ("standard", "time-lapse"),
+                "continue_on_map_error": True,
+                "map_failures": [],
+                "skip_rendering": False,
+            }
+            with patch("GetGeoLocations.render_media_location_map", side_effect=RuntimeError("provider offline")) as render:
+                rendered = render_media_map_specs(
+                    [{
+                        "date": date(2024, 7, 12),
+                        "filename": "Trip-media-2024-07-12.png",
+                        "coordinates": [(50.0, 7.0)],
+                    }],
+                    root / "Trip-sorted.lst",
+                    options,
+                )
+        self.assertEqual(rendered, [])
+        self.assertEqual(len(options["map_failures"]), 1)
+        self.assertTrue(options["skip_rendering"])
+        self.assertNotIn("skip_rendering", render.call_args.kwargs)
 
     def test_merge_regenerates_existing_media_map_from_complete_section(self):
         entries = parse_control_file_entries(

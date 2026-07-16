@@ -3,7 +3,7 @@
 
 import json
 from datetime import datetime
-from math import atan, degrees, exp, log, pi, radians, tan
+from math import atan, degrees, exp, isfinite, log, pi, radians, tan
 from pathlib import Path
 
 
@@ -76,6 +76,11 @@ def build_photo_metadata_payload(
     longitude,
     place,
     place_details=None,
+    *,
+    source_file_signature=None,
+    datetime_source=None,
+    metadata_updated_at=None,
+    place_coordinate=None,
 ):
     """Build one normalized photo sidecar JSON payload."""
     payload = {
@@ -94,6 +99,14 @@ def build_photo_metadata_payload(
         for key in ("name", "locality", "subLocality", "administrativeArea", "areasOfInterest"):
             if key in place_details:
                 payload[key] = place_details.get(key)
+    if isinstance(source_file_signature, dict):
+        payload["source_file_signature"] = dict(source_file_signature)
+    if isinstance(datetime_source, str) and datetime_source.strip():
+        payload["datetime_source"] = datetime_source.strip()
+    if isinstance(metadata_updated_at, str) and metadata_updated_at.strip():
+        payload["metadata_updated_at"] = metadata_updated_at.strip()
+    if isinstance(place_coordinate, dict):
+        payload["place_coordinate"] = dict(place_coordinate)
     return payload
 
 
@@ -117,6 +130,31 @@ def media_sidecar_path(media_path):
     return path.with_name(f"{path.name}.json")
 
 
+def media_file_signature(media_path):
+    """Return the inexpensive signature used to detect changed media files."""
+    stat_result = Path(media_path).stat()
+    return {
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+    }
+
+
+def media_sidecar_freshness(media_path, payload):
+    """Return ``current``, ``changed``, or ``unknown`` for a valid sidecar."""
+    stored = payload.get("source_file_signature") if isinstance(payload, dict) else None
+    if not isinstance(stored, dict):
+        return "unknown"
+    try:
+        expected = {
+            "size": int(stored["size"]),
+            "mtime_ns": int(stored["mtime_ns"]),
+        }
+        current = media_file_signature(media_path)
+    except (KeyError, OSError, TypeError, ValueError):
+        return "unknown"
+    return "current" if expected == current else "changed"
+
+
 def legacy_media_sidecar_path(media_path):
     """Return the pre-migration, stem-only media sidecar path."""
     return Path(media_path).with_suffix(".json")
@@ -136,6 +174,49 @@ def media_sidecar_matches_media(metadata, media_path) -> bool:
     if isinstance(photo_path, str) and photo_path.strip():
         declared_names.append(Path(photo_path).name.casefold())
     return bool(declared_names) and all(name == expected_name for name in declared_names)
+
+
+def validate_media_sidecar(media_path, sidecar_path=None):
+    """Return ``(status, payload, reason)`` for one extension-aware sidecar.
+
+    Consumers use this without falling back to metadata extraction. ``status``
+    is one of ``available``, ``missing``, or ``invalid``.
+    """
+    media = Path(media_path)
+    sidecar = Path(sidecar_path) if sidecar_path is not None else media_sidecar_path(media)
+    if not sidecar.is_file():
+        return "missing", None, "sidecar file does not exist"
+    try:
+        payload = read_photo_metadata(sidecar)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return "invalid", None, f"could not read sidecar: {exc}"
+    if not isinstance(payload, dict):
+        return "invalid", None, "sidecar does not contain an object"
+    if not media_sidecar_matches_media(payload, media):
+        return "invalid", None, "sidecar belongs to another media file"
+    try:
+        parse_photo_datetime(payload.get("datetime_iso"))
+    except (TypeError, ValueError):
+        return "invalid", None, "sidecar has no valid exposure date/time"
+
+    latitude = payload.get("latitude")
+    longitude = payload.get("longitude")
+    if (latitude is None) != (longitude is None):
+        return "invalid", None, "sidecar contains an incomplete GPS coordinate"
+    if latitude is not None:
+        try:
+            latitude_value = float(latitude)
+            longitude_value = float(longitude)
+        except (TypeError, ValueError):
+            return "invalid", None, "sidecar contains an invalid GPS coordinate"
+        if (
+            not isfinite(latitude_value)
+            or not isfinite(longitude_value)
+            or not -90.0 <= latitude_value <= 90.0
+            or not -180.0 <= longitude_value <= 180.0
+        ):
+            return "invalid", None, "sidecar GPS coordinate is outside the valid range"
+    return "available", payload, None
 
 
 def format_german_date(value):

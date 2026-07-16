@@ -5,35 +5,202 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from GPSTrackShow import (
     GPSTrackShowApp,
+    PlaybackPhase,
     PilgrimWalkState,
     advance_time_lapse_progress,
     best_media_corner_layout,
     clear_corner_rect_options,
     config_from_options,
     derive_clock_date_text,
+    dynamic_stage_header_lines,
     endpoint_tangent,
     fixed_arrow_normal,
     inset_rect,
     largest_clear_corner_rects,
     map_plot_rect,
     normalize_transition,
+    parse_stage_descriptors,
+    stage_name_endpoints,
+    stage_index_for_playlist_row,
+    intro_metadata_from_playlist,
     previous_displayable_playlist_index,
+    first_media_coordinate,
+    should_restart_time_lapse_stage_at_overview,
     pilgrim_orientation_for_tangent,
     pilgrim_motion_threshold,
     relation_title_band,
+    resolve_intro_title_image,
     resolve_map_window,
     set_runtime_map_window,
+    simplify_display_path,
     should_show_single_window_stage_overview,
     slideshow_transition_completion_allowed,
     time_lapse_marker_style,
+    time_lapse_clock_layout,
+    time_lapse_header_title_font_size,
     time_lapse_media_minimum_pending,
+    track_display_title,
+    track_header_lines,
+    track_metadata_supports_clock,
 )
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_track_header_prefers_endpoint_places_and_formats_metrics(self):
+        metadata = {
+            "track_name": "JW Internal Name",
+            "track_date": "16.07.2026",
+            "track_length_km": 21.45,
+            "track_duration": "7:03",
+            "track_endpoint_places": {
+                "start": {"place": "Zubiri"},
+                "end": {"place": "Pamplona"},
+            },
+        }
+        self.assertEqual(
+            track_display_title(metadata),
+            "Zubiri - Pamplona",
+        )
+        self.assertEqual(
+            track_header_lines(metadata),
+            (
+                "Zubiri - Pamplona",
+                "16.07.2026 · 21.4 km - 07:03 h",
+            ),
+        )
+        self.assertEqual(
+            track_header_lines(metadata, omit_date=True),
+            ("Zubiri - Pamplona", "21.4 km - 07:03 h"),
+        )
+        self.assertEqual(
+            track_display_title(metadata, "track_name"),
+            "JW Internal Name",
+        )
+
+    def test_track_header_falls_back_to_track_name_without_endpoint_places(self):
+        metadata = {
+            "track_name": "JW Zubiri - Pamplona",
+            "track_length_km": 21.5,
+            "track_duration": "06:30",
+        }
+        self.assertEqual(
+            track_header_lines(metadata, omit_date=True),
+            ("JW Zubiri - Pamplona", "21.5 km - 06:30 h"),
+        )
+
+    def test_adjacent_day_replaces_length_and_duration_in_second_header_line(self):
+        metadata = {
+            "track_name": "JW Zubiri - Pamplona",
+            "track_date": "16.07.2026",
+            "track_length_km": 21.5,
+            "track_duration": "06:30",
+        }
+        self.assertEqual(
+            track_header_lines(metadata, details_override="Day before"),
+            ("JW Zubiri - Pamplona", "16.07.2026 · Day before"),
+        )
+        self.assertEqual(
+            track_header_lines(
+                metadata,
+                omit_date=True,
+                details_override="Day after",
+            ),
+            ("JW Zubiri - Pamplona", "Day after"),
+        )
+
+    def test_media_stage_omits_date_when_clock_is_visible(self):
+        metadata = {
+            "stage_kind": "media_stage",
+            "media_stage_name": "Vichy",
+            "header_lines": ["Vichy", "01.04.2023"],
+            "media_points": [
+                {
+                    "lat": 46.1,
+                    "lon": 3.4,
+                    "time_iso": "2023-04-01T11:51:15+02:00",
+                }
+            ],
+        }
+        config = SimpleNamespace(track_title_mode="endpoint_places")
+        self.assertEqual(
+            dynamic_stage_header_lines(
+                metadata,
+                config,
+                clock_visible=True,
+            ),
+            ("Vichy",),
+        )
+        self.assertEqual(
+            dynamic_stage_header_lines(
+                metadata,
+                config,
+                clock_visible=False,
+            ),
+            ("Vichy", "01.04.2023"),
+        )
+
+    def test_track_header_uses_locality_instead_of_long_reverse_geocoded_label(self):
+        metadata = {
+            "track_name": "JW Internal Name",
+            "track_endpoint_places": {
+                "start": {
+                    "place": "Zubiri (Navarra), Calle Mayor 1",
+                    "place_details": {
+                        "locality": "Zubiri",
+                        "administrativeArea": "Navarra",
+                        "name": "Calle Mayor 1",
+                    },
+                },
+                "end": {
+                    "place": "Pamplona-Iruna (Navarra), Plaza del Castillo",
+                    "place_details": {
+                        "locality": "Pamplona",
+                        "subLocality": "Iruna",
+                        "administrativeArea": "Navarra",
+                    },
+                },
+            },
+        }
+        self.assertEqual(track_display_title(metadata), "Zubiri - Pamplona")
+
+    def test_track_header_uses_another_place_when_locality_is_missing(self):
+        metadata = {
+            "track_endpoint_places": {
+                "start": {
+                    "place": "Navarra, Monastery",
+                    "place_details": {"areasOfInterest": ["Monastery"]},
+                },
+                "end": {"place": "Pimbo (Landes), Rue Principale"},
+            },
+        }
+        self.assertEqual(track_display_title(metadata), "Monastery - Pimbo")
+
+    def test_intro_title_image_prefers_configuration_then_first_still(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first.jpeg"
+            selected = root / "selected.png"
+            movie = root / "before.mov"
+            for path in (first, selected, movie):
+                path.write_bytes(b"media")
+            lines = [
+                "before.mov | 09:00 | - | -",
+                "first.jpeg | 09:01 | - | -",
+            ]
+            self.assertEqual(
+                resolve_intro_title_image(selected, root, lines),
+                selected.resolve(),
+            )
+            self.assertEqual(
+                resolve_intro_title_image(None, root, lines),
+                first.resolve(),
+            )
+
     def test_automatic_window_mode_uses_screen_count(self):
         self.assertFalse(resolve_map_window(None, 1))
         self.assertTrue(resolve_map_window(None, 2))
@@ -42,9 +209,158 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
 
     def test_single_window_stage_overview_is_only_for_fresh_stages(self):
         self.assertTrue(should_show_single_window_stage_overview(False, 0.0, False))
+        self.assertTrue(
+            should_show_single_window_stage_overview(False, 0.0, False, "")
+        )
+        self.assertFalse(
+            should_show_single_window_stage_overview(
+                False,
+                0.0,
+                False,
+                "Day before",
+            )
+        )
         self.assertFalse(should_show_single_window_stage_overview(True, 0.0, False))
         self.assertFalse(should_show_single_window_stage_overview(False, 0.4, False))
         self.assertFalse(should_show_single_window_stage_overview(False, 0.0, True))
+
+    def test_media_only_overview_continues_into_static_stage(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.time_lapse_stage = SimpleNamespace(relation="")
+        app.time_lapse_active = True
+        app.active_callback = None
+        app.time_lapse_media_image = object()
+        app.time_lapse_media_marker_latlon = (50.0, 7.0)
+        app.time_lapse_overview_preview_active = True
+        app.time_lapse_overview_inset_active = True
+        app.current_state = object()
+        app.photo_presenter = None
+        app.map_presenter = None
+        calls = []
+        app._begin_special_time_lapse_stage = lambda: calls.append("static")
+
+        app._continue_after_time_lapse_overview()
+
+        self.assertEqual(calls, ["static"])
+        self.assertIsNone(app.time_lapse_media_image)
+        self.assertFalse(app.time_lapse_overview_preview_active)
+
+    def test_media_only_stage_uses_first_known_photo_coordinate_on_overview(self):
+        metadata = {
+            "stage_kind": "media_stage",
+            "media_points": [
+                {"lat": 50.1, "lon": 7.2, "source_name": "first.jpeg"},
+                {"lat": 50.2, "lon": 7.3, "source_name": "second.jpeg"},
+            ],
+        }
+        self.assertEqual(first_media_coordinate(metadata), (50.1, 7.2))
+        self.assertIsNone(
+            first_media_coordinate(
+                {"stage_kind": "gpx_track", "track_points": [[50.1, 7.2]]}
+            )
+        )
+
+    def test_back_restarts_current_stage_overview_before_previous_stage(self):
+        self.assertTrue(
+            should_restart_time_lapse_stage_at_overview(
+                0.4,
+                False,
+                0,
+                False,
+                None,
+            )
+        )
+        self.assertTrue(
+            should_restart_time_lapse_stage_at_overview(
+                0.0,
+                True,
+                1,
+                False,
+                "",
+            )
+        )
+        self.assertFalse(
+            should_restart_time_lapse_stage_at_overview(
+                0.0,
+                False,
+                0,
+                True,
+                None,
+            )
+        )
+
+    def test_backward_from_first_media_restores_the_stage_overview(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(debug=False)
+        app.time_lapse_active = True
+        app.time_lapse_stage = SimpleNamespace(
+            map_index=2,
+            relation=None,
+        )
+        app.time_lapse_handle = None
+        app.time_lapse_media_cursor = 1
+        app.time_lapse_current_media = (3, object())
+        app.time_lapse_media_queue = [(0.2, 3, object())]
+        app.time_lapse_progress = 0.2
+        app.time_lapse_overview_preview_active = False
+        calls = []
+        app._end_time_lapse_media = lambda redraw=False: calls.append(("end", redraw))
+        app._show_time_lapse_overview_or_begin = lambda progress, media, relation: calls.append(
+            ("overview", progress, media, relation)
+        )
+
+        app._step_backward()
+
+        self.assertEqual(
+            calls,
+            [
+                ("end", False),
+                ("overview", 0.0, None, None),
+            ],
+        )
+        self.assertEqual(app.time_lapse_progress, 0.0)
+        self.assertEqual(app.time_lapse_media_cursor, 0)
+
+    def test_backward_from_first_standard_stage_returns_to_title_intro(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(debug=False)
+        app.time_lapse_active = False
+        app.time_lapse_stage = None
+        app.time_lapse_handle = None
+        app.manual_mode = True
+        app.active_callback = None
+        app.current_phase = PlaybackPhase.STAGE_MAP
+        app.current_stage_index = 0
+        app.stages = [SimpleNamespace(map_index=2, media_indexes=())]
+        app.intro_was_shown = True
+        calls = []
+        app._show_intro_phase = lambda phase: calls.append(phase)
+
+        app._step_backward()
+
+        self.assertEqual(calls, [PlaybackPhase.INTRO_INFO])
+
+    def test_backward_from_first_dual_window_time_lapse_returns_to_title_intro(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(debug=False)
+        app.time_lapse_active = True
+        app.time_lapse_stage = SimpleNamespace(map_index=2, relation=None)
+        app.time_lapse_handle = None
+        app.time_lapse_stage_map_preview_active = False
+        app.time_lapse_overview_preview_active = False
+        app.time_lapse_current_media = None
+        app.time_lapse_media_cursor = 0
+        app.time_lapse_media_queue = []
+        app.time_lapse_progress = 0.0
+        app.current_stage_index = 0
+        app.intro_was_shown = True
+        calls = []
+        app._cancel_time_lapse_stage = lambda: calls.append("cancel")
+        app._show_intro_phase = lambda phase: calls.append(phase)
+
+        app._step_backward()
+
+        self.assertEqual(calls, ["cancel", PlaybackPhase.INTRO_INFO])
 
     def test_time_lapse_overview_transition_may_schedule_motion(self):
         self.assertTrue(slideshow_transition_completion_allowed(True, True))
@@ -230,7 +546,20 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         placement = inset_rect(map_plot_rect(image_rect, {}), 0.05)
         candidates = clear_corner_rect_options(placement, [])
         self.assertEqual(map_plot_rect(image_rect, {}), image_rect)
-        self.assertEqual(set(candidates), {"top_right", "top_left", "bottom_right", "bottom_left"})
+        self.assertEqual(
+            set(candidates),
+            {
+                "top_right",
+                "top_left",
+                "bottom_right",
+                "bottom_left",
+                "center_left",
+                "center",
+                "center_right",
+                "top_center",
+                "bottom_center",
+            },
+        )
 
     def test_margin_uses_map_dimensions_not_window_dimensions(self):
         self.assertEqual(inset_rect((100.0, 200.0, 400.0, 200.0), 0.05), (120.0, 210.0, 360.0, 180.0))
@@ -241,11 +570,24 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         dense = [(0.0, 50.0), (20.0, 50.0), (40.0, 50.0), (60.0, 50.0), (80.0, 50.0), (100.0, 50.0)]
         self.assertEqual(clear_corner_rect_options(placement, sparse), clear_corner_rect_options(placement, dense))
 
-    def test_stage_stores_largest_clear_box_for_every_corner(self):
+    def test_stage_stores_largest_clear_box_for_every_position(self):
         placement = (0.0, 0.0, 1000.0, 600.0)
         route = [(300.0, 0.0), (300.0, 600.0)]
         clear_rects = largest_clear_corner_rects(placement, route)
-        self.assertEqual(set(clear_rects), {"top_right", "top_left", "bottom_right", "bottom_left"})
+        self.assertEqual(
+            set(clear_rects),
+            {
+                "top_right",
+                "top_left",
+                "bottom_right",
+                "bottom_left",
+                "center_left",
+                "center",
+                "center_right",
+                "top_center",
+                "bottom_center",
+            },
+        )
         self.assertGreater(clear_rects["top_right"][2], clear_rects["top_left"][2])
         self.assertGreater(clear_rects["bottom_right"][2], clear_rects["bottom_left"][2])
 
@@ -273,6 +615,22 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertEqual(portrait_corner, "top_left")
         self.assertGreater(landscape[2], 500.0)
         self.assertGreater(portrait[3], 300.0)
+
+    def test_center_position_is_used_when_it_allows_the_largest_image(self):
+        clear_rects = {
+            "top_right": (800.0, 500.0, 200.0, 100.0),
+            "top_left": (0.0, 500.0, 200.0, 100.0),
+            "bottom_right": (800.0, 0.0, 200.0, 100.0),
+            "bottom_left": (0.0, 0.0, 200.0, 100.0),
+            "center": (250.0, 100.0, 500.0, 400.0),
+        }
+        position, outer, content = best_media_corner_layout(
+            clear_rects, (1000.0, 600.0), 0.5, (1200.0, 800.0)
+        )
+        self.assertEqual(position, "center")
+        self.assertAlmostEqual(outer[0] + outer[2] / 2.0, 500.0)
+        self.assertAlmostEqual(outer[1] + outer[3] / 2.0, 300.0)
+        self.assertGreater(content[2] * content[3], 100000.0)
 
     def test_backward_navigation_uses_playlist_rows_without_image_history(self):
         lines = [
@@ -342,12 +700,22 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             self.assertEqual(config.time_lapse_marker, "pilgrim")
             self.assertTrue(config.time_lapse_overview_as_media)
             self.assertFalse(config.track_map_before_media)
+            self.assertTrue(config.time_lapse_stages)
+            self.assertEqual(config.initial_style, "TIME_LAPSE")
+            self.assertEqual(config.transition.value, "BLEND")
             self.assertEqual(config.audio_crossfade_seconds, 2.0)
             self.assertEqual(
                 config_from_options(project_dir, inputlist=control_file, transition="blend").transition.value,
                 "BLEND",
             )
             self.assertEqual(normalize_transition(" blend "), "BLEND")
+            fade_config = config_from_options(
+                project_dir,
+                inputlist=control_file,
+                transition="fade",
+            )
+            self.assertFalse(fade_config.time_lapse_stages)
+            self.assertEqual(fade_config.initial_style, "FADE")
             arrow_config = config_from_options(
                 project_dir,
                 inputlist=control_file,
@@ -386,6 +754,231 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
                     inputlist=control_file,
                     audio_crossfade_seconds=31.0,
                 )
+
+    def test_stage_descriptors_and_intro_metadata(self):
+        lines = [
+            "#Overviewmap: overview.png",
+            "#Datum: Mon, 01.01.2024",
+            "#Map: stage1.png",
+            "one.jpg | 09:00 | 50, 7 | Start",
+            "#Datum: Tue, 02.01.2024",
+            "#MediaMap: stage2.png",
+            "two.jpg | 10:00 | 51, 8 | Finish",
+        ]
+        stages = parse_stage_descriptors(lines)
+        self.assertEqual(len(stages), 2)
+        self.assertEqual(stages[0].media_indexes, (3,))
+        self.assertEqual(stages[1].media_indexes, (6,))
+        self.assertEqual(stage_index_for_playlist_row(stages, 6), 1)
+        summary = intro_metadata_from_playlist(lines)
+        self.assertEqual(summary["date_range"], "01.01.2024 - 02.01.2024")
+        self.assertEqual(summary["first_place"], "Start")
+        self.assertEqual(summary["last_place"], "Finish")
+
+    def test_intro_summary_uses_first_and_last_stage_endpoints(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for filename, track_name in (
+                ("stage1.png", "JW Cologne - Bonn"),
+                ("stage2.png", "JW Sarria - Santiago"),
+            ):
+                (root / filename).write_bytes(b"map")
+                (root / filename).with_suffix(".json").write_text(
+                    f'{{"track_name": "{track_name}", "track_length_km": 10.0}}',
+                    encoding="utf-8",
+                )
+            app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+            app.config = SimpleNamespace(trackdir=root, photodir=root)
+            app.playlist_lines = [
+                "#Datum: Mon, 01.01.2024",
+                "#Map: stage1.png",
+                "one.jpg | 09:00 | 50, 7 | Cologne",
+                "#Datum: Tue, 02.01.2024",
+                "#Map: stage2.png",
+                "two.jpg | 10:00 | 51, 8 | Bonn",
+            ]
+            app.stages = parse_stage_descriptors(app.playlist_lines)
+            self.assertIn("Cologne - Santiago", app._intro_summary_lines())
+
+    def test_intro_summary_uses_one_compact_summary_without_stage_sidecars(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            overview = root / "Trip.png"
+            overview.write_bytes(b"map")
+            (root / "Trip-summary.json").write_text(
+                """
+                {
+                  "tracks": [
+                    {
+                      "track_name": "JW Cologne - Bonn",
+                      "track_plot_image_filename": "stage1.png",
+                      "laenge_km": 12.5
+                    },
+                    {
+                      "track_name": "JW Sarria - Santiago",
+                      "track_plot_image_filename": "stage2.png",
+                      "laenge_km": 18.0
+                    }
+                  ]
+                }
+                """,
+                encoding="utf-8",
+            )
+            app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+            app.config = SimpleNamespace(trackdir=root, photodir=root)
+            app.current_overview_path = overview
+            app.current_overview_metadata = None
+            app.compact_track_summary_loaded = False
+            app.compact_track_summary = None
+            app.playlist_lines = [
+                "#Datum: Mon, 01.01.2024",
+                "#Map: stage1.png",
+                "one.jpg | 09:00 | 50, 7 | Cologne",
+                "#Datum: Tue, 02.01.2024",
+                "#Map: stage2.png",
+                "two.jpg | 10:00 | 51, 8 | Bonn",
+            ]
+            app.stages = parse_stage_descriptors(app.playlist_lines)
+            with patch(
+                "GPSTrackShow.try_read_plot_metadata",
+                side_effect=AssertionError("stage sidecar should not be opened"),
+            ):
+                summary_lines = app._intro_summary_lines()
+            self.assertIn("Cologne - Santiago", summary_lines)
+            self.assertIn("Total traveled: 30.5 km", summary_lines)
+
+    def test_time_lapse_distance_uses_compact_summary_and_caches_prefix(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(trackdir=Path("/unused"), photodir=Path("/unused"))
+        app.playlist_lines = [
+            "#Map: stage1.png",
+            "#Map: stage2.png",
+            "#Map: stage3.png",
+        ]
+        app.stages = parse_stage_descriptors(app.playlist_lines)
+        app.stage_start_distance_cache = {}
+        app.stage_length_cache = {}
+        app._summary_tracks_by_map_filename = lambda: {
+            "stage1.png": {"laenge_km": 10.0},
+            "stage2.png": {"laenge_km": 20.0},
+            "stage3.png": {"laenge_km": 30.0},
+        }
+        self.assertEqual(app._time_lapse_distance_before_stage(2), 30.0)
+        app._summary_tracks_by_map_filename = lambda: (_ for _ in ()).throw(
+            AssertionError("cached prefix should be reused")
+        )
+        self.assertEqual(app._time_lapse_distance_before_stage(2), 30.0)
+
+    def test_stage_name_endpoints_remove_generated_jw_prefix(self):
+        self.assertEqual(
+            stage_name_endpoints("JW Cologne - Santiago"),
+            ("Cologne", "Santiago"),
+        )
+
+    def test_time_lapse_clock_fits_inside_map_header(self):
+        frame, clock_size = time_lapse_clock_layout(
+            (0.0, 0.0, 1600.0, 900.0),
+            {
+                "axes_box_fraction": {
+                    "left": 0.05,
+                    "bottom": 0.05,
+                    "width": 0.90,
+                    "height": 0.80,
+                }
+            },
+            True,
+        )
+        header_bottom = 900.0 * 0.85
+        self.assertGreaterEqual(frame[1], header_bottom)
+        self.assertLessEqual(frame[1] + frame[3], 900.0)
+        self.assertGreater(clock_size, 100.0)
+        self.assertGreater(frame[2], clock_size)
+
+    def test_time_lapse_clock_fits_small_notebook_header(self):
+        frame, clock_size = time_lapse_clock_layout(
+            (0.0, 40.0, 1280.0, 720.0),
+            {
+                "axes_box_fraction": {
+                    "left": 0.001,
+                    "bottom": 0.002,
+                    "width": 0.998,
+                    "height": 0.90,
+                }
+            },
+            True,
+        )
+        header_bottom = 40.0 + 720.0 * 0.902
+        self.assertGreaterEqual(frame[1], header_bottom)
+        self.assertLessEqual(frame[1] + frame[3], 760.0)
+        self.assertLessEqual(frame[0] + frame[2], 1280.0)
+        self.assertGreater(clock_size, 50.0)
+
+    def test_clock_date_uses_the_stage_header_title_font_size(self):
+        metadata = {
+            "axes_box_fraction": {
+                "left": 0.001,
+                "bottom": 0.002,
+                "width": 0.998,
+                "height": 0.90,
+            }
+        }
+        font_size = time_lapse_header_title_font_size(
+            (0.0, 40.0, 1280.0, 720.0),
+            metadata,
+            2.2,
+            3,
+        )
+        self.assertGreaterEqual(font_size, 8.0)
+        self.assertLessEqual(font_size, 14.0 * 2.2)
+
+    def test_track_clock_support_accepts_timed_point_iso_field(self):
+        self.assertTrue(
+            track_metadata_supports_clock(
+                {"timed_track_points": [{"time_iso": "2024-07-15T10:00:00+02:00"}]}
+            )
+        )
+
+    def test_track_clock_support_accepts_media_point_iso_field(self):
+        self.assertTrue(
+            track_metadata_supports_clock(
+                {
+                    "media_points": [
+                        {"time_iso": "2024-07-15T10:00:00+02:00"}
+                    ]
+                }
+            )
+        )
+
+    def test_display_path_simplification_preserves_endpoints(self):
+        points = [
+            (0.0, 0.0),
+            (0.1, 0.1),
+            (0.2, 0.2),
+            (2.0, 0.0),
+            (2.1, 0.1),
+            (4.0, 1.0),
+        ]
+        simplified = simplify_display_path(points, 0.75)
+        self.assertEqual(simplified[0], points[0])
+        self.assertEqual(simplified[-1], points[-1])
+        self.assertLess(len(simplified), len(points))
+
+    def test_space_begins_waiting_intro_and_starts_music(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.awaiting_intro_start = True
+        app.playlist_index = 7
+        calls = []
+        app._hide_startup_hint = lambda: calls.append("hide")
+        app.music_controller = SimpleNamespace(
+            start=lambda index: calls.append(("music", index))
+        )
+        app._show_intro_phase = lambda phase: calls.append(phase)
+        app._begin_intro_playback()
+        self.assertFalse(app.awaiting_intro_start)
+        self.assertEqual(
+            calls,
+            ["hide", ("music", 7), PlaybackPhase.INTRO_INFO],
+        )
 
     def test_pilgrim_stands_and_resumes_with_frame_three(self):
         state = PilgrimWalkState()
