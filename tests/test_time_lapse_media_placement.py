@@ -427,13 +427,13 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             )
         )
 
-    def test_backward_from_first_media_restores_the_stage_overview(self):
+    def test_backward_from_first_media_only_medium_restores_stage_overview(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.config = SimpleNamespace(debug=False)
         app.time_lapse_active = True
         app.time_lapse_stage = SimpleNamespace(
             map_index=2,
-            relation=None,
+            relation="",
         )
         app.time_lapse_handle = None
         app.time_lapse_media_cursor = 1
@@ -453,7 +453,7 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             calls,
             [
                 ("end", False),
-                ("overview", 0.0, None, None),
+                ("overview", 0.0, None, ""),
             ],
         )
         self.assertEqual(app.time_lapse_progress, 0.0)

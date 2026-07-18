@@ -4246,7 +4246,7 @@ def draw_overview_overlay(
                     pixel_x,
                     pixel_y,
                     height,
-                    config.media_point_color,
+                    config.dot_color,
                     max(1, int(round(config.media_point_size / 2.0))),
                     COLOR_NAMES["white"],
                 )
@@ -7335,7 +7335,7 @@ class GPSTrackShowApp:
                 self._start_time_lapse_media(row_index, entry)
                 self._continue_time_lapse_after_navigation()
                 return
-            if self.time_lapse_stage.relation is None:
+            if self.time_lapse_stage.relation in {None, ""}:
                 self._show_time_lapse_phase_before_motion()
                 return
             if (
