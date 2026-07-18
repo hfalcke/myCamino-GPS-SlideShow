@@ -282,6 +282,48 @@ def best_media_corner_layout(
     return best_corner, best_outer, best_content
 
 
+def best_unframed_media_layout(
+    clear_rects: dict[str, RectTuple | list[RectTuple]],
+    media_size: tuple[float, float],
+) -> tuple[str, RectTuple]:
+    """Choose the largest track-free placement without adding a photo frame."""
+    media_width, media_height = media_size
+    best_position = "top_right"
+    best_rect: RectTuple = (0.0, 0.0, 1.0, 1.0)
+    best_area = -1.0
+    for position in PLACEMENT_ORDER:
+        options = clear_rects.get(position)
+        if options is None:
+            continue
+        if isinstance(options, tuple):
+            options = [options]
+        for clear_x, clear_y, clear_width, clear_height in options:
+            draw_width, draw_height = aspect_fit_size(
+                media_width,
+                media_height,
+                max(1.0, clear_width),
+                max(1.0, clear_height),
+            )
+            if position.endswith("left"):
+                x = clear_x
+            elif position.endswith("right"):
+                x = clear_x + clear_width - draw_width
+            else:
+                x = clear_x + (clear_width - draw_width) / 2.0
+            if position.startswith("bottom"):
+                y = clear_y
+            elif position.startswith("top"):
+                y = clear_y + clear_height - draw_height
+            else:
+                y = clear_y + (clear_height - draw_height) / 2.0
+            area = draw_width * draw_height
+            if area > best_area:
+                best_position = position
+                best_rect = (x, y, draw_width, draw_height)
+                best_area = area
+    return best_position, best_rect
+
+
 def projected_route_pixels(
     projected_points: list[tuple[float, float]],
     extent: tuple[float, float, float, float],

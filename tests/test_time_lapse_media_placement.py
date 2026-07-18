@@ -19,10 +19,12 @@ from GPSTrackShow import (
     derive_clock_date_text,
     dynamic_stage_header_lines,
     endpoint_tangent,
+    external_jump_command_row,
     fixed_arrow_normal,
     inset_rect,
     largest_clear_corner_rects,
     map_plot_rect,
+    normalize_time_lapse_resume_phase,
     normalize_transition,
     parse_stage_descriptors,
     stage_name_endpoints,
@@ -31,6 +33,7 @@ from GPSTrackShow import (
     previous_displayable_playlist_index,
     first_media_coordinate,
     should_restart_time_lapse_stage_at_overview,
+    should_restart_time_lapse_stage_intro,
     pilgrim_orientation_for_tangent,
     pilgrim_motion_threshold,
     relation_title_band,
@@ -38,9 +41,10 @@ from GPSTrackShow import (
     resolve_map_window,
     set_runtime_map_window,
     simplify_display_path,
-    should_show_single_window_stage_overview,
+    should_show_stage_overview_preview,
     slideshow_transition_completion_allowed,
     time_lapse_marker_style,
+    time_lapse_overview_display_seconds,
     time_lapse_clock_layout,
     time_lapse_header_title_font_size,
     time_lapse_media_minimum_pending,
@@ -48,9 +52,134 @@ from GPSTrackShow import (
     track_header_lines,
     track_metadata_supports_clock,
 )
+from track_map_layout_utils import best_unframed_media_layout
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_first_stage_overview_gets_window_startup_grace(self):
+        self.assertEqual(time_lapse_overview_display_seconds(3.0, True), 4.0)
+        self.assertEqual(time_lapse_overview_display_seconds(3.0, False), 3.0)
+
+    def test_zero_progress_resume_restarts_stage_intro_even_with_saved_media(self):
+        self.assertTrue(
+            should_restart_time_lapse_stage_intro(
+                PlaybackPhase.TIME_LAPSE.value,
+                0.0,
+                None,
+            )
+        )
+        self.assertFalse(
+            should_restart_time_lapse_stage_intro(
+                PlaybackPhase.TIME_LAPSE.value,
+                0.01,
+                None,
+            )
+        )
+
+    def test_legacy_stage_map_resume_restarts_at_overview(self):
+        self.assertEqual(
+            normalize_time_lapse_resume_phase(PlaybackPhase.STAGE_MAP.value),
+            PlaybackPhase.STAGE_OVERVIEW.value,
+        )
+        self.assertEqual(
+            normalize_time_lapse_resume_phase(
+                PlaybackPhase.ELEVATION_PROFILE.value
+            ),
+            PlaybackPhase.ELEVATION_PROFILE.value,
+        )
+
+    def test_unframed_profile_uses_full_track_free_rectangle(self):
+        position, rect = best_unframed_media_layout(
+            {
+                "top_left": [(0.0, 50.0, 400.0, 200.0)],
+                "top_right": [(500.0, 50.0, 200.0, 200.0)],
+            },
+            (1200.0, 360.0),
+        )
+        self.assertEqual(position, "top_left")
+        self.assertEqual(rect, (0.0, 130.0, 400.0, 120.0))
+
+    def test_external_jump_command_validation(self):
+        control_file = Path("/tmp/project/show.lst")
+        payload = {
+            "command": "jump",
+            "sequence": 12,
+            "row": 4,
+            "control_file": str(control_file),
+        }
+        self.assertEqual(
+            external_jump_command_row(payload, control_file, 11, 8),
+            (12, 4),
+        )
+        self.assertIsNone(external_jump_command_row(payload, control_file, 12, 8))
+        self.assertIsNone(
+            external_jump_command_row(
+                {**payload, "control_file": "/tmp/project/other.lst"},
+                control_file,
+                11,
+                8,
+            )
+        )
+        self.assertIsNone(
+            external_jump_command_row({**payload, "row": 8}, control_file, 11, 8)
+        )
+        self.assertIsNone(
+            external_jump_command_row({**payload, "command": "stop"}, control_file, 11, 8)
+        )
+
+    def test_external_jump_to_directive_reconstructs_context_and_advances(self):
+        calls = []
+        app = SimpleNamespace(
+            playlist_lines=["#Datum: 16.07.2026"],
+            active_callback=None,
+            time_lapse_stage=None,
+            time_lapse_handle=None,
+            photo_presenter=None,
+            map_presenter=None,
+            stages=[],
+            music_controller=SimpleNamespace(
+                synchronize_row=lambda row: calls.append(("music", row))
+            ),
+            _prime_context_before_index=lambda row: calls.append(("prime", row)),
+            _advance=lambda: calls.append(("advance",)),
+            playlist_index=99,
+            pending_display_index=99,
+            current_display_index=99,
+        )
+        self.assertTrue(GPSTrackShowApp._jump_to_playlist_row(app, 0))
+        self.assertEqual(calls, [("music", -1), ("prime", 0), ("advance",)])
+        self.assertEqual(app.playlist_index, 0)
+        self.assertIsNone(app.pending_display_index)
+        self.assertIsNone(app.current_display_index)
+
+    def test_external_jump_to_standard_medium_uses_exact_stage_position(self):
+        lines = [
+            "#Datum: 16.07.2026",
+            "#Map: stage.png",
+            "first.jpeg | 10:00 | |",
+            "second.jpeg | 10:05 | |",
+        ]
+        stages = parse_stage_descriptors(lines)
+        calls = []
+        app = SimpleNamespace(
+            playlist_lines=lines,
+            active_callback=None,
+            time_lapse_stage=None,
+            time_lapse_handle=None,
+            photo_presenter=None,
+            map_presenter=None,
+            stages=stages,
+            time_lapse_active=False,
+            music_controller=SimpleNamespace(
+                synchronize_row=lambda row: calls.append(("music", row))
+            ),
+            _show_standard_stage_media=lambda stage, medium: calls.append(
+                ("standard", stage, medium)
+            ),
+        )
+        self.assertTrue(GPSTrackShowApp._jump_to_playlist_row(app, 3))
+        self.assertEqual(calls, [("music", 3), ("standard", 0, 1)])
+
     def test_track_header_prefers_endpoint_places_and_formats_metrics(self):
         metadata = {
             "track_name": "JW Internal Name",
@@ -207,22 +336,31 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertTrue(resolve_map_window(True, 1))
         self.assertFalse(resolve_map_window(False, 2))
 
-    def test_single_window_stage_overview_is_only_for_fresh_stages(self):
-        self.assertTrue(should_show_single_window_stage_overview(False, 0.0, False))
+    def test_stage_overview_is_shown_for_fresh_stages_on_every_window_layout(self):
         self.assertTrue(
-            should_show_single_window_stage_overview(False, 0.0, False, "")
+            should_show_stage_overview_preview(False, True, 0.0, False)
+        )
+        self.assertTrue(
+            should_show_stage_overview_preview(True, True, 0.0, False, "")
         )
         self.assertFalse(
-            should_show_single_window_stage_overview(
+            should_show_stage_overview_preview(True, False, 0.0, False)
+        )
+        self.assertFalse(
+            should_show_stage_overview_preview(
                 False,
+                True,
                 0.0,
                 False,
                 "Day before",
             )
         )
-        self.assertFalse(should_show_single_window_stage_overview(True, 0.0, False))
-        self.assertFalse(should_show_single_window_stage_overview(False, 0.4, False))
-        self.assertFalse(should_show_single_window_stage_overview(False, 0.0, True))
+        self.assertFalse(
+            should_show_stage_overview_preview(False, True, 0.4, False)
+        )
+        self.assertFalse(
+            should_show_stage_overview_preview(False, True, 0.0, True)
+        )
 
     def test_media_only_overview_continues_into_static_stage(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
@@ -340,7 +478,7 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
 
         self.assertEqual(calls, [PlaybackPhase.INTRO_INFO])
 
-    def test_backward_from_first_dual_window_time_lapse_returns_to_title_intro(self):
+    def test_backward_from_first_dual_window_motion_restores_stage_overview(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.config = SimpleNamespace(debug=False)
         app.time_lapse_active = True
@@ -354,13 +492,90 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         app.time_lapse_progress = 0.0
         app.current_stage_index = 0
         app.intro_was_shown = True
+        app.map_presenter = object()
         calls = []
-        app._cancel_time_lapse_stage = lambda: calls.append("cancel")
-        app._show_intro_phase = lambda phase: calls.append(phase)
+        app._show_time_lapse_overview_or_begin = (
+            lambda progress, media, relation: calls.append(
+                ("overview", progress, media, relation)
+            )
+        )
 
         app._step_backward()
 
-        self.assertEqual(calls, ["cancel", PlaybackPhase.INTRO_INFO])
+        self.assertEqual(calls, [("overview", 0.0, None, None)])
+
+    def test_time_lapse_overview_continues_to_elevation_profile(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.time_lapse_stage = SimpleNamespace(relation=None)
+        app.time_lapse_active = True
+        app.time_lapse_media_draw_frame = True
+        calls = []
+        app._current_elevation_profile = lambda: object()
+        app._begin_time_lapse_stage_map_preview = lambda: calls.append("profile")
+        app._begin_time_lapse_motion = lambda: calls.append("motion")
+
+        app._continue_after_time_lapse_overview()
+
+        self.assertEqual(calls, ["profile"])
+
+    def test_time_lapse_profile_continues_to_motion(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.time_lapse_stage = SimpleNamespace(relation=None)
+        app.time_lapse_active = True
+        app.time_lapse_stage_map_preview_active = True
+        app.time_lapse_media_image = object()
+        app.time_lapse_media_draw_frame = False
+        calls = []
+        app._begin_time_lapse_motion = lambda: calls.append("motion")
+
+        app._continue_after_time_lapse_stage_map()
+
+        self.assertEqual(calls, ["motion"])
+        self.assertFalse(app.time_lapse_stage_map_preview_active)
+
+    def test_backward_from_profile_restores_stage_overview(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(debug=False)
+        app.time_lapse_active = True
+        app.time_lapse_stage = SimpleNamespace(relation=None)
+        app.time_lapse_handle = None
+        app.time_lapse_stage_map_preview_active = True
+        app.time_lapse_overview_preview_active = False
+        app.time_lapse_media_image = object()
+        app.time_lapse_media_draw_frame = False
+        app.map_presenter = None
+        app.active_callback = None
+        calls = []
+        app._show_time_lapse_overview_or_begin = (
+            lambda progress, media, relation: calls.append(
+                ("overview", progress, media, relation)
+            )
+        )
+
+        app._step_backward()
+
+        self.assertEqual(calls, [("overview", 0.0, None, None)])
+
+    def test_backward_from_motion_restores_profile_without_rewinding_arrow(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(debug=False)
+        app.time_lapse_active = True
+        app.time_lapse_stage = SimpleNamespace(relation=None)
+        app.time_lapse_handle = None
+        app.time_lapse_stage_map_preview_active = False
+        app.time_lapse_overview_preview_active = False
+        app.time_lapse_current_media = None
+        app.time_lapse_media_cursor = 0
+        app.time_lapse_media_queue = []
+        app.time_lapse_progress = 0.65
+        calls = []
+        app._current_elevation_profile = lambda: object()
+        app._begin_time_lapse_stage_map_preview = lambda: calls.append("profile")
+
+        app._step_backward()
+
+        self.assertEqual(calls, ["profile"])
+        self.assertEqual(app.time_lapse_progress, 0.0)
 
     def test_time_lapse_overview_transition_may_schedule_motion(self):
         self.assertTrue(slideshow_transition_completion_allowed(True, True))
@@ -396,6 +611,59 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         app.map_window = object()
         app._toggle_window_mode()
         self.assertEqual(actions[-2:], ["remove", "Single window"])
+
+    def test_restored_standard_map_window_shows_marked_overview(self):
+        class ViewStub:
+            def __init__(self):
+                self.hidden = None
+
+            def setHidden_(self, hidden):
+                self.hidden = hidden
+
+        class PresenterStub:
+            def __init__(self):
+                self.visible = None
+                self.images = []
+
+            def set_content_visible(self, visible):
+                self.visible = visible
+
+            def transition_to(self, image, transition):
+                self.images.append((image, transition))
+
+        class ContentStub:
+            def __init__(self):
+                self.needs_display = False
+
+            def setNeedsDisplay_(self, value):
+                self.needs_display = bool(value)
+
+        class WindowStub:
+            def __init__(self):
+                self.content = ContentStub()
+                self.displayed = False
+
+            def contentView(self):
+                return self.content
+
+            def displayIfNeeded(self):
+                self.displayed = True
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.map_window = WindowStub()
+        app.map_presenter = PresenterStub()
+        app.time_map_view = ViewStub()
+        app.time_lapse_active = False
+        app.time_lapse_stage = None
+        app.current_stage_overview_image = "marked overview"
+
+        app._refresh_separate_map_window_content()
+
+        self.assertTrue(app.map_presenter.visible)
+        self.assertEqual(app.map_presenter.images[0][0], "marked overview")
+        self.assertTrue(app.time_map_view.hidden)
+        self.assertTrue(app.map_window.content.needs_display)
+        self.assertTrue(app.map_window.displayed)
 
     def test_retired_map_cleanup_uses_bound_callbacks_and_retains_wrappers(self):
         class WindowStub:
@@ -699,11 +967,23 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             self.assertEqual(config.time_lapse_media_max_fraction, 0.5)
             self.assertEqual(config.time_lapse_marker, "pilgrim")
             self.assertTrue(config.time_lapse_overview_as_media)
+            self.assertTrue(config.time_lapse_overview_on_stage_map_dual)
             self.assertFalse(config.track_map_before_media)
             self.assertTrue(config.time_lapse_stages)
             self.assertEqual(config.initial_style, "TIME_LAPSE")
             self.assertEqual(config.transition.value, "BLEND")
             self.assertEqual(config.audio_crossfade_seconds, 2.0)
+            self.assertEqual(config.music_volume_percent, 65.0)
+            self.assertEqual(config.video_volume_percent, 100.0)
+            self.assertTrue(config.use_normalized_videos)
+            self.assertTrue(config.elevation_profile)
+            self.assertFalse(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    elevation_profile=False,
+                ).elevation_profile
+            )
             self.assertEqual(
                 config_from_options(project_dir, inputlist=control_file, transition="blend").transition.value,
                 "BLEND",
@@ -735,6 +1015,13 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
                     inputlist=control_file,
                     time_lapse_overview_as_media=False,
                 ).time_lapse_overview_as_media
+            )
+            self.assertFalse(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    time_lapse_overview_on_stage_map_dual=False,
+                ).time_lapse_overview_on_stage_map_dual
             )
             with self.assertRaises(ValueError):
                 config_from_options(

@@ -154,6 +154,13 @@ from plot_metadata_utils import (
     validate_media_sidecar,
 )
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
+from video_audio_normalization import (
+    GENERATED_DIRECTORY_NAMES,
+    NormalizationSettings,
+    is_generated_media_path,
+    normalization_status,
+    normalize_project_videos,
+)
 from track_map_layout_utils import (
     DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
     resolve_track_map_variant,
@@ -253,7 +260,8 @@ except Exception:
 
 PROGRAM_TITLE = "myCamino GPS Track Show"
 MIN_WINDOW_WIDTH = 920
-MIN_WINDOW_HEIGHT = 720
+MIN_WINDOW_HEIGHT = 780
+MUSIC_WINDOW_HEIGHT = 840
 LABEL_WIDTH = 140.0
 BUTTON_WIDTH = 110.0
 FILE_BUTTON_WIDTH = 28.0
@@ -279,6 +287,11 @@ IMAGE_EXTENSIONS = {
     ".bmp", ".webp",
 }
 VIDEO_EXTENSIONS = MEDIA_EXTENSIONS - IMAGE_EXTENSIONS
+
+
+def required_main_window_height(music_enabled: bool) -> float:
+    """Return the content height needed to keep the bottom status visible."""
+    return MUSIC_WINDOW_HEIGHT if music_enabled else MIN_WINDOW_HEIGHT
 CONTROL_TABLE_COLUMNS = ["preview", "file_datetime", "type", "name", "time", "gps", "place"]
 CONTROL_TABLE_TITLES = {
     "preview": "",
@@ -313,6 +326,21 @@ CONTROL_ROW_TYPES = tuple(CONTROL_ROW_TYPE_DESCRIPTIONS)
 CONTROL_ROW_TYPE_CHOICES = tuple(
     f"{row_type} - {description}"
     for row_type, description in CONTROL_ROW_TYPE_DESCRIPTIONS.items()
+)
+CONTROL_TABLE_FILTERS = (
+    ("all", "All Rows"),
+    ("no_media", "No Media"),
+    ("media", "Media"),
+    ("maps", "Maps"),
+    ("mus", "MUS – Music control"),
+    ("img", "IMG – Image"),
+    ("vid", "VID – Video"),
+    ("map", "MAP – Overview map"),
+    ("trk", "TRK – Track map"),
+    ("bef", "BEF – Day before map"),
+    ("aft", "AFT – Day after map"),
+    ("loc", "LOC – Media location map"),
+    ("dat", "DAT – Date"),
 )
 CONTROL_TABLE_DRAG_TYPE = NSPasteboardTypeString
 PH_AUTH_NOT_DETERMINED = 0
@@ -408,6 +436,11 @@ def control_file_signature(path):
     except OSError:
         return None
     return (str(candidate), int(stat_result.st_size), int(stat_result.st_mtime_ns))
+
+
+def slideshow_process_is_running(process):
+    """Return whether an optional player subprocess is still active."""
+    return process is not None and process.poll() is None
 
 
 def control_file_recovery_is_newer(control_path, recovery_path):
@@ -623,20 +656,41 @@ def next_control_table_search_position(current, count, direction):
     return (current + direction) % count
 
 
-def visible_control_row_indexes(rows, hide_media=False):
+def visible_control_row_indexes(rows, filter_key="all", hide_media=None):
     """Return model indexes exposed by the control-table data source."""
-    if not hide_media:
+    if hide_media is not None:
+        filter_key = "no_media" if hide_media else "all"
+    elif isinstance(filter_key, bool):
+        filter_key = "no_media" if filter_key else "all"
+    filter_key = str(filter_key or "all").casefold()
+    if filter_key == "all":
         return list(range(len(rows)))
+    exact = {"mus", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
+    if filter_key in exact:
+        return [
+            index for index, row in enumerate(rows)
+            if str(row.get("type", "")).casefold() == filter_key
+        ]
+    if filter_key == "media":
+        accepted = {"IMG", "VID"}
+    elif filter_key == "maps":
+        accepted = {"MAP", "TRK", "BEF", "AFT", "LOC"}
+    else:
+        accepted = None
     return [
         index
         for index, row in enumerate(rows)
-        if str(row.get("type", "")).upper() not in {"IMG", "VID"}
+        if (
+            str(row.get("type", "")).upper() in accepted
+            if accepted is not None
+            else str(row.get("type", "")).upper() not in {"IMG", "VID"}
+        )
     ]
 
 
-def control_table_filter_anchor_index(rows, selected_indexes, hide_media=False):
+def control_table_filter_anchor_index(rows, selected_indexes, filter_key="all", hide_media=None):
     """Return the selected or nearest row that remains visible after filtering."""
-    visible = visible_control_row_indexes(rows, hide_media)
+    visible = visible_control_row_indexes(rows, filter_key, hide_media)
     if not visible:
         return None
     selected = [int(index) for index in selected_indexes if 0 <= int(index) < len(rows)]
@@ -646,7 +700,18 @@ def control_table_filter_anchor_index(rows, selected_indexes, hide_media=False):
     if not selected:
         return visible[0]
     pivot = selected[0]
-    return min(visible, key=lambda index: (abs(index - pivot), 0 if index <= pivot else 1))
+    preceding = [index for index in visible if index <= pivot]
+    return preceding[-1] if preceding else visible[0]
+
+
+def control_table_follow_selection_action(enabled, selected_indexes, live_row):
+    """Return how a manual table selection should affect show following."""
+    if not enabled:
+        return "inactive"
+    indexes = [int(index) for index in selected_indexes]
+    if len(indexes) != 1:
+        return "stop"
+    return "follow" if indexes[0] == live_row else "jump"
 
 
 def media_viewer_control_row_index(source, items, index):
@@ -844,10 +909,16 @@ class SlideShowControlTableDataSource(NSObject):
             disable_field_editor_text_checking(
                 window.fieldEditor_forObject_(True, table_view)
             )
+        self.controller._suspend_control_table_sync("editing")
         return True
 
     def tableViewSelectionDidChange_(self, notification):
         table_view = notification.object()
+        if self.controller.control_table_programmatic_selection:
+            return
+        if self.controller._handle_following_control_table_selection():
+            return
+        self.controller._suspend_control_table_sync("selection")
         for model_index in self.controller._selected_control_table_indexes():
             if str(self.controller.control_table_rows[model_index].get("type", "")).upper() == "MUS":
                 self.controller.showMusicDirectiveHelp_(table_view)
@@ -1766,7 +1837,17 @@ class GPXTrackerController(NSObject):
         self.control_table_file_datetime_cache = {}
         self.control_table_show_previews = False
         self.control_table_media_hidden = False
+        self.control_table_filter_key = "all"
         self.control_table_media_filter_button = None
+        self.control_table_filter_popup = None
+        self.control_table_reset_filter_button = None
+        self.control_table_jump_to_show_button = None
+        self.control_table_sync_enabled = False
+        self.control_table_programmatic_selection = False
+        self.slideshow_live_state = None
+        self.slideshow_live_state_sequence = -1
+        self.slideshow_command_file = None
+        self.slideshow_command_sequence = 0
         self.control_table_preview_checkbox = None
         self.control_table_search_field = None
         self.control_table_search_status = None
@@ -1847,7 +1928,10 @@ class GPXTrackerController(NSObject):
         return self.initWithProjectDirectory_projectFile_(None, None)
 
     def _build_window(self):
-        rect = NSMakeRect(120.0, 48.0, 980.0, 740.0)
+        initial_height = required_main_window_height(
+            bool(self.parameters.get("audio.enabled", False))
+        )
+        rect = NSMakeRect(120.0, 28.0, 980.0, initial_height)
         style = (
             NSWindowStyleMaskTitled
             | NSWindowStyleMaskClosable
@@ -1861,7 +1945,7 @@ class GPXTrackerController(NSObject):
             False,
         )
         self.window.setTitle_(PROGRAM_TITLE)
-        self.window.setMinSize_((MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT))
+        self.window.setMinSize_((MIN_WINDOW_WIDTH, initial_height))
 
         content = self.window.contentView()
         self.root_view = NSView.alloc().initWithFrame_(content.bounds())
@@ -2098,6 +2182,14 @@ class GPXTrackerController(NSObject):
         self.music_playlist_button = self._make_button("Create Playlist", "createMusicPlaylist:")
         self.music_playlist_update_button = self._make_button("Update Playlist", "updateMusicPlaylist:")
         self.music_playlist_edit_button = self._make_button("Edit Playlist", "editMusicPlaylist:")
+        self.normalize_video_audio_button = self._make_button(
+            "Normalize Video Audio",
+            "normalizeVideoAudio:",
+        )
+        self.video_normalization_summary_label = self._make_label(
+            "Video-audio normalization has not been checked.",
+            size=12.0,
+        )
         self.music_summary_label = self._make_label(
             "No playlist selected; alphabetical order.",
             size=12.0,
@@ -2111,6 +2203,8 @@ class GPXTrackerController(NSObject):
             self.music_playlist_update_button,
             self.music_playlist_edit_button,
             self.music_summary_label,
+            self.normalize_video_audio_button,
+            self.video_normalization_summary_label,
         ):
             self.root_view.addSubview_(control)
 
@@ -2438,6 +2532,12 @@ class GPXTrackerController(NSObject):
             "from the project audio folder."
         )
         self.music_summary_label.setToolTip_("Shows the number of playable audio files and whether playlist or alphabetical ordering is used.")
+        self.normalize_video_audio_button.setToolTip_(
+            "Prepare reusable project video copies with normalized audio. Originals remain unchanged and current copies are skipped."
+        )
+        self.video_normalization_summary_label.setToolTip_(
+            "Shows current, stale, missing, and audio-free normalized video copies."
+        )
 
         self.help_button.setToolTip_("Show a simple overview of the program and the recommended workflow.")
         self.assistant_checkbox.setToolTip_(
@@ -2480,7 +2580,8 @@ class GPXTrackerController(NSObject):
         self.music_choose_button.setNextKeyView_(self.music_playlist_button)
         self.music_playlist_button.setNextKeyView_(self.music_playlist_update_button)
         self.music_playlist_update_button.setNextKeyView_(self.music_playlist_edit_button)
-        self.music_playlist_edit_button.setNextKeyView_(self.slideshow_start_button)
+        self.music_playlist_edit_button.setNextKeyView_(self.normalize_video_audio_button)
+        self.normalize_video_audio_button.setNextKeyView_(self.slideshow_start_button)
         self.slideshow_start_button.setNextKeyView_(self.slideshow_continue_button)
         self.slideshow_continue_button.setNextKeyView_(self.pdf_summary_button)
         self.pdf_summary_button.setNextKeyView_(self.quit_button)
@@ -2493,6 +2594,23 @@ class GPXTrackerController(NSObject):
         bounds = self.root_view.bounds()
         width = bounds.size.width
         height = bounds.size.height
+        required_height = required_main_window_height(
+            bool(self.parameters.get("audio.enabled", False))
+        )
+        self.window.setMinSize_((MIN_WINDOW_WIDTH, required_height))
+        if height + 0.5 < required_height:
+            old_frame = self.window.frame()
+            old_top = old_frame.origin.y + old_frame.size.height
+            self.window.setContentSize_(NSMakeSize(max(width, MIN_WINDOW_WIDTH), required_height))
+            new_frame = self.window.frame()
+            new_origin_y = old_top - new_frame.size.height
+            screen = self.window.screen()
+            if screen is not None:
+                new_origin_y = max(screen.visibleFrame().origin.y, new_origin_y)
+            self.window.setFrameOrigin_(NSMakePoint(old_frame.origin.x, new_origin_y))
+            bounds = self.root_view.bounds()
+            width = bounds.size.width
+            height = bounds.size.height
 
         left_x = PADDING
         field_x = left_x + LABEL_WIDTH + INNER_GAP
@@ -2800,7 +2918,21 @@ class GPXTrackerController(NSObject):
             )
             current_top = music_summary_y - BLOCK_GAP
         else:
-            current_top -= BLOCK_GAP
+            current_top -= 4.0
+
+        normalization_y = current_top - FIELD_HEIGHT
+        self.normalize_video_audio_button.setFrame_(
+            NSMakeRect(field_x, normalization_y, 170.0, FIELD_HEIGHT)
+        )
+        self.video_normalization_summary_label.setFrame_(
+            NSMakeRect(
+                field_x + 178.0,
+                normalization_y + 4.0,
+                max(120.0, description_width - 178.0),
+                18.0,
+            )
+        )
+        current_top = normalization_y - BLOCK_GAP
 
         self.slideshow_box.setFrame_(NSMakeRect(PADDING, current_top - 18.0, 118.0, 18.0))
         self.slideshow_divider.setFrame_(
@@ -2824,9 +2956,11 @@ class GPXTrackerController(NSObject):
         self.quit_button.setFrame_(NSMakeRect(quit_x, row_y, BUTTON_WIDTH, FIELD_HEIGHT))
         progress_visible = not bool(self.progress_bar.isHidden())
         status_bottom = row_y - STATUS_HEIGHT - 4.0
-        progress_bottom = status_bottom - PROGRESS_HEIGHT - 4.0
-        if not progress_visible:
-            status_bottom = progress_bottom
+        progress_bottom = (
+            status_bottom - PROGRESS_HEIGHT - 4.0
+            if progress_visible
+            else status_bottom
+        )
         self.status_label.setFrame_(NSMakeRect(field_x, status_bottom, description_width, STATUS_HEIGHT))
         self.progress_bar.setFrame_(
             NSMakeRect(
@@ -4508,6 +4642,7 @@ class GPXTrackerController(NSObject):
             self.music_playlist_button.setEnabled_(False)
             self.music_playlist_update_button.setEnabled_(False)
             self.music_playlist_edit_button.setEnabled_(False)
+            self._refresh_video_normalization_summary()
             return
         source = Path(source).expanduser().resolve(strict=False)
         self.music_playlist_select_button.setEnabled_(True)
@@ -4546,6 +4681,7 @@ class GPXTrackerController(NSObject):
                 "Copy audio files and album folders into the audio folder."
             )
         self.music_playlist_edit_button.setEnabled_(bool(files) or bool(playlist and Path(playlist).is_file()))
+        self._refresh_video_normalization_summary()
 
     def _confirm_shared_asset_change(self, field, value, label):
         if self.current_project_dir is None or self.current_project_file is None or not value:
@@ -5241,6 +5377,12 @@ class GPXTrackerController(NSObject):
             self.set_status(f"Applied {len(changed)} Adventure setting(s); auto-save scheduled.")
             if changed & {"trackmaps.route_source", "audio.enabled"}:
                 self.layout_window()
+            if changed & {
+                "audio.video_normalization_target_lufs",
+                "audio.video_normalization_max_boost_db",
+                "audio.video_normalization_true_peak_db",
+            }:
+                self._refresh_video_normalization_summary()
             if "trackmaps.route_source" in changed:
                 route_source = str(self.parameters.get("trackmaps.route_source", "automatic"))
                 if route_source == "media":
@@ -5274,13 +5416,13 @@ class GPXTrackerController(NSObject):
             "7. If no control file exists, Adventure Processing creates it after successful map generation. If an edited control file already exists, the program asks before opening Update Control File and never replaces it automatically. GPX journeys combine media with measured stages; media-only journeys group located media by date. Missing media GPS can be inferred when its exposure time falls inside exactly one timed GPX track.\n"
             "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. For later additions or corrections, press Update Control File instead of recreating the complete list. It checks map references and automatically finds imported, missing, invalid, legacy, and changed media. One review shows required reference corrections and recommended media updates. Map images themselves are rendered in Map Generation. Choose Other Media deliberately rechecks otherwise current files; changed GPS can trigger a targeted place-name update.\n"
-            "11. Music is a separate optional section and new Adventures start with No Music selected. Every project has a fixed audio folder, which is created automatically and recreated if missing. Clear No Music, click the folder icon, and copy audio files or complete album directories into that folder. Choose selects one of the .playlist files stored there; without a playlist, titles play alphabetically. Create Playlist makes another named playlist, and Update Playlist appends newly found audio without replacing your edits. Insert MUS rows in the control-file table to add #MUSIC commands for jumps, queues, loops, gate control, and internal volume. A manual Audio Off with the a key always has priority.\n"
+            "11. Music is a separate optional section and new Adventures start with No Music selected. Every project has a fixed audio folder, which is created automatically and recreated if missing. Clear No Music, click the folder icon, and copy audio files or complete album directories into that folder. Choose selects one of the .playlist files stored there; without a playlist, titles play alphabetically. Create Playlist makes another named playlist, and Update Playlist appends newly found audio without replacing your edits. Insert MUS rows in the control-file table to add #MUSIC commands for jumps, queues, loops, gate control, and internal volume. A manual Audio Off with the a key always has priority. Normalize Video Audio is always available: it prepares reusable copies without modifying originals or delaying slide-show startup. Press n during playback to switch normalized video sound on or off.\n"
             "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
             "13. Update Metadata Extraction in the Photos and Video Clips section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
             "14. Press Start to begin at the start, or Continue to resume from the last automatically saved stage, phase, medium, and Time-Lapse position. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
-            "15. In the control-file editor, right-click any row and choose Start Slide Show Here to launch once from that exact map, medium, date, or music directive without first replacing the saved Continue position.\n"
-            "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. In one-window Time-Lapse mode the overview is shown by default as a framed image over the track map before each stage and advances automatically in Auto mode. Settings can instead make it full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
-            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Choose the title image below Description; Use First selects the first still image in the control file. Each one-window stage then shows its Stage Map, marked Tour Overview, and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Press a during either show to pause or resume background audio.\n\n"
+            "15. In the control-file editor, use the row-type filter or Reset Filter, and press Start Slide Show Here at the bottom or in the context menu to launch once from that exact map, medium, date, or music directive. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
+            "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
+            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Press a during either show to pause or resume background audio.\n\n"
             "Workflow Assistant:\n"
             "- Assistant in the header is enabled for new Adventures and offers a recommended action for the next incomplete step. Return activates the default action.\n"
             "- It guides Project directory, Adventure name, the two explicit GPX or photo-only choices, explicit media acceptance/import, metadata using the visible place-name option, combined control/map creation, and the first slide-show start.\n"
@@ -5812,6 +5954,8 @@ class GPXTrackerController(NSObject):
                 self.set_status("Cancelling reverse geolocation...")
             elif self.geolocations_mode in {"media_update_analysis", "media_update_commit"}:
                 self.set_status("Cancelling control-file update...")
+            elif self.geolocations_mode == "video_normalization":
+                self.set_status("Cancelling video-audio normalization...")
             else:
                 self.set_status("Cancelling control-file creation...")
 
@@ -6310,6 +6454,7 @@ class GPXTrackerController(NSObject):
             self.music_summary_label,
         ):
             control.setHidden_(not enabled)
+        self._refresh_video_normalization_summary()
 
     @objc.IBAction
     def noMusicChanged_(self, sender):
@@ -6327,6 +6472,123 @@ class GPXTrackerController(NSObject):
             if enabled
             else "No Music selected; slide shows will start without background music."
         )
+
+    def _video_normalization_settings(self):
+        return NormalizationSettings(
+            target_lufs=float(self.parameters["audio.video_normalization_target_lufs"]),
+            maximum_boost_db=float(self.parameters["audio.video_normalization_max_boost_db"]),
+            true_peak_db=float(self.parameters["audio.video_normalization_true_peak_db"]),
+        )
+
+    def _refresh_video_normalization_summary(self):
+        if not hasattr(self, "video_normalization_summary_label"):
+            return
+        project_dir = self.current_project_dir
+        if project_dir is None or not Path(project_dir).is_dir():
+            self.video_normalization_summary_label.setStringValue_("Choose an Adventure first.")
+            return
+        try:
+            counts = normalization_status(project_dir, self._video_normalization_settings())
+        except OSError as exc:
+            self.video_normalization_summary_label.setStringValue_(f"Could not inspect videos: {exc}")
+            return
+        if counts["total"] == 0:
+            text = "No project videos found."
+        else:
+            text = (
+                f"{counts['current']}/{counts['total']} videos normalized, "
+                f"{counts['stale']} stale, {counts['without_audio']} without audio"
+            )
+            if counts["missing"]:
+                text += f", {counts['missing']} missing"
+        self.video_normalization_summary_label.setStringValue_(text)
+
+    @objc.IBAction
+    def normalizeVideoAudio_(self, _sender):
+        project_dir = self._resolve_project_directory(
+            allow_create=False,
+            update_gpx_field=False,
+        )
+        if project_dir is None:
+            show_alert("Please choose an Adventure first.")
+            return
+        if self.geolocations_running:
+            self.geolocations_window.makeKeyAndOrderFront_(None)
+            self.set_status("Another Adventure operation is already running.")
+            return
+        self._prepare_geolocations_window("Normalize Video Audio")
+        self.appendGeoLocationsOutputLine_(
+            "Original videos remain unchanged. Current generated copies are skipped."
+        )
+        cancel_event = threading.Event()
+        self.geolocations_cancel_event = cancel_event
+        self.geolocations_mode = "video_normalization"
+        writer = GeoLocationsOutputWriter(self)
+
+        def progress(current, total, name):
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "videoNormalizationProgress:",
+                {"current": current, "total": total, "name": name},
+                False,
+            )
+
+        def run_task():
+            try:
+                result = normalize_project_videos(
+                    project_dir,
+                    self._video_normalization_settings(),
+                    progress_callback=progress,
+                    detail_callback=lambda line: writer.write(f"{line}\n"),
+                    cancel_event=cancel_event,
+                )
+                writer.flush()
+                payload = {"status": "cancelled" if result.cancelled else "success", "result": result}
+            except Exception as exc:
+                writer.flush()
+                payload = {"status": "error", "error": str(exc)}
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "videoNormalizationFinished:", payload, False
+            )
+
+        self.geolocations_thread = threading.Thread(
+            target=run_task,
+            name="video-audio-normalization",
+            daemon=True,
+        )
+        self.geolocations_thread.start()
+
+    def videoNormalizationProgress_(self, payload):
+        current = int(payload.get("current", 0))
+        total = max(1, int(payload.get("total", 1)))
+        name = str(payload.get("name", ""))
+        self.set_progress(current, total)
+        if self.geolocations_window is not None:
+            self.geolocations_window.setTitle_(
+                f"Video Audio Normalization — {min(current + 1, total)}/{total} — {name}"
+            )
+
+    def videoNormalizationFinished_(self, payload):
+        status = str(payload.get("status", "error"))
+        if status == "error":
+            self._finish_geolocations_run(
+                f"Error: {payload.get('error', 'unknown failure')}",
+                "Video-audio normalization failed; original videos remain available.",
+            )
+        else:
+            result = payload.get("result")
+            summary = (
+                f"Normalized {getattr(result, 'normalized', 0)}, "
+                f"already current {getattr(result, 'current', 0)}, "
+                f"without audio {getattr(result, 'without_audio', 0)}, "
+                f"failed {getattr(result, 'failed', 0)}."
+            )
+            self._finish_geolocations_run(
+                ("Cancelled. " if status == "cancelled" else "Complete. ") + summary,
+                "Video-audio normalization cancelled; completed outputs were retained."
+                if status == "cancelled"
+                else "Video-audio normalization complete.",
+            )
+        self._refresh_video_normalization_summary()
 
     @objc.IBAction
     def noGPXNeededChanged_(self, sender):
@@ -6364,22 +6626,38 @@ class GPXTrackerController(NSObject):
         preview_checkbox.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
         content.addSubview_(preview_checkbox)
 
-        media_filter_button = self._make_button(
-            "Show Media Rows" if self.control_table_media_hidden else "Hide Media Rows",
-            "toggleControlTableMediaRows:",
+        filter_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(132.0, 344.0, 178.0, FIELD_HEIGHT),
+            False,
         )
-        media_filter_button.setFrame_(NSMakeRect(132.0, 344.0, 160.0, FIELD_HEIGHT))
-        media_filter_button.setToolTip_("Hide photo and video rows so stage, date, and map rows are easier to edit.")
-        media_filter_button.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
-        content.addSubview_(media_filter_button)
+        filter_popup.addItemsWithTitles_([label for _key, label in CONTROL_TABLE_FILTERS])
+        filter_popup.setTarget_(self)
+        filter_popup.setAction_("controlTableFilterChanged:")
+        filter_popup.setToolTip_("Show only the selected control-file row category without changing row order.")
+        filter_popup.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        content.addSubview_(filter_popup)
+
+        reset_filter_button = self._make_button("Reset Filter", "resetControlTableFilter:")
+        reset_filter_button.setFrame_(NSMakeRect(316.0, 344.0, 96.0, FIELD_HEIGHT))
+        reset_filter_button.setToolTip_("Return to All Rows while keeping the current location visible.")
+        reset_filter_button.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        content.addSubview_(reset_filter_button)
 
         insert_row_button = self._make_button("Insert Row", "insertControlRow:")
-        insert_row_button.setFrame_(NSMakeRect(300.0, 344.0, 96.0, FIELD_HEIGHT))
+        insert_row_button.setFrame_(NSMakeRect(418.0, 344.0, 96.0, FIELD_HEIGHT))
         insert_row_button.setToolTip_("Insert a row after the selection (Cmd-I), then choose its directive type.")
         insert_row_button.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
         content.addSubview_(insert_row_button)
 
-        search_field = NSSearchField.alloc().initWithFrame_(NSMakeRect(670.0, 344.0, 210.0, FIELD_HEIGHT))
+        jump_to_show_button = self._make_button("Jump to Show", "jumpControlTableToShow:")
+        jump_to_show_button.setFrame_(NSMakeRect(520.0, 344.0, 124.0, FIELD_HEIGHT))
+        jump_to_show_button.setToolTip_(
+            "Jump to the latest row in the running slide show and follow it until playback stops or you select or edit another row."
+        )
+        jump_to_show_button.setAutoresizingMask_(NSViewMaxXMargin | NSViewMinYMargin)
+        content.addSubview_(jump_to_show_button)
+
+        search_field = NSSearchField.alloc().initWithFrame_(NSMakeRect(700.0, 344.0, 180.0, FIELD_HEIGHT))
         search_field.setPlaceholderString_("Search control file")
         search_field.setFont_(NSFont.systemFontOfSize_(13.0))
         search_field.setTarget_(self)
@@ -6413,7 +6691,7 @@ class GPXTrackerController(NSObject):
 
         search_status = self._make_label("", size=11.0)
         search_status.setAlignment_(2)
-        search_status.setFrame_(NSMakeRect(600.0, 344.0, 64.0, FIELD_HEIGHT))
+        search_status.setFrame_(NSMakeRect(664.0, 344.0, 32.0, FIELD_HEIGHT))
         search_status.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
         content.addSubview_(search_status)
 
@@ -6485,6 +6763,10 @@ class GPXTrackerController(NSObject):
         delete_button = self._make_button("Delete", "deleteControlRows:")
         save_button = self._make_button("Save", "saveControlTable:")
         revert_button = self._make_button("Revert", "revertControlTable:")
+        start_here_button = self._make_button(
+            "Start Slide Show Here",
+            "startSlideShowFromSelectedControlRow:",
+        )
         close_button = self._make_button("Close", "closeControlTable:")
         buttons = [
             (undo_button, FIELD_HEIGHT),
@@ -6496,6 +6778,7 @@ class GPXTrackerController(NSObject):
             (delete_button, 76.0),
             (save_button, 76.0),
             (revert_button, 76.0),
+            (start_here_button, 156.0),
             (close_button, 76.0),
         ]
         x = 16.0
@@ -6506,7 +6789,7 @@ class GPXTrackerController(NSObject):
             x += width + 8.0
 
         hint = self._make_label(
-            "Double-click previews media; right-click for Finder or Start Slide Show Here. Drag rows. Cmd-I inserts; Cmd-F/Shift-Cmd-F searches; Cmd-C/V/X/Z edits.",
+            "Double-click previews media; Jump to Show follows playback. Drag rows. Cmd-I inserts; Cmd-F/Shift-Cmd-F searches; Cmd-C/V/X/Z edits.",
             size=12.0,
         )
         hint.setFrame_(NSMakeRect(16.0, 8.0, 948.0, 16.0))
@@ -6519,18 +6802,20 @@ class GPXTrackerController(NSObject):
         self.control_table_data_source = data_source
         self.control_table_hint_label = hint
         self.control_table_preview_checkbox = preview_checkbox
-        self.control_table_media_filter_button = media_filter_button
+        self.control_table_filter_popup = filter_popup
+        self.control_table_reset_filter_button = reset_filter_button
+        self.control_table_jump_to_show_button = jump_to_show_button
+        self.control_table_start_here_button = start_here_button
+        self._sync_control_table_filter_popup()
         self.control_table_search_field = search_field
         self.control_table_search_status = search_status
 
     def _control_table_search_indexes(self, query):
         """Return rows containing a case-insensitive control-file substring."""
         matches = control_table_search_indexes(self.control_table_rows, query)
-        if self.control_table_media_hidden:
-            matches = [
-                index for index in matches
-                if str(self.control_table_rows[index].get("type", "")).upper() not in {"IMG", "VID"}
-            ]
+        visible = set(self.control_table_view_model_indexes)
+        if self.control_table_filter_key != "all":
+            matches = [index for index in matches if index in visible]
         return matches
 
     def _refresh_control_table_search(self, select_first=False):
@@ -6615,7 +6900,7 @@ class GPXTrackerController(NSObject):
     def _rebuild_control_table_view_index(self):
         self.control_table_view_model_indexes = visible_control_row_indexes(
             self.control_table_rows,
-            self.control_table_media_hidden,
+            self.control_table_filter_key,
         )
         self.control_table_model_to_view_index = {
             model_index: view_index
@@ -6649,19 +6934,25 @@ class GPXTrackerController(NSObject):
             for index in indexes
             if index in self.control_table_model_to_view_index
         )
-        if not view_indexes:
-            self.control_table_view.deselectAll_(None)
-            return
-        selection = NSIndexSet.indexSetWithIndexesInRange_((view_indexes[0], 1))
-        mutable_selection = selection.mutableCopy()
-        for index in view_indexes[1:]:
-            mutable_selection.addIndex_(index)
-        self.control_table_view.selectRowIndexes_byExtendingSelection_(mutable_selection, False)
+        self.control_table_programmatic_selection = True
+        try:
+            if not view_indexes:
+                self.control_table_view.deselectAll_(None)
+                return
+            selection = NSIndexSet.indexSetWithIndexesInRange_((view_indexes[0], 1))
+            mutable_selection = selection.mutableCopy()
+            for index in view_indexes[1:]:
+                mutable_selection.addIndex_(index)
+            self.control_table_view.selectRowIndexes_byExtendingSelection_(mutable_selection, False)
+        finally:
+            self.control_table_programmatic_selection = False
 
     def _snapshot_control_table(self):
         return [clone_slideshow_row(row) for row in self.control_table_rows]
 
     def _push_control_table_undo(self):
+        # Every mutation that can be undone is an edit and must stop live following.
+        self._suspend_control_table_sync("editing")
         self.control_table_undo_stack.append(self._snapshot_control_table())
         self.control_table_redo_stack.clear()
         self._schedule_control_table_recovery()
@@ -6882,26 +7173,192 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def toggleControlTableMediaRows_(self, _sender):
+        """Compatibility action: switch between All Rows and No Media."""
+        self._set_control_table_filter(
+            "all" if self.control_table_filter_key == "no_media" else "no_media"
+        )
+
+    def _sync_control_table_filter_popup(self):
+        if self.control_table_filter_popup is None:
+            return
+        keys = [key for key, _label in CONTROL_TABLE_FILTERS]
+        try:
+            index = keys.index(self.control_table_filter_key)
+        except ValueError:
+            index = 0
+        self.control_table_filter_popup.selectItemAtIndex_(index)
+        if self.control_table_reset_filter_button is not None:
+            self.control_table_reset_filter_button.setEnabled_(index != 0)
+
+    def _set_control_table_filter(self, filter_key):
         selected_indexes = self._selected_control_table_indexes()
-        hide_media = not self.control_table_media_hidden
+        filter_key = str(filter_key or "all").casefold()
+        valid_keys = {key for key, _label in CONTROL_TABLE_FILTERS}
+        if filter_key not in valid_keys:
+            filter_key = "all"
         anchor_index = control_table_filter_anchor_index(
             self.control_table_rows,
             selected_indexes,
-            hide_media,
+            filter_key,
         )
-        self.control_table_media_hidden = hide_media
-        if self.control_table_media_filter_button is not None:
-            self.control_table_media_filter_button.setTitle_(
-                "Show Media Rows" if hide_media else "Hide Media Rows"
-            )
-            self.control_table_media_filter_button.setToolTip_(
-                "Show photo and video rows while keeping the selected stage visible." if hide_media
-                else "Hide photo and video rows so stage, date, and map rows are easier to edit."
-            )
+        self.control_table_filter_key = filter_key
+        self.control_table_media_hidden = filter_key == "no_media"
+        self._sync_control_table_filter_popup()
         self._reload_control_table()
-        if anchor_index is not None:
+        if self.control_table_sync_enabled and isinstance(self.slideshow_live_state, dict):
+            self._apply_slideshow_live_state()
+        elif anchor_index is not None:
             self._select_control_table_indexes([anchor_index])
             self._scroll_control_table_model_row_to_visible(anchor_index)
+
+    @objc.IBAction
+    def controlTableFilterChanged_(self, sender):
+        index = int(sender.indexOfSelectedItem())
+        if 0 <= index < len(CONTROL_TABLE_FILTERS):
+            self._set_control_table_filter(CONTROL_TABLE_FILTERS[index][0])
+
+    @objc.IBAction
+    def resetControlTableFilter_(self, _sender):
+        self._set_control_table_filter("all")
+
+    def _set_control_table_sync_enabled(self, enabled, *, message=None):
+        self.control_table_sync_enabled = bool(enabled)
+        if enabled:
+            self._apply_slideshow_live_state()
+        if message and (not enabled or self.control_table_sync_enabled):
+            self.set_status(message)
+
+    def _suspend_control_table_sync(self, reason):
+        if not self.control_table_sync_enabled:
+            return
+        self._set_control_table_sync_enabled(
+            False,
+            message=(
+                "Show following stopped while editing. Press Jump to Show to return to the live row."
+                if reason == "editing"
+                else "Show following stopped after manual selection."
+            ),
+        )
+
+    def _request_slideshow_row_jump(self, row_index):
+        """Send one exact-row jump to the running player."""
+        if not slideshow_process_is_running(self.slideshow_process):
+            self._set_control_table_sync_enabled(
+                False,
+                message="Show following stopped because the slide show is no longer running.",
+            )
+            return False
+        if self.slideshow_command_file is None or self.control_table_path is None:
+            self._set_control_table_sync_enabled(
+                False,
+                message="Show following stopped because the player command channel is unavailable.",
+            )
+            return False
+        self.slideshow_command_sequence = max(
+            time.time_ns(),
+            self.slideshow_command_sequence + 1,
+        )
+        payload = {
+            "version": 1,
+            "sequence": self.slideshow_command_sequence,
+            "command": "jump",
+            "row": int(row_index),
+            "control_file": str(self.control_table_path.resolve(strict=False)),
+        }
+        try:
+            atomic_write_json(self.slideshow_command_file, payload)
+        except OSError as exc:
+            self._set_control_table_sync_enabled(
+                False,
+                message=f"Could not send the slide-show jump: {exc}",
+            )
+            return False
+        self.set_status(f"Jumping the slide show to control-file row {int(row_index) + 1}.")
+        return True
+
+    def _handle_following_control_table_selection(self):
+        """Jump on a unique manual selection while follow mode remains active."""
+        indexes = self._selected_control_table_indexes()
+        live_row = (
+            self.slideshow_live_state.get("active_row")
+            if isinstance(self.slideshow_live_state, dict)
+            else None
+        )
+        action = control_table_follow_selection_action(
+            self.control_table_sync_enabled,
+            indexes,
+            live_row,
+        )
+        if action == "inactive":
+            return False
+        if action == "stop":
+            self._suspend_control_table_sync("selection")
+            return True
+        if action == "jump":
+            self._request_slideshow_row_jump(indexes[0])
+        return True
+
+    @objc.IBAction
+    def jumpControlTableToShow_(self, _sender):
+        if not slideshow_process_is_running(self.slideshow_process):
+            self._set_control_table_sync_enabled(False)
+            self.set_status("No running slide show is available to jump to.")
+            return
+        self._set_control_table_sync_enabled(
+            True,
+            message=(
+                "Following the running slide show."
+                if isinstance(self.slideshow_live_state, dict)
+                else "Waiting for the running slide show to publish its current row."
+            ),
+        )
+
+    def _apply_slideshow_live_state(self):
+        if not self.control_table_sync_enabled or not isinstance(self.slideshow_live_state, dict):
+            return
+        state = self.slideshow_live_state
+        if self.control_table_path is None:
+            return
+        if self.control_table_dirty:
+            self._set_control_table_sync_enabled(
+                False,
+                message="Show following stopped because the editor has unsaved control-file changes.",
+            )
+            return
+        try:
+            running_path = Path(str(state.get("control_file", ""))).resolve(strict=False)
+        except (TypeError, ValueError):
+            return
+        if running_path != self.control_table_path.resolve(strict=False):
+            self._set_control_table_sync_enabled(
+                False,
+                message="Show following stopped because the editor contains another control file.",
+            )
+            return
+        signature = state.get("control_file_signature")
+        current = control_file_signature(self.control_table_path)
+        if (
+            isinstance(signature, dict)
+            and current is not None
+            and (int(signature.get("size", -1)), int(signature.get("mtime_ns", -1)))
+            != (current[1], current[2])
+        ):
+            self._set_control_table_sync_enabled(
+                False,
+                message="Show following stopped because the control file changed after playback started.",
+            )
+            return
+        row_index = state.get("active_row")
+        if not isinstance(row_index, int) or not 0 <= row_index < len(self.control_table_rows):
+            return
+        visible = self.control_table_view_model_indexes
+        if row_index not in self.control_table_model_to_view_index:
+            preceding = [index for index in visible if index <= row_index]
+            row_index = preceding[-1] if preceding else (visible[0] if visible else None)
+        if row_index is None:
+            return
+        self._select_control_table_indexes([row_index])
+        self._scroll_control_table_model_row_to_visible(row_index)
 
     def control_media_items(self):
         items = []
@@ -8109,10 +8566,21 @@ class GPXTrackerController(NSObject):
         for path in paths:
             if path.is_dir():
                 for child in sorted(path.rglob("*")):
-                    if child.is_file() and child.suffix.lower() in allowed:
+                    if (
+                        child.is_file()
+                        and child.suffix.lower() in allowed
+                        and not any(
+                            part.casefold() in GENERATED_DIRECTORY_NAMES
+                            for part in child.relative_to(path).parts[:-1]
+                        )
+                    ):
                         collected.append(child)
             elif path.is_file() and path.suffix.lower() in allowed:
-                collected.append(path)
+                if (
+                    self.current_project_dir is None
+                    or not is_generated_media_path(path, self.current_project_dir)
+                ):
+                    collected.append(path)
         return collected
 
     def _import_media_files(self, source_paths, images_only=False, force_jpeg=False):
@@ -10679,10 +11147,12 @@ class GPXTrackerController(NSObject):
             self._update_slideshow_continue_button()
             return
         state_file = project_dir / ".mycamino-slideshow-state.json"
+        command_file = project_dir / ".mycamino-slideshow-command.json"
         try:
             state_file.unlink(missing_ok=True)
+            command_file.unlink(missing_ok=True)
         except OSError as exc:
-            show_alert("Could not prepare slide-show state file.", str(exc))
+            show_alert("Could not prepare slide-show communication files.", str(exc))
             return
 
         try:
@@ -10692,11 +11162,16 @@ class GPXTrackerController(NSObject):
                 trackimages_dir,
                 resume_position=resume_position,
                 state_file=state_file,
+                command_file=command_file,
             )
             self.slideshow_process = subprocess.Popen(
                 command,
                 cwd=str(self.base_dir),
             )
+            self.slideshow_live_state = None
+            self.slideshow_live_state_sequence = -1
+            self.slideshow_command_file = command_file
+            self.slideshow_command_sequence = 0
             self.workflow_assistant_state["slideshow_started"] = True
             self.mark_dirty(immediate=True)
             self.refresh_workflow_assistant()
@@ -10714,7 +11189,7 @@ class GPXTrackerController(NSObject):
             return
         watcher = threading.Thread(
             target=self._watch_slideshow_process,
-            args=(self.slideshow_process, state_file),
+            args=(self.slideshow_process, state_file, command_file),
             daemon=True,
         )
         watcher.start()
@@ -10743,7 +11218,25 @@ class GPXTrackerController(NSObject):
         if controller is not None:
             self.set_status("Opened GPXEditor and PDF Summary options.")
 
-    def _watch_slideshow_process(self, process, state_file):
+    def _watch_slideshow_process(self, process, state_file, command_file):
+        last_signature = None
+        while process.poll() is None:
+            try:
+                stat = state_file.stat()
+                signature = (int(stat.st_size), int(stat.st_mtime_ns))
+                if signature != last_signature:
+                    with state_file.open("r", encoding="utf-8") as handle:
+                        live_state = json.load(handle)
+                    last_signature = signature
+                    if isinstance(live_state, dict) and live_state.get("live"):
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            "slideShowLiveStateUpdated:",
+                            {"pid": process.pid, "state": live_state},
+                            False,
+                        )
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.2)
         return_code = process.wait()
         resume_state = None
         try:
@@ -10755,10 +11248,11 @@ class GPXTrackerController(NSObject):
         except (OSError, json.JSONDecodeError):
             resume_state = None
         finally:
-            try:
-                state_file.unlink(missing_ok=True)
-            except OSError:
-                pass
+            for transient_file in (state_file, command_file):
+                try:
+                    transient_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if return_code == 0:
             message = "Slide show closed."
         else:
@@ -10773,12 +11267,35 @@ class GPXTrackerController(NSObject):
             False,
         )
 
+    def slideShowLiveStateUpdated_(self, payload):
+        active_process = self.slideshow_process
+        if active_process is None or active_process.pid != int(payload.get("pid", -1)):
+            return
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            return
+        sequence = int(state.get("sequence", -1))
+        if sequence <= self.slideshow_live_state_sequence:
+            return
+        self.slideshow_live_state_sequence = sequence
+        self.slideshow_live_state = state
+        self._apply_slideshow_live_state()
+
     def slideShowProcessFinished_(self, result):
+        was_synchronized = self.control_table_sync_enabled
         active_process = self.slideshow_process
         if active_process is not None and active_process.pid == int(result.get("pid", -1)):
             self.slideshow_process = None
+            self.slideshow_command_file = None
         resume_state = result.get("resume_state")
         if isinstance(resume_state, dict):
+            if was_synchronized and not resume_state.get("completed"):
+                final_state = dict(resume_state)
+                final_state["active_row"] = final_state.get("media_index")
+                if not isinstance(final_state["active_row"], int):
+                    final_state["active_row"] = final_state.get("playlist_index")
+                self.slideshow_live_state = final_state
+                self._apply_slideshow_live_state()
             new_position = None if resume_state.get("completed") else resume_state
             if new_position != self.slideshow_resume_position:
                 self.slideshow_resume_position = new_position
@@ -10786,7 +11303,9 @@ class GPXTrackerController(NSObject):
                 if self.save_project_configuration():
                     suffix = " Resume position saved automatically." if new_position is not None else " Resume position cleared."
                     self.set_status(str(result.get("message", "Slide show closed.")) + suffix)
+                    self.control_table_sync_enabled = False
                     return
+        self.control_table_sync_enabled = False
         self.set_status(str(result.get("message", "Slide show closed.")))
 
     def _slideshow_command(
@@ -10796,6 +11315,7 @@ class GPXTrackerController(NSObject):
         trackimages_dir,
         resume_position=None,
         state_file=None,
+        command_file=None,
     ):
         settings = self.parameters
         initial_style = str(settings["slideshow.transition"]).upper()
@@ -10882,7 +11402,21 @@ class GPXTrackerController(NSObject):
             str(settings["timelapse.marker_style"]),
             "--audio-crossfade-seconds",
             str(settings["audio.crossfade_seconds"]),
+            "--music-volume-percent",
+            str(settings["audio.music_volume_percent"]),
+            "--video-volume-percent",
+            str(settings["audio.video_volume_percent"]),
+            "--video-normalization-target-lufs",
+            str(settings["audio.video_normalization_target_lufs"]),
+            "--video-normalization-max-boost-db",
+            str(settings["audio.video_normalization_max_boost_db"]),
+            "--video-normalization-true-peak-db",
+            str(settings["audio.video_normalization_true_peak_db"]),
         ]
+        if not settings["slideshow.elevation_profile"]:
+            args.append("--no-elevation-profile")
+        if not settings["audio.use_normalized_videos"]:
+            args.append("--no-normalized-videos")
         if self.title_image is not None and Path(self.title_image).is_file():
             args.extend(
                 [
@@ -10900,6 +11434,8 @@ class GPXTrackerController(NSObject):
                 args.extend(["--music-playlist", str(Path(playlist_path).resolve(strict=False))])
         if not settings["timelapse.overview_as_media"]:
             args.append("--time-lapse-overview-fullscreen")
+        if not settings["timelapse.overview_on_stage_map_dual"]:
+            args.append("--no-time-lapse-overview-on-stage-map-dual")
         if settings["slideshow.track_map_before_media"]:
             args.append("--track-map-before-media")
         window_mode = settings["slideshow.window_mode"]
@@ -10922,6 +11458,8 @@ class GPXTrackerController(NSObject):
             args.append("--no-fullscreen")
         if state_file is not None:
             args.extend(["--state-file", str(state_file)])
+        if command_file is not None:
+            args.extend(["--command-file", str(command_file)])
         if isinstance(resume_position, dict):
             args.extend(["--resume-index", str(int(resume_position["playlist_index"]))])
             progress = resume_position.get("time_lapse_progress")

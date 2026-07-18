@@ -31,6 +31,9 @@ The active source files are:
   parsing/generation/update, album membership, and pure transport progression.
 - `slideshow_control_format.py`: strict CSV-style `#MUSIC:` parsing and command
   normalization.
+- `video_audio_normalization.py`: generated-directory exclusion, FFmpeg
+  discovery, two-pass loudness normalization, atomic manifests, freshness
+  checks, and runtime normalized-video resolution.
 - `gpxjoin.py`, `gpxlist.py`, `editGPXTrack.py`: older or supporting GPX tools.
 
 ## Runtime Model
@@ -140,6 +143,14 @@ directory. The small Help link beside No Music calls the same retained
 main window and control-file editor cannot develop different command
 references. Loading an older Adventure without `audio.enabled` enables music
 only when that Adventure already references a music source.
+
+Video normalization remains available when music is disabled. It runs only
+after the explicit GUI action, writes into `normalized-videos`, and commits
+each manifest update atomically. The manifest binds outputs to source size and
+nanosecond modification time plus the LUFS/boost/true-peak settings. Playback
+never invokes FFmpeg: it validates the manifest and falls back to the original.
+`scripts/build_ffmpeg_lgpl.sh` builds the pinned non-GPL FFmpeg executable that
+`GPSTrackShow.spec` includes with its LGPL notice.
 
 Guided metadata preparation wraps `discover_media_update_candidates(...)`,
 `analyze_control_file_updates(...)`, and `commit_control_file_update_plan(...)`
@@ -672,17 +683,37 @@ crossfading. Videos and Space pause audio transiently, while `a` changes the
 independent user-enabled state. This manual state always has priority over the
 control-file gate.
 
+The effective music gain is the configured music percentage multiplied by the
+0–9 directive level and the retained slot's crossfade envelope. A level change
+therefore updates both players during a crossfade. Video players use the
+separate configured video percentage. Runtime `n` replaces an active player
+item with the normalized/original counterpart, seeks to the prior timestamp,
+and restores its playing state.
+
 The transport supports ordered target queues that return to the interrupted
 playlist title and time position, permanent playlist jumps, continue,
 single/line/range/album/all loops, a 0–9 gain level, and `#ON/#OFF`. Targets
 open the control gate; volume and gate actions do not cancel transport modes.
 The player reports unresolved targets but keeps the current title running.
 
-Player entry points accept `music_source`, `music_playlist`, and
-`audio_crossfade_seconds`; CLI equivalents are `--music`, `--music-playlist`,
-and `--audio-crossfade-seconds`. A directory without an explicit playlist
+Player entry points accept `music_source`, `music_playlist`, crossfade,
+music/video gain, normalized-video preference, and normalization-signature
+settings. CLI equivalents include `--music`, `--music-playlist`,
+`--audio-crossfade-seconds`, `--music-volume-percent`,
+`--video-volume-percent`, `--use-normalized-videos`, and
+`--no-normalized-videos`. A directory without an explicit playlist
 looks for the control-list stem (without `-sorted`) plus `.playlist`, then
 falls back to recursive case-insensitive relative-path order.
+
+The player atomically publishes active control-row changes to its state file.
+The main GUI watcher reads sequence-numbered updates while the subprocess is
+alive. Control-editor synchronization validates control-file identity and
+signature, and maps the active model index through the current filter. While
+**Jump to Show** following is active, a unique manual row selection is sent to
+the player through a separate atomic command file and following continues from
+that row. Cell editing or multiple selection suspends following. Time-Lapse
+animation frames do not write state unless their active row or display phase
+changed.
 
 `GPSTrackShowWindowDelegate` gives every Cocoa window a stable `photo` or `map`
 role. Closing the primary photo window quits playback. Closing the secondary
@@ -717,6 +748,22 @@ map is rendered by a retained `TimeLapseMapView`; the overview is drawn in the
 map role with the complete active route and current position. This avoids
 allocating a new full-screen image for every 20 ms animation tick.
 
+GPX-backed stages optionally begin with an elevation-profile inset. The player
+reads `processed_track_segments` from the selected Track Map sidecar, so it
+does not parse the GPX file during playback. `elevation_profile_cache.py` owns
+sample extraction, the same min/max-plus-five-percent range used by
+`ElevationProfileView`, cache naming, and freshness signatures. The native
+renderer writes one shared Standard/Time-Lapse PNG and manifest under
+`trackimages/elevation-profiles`. Track fingerprint, GPX processing parameters,
+retained-point count, and renderer version invalidate the cache. The inset uses
+the shared route-free placement frontier but omits the normal white media
+frame. Standard playback composites it into the roomier Time-Lapse map variant
+for the initial Stage Map without replacing the centered map context retained
+for the other display. Time-Lapse presents the overview inset first, then the
+profile, then route motion. `PlaybackPhase.ELEVATION_PROFILE` makes this order
+and reverse navigation explicit. `e` changes the retained session preference
+without rewriting the Adventure.
+
 `parse_map_directive(...)` distinguishes canonical stages from
 `#MapBefore:`/`#MapAfter:` and `#MediaMap:`. Adjacent-day and media-only
 directives create static Time-Lapse
@@ -748,8 +795,14 @@ intentionally skipping a media row. Entering Time-Lapse cancels the standard
 continuation timer and presenter transitions, then hides every standard
 content layer so both modes cannot animate concurrently.
 
-With no map presenter, a fresh Time-Lapse stage first displays the overview in
-the stage view as a framed medium for `--duration`, then starts route motion.
+Every fresh Time-Lapse stage first displays the overview in the stage view as a
+framed medium for `--duration`, then the optional elevation profile for the
+same duration, and finally starts route motion. This sequence is retained when
+a separate overview window is active; that window continues to show its
+centered overview simultaneously.
+`timelapse.overview_on_stage_map_dual` defaults to true and controls only this
+additional dual-display inset; single-window playback always retains the
+overview phase.
 `draw_time_lapse_overview_media(...)` projects the active stage's repaired
 track points through the overview sidecar coordinates before the rendered
 overview is scaled into its media frame, preserving the route highlight.

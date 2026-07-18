@@ -23,11 +23,13 @@ from GetGeoLocations import (
     update_control_special_map_entries,
 )
 from GPSTrackShowGUI import (
+    CONTROL_TABLE_FILTERS,
     GeoLocationsOutputWriter,
     GPXTrackerController,
     control_file_update_requires_review,
     control_file_recovery_is_newer,
     control_file_signature,
+    control_table_follow_selection_action,
     control_table_filter_anchor_index,
     control_table_search_indexes,
     control_table_recovery_path,
@@ -35,7 +37,9 @@ from GPSTrackShowGUI import (
     media_viewer_control_row_index,
     next_control_table_search_position,
     parse_slideshow_control_line,
+    required_main_window_height,
     serialize_slideshow_control_row,
+    slideshow_process_is_running,
     track_endpoint_place_completeness,
     update_slideshow_control_row_cell,
     visible_control_row_indexes,
@@ -44,6 +48,28 @@ from GPSTrackShowGUI import (
 
 
 class ControlFileTrackSyncTests(unittest.TestCase):
+    def test_following_selection_jumps_only_for_one_different_row(self):
+        self.assertEqual(
+            control_table_follow_selection_action(False, [4], 3),
+            "inactive",
+        )
+        self.assertEqual(
+            control_table_follow_selection_action(True, [4], 3),
+            "jump",
+        )
+        self.assertEqual(
+            control_table_follow_selection_action(True, [3], 3),
+            "follow",
+        )
+        self.assertEqual(
+            control_table_follow_selection_action(True, [3, 4], 3),
+            "stop",
+        )
+        self.assertEqual(
+            control_table_follow_selection_action(True, [], 3),
+            "stop",
+        )
+
     def test_track_endpoint_place_completeness_requires_both_map_variants(self):
         track = {
             "track_fingerprint": "fingerprint",
@@ -110,6 +136,39 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertIn("$LABEL", text)
         self.assertIn("audio subdirectory", text)
         self.assertIn("folders containing songs", text)
+
+    def test_control_table_filter_order_and_categories(self):
+        self.assertEqual(
+            [label for _key, label in CONTROL_TABLE_FILTERS],
+            [
+                "All Rows", "No Media", "Media", "Maps",
+                "MUS – Music control", "IMG – Image", "VID – Video",
+                "MAP – Overview map", "TRK – Track map",
+                "BEF – Day before map", "AFT – Day after map",
+                "LOC – Media location map", "DAT – Date",
+            ],
+        )
+        rows = [{"type": value} for value in ("DAT", "MUS", "IMG", "TRK", "VID", "LOC")]
+        self.assertEqual(visible_control_row_indexes(rows, "media"), [2, 4])
+        self.assertEqual(visible_control_row_indexes(rows, "maps"), [3, 5])
+        self.assertEqual(visible_control_row_indexes(rows, "mus"), [1])
+        self.assertEqual(control_table_filter_anchor_index(rows, [4], "mus"), 1)
+
+    def test_jump_to_show_requires_a_running_player(self):
+        self.assertFalse(slideshow_process_is_running(None))
+        self.assertTrue(
+            slideshow_process_is_running(SimpleNamespace(poll=lambda: None))
+        )
+        self.assertFalse(
+            slideshow_process_is_running(SimpleNamespace(poll=lambda: 0))
+        )
+
+    def test_main_window_reserves_space_for_video_normalization(self):
+        self.assertGreater(
+            required_main_window_height(True),
+            required_main_window_height(False),
+        )
+        self.assertGreaterEqual(required_main_window_height(False), 780.0)
 
     def test_processing_output_does_not_wait_synchronously_for_main_thread(self):
         calls = []

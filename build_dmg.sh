@@ -68,7 +68,13 @@ echo "==> Checking Python syntax"
   json_storage.py \
   GetGeoLocations.py \
   gpx_tracks_table.py \
-  GPSTrackShow.py
+  GPSTrackShow.py \
+  video_audio_normalization.py
+
+if [[ ! -x "vendor/ffmpeg/ffmpeg" ]]; then
+  echo "==> Building pinned LGPL FFmpeg for normalized video audio"
+  scripts/build_ffmpeg_lgpl.sh
+fi
 
 echo "==> Building bundled slide-show player"
 "$PYINSTALLER" --noconfirm GPSTrackShow.spec

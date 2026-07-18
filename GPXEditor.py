@@ -25,6 +25,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from elevation_profile_cache import elevation_profile_visible_range
+
 import objc
 from AppKit import (
     NSAlert,
@@ -309,22 +311,6 @@ def inspector_table_document_size(
     content_height = max(0, int(row_count)) * max(0.0, float(row_height))
     content_height += row_gaps * max(0.0, float(intercell_height))
     return max(float(viewport_width), content_width), max(float(viewport_height), content_height)
-
-
-def elevation_profile_visible_range(rows: Iterable[dict], x_min: float, x_max: float) -> tuple[float, float] | None:
-    """Return the visible elevation bounds with five percent headroom."""
-    visible = [
-        float(row["elevation"])
-        for row in rows
-        if row.get("elevation") is not None and x_min <= float(row.get("distance", 0.0)) <= x_max
-    ]
-    if not visible:
-        return None
-    minimum = min(visible)
-    maximum = max(visible)
-    span = maximum - minimum
-    margin = span * 0.05 if span > 0.0 else max(5.0, abs(maximum) * 0.05)
-    return minimum - margin, maximum + margin
 
 
 def elevation_distance_range_for_map_extent(

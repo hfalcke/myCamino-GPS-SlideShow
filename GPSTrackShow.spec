@@ -1,14 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+ffmpeg_binary = Path('vendor/ffmpeg/ffmpeg')
+ffmpeg_license = Path('vendor/ffmpeg/COPYING.LGPLv2.1')
+
 
 a = Analysis(
     ['GPSTrackShow.py'],
     pathex=[],
-    binaries=[],
-    datas=[
+    binaries=[(str(ffmpeg_binary), '.')] if ffmpeg_binary.is_file() else [],
+    datas=([
         (f'pilgrim-frame{index:02d}-rigged-512.png', '.')
         for index in range(9)
-    ],
+    ] + ([(str(ffmpeg_license), 'licenses/ffmpeg')] if ffmpeg_license.is_file() else [])),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

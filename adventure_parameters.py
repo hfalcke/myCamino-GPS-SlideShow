@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-PARAMETER_SCHEMA_VERSION = 8
+PARAMETER_SCHEMA_VERSION = 11
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,7 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.arrow_scale", "Slide Show", "Arrow scale", 1.0, "float", "Scale factor for the direction arrow; zero hides it.", 0.0, 10.0),
     ParameterSpec("slideshow.clock", "Slide Show", "Show clock", True, "bool", "Show the analog clock when timing is available."),
     ParameterSpec("slideshow.place_names", "Slide Show", "Show place names", True, "bool", "Show reverse-geocoded place names."),
+    ParameterSpec("slideshow.elevation_profile", "Slide Show", "Show elevation profile", True, "bool", "Show the cached min/max elevation profile in the Stage Map at the beginning of every GPX track."),
     ParameterSpec("slideshow.fullscreen", "Slide Show", "Fullscreen", "auto", "choice", "Choose automatic, always-on, or windowed startup.", choices=_choice(("auto", "Auto"), ("on", "On"), ("off", "Off"))),
     ParameterSpec("slideshow.window_mode", "Slide Show", "Window mode", "auto", "choice", "Automatic uses one window on one screen and a separate overview window when multiple screens are available.", choices=_choice(("auto", "Automatic"), ("single", "Single window"), ("multiple", "Separate overview window"))),
     ParameterSpec("slideshow.track_map_before_media", "Slide Show", "Track map before each medium", False, "bool", "In single-window Standard playback, briefly show the marked track map before every photo or video. The stage map is always shown once at the beginning of its stage."),
@@ -54,10 +55,17 @@ PARAMETER_SPECS = (
 
     ParameterSpec("audio.enabled", "Audio", "Background music", False, "bool", "Enable the optional background-music source for this Adventure."),
     ParameterSpec("audio.crossfade_seconds", "Audio", "Crossfade duration", 2.0, "float", "Fade duration for normal music changes, marker jumps, pause, and resume.", 0.0, 30.0, unit="s"),
+    ParameterSpec("audio.music_volume_percent", "Audio", "Music volume", 65.0, "float", "Maximum internal background-music level. Device volume remains authoritative.", 0.0, 100.0, unit="%"),
+    ParameterSpec("audio.video_volume_percent", "Audio", "Video volume", 100.0, "float", "Playback level for the sound contained in videos.", 0.0, 100.0, unit="%"),
+    ParameterSpec("audio.use_normalized_videos", "Audio", "Use normalized video audio", True, "bool", "Prefer current prepared video copies with normalized audio during playback."),
+    ParameterSpec("audio.video_normalization_target_lufs", "Audio", "Video normalization target", -16.0, "float", "Target integrated loudness for prepared video audio.", -40.0, -5.0, unit="LUFS"),
+    ParameterSpec("audio.video_normalization_max_boost_db", "Audio", "Maximum video boost", 12.0, "float", "Maximum gain applied to a quiet video during normalization.", 0.0, 30.0, unit="dB"),
+    ParameterSpec("audio.video_normalization_true_peak_db", "Audio", "Maximum true peak", -1.5, "float", "True-peak ceiling used while preparing normalized video audio.", -10.0, 0.0, unit="dBTP"),
 
     ParameterSpec("timelapse.stage_duration_seconds", "Time-Lapse", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s"),
     ParameterSpec("timelapse.media_min_fraction", "Time-Lapse", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%"),
     ParameterSpec("timelapse.overview_as_media", "Time-Lapse", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage."),
+    ParameterSpec("timelapse.overview_on_stage_map_dual", "Time-Lapse", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active."),
     ParameterSpec("timelapse.marker_style", "Time-Lapse", "Moving marker", "pilgrim", "choice", "Show a walking pilgrim or the traditional arrow at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("arrow", "Arrow"))),
 
     ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),

@@ -153,6 +153,17 @@ stage it adopts the fixed arrow angle and is mirrored when necessary so that it
 faces from the stage start toward its end. This setting affects only the stage
 map; the overview map continues to show the traditional arrow.
 
+**Show elevation profile** is enabled by default. At the beginning of every
+GPX-backed Time-Lapse stage, the marked Tour Overview appears first inside the
+Stage Map, followed by the processed elevation profile and then route motion
+and media. Standard styles include the profile in their initial Stage Map. The
+profile uses the roomier Time-Lapse map variant while a separate overview
+screen keeps its centered map. Its vertical axis follows the track minimum and
+maximum with five percent headroom rather than starting at zero. The first use
+creates a PNG under `trackimages/elevation-profiles`; later shows reuse it
+until the track or its GPX processing settings change. Press `e` during a show
+to toggle these stage-start profiles for the current session.
+
 The Locations radius groups nearby GPS positions under an already determined
 place name. A larger radius reduces the number of lookups and can speed up
 place-name extraction, while a smaller radius gives more locally specific names.
@@ -476,11 +487,20 @@ Music control uses separate `MUS` rows rather than an extra column. Press
 **Insert Row** or Command-I, choose `MUS` in the Type field, and enter the
 comma-separated commands in **File / Date / Map**. A nonmodal command reference
 opens for a `MUS` row. The same reference is available from the small **Help**
-link beside **No Music** in the main window. **Hide Media Rows** temporarily
-removes only image and video rows and then changes to **Show Media Rows**. The
-selected stage remains selected and is scrolled into view when media rows
-return, making it easy to continue editing there. Filtering never changes the
-saved row order, and search uses only visible rows while the filter is active.
+link beside **No Music** in the main window. The filter popup offers All Rows,
+No Media, Media, Maps, Music control, each individual image/video/map type, and
+Date. **Reset Filter** returns to All Rows. The selected row remains visible
+where possible; otherwise the nearest preceding matching row is selected.
+Filtering never changes the saved row order, and search uses only visible rows.
+
+**Start Slide Show Here** is available both at the bottom and in the row
+context menu. **Jump to Show** immediately selects the latest row reported by
+the running player and then follows playback. In a filtered view it follows the
+nearest preceding matching row, such as the current Track Map or Music command.
+While following, selecting one different row jumps the running slide show to
+that exact control-file location and following continues from there. Editing a
+cell or selecting multiple rows stops following; press **Jump to Show** again
+to return to the live position.
 
 The compact Type column shows only its short code. Its dropdown menu shows both
 the short type and its meaning, for example `TRK - Track map` and
@@ -638,6 +658,14 @@ The Music section contains:
   grouped by folder, with new unique album and file labels.
 - Edit Playlist: open the active playlist in TextEdit. If no playlist exists
   yet, it is first created from the supported audio files in the directory.
+- Normalize Video Audio: explicitly prepare reusable copies of project videos
+  with a consistent sound level. Originals are never modified. Current copies
+  are skipped, stale copies are rebuilt, and cancellation retains every
+  completed result. Generated copies live in `normalized-videos` and are
+  excluded from media import and control files.
+- Settings > Audio controls music and video playback percentages, whether
+  prepared copies are preferred at startup, the `-16 LUFS` target, maximum
+  boost, true-peak ceiling, and music crossfade duration.
 - The Adventure stores `audio` as its fixed music source and the explicit
   selected playlist path.
   Renaming or copying an Adventure with related files enabled also renames or
@@ -703,17 +731,22 @@ the running player later autosaves its actual position.
 Window behavior is **Automatic** by default. A computer with one display starts
 with one slide-show window. At the beginning of every new Time-Lapse stage, the
 overview is shown by default as a framed medium over the stage map for the
-current media duration. The current stage route is projected into that smaller
-overview and highlighted there, followed by the animated route. Settings can restore a
-full-screen overview instead. In a Standard show, the single-window sequence is
+current media duration, including when a separate overview window is active.
+The current stage route is projected into that smaller overview and highlighted
+there, followed by the elevation profile and animated route. Settings can
+disable the duplicate inset for a separate display or restore a full-screen
+overview instead. In a Standard show, the single-window sequence is
 Stage Map, marked Tour Overview, then media. The marked overview uses a runtime
 black title panel; the Intro uses the same full-tile overview without a
 duplicated baked-in title. A computer with two or more displays starts
 with a separate overview window. Settings can force either Single window or
 Separate overview window regardless of display count.
 
-In automatic Time-Lapse playback, the temporary overview advances to the moving
-stage after the normal media duration. In Standard playback,
+In automatic Time-Lapse playback, the temporary overview advances to the
+elevation profile and then to the moving stage after the configured media
+duration for each static phase. Left/Right step through these visible phases;
+going left from the overview enters the previous stage rather than merely
+rewinding the moving marker. In Standard playback,
 the track map is shown once at the beginning of each stage. The Settings option
 **Track map before each medium** can restore the older behavior of showing the
 marked track map before every photo or video; it is off by default.
@@ -770,6 +803,12 @@ Common slide-show keys:
 - `i`: show photo metadata overlay.
 - `c`, `p`, `f`, `d`, and `D`: keep their existing clock, place-name,
   fullscreen, display-swap, and memory-debug functions.
+- `e`: switch the Stage Map elevation-profile introduction on or off. The
+  Adventure setting is on by default; the key changes only the running show.
+- `n`: switch subsequent videos between valid normalized copies and originals.
+  If a video is active, playback resumes at the same time and in the same
+  paused/playing state. If no current normalized copy exists, playback is left
+  unchanged.
 - `h`: show help.
 - `q` or Escape: quit slide show.
 

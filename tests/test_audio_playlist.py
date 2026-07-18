@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -36,6 +37,22 @@ class AudioPlaylistTests(unittest.TestCase):
         controller.active_slot = 0
         controller.overlay_callback = lambda *_args: None
         return controller
+
+    def test_volume_level_updates_both_crossfade_players(self):
+        class Player:
+            def __init__(self):
+                self.volume = None
+
+            def setVolume_(self, value):
+                self.volume = float(value)
+
+        controller = self._controller_without_players(SimpleNamespace(files=[]))
+        controller.config = SimpleNamespace(music_volume_percent=60.0)
+        controller.fade_envelopes = [0.25, 0.75]
+        controller.players = [Player(), Player()]
+        controller._set_volume_level(3, False)
+        self.assertAlmostEqual(controller.players[0].volume, 0.05)
+        self.assertAlmostEqual(controller.players[1].volume, 0.15)
 
     def test_music_directive_parses_csv_paths_and_ordered_commands(self):
         directive = parse_music_directive(
