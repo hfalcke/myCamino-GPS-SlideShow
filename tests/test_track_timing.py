@@ -185,10 +185,14 @@ class TrackTimingTests(unittest.TestCase):
         app.playlist_index = 6
         app.playlist_lines = ["#Overviewmap: map.png", "#Datum: 01.01.2024", "#Comment: test", "#Map: stage.png", "#Datum: 01.01.2024", "photo.jpeg"]
         state = app._resume_state_payload()
+        self.assertEqual(state["version"], 4)
+        self.assertEqual(state["control"]["version"], 1)
         self.assertEqual(state["playlist_index"], 3)
         self.assertEqual(state["media_index"], 5)
         self.assertEqual(state["time_lapse_progress"], 0.625)
         self.assertEqual(state["mode"], "time-lapse")
+        self.assertEqual(state["display"]["media_name"], "photo.jpeg")
+        self.assertIsNotNone(datetime.fromisoformat(state["stopped_at"]).tzinfo)
 
     def test_time_lapse_resume_rewinds_media_row_to_its_stage_map(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)

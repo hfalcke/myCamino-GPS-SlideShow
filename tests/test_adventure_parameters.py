@@ -25,6 +25,8 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(payload["version"], PARAMETER_SCHEMA_VERSION)
         self.assertEqual(payload["values"], defaults)
         self.assertEqual(defaults["slideshow.transition"], "time_lapse")
+        self.assertEqual(defaults["slideshow.end_behavior"], "loop_forever")
+        self.assertNotIn("slideshow.repeat", defaults)
         self.assertNotIn("slideshow.start_mode", defaults)
         self.assertEqual(defaults["slideshow.window_mode"], "auto")
         self.assertFalse(defaults["slideshow.track_map_before_media"])
@@ -91,6 +93,17 @@ class AdventureParameterTests(unittest.TestCase):
         )
         self.assertEqual(time_lapse["slideshow.transition"], "time_lapse")
         self.assertEqual(standard["slideshow.transition"], "fade")
+
+    def test_legacy_repeat_setting_migrates_to_new_loop_forever_default(self):
+        for repeat in (False, True):
+            migrated = normalize_parameters(
+                {
+                    "version": 11,
+                    "values": {"slideshow.repeat": repeat},
+                }
+            )
+            self.assertEqual(migrated["slideshow.end_behavior"], "loop_forever")
+            self.assertNotIn("slideshow.repeat", migrated)
 
     def test_invalid_loaded_values_fall_back_individually(self):
         normalized = normalize_parameters(

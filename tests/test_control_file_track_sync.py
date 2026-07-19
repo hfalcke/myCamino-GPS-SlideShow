@@ -137,22 +137,32 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertIn("audio subdirectory", text)
         self.assertIn("folders containing songs", text)
 
+    def test_slide_show_control_help_lists_timing_styles_and_flow(self):
+        text = GPXTrackerController._control_directive_help_content(SimpleNamespace())
+        self.assertIn("#DURATION NN", text)
+        self.assertIn("#TRANSITION STYLE", text)
+        self.assertIn("TIME_LAPSE", text)
+        self.assertIn("#GOTO $NAME", text)
+        self.assertIn("#END", text)
+
     def test_control_table_filter_order_and_categories(self):
         self.assertEqual(
             [label for _key, label in CONTROL_TABLE_FILTERS],
             [
                 "All Rows", "No Media", "Media", "Maps",
-                "MUS – Music control", "IMG – Image", "VID – Video",
+                "MUS – Music control", "CTL – Slide-show control",
+                "IMG – Image", "VID – Video",
                 "MAP – Overview map", "TRK – Track map",
                 "BEF – Day before map", "AFT – Day after map",
                 "LOC – Media location map", "DAT – Date",
             ],
         )
-        rows = [{"type": value} for value in ("DAT", "MUS", "IMG", "TRK", "VID", "LOC")]
-        self.assertEqual(visible_control_row_indexes(rows, "media"), [2, 4])
-        self.assertEqual(visible_control_row_indexes(rows, "maps"), [3, 5])
+        rows = [{"type": value} for value in ("DAT", "MUS", "CTL", "IMG", "TRK", "VID", "LOC")]
+        self.assertEqual(visible_control_row_indexes(rows, "media"), [3, 5])
+        self.assertEqual(visible_control_row_indexes(rows, "maps"), [4, 6])
         self.assertEqual(visible_control_row_indexes(rows, "mus"), [1])
-        self.assertEqual(control_table_filter_anchor_index(rows, [4], "mus"), 1)
+        self.assertEqual(visible_control_row_indexes(rows, "ctl"), [2])
+        self.assertEqual(control_table_filter_anchor_index(rows, [5], "mus"), 1)
 
     def test_jump_to_show_requires_a_running_player(self):
         self.assertFalse(slideshow_process_is_running(None))
@@ -338,6 +348,26 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertEqual(serialize_slideshow_control_row(row), "#MUSIC: #ON, #JUMP $STAGE")
         merge_entry = parse_control_file_entries(["#MUSIC: #ON, #JUMP $STAGE"])[0]
         self.assertEqual((merge_entry["type"], merge_entry["line"]), ("music", "#MUSIC: #ON, #JUMP $STAGE"))
+
+    def test_gui_round_trips_slide_show_control_directive(self):
+        row = parse_slideshow_control_line("#CONTROL: #LABEL $START, #DURATION 5")
+        self.assertEqual(row["type"], "CTL")
+        self.assertEqual(row["name"], "#LABEL $START, #DURATION 5")
+        self.assertEqual(
+            serialize_slideshow_control_row(row),
+            "#CONTROL: #LABEL $START, #DURATION 5",
+        )
+        merge_entry = parse_control_file_entries(
+            ["#CONTROL: #LABEL $START, #DURATION 5"]
+        )[0]
+        self.assertEqual(merge_entry["type"], "control")
+
+    def test_control_directive_serializes_time_lapse_canonically(self):
+        row = parse_slideshow_control_line("#CONTROL: #TRANSITION time-lapse")
+        self.assertEqual(
+            serialize_slideshow_control_row(row),
+            "#CONTROL: #TRANSITION TIME_LAPSE",
+        )
 
     def test_gui_round_trips_media_map_directive(self):
         row = parse_slideshow_control_line("#MediaMap: trip-media-2024-07-14.png")

@@ -560,6 +560,7 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         self.control.write_text(
             "#Overviewmap: Old-overview.png\n"
             "#MUSIC: #ON, $INTRO\n"
+            "#CONTROL: #LABEL $CHAPTER, #DURATION 5\n"
             "#Datum: Montag, 15.07.2024\n"
             "#Map: 0001_Old_stage.png\n"
             "kept.jpeg | 12:00 | kein GPS | kein Ort\n",
@@ -584,6 +585,7 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         self.assertNotIn("Old-overview.png", text)
         self.assertNotIn("0001_Old_stage.png", text)
         self.assertIn("#MUSIC: #ON, $INTRO", text)
+        self.assertIn("#CONTROL: #LABEL $CHAPTER, #DURATION 5", text)
         self.assertIn("kept.jpeg | 12:00", text)
         self.assertEqual(result.map_entries_added, 2)
         self.assertEqual(result.map_entries_removed, 2)

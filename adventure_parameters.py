@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-PARAMETER_SCHEMA_VERSION = 11
+PARAMETER_SCHEMA_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.track_map_before_media", "Slide Show", "Track map before each medium", False, "bool", "In single-window Standard playback, briefly show the marked track map before every photo or video. The stage map is always shown once at the beginning of its stage."),
     ParameterSpec("slideshow.join_windows", "Slide Show", "Join windows", False, "bool", "Place photo and map roles side-by-side in one window."),
     ParameterSpec("slideshow.display_swap", "Slide Show", "Swap displays", False, "bool", "Swap the initial photo and map display assignment."),
-    ParameterSpec("slideshow.repeat", "Slide Show", "Repeat", False, "bool", "Restart after the final control-file row."),
+    ParameterSpec("slideshow.end_behavior", "Slide Show", "At end", "loop_forever", "choice", "Show a black final slide, replay the complete show once, or loop forever. Every replay starts with the title slide.", choices=_choice(("black", "Black final slide"), ("loop_once", "Loop once"), ("loop_forever", "Loop forever"))),
     ParameterSpec("slideshow.manual_start", "Slide Show", "Start manually", False, "bool", "Start in manual rather than automatic playback mode."),
     ParameterSpec("slideshow.collage_size_range", "Slide Show", "Collage size range", "33-66", "range", "Minimum and maximum collage image size in percent, for example 33-66.", unit="%"),
     ParameterSpec("slideshow.collage_max_images", "Slide Show", "Maximum collage images", 9, "int", "Clear the collage after this many images.", 1, 100),
@@ -267,6 +267,11 @@ def normalize_parameters(raw: Any) -> dict[str, Any]:
         elif "slideshow.transition" not in values:
             values["slideshow.transition"] = "blend"
         values.pop("slideshow.start_mode", None)
+    if "slideshow.end_behavior" not in values and "slideshow.repeat" in values:
+        # The former bool was normally stored even when the user never chose it.
+        # Adopt the new requested default for all pre-schema-12 Adventures.
+        values["slideshow.end_behavior"] = "loop_forever"
+    values.pop("slideshow.repeat", None)
     try:
         legacy_schema = int(source_version or 1) < 2
     except (TypeError, ValueError):

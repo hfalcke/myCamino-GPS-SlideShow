@@ -29,6 +29,9 @@ def adventure_payload(directory: Path, name: str) -> dict:
         "track_map_base": name,
         "parameters": {"version": 1, "values": {}},
         "slideshow_resume_position": {"playlist_index": 2},
+        "slideshow_resume_history": [
+            {"version": 4, "playlist_index": 2, "completed": False}
+        ],
     }
 
 
@@ -114,7 +117,8 @@ class AdventureFileTests(unittest.TestCase):
             self.assertTrue(source_adv.exists())
             self.assertTrue(target_adv.exists())
             self.assertEqual(target_payload["gpx_file"], f"{new_name}.gpx")
-            self.assertIsNone(target_payload["slideshow_resume_position"])
+            self.assertNotIn("slideshow_resume_position", target_payload)
+            self.assertEqual(target_payload["slideshow_resume_history"], [])
             copied_list = (directory / f"{new_name}-sorted.lst").read_text()
             self.assertIn(f"#Map: 0001_Stage_{new_name}.png", copied_list)
             self.assertIn(str(track_dir / f"{new_name}.png"), copied_list)
@@ -137,6 +141,7 @@ class AdventureFileTests(unittest.TestCase):
             (directory / "Old.gpx").write_text("<gpx/>")
             (directory / "Old-sorted.lst").write_text(
                 "#MUSIC: #JUMP $EVENING\n"
+                "#CONTROL: #TRANSITION FADE\n"
                 "#MapAfter: 0001_Old.png\n"
                 "photo.jpeg | 12:00 | - | -\n"
             )
@@ -157,6 +162,7 @@ class AdventureFileTests(unittest.TestCase):
             self.assertTrue((audio_dir / "New.playlist").is_file())
             copied_control = (directory / "New-sorted.lst").read_text()
             self.assertIn("#MUSIC: #JUMP $EVENING", copied_control)
+            self.assertIn("#CONTROL: #TRANSITION FADE", copied_control)
             self.assertIn("#MapAfter: 0001_New.png", copied_control)
             self.assertIn("photo.jpeg | 12:00 | - | -", copied_control)
 
@@ -176,6 +182,11 @@ class AdventureFileTests(unittest.TestCase):
             self.assertEqual(renamed["gpx_file"], "Shared.gpx")
             self.assertEqual(renamed["control_file"], "Shared-sorted.lst")
             self.assertEqual(renamed["track_map_base"], "Shared")
+            self.assertNotIn("slideshow_resume_position", renamed)
+            self.assertEqual(
+                renamed["slideshow_resume_history"],
+                payload["slideshow_resume_history"],
+            )
 
     def test_conflict_does_not_modify_source(self):
         with TemporaryDirectory() as temporary:

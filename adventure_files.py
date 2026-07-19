@@ -237,8 +237,9 @@ def rename_or_copy_adventure(
     target_payload["project_name"] = target_base
     target_payload["project_directory"] = str(project_dir)
     target_payload["adventure_format_version"] = ADVENTURE_FORMAT_VERSION
+    target_payload.pop("slideshow_resume_position", None)
     if operation == "copy":
-        target_payload["slideshow_resume_position"] = None
+        target_payload["slideshow_resume_history"] = []
 
     if include_related:
         if operation == "rename":

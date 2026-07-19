@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import PropertyMock, patch
 
 from audio_playlist import (
     MusicTransportState,
@@ -15,7 +16,15 @@ from audio_playlist import (
     load_audio_playlist,
     updated_playlist_text,
 )
-from slideshow_control_format import MusicSyntaxError, parse_music_directive
+from slideshow_control_format import (
+    CONTROL_TRANSITIONS,
+    ControlSyntaxError,
+    MusicSyntaxError,
+    control_labels,
+    parse_control_directive,
+    parse_music_directive,
+    serialize_control_parameters,
+)
 from GPSTrackShow import BackgroundMusicController
 
 
@@ -81,6 +90,55 @@ class AudioPlaylistTests(unittest.TestCase):
             parse_music_directive("#MUSIC: #LOOP")
         with self.assertRaises(MusicSyntaxError):
             parse_music_directive("#MUSIC: #VOLUME 10")
+
+    def test_music_goto_is_an_alias_for_jump(self):
+        jump = parse_music_directive("#MUSIC: #JUMP $INTRO")
+        goto = parse_music_directive("#MUSIC: #GOTO $INTRO")
+        self.assertEqual(goto.actions, jump.actions)
+
+    def test_control_directive_parses_ordered_commands_and_styles(self):
+        directive = parse_control_directive(
+            "#CONTROL: #LABEL $INTRO, #DURATION 4.5, #TRANSITION time-lapse, #PAUSE 2"
+        )
+        self.assertEqual(
+            [action.kind for action in directive.actions],
+            ["label", "duration", "transition", "pause"],
+        )
+        self.assertEqual(directive.actions[2].value, "TIME_LAPSE")
+        self.assertEqual(
+            set(CONTROL_TRANSITIONS),
+            {"TIME_LAPSE", "BLEND", "FADE", "SWITCH", "EXPAND", "COLLAGE", "QUAD", "RANDOM"},
+        )
+
+    def test_control_directive_serializes_canonical_transition(self):
+        directive = parse_control_directive(
+            "#CONTROL: #jump $Intro, #transition time-lapse, #duration 5.0"
+        )
+        self.assertEqual(
+            serialize_control_parameters(directive),
+            "#GOTO $Intro, #TRANSITION TIME_LAPSE, #DURATION 5",
+        )
+
+    def test_control_directive_rejects_bad_numbers_and_styles(self):
+        for line in (
+            "#CONTROL: #DURATION 0",
+            "#CONTROL: #PAUSE -1",
+            "#CONTROL: #TRANSITION SPIN",
+            "#CONTROL: bare text",
+        ):
+            with self.subTest(line=line), self.assertRaises(ControlSyntaxError):
+                parse_control_directive(line)
+
+    def test_control_labels_keep_first_and_report_duplicates(self):
+        labels, duplicates = control_labels(
+            [
+                "#CONTROL: #LABEL $Start",
+                "image.jpeg | 12:00 | 1, 2 | Place",
+                "#CONTROL: #LABEL $START",
+            ]
+        )
+        self.assertEqual(labels, {"start": 0})
+        self.assertEqual(duplicates, (("START", 0, 2),))
 
     def test_recursive_order_album_membership_and_dollar_labels(self):
         with TemporaryDirectory() as temporary:
@@ -185,6 +243,88 @@ class AudioPlaylistTests(unittest.TestCase):
             controller._remember_queue_resume_position(0)
             self.assertEqual(controller.queue_resume_index, 0)
             self.assertEqual(controller.queue_resume_seconds, 14.5)
+
+    def test_audio_resume_snapshot_remaps_paths_after_playlist_reordering(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("one.mp3", "two.mp3", "three.mp3"):
+                (root / name).touch()
+            original_playlist_path = root / "Original.playlist"
+            original_playlist_path.write_text(
+                "one.mp3\ntwo.mp3\nthree.mp3\n",
+                encoding="utf-8",
+            )
+            original = load_audio_playlist(root, original_playlist_path)
+            controller = self._controller_without_players(original)
+            controller.config = SimpleNamespace(
+                music_playlist=original_playlist_path,
+                music_volume_percent=65.0,
+            )
+            controller.started = True
+            controller.transport.set_loop("loop_range", (0, 2))
+            controller.transport.sequence_position = 1
+            controller.transport.current_index = 2
+            controller.current_index = 2
+            controller.queue_resume_index = 1
+            controller.queue_resume_seconds = 8.25
+            controller.user_enabled = False
+            controller.control_enabled = True
+            controller.volume_level = 4
+            controller._player = lambda: object()
+            controller._current_seconds = lambda _player: 37.5
+            with patch.object(
+                BackgroundMusicController,
+                "available",
+                new_callable=PropertyMock,
+                return_value=True,
+            ):
+                snapshot = controller.resume_state_snapshot()
+
+            reordered_path = root / "Reordered.playlist"
+            reordered_path.write_text(
+                "three.mp3\none.mp3\ntwo.mp3\n",
+                encoding="utf-8",
+            )
+            restored = self._controller_without_players(
+                load_audio_playlist(root, reordered_path)
+            )
+            restored.config = SimpleNamespace(music_volume_percent=65.0)
+            switched = []
+            restored._switch_to = (
+                lambda index, immediate=False, resume_seconds=None,
+                fade_in_from_silence=False: switched.append(
+                    (index, immediate, resume_seconds, fade_in_from_silence)
+                )
+            )
+            restored._apply_all_player_gains = lambda: None
+
+            self.assertTrue(restored.restore_resume_state(snapshot))
+            self.assertEqual(restored.transport.mode, "loop_range")
+            self.assertEqual(restored.transport.sequence, (1, 0))
+            self.assertEqual(restored.transport.sequence_position, 1)
+            self.assertEqual(restored.transport.current_index, 0)
+            self.assertEqual(restored.queue_resume_index, 2)
+            self.assertEqual(restored.queue_resume_seconds, 8.25)
+            self.assertFalse(restored.user_enabled)
+            self.assertTrue(restored.control_enabled)
+            self.assertEqual(restored.volume_level, 4)
+            self.assertEqual(switched, [(0, False, 37.5, True)])
+
+    def test_audio_resume_rejects_a_missing_saved_title(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "one.mp3").touch()
+            controller = self._controller_without_players(load_audio_playlist(root))
+            controller.config = SimpleNamespace(music_volume_percent=65.0)
+            self.assertFalse(
+                controller.restore_resume_state(
+                    {
+                        "version": 1,
+                        "current_file": "missing.mp3",
+                        "transport": {"mode": "playlist", "sequence": []},
+                    }
+                )
+            )
 
     def test_transport_loop_range_is_inclusive(self):
         with TemporaryDirectory() as temporary:

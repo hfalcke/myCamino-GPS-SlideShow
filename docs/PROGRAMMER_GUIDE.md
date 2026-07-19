@@ -29,8 +29,8 @@ The active source files are:
   tile-request handling.
 - `audio_playlist.py`: recursive audio discovery, `$`-label playlist
   parsing/generation/update, album membership, and pure transport progression.
-- `slideshow_control_format.py`: strict CSV-style `#MUSIC:` parsing and command
-  normalization.
+- `slideshow_control_format.py`: strict CSV-style `#MUSIC:` and `#CONTROL:`
+  parsing and command normalization.
 - `video_audio_normalization.py`: generated-directory exclusion, FFmpeg
   discovery, two-pass loudness normalization, atomic manifests, freshness
   checks, and runtime normalized-video resolution.
@@ -573,13 +573,16 @@ Supported line types:
 - `#MediaMap: filename`: date-only location map for media not assigned to a track.
 - `#Date:` or `#Datum:`: date section line.
 - `#MUSIC: command, target, ...`: ordered non-display music transport commands.
+- `#CONTROL: command, ...`: ordered non-display slide-show timing, style,
+  label, jump, pause, and end commands.
 
-Media lines have exactly the normal filename/time/GPS/place fields; music is
-never attached to another row. `parse_music_directive(...)` uses strict CSV
-quoting, normalizes case-insensitive `$LABEL` references, rejects malformed
-command syntax, and leaves unresolved labels/files for runtime warnings.
-GetGeoLocations merge/sync and Adventure rename/copy keep `#MUSIC:` entries as
-ordinary ordered directives and never interpret their payload as a map path.
+Media lines have exactly the normal filename/time/GPS/place fields; directives
+are never attached to another row. The shared parsers use strict CSV quoting,
+normalize case-insensitive `$LABEL` references, and reject malformed command
+syntax. `#CONTROL` labels are indexed once; duplicate labels warn and the first
+definition wins in direct-player launches. GetGeoLocations merge/sync and
+Adventure rename/copy keep `#MUSIC:` and `#CONTROL:` entries as ordinary
+ordered directives and never interpret their payload as a map path.
 
 The control-table window intercepts Command- and Control-C/X/V before row
 commands and sends them to the shared field editor whenever a cell is actively
@@ -599,6 +602,7 @@ The GUI table maps these to row types:
 - `LOC`: media-only location map
 - `DAT`: date row
 - `MUS`: music directive
+- `CTL`: slide-show control directive
 
 The editable Type combo displays the canonical short code in its closed cell
 and `<code> - <description>` in its dropdown menu.
@@ -880,28 +884,41 @@ do not allocate per-frame overlay images.
 
 The GUI launches the separate player with a project-local `--state-file`.
 During orderly quit, the player atomically writes the active zero-based control-
-file row, its exact line text, mode, Time-Lapse progress, optional visible-media
-row, control-file path, and timestamp. Natural completion writes
-`completed: true`. The GUI watcher reads and removes this transient file on the
-main thread, stores or clears `slideshow_resume_position` in the `.adv` payload,
-and saves the adventure automatically.
+file row, its exact line text, mode, stage/phase, Time-Lapse progress, optional
+visible-media row, a control-file identity, a human-readable display snapshot,
+and a timezone-aware stop timestamp. It captures music before releasing
+AVPlayer objects: playlist/path identity, elapsed seconds, path-based transport
+sequence and position, continuation and interrupted-queue positions, gate,
+manual audio state, and volume. Natural completion writes `completed: true`.
+The GUI watcher reads and removes the transient file on the main thread and
+prepends non-completed version-4 checkpoints to `slideshow_resume_history` in
+the `.adv`, retaining at most twenty.
 
-Before a later launch, the GUI validates the stored control-file path, row
-range, and line text. **Start** deliberately omits resume arguments and begins
-at the beginning. **Continue** is enabled when saved state exists and passes
-`--resume-index`, `--resume-progress`, and `--resume-media-index` after
-validation, without a modal confirmation. The same optional values are available to
-`config_from_options(...)` and `run_with_options(...)`. Standard playback
-reopens the exact media/map row; Time-Lapse reconstructs the containing stage,
-marker progress, and visible medium. Edited or replaced control files invalidate
-the stored position safely.
+Before a later launch, the GUI validates the control-file path, size, nanosecond
+modification time, row range, exact row text, and required media/map assets.
+Stale entries remain visible but disabled in the Continue table. **Start**
+deliberately omits resume arguments and leaves history unchanged. **Continue**
+passes `--resume-index`, `--resume-progress`, `--resume-media-index`, phase, and
+the hidden JSON `--resume-audio-state` and `--resume-control-state` after selection. The same optional values
+are available to `config_from_options(...)` and `run_with_options(...)`.
+Standard playback reopens the exact media/map row; Time-Lapse reconstructs the
+containing stage, marker progress, and visible medium. Music state remaps saved
+paths after playlist reordering and falls back to replaying preceding
+`#MUSIC:` directives when exact restoration is impossible.
+The control snapshot restores the effective media duration and playback style.
+
+Only checkpoint format version 4 is accepted. Older
+`slideshow_resume_position` data and unsupported history entries are ignored
+and are omitted by the next Adventure save. Copying an Adventure clears its
+history; renaming preserves it. Natural completion neither adds a checkpoint
+nor clears earlier ones.
 
 The control-table **Start Slide Show Here** action constructs a transient
 resume payload with the selected model-row index and exact line text. It passes
 that payload through the same `--resume-index` path without replacing the
 Adventure's saved Continue position before launch. Time-Lapse rewinds media
-rows to their owning map, but starts non-display directives such as `#Datum:`
-and `#MUSIC:` at their exact row so they execute normally.
+rows to their owning map, but starts non-display directives such as `#Datum:`,
+`#MUSIC:`, and `#CONTROL:` at their exact row so they execute normally.
 
 `track_timing_utils.py` is the single timestamp-repair policy shared by the
 GPX editor, `gpx_tracks_table.py`, and the player. It preserves usable GPX
@@ -923,7 +940,7 @@ back to in-memory distance-based timing for legacy or foreign sidecars.
 The Adventure settings window now persists the global slide-show parameters in
 `.adv` files: media and stage durations, time-lapse media minimum size,
 transition, background/marker/arrow styling, font and clock/place overlays,
-fullscreen/display swap/map-window/joined-window/repeat options, and collage
+fullscreen/display swap/map-window/joined-window/end-behavior options, and collage
 size and maximum. Playback key changes remain session-only by design.
 
 `timelapse.marker_style` selects `pilgrim` (default) or `arrow`. The player

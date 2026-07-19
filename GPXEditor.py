@@ -1647,7 +1647,14 @@ class PlotView(NSView):
         self.controller.refresh_elevation_profile_for_plot_view(self)
         self.setNeedsDisplay_(True)
 
-    def move_cursor_to_track_point(self, track: TrackRecord, point_index: int, inspector=None, sync_table: bool = True):
+    def move_cursor_to_track_point(
+        self,
+        track: TrackRecord,
+        point_index: int,
+        inspector=None,
+        sync_table: bool = True,
+        focus_plot: bool = True,
+    ):
         points = track.points()
         if point_index < 0 or point_index >= len(points):
             return
@@ -1666,7 +1673,7 @@ class PlotView(NSView):
             if sync_table:
                 inspector.select_point_index(point_index)
         window = self.window()
-        if window is not None:
+        if focus_plot and window is not None:
             window.makeFirstResponder_(self)
         self.update_window_title()
         self.controller.refresh_elevation_profile_for_plot_view(self)
@@ -3410,10 +3417,21 @@ class TrackInspectorController(NSObject):
         self.update_info_label()
         if self.plot_view is not None:
             rows = self.selected_row_indexes()
-            if rows and getattr(self.plot_view, "marker", None) is None:
-                self.plot_view.move_cursor_to_track_point(self.track, rows[-1], self, sync_table=False)
-            self.plot_view.setNeedsDisplay_(True)
-            self.parent.refresh_elevation_profile_for_plot_view(self.plot_view)
+            # A direct table selection replaces a range previously established
+            # with the map marker. Programmatic map-to-table synchronization is
+            # suppressed above and therefore keeps its marker intact.
+            self.plot_view.marker = None
+            if rows:
+                self.plot_view.move_cursor_to_track_point(
+                    self.track,
+                    rows[-1],
+                    self,
+                    sync_table=False,
+                    focus_plot=False,
+                )
+            else:
+                self.plot_view.setNeedsDisplay_(True)
+                self.parent.refresh_elevation_profile_for_plot_view(self.plot_view)
 
     def undo(self):
         if not self.undo_stack:
@@ -3691,7 +3709,7 @@ class TrackInspectorController(NSObject):
             "This window shows every raw waypoint of the selected track. Scroll the table to inspect coordinates, height, time, accuracy fields, and any extra data stored with each point. The compact XY use and Elevation use columns are at the right end. Used means retained in processed geometry; Smooth means valid but used only for smoothing. Interp retains the reason for elevation interpolation, while the other short values state rejection reasons. The header reports retained/raw point counts.\n\n"
             "Click a row to select a waypoint. Shift-click or drag in the table to select a range. Double-click a row to open the track map if needed and move the white cursor dot and arrow to that waypoint.\n\n"
             "Edit a table cell and press Enter to change a waypoint value. Undo restores recent inspector edits. Backspace/Delete removes selected waypoints after confirmation.\n\n"
-            "Plot Track opens the track map. When this inspector and the map are both open, selecting points in the table highlights them on the map; clicking the map selects the nearest waypoint here. If a map marker is active, the selected range is shown in red.\n\n"
+            "Plot Track opens the track map. When this inspector and the map are both open, selecting points in the table highlights them on the map; clicking the map selects the nearest waypoint here. If a map marker is active, the selected range is shown in red. A new manual table selection replaces the active map-marker range.\n\n"
             "Split Track moves the selected waypoint and all following waypoints into a new track. Readjust Time recalculates selected waypoint timestamps from the first selected timestamp and the velocity field. Save keeps inspector edits in memory; Save & Exit keeps them and closes this window. The main editor Save writes everything to disk.",
         )
 

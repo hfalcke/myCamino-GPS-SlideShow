@@ -62,10 +62,16 @@ from video_audio_normalization import (
     valid_normalized_video,
 )
 from slideshow_control_format import (
+    ControlDirective,
+    ControlSyntaxError,
     MusicAction,
     MusicDirective,
     MusicSyntaxError,
+    control_label_key,
+    is_control_directive,
     is_music_directive,
+    normalize_control_transition,
+    parse_control_directive,
     parse_music_directive,
 )
 
@@ -243,6 +249,9 @@ TRANSITION_STEPS = 14
 WIPE_TRANSITION_MS = 1000
 WIPE_TRANSITION_STEPS = 100
 FIRST_STAGE_OVERVIEW_STARTUP_GRACE_SECONDS = 1.0
+INTRO_AUTO_ADVANCE_SECONDS = 30.0
+SLIDESHOW_CHECKPOINT_VERSION = 4
+MUSIC_RESUME_STATE_VERSION = 1
 DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
 MEMORY_WATCHDOG_INTERVAL_SECONDS = 5.0
@@ -276,7 +285,7 @@ KEY_HELP_LINES = [
     "q or Esc              quit",
 ]
 STARTUP_HINT_TEXT = (
-    "Press Space to start the slideshow. Press h for keyboard help."
+    "Press Space or Right Arrow to continue. Press h for keyboard help."
 )
 
 COLOR_NAMES = {
@@ -430,7 +439,7 @@ class Config:
     font_size: int
     mapwindow: bool
     join_windows: bool
-    repeat: bool
+    end_behavior: str
     photo_geometry: Optional[str]
     map_geometry: Optional[str]
     fullscreen: bool
@@ -455,6 +464,8 @@ class Config:
     resume_progress: Optional[float] = None
     resume_media_index: Optional[int] = None
     resume_phase: Optional[str] = None
+    resume_audio_state: Optional[dict] = None
+    resume_control_state: Optional[dict] = None
     state_file: Optional[Path] = None
     command_file: Optional[Path] = None
     music_source: Optional[Path] = None
@@ -582,6 +593,14 @@ def should_restart_time_lapse_stage_intro(
         and relation is None
         and float(progress) <= 0.0
     )
+
+
+def should_restart_slideshow(end_behavior: str, completed_replays: int) -> bool:
+    """Return whether the completed show should restart at its title slide."""
+    behavior = str(end_behavior).strip().casefold()
+    if behavior == "loop_forever":
+        return True
+    return behavior == "loop_once" and int(completed_replays) < 1
 
 
 def time_lapse_overview_display_seconds(
@@ -742,6 +761,8 @@ def parse_args(argv: list[str]) -> Config:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--resume-audio-state", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--resume-control-state", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--state-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--command-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--adventure-title", default="", help="Adventure title shown on the introductory slide.")
@@ -847,7 +868,18 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument("--mapwindow", "-m", action="store_true", default=None, help="Open a separate map window.")
     parser.add_argument("--no-mapwindow", action="store_false", dest="mapwindow", default=None, help="Do not open a separate map window.")
     parser.add_argument("--join-windows", "-j", action="store_true", help="Show photo and map views side by side.")
-    parser.add_argument("--repeat", "-r", action="store_true", help="Repeat until q or Ctrl-C.")
+    parser.add_argument(
+        "--end-behavior",
+        choices=("black", "loop_once", "loop_forever"),
+        default="loop_forever",
+        help="Behavior after the final slide (default: loop_forever).",
+    )
+    parser.add_argument(
+        "--repeat",
+        "-r",
+        action="store_true",
+        help="Compatibility alias for --end-behavior loop_forever.",
+    )
     parser.add_argument("--photo-geometry", default=None, help="Window geometry WIDTHxHEIGHT+X+Y.")
     parser.add_argument("--map-geometry", default=None, help="Window geometry WIDTHxHEIGHT+X+Y.")
     parser.add_argument("--fullscreen", "-f", action="store_true", default=None, help="Start slideshow windows fullscreen.")
@@ -946,6 +978,31 @@ def parse_args(argv: list[str]) -> Config:
         if initial_style == "TIME_LAPSE"
         else Transition(initial_style)
     )
+    resume_audio_state = None
+    if args.resume_audio_state:
+        try:
+            resume_audio_state = json.loads(args.resume_audio_state)
+        except (TypeError, json.JSONDecodeError) as exc:
+            parser.error(f"invalid --resume-audio-state: {exc}")
+        if not isinstance(resume_audio_state, dict):
+            parser.error("--resume-audio-state must contain a JSON object")
+    resume_control_state = None
+    resume_initial_style = None
+    if args.resume_control_state:
+        try:
+            resume_control_state = json.loads(args.resume_control_state)
+        except (TypeError, json.JSONDecodeError) as exc:
+            parser.error(f"invalid --resume-control-state: {exc}")
+        if not isinstance(resume_control_state, dict):
+            parser.error("--resume-control-state must contain a JSON object")
+        if resume_control_state.get("version") == 1:
+            try:
+                resume_initial_style = normalize_control_transition(
+                    resume_control_state.get("transition")
+                )
+            except ControlSyntaxError as exc:
+                parser.error(f"invalid resume control transition: {exc}")
+
     return Config(
         photodir=photodir,
         inputlist=inputlist,
@@ -962,7 +1019,7 @@ def parse_args(argv: list[str]) -> Config:
         font_size=args.font_size,
         mapwindow=mapwindow_enabled,
         join_windows=bool(args.join_windows),
-        repeat=bool(args.repeat),
+        end_behavior=("loop_forever" if args.repeat else str(args.end_behavior)),
         photo_geometry=args.photo_geometry,
         map_geometry=args.map_geometry,
         fullscreen=fullscreen_enabled,
@@ -976,7 +1033,7 @@ def parse_args(argv: list[str]) -> Config:
         collage_size_max=collage_size_max,
         collage_max_images=args.collage_max_images,
         trackdir=trackdir,
-        time_lapse_stages=initial_style == "TIME_LAPSE",
+        time_lapse_stages=(resume_initial_style or initial_style) == "TIME_LAPSE",
         time_lapse_duration=float(args.time_lapse_duration),
         time_lapse_media_min_fraction=float(args.time_lapse_media_min_fraction),
         time_lapse_marker=str(args.time_lapse_marker),
@@ -989,6 +1046,8 @@ def parse_args(argv: list[str]) -> Config:
         resume_progress=args.resume_progress,
         resume_media_index=args.resume_media_index,
         resume_phase=args.resume_phase,
+        resume_audio_state=resume_audio_state,
+        resume_control_state=resume_control_state,
         state_file=args.state_file.expanduser().resolve() if args.state_file else None,
         command_file=args.command_file.expanduser().resolve() if args.command_file else None,
         music_source=music_source,
@@ -1123,7 +1182,8 @@ def config_from_options(
     font_size: int = 30,
     mapwindow: Optional[bool] = None,
     join_windows: bool = False,
-    repeat: bool = False,
+    end_behavior: str = "loop_forever",
+    repeat: Optional[bool] = None,
     photo_geometry: Optional[str] = None,
     map_geometry: Optional[str] = None,
     fullscreen: Optional[bool] = None,
@@ -1147,6 +1207,8 @@ def config_from_options(
     resume_progress: Optional[float] = None,
     resume_media_index: Optional[int] = None,
     resume_phase: Optional[str] = None,
+    resume_audio_state: Optional[dict] = None,
+    resume_control_state: Optional[dict] = None,
     state_file: str | Path | None = None,
     command_file: str | Path | None = None,
     music_source: str | Path | None = None,
@@ -1238,6 +1300,14 @@ def config_from_options(
     if transition_name not in PLAYBACK_STYLE_VALUES:
         raise ValueError(f"transition is not enabled: {transition_name}")
     initial_style = "TIME_LAPSE" if time_lapse_stages else transition_name
+    resume_initial_style = None
+    if isinstance(resume_control_state, dict) and resume_control_state.get("version") == 1:
+        try:
+            resume_initial_style = normalize_control_transition(
+                resume_control_state.get("transition")
+            )
+        except ControlSyntaxError as exc:
+            raise ValueError(f"invalid resume control transition: {exc}") from exc
     transition_value = (
         Transition.BLEND
         if initial_style == "TIME_LAPSE"
@@ -1257,6 +1327,12 @@ def config_from_options(
     if music_playlist_path is not None and not music_playlist_path.is_file():
         raise ValueError(f"music playlist not found: {music_playlist_path}")
 
+    normalized_end_behavior = str(end_behavior).strip().casefold()
+    if repeat is not None:
+        normalized_end_behavior = "loop_forever" if repeat else "black"
+    if normalized_end_behavior not in {"black", "loop_once", "loop_forever"}:
+        raise ValueError(f"unsupported end behavior: {end_behavior}")
+
     return Config(
         photodir=photo_dir_path,
         inputlist=input_list_path,
@@ -1273,7 +1349,7 @@ def config_from_options(
         font_size=int(font_size),
         mapwindow=mapwindow_enabled,
         join_windows=bool(join_windows),
-        repeat=bool(repeat),
+        end_behavior=normalized_end_behavior,
         photo_geometry=photo_geometry,
         map_geometry=map_geometry,
         fullscreen=fullscreen_enabled,
@@ -1287,7 +1363,7 @@ def config_from_options(
         collage_size_max=collage_size_max,
         collage_max_images=int(collage_max_images),
         trackdir=track_dir_path,
-        time_lapse_stages=initial_style == "TIME_LAPSE",
+        time_lapse_stages=(resume_initial_style or initial_style) == "TIME_LAPSE",
         time_lapse_duration=float(time_lapse_duration),
         time_lapse_media_min_fraction=float(time_lapse_media_min_fraction),
         time_lapse_marker=str(time_lapse_marker),
@@ -1300,6 +1376,16 @@ def config_from_options(
         resume_progress=resume_progress,
         resume_media_index=resume_media_index,
         resume_phase=resume_phase,
+        resume_audio_state=(
+            dict(resume_audio_state)
+            if isinstance(resume_audio_state, dict)
+            else None
+        ),
+        resume_control_state=(
+            dict(resume_control_state)
+            if isinstance(resume_control_state, dict)
+            else None
+        ),
         state_file=Path(state_file).expanduser().resolve() if state_file is not None else None,
         command_file=Path(command_file).expanduser().resolve() if command_file is not None else None,
         music_source=music_source_path,
@@ -3543,7 +3629,8 @@ def create_startup_hint_overlay_image(
     panel_width = min(width * 0.78, 1180.0)
     lines = (
         [
-            "Press Space to start the slideshow",
+            "Press Space or Right Arrow to continue",
+            "The title advances automatically after 30 seconds",
             "Press h for help with keyboard controls",
         ]
         if wait_for_start
@@ -3599,7 +3686,7 @@ def parse_clock_time(value: object) -> Optional[tuple[int, int]]:
 
 
 def derive_clock_date_text(photo_metadata: dict, fallback_date_text: Optional[str]) -> Optional[str]:
-    """Return one dd.mm.yyyy date string for the clock overlay."""
+    """Return the best available date context for the clock overlay."""
     datetime_iso = photo_metadata.get("datetime_iso")
     if isinstance(datetime_iso, str) and len(datetime_iso) >= 10:
         iso_date = datetime_iso[:10]
@@ -3608,12 +3695,35 @@ def derive_clock_date_text(photo_metadata: dict, fallback_date_text: Optional[st
             return f"{parts[2]}.{parts[1]}.{parts[0]}"
     date_german = photo_metadata.get("date_german")
     if isinstance(date_german, str) and "," in date_german:
-        return date_german.partition(",")[2].strip() or None
+        return date_german.strip() or None
     if isinstance(fallback_date_text, str):
-        fallback = fallback_date_text.partition(",")[2].strip() if "," in fallback_date_text else fallback_date_text.strip()
+        fallback = fallback_date_text.strip()
         if fallback:
             return fallback
     return None
+
+
+def clock_date_lines(date_text: Optional[str]) -> tuple[str, str]:
+    """Return weekday and date lines, preserving an explicitly supplied weekday."""
+    text = str(date_text or "").strip()
+    if not text:
+        return "", ""
+    if "\n" in text:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            return lines[0], lines[1]
+        text = lines[0] if lines else ""
+    if "," in text:
+        weekday, _separator, date_value = text.partition(",")
+        if weekday.strip() and date_value.strip():
+            return weekday.strip(), date_value.strip()
+    for date_format in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text, date_format)
+        except ValueError:
+            continue
+        return parsed.strftime("%A"), parsed.strftime("%d.%m.%Y")
+    return "", text
 
 
 def create_clock_overlay_image(
@@ -3625,15 +3735,21 @@ def create_clock_overlay_image(
     date_on_right: bool = False,
     date_font_size: Optional[float] = None,
 ):
-    """Create a transparent analog clock image with an optional date."""
+    """Create a transparent analog clock with weekday above its date."""
     import math
 
+    weekday_text, calendar_date_text = clock_date_lines(date_text)
+    date_lines = [
+        line
+        for line in (weekday_text, calendar_date_text)
+        if line
+    ]
     date_height = (
         0.0
         if date_on_right
-        else (max(16.0, clock_size * 0.22) if date_text else 0.0)
+        else (max(16.0, clock_size * 0.22 * len(date_lines)) if date_lines else 0.0)
     )
-    date_width = clock_size * 1.9 if date_text and date_on_right else 0.0
+    date_width = clock_size * 1.9 if date_lines and date_on_right else 0.0
     total_height = clock_size + date_height
     total_width = clock_size + date_width
     image = NSImage.alloc().initWithSize_(NSMakeSize(total_width, total_height))
@@ -3696,29 +3812,52 @@ def create_clock_overlay_image(
     hub_rect = NSMakeRect(center_x - 2.5, center_y - 2.5, 5.0, 5.0)
     NSBezierPath.bezierPathWithOvalInRect_(hub_rect).fill()
 
-    if date_text:
-        font_size = max(
+    if date_lines:
+        requested_font_size = max(
             12.0,
             float(date_font_size)
             if date_font_size is not None
             else clock_size * (0.32 if date_on_right else 0.22),
         )
+        if date_on_right and len(date_lines) > 1:
+            requested_font_size = min(
+                requested_font_size,
+                max(8.0, (clock_size - 2.0 * padding) / 2.25),
+            )
+        font_size = requested_font_size
         font = NSFont.boldSystemFontOfSize_(font_size)
         outline_width = max(1.0, font_size / 10.0)
-        baseline_y = (
-            max(stroke_width + 1.0, (clock_size - font_size) / 2.0)
+        attributes = {NSFontAttributeName: font}
+        line_heights = [
+            float(NSString.stringWithString_(line).sizeWithAttributes_(attributes).height)
+            for line in date_lines
+        ]
+        line_gap = max(1.0, font_size * 0.08) if len(date_lines) > 1 else 0.0
+        block_height = sum(line_heights) + line_gap * (len(date_lines) - 1)
+        if date_on_right:
+            baseline_y = max(
+                stroke_width + 1.0,
+                (clock_size - block_height) / 2.0,
+            )
+        else:
+            baseline_y = max(stroke_width + 1.0, (date_height - block_height) / 2.0)
+        center_x = (
+            clock_size + date_width / 2.0
             if date_on_right
-            else max(stroke_width + 1.0, date_height * 0.08)
+            else clock_size / 2.0
         )
-        draw_outlined_text(
-            date_text,
-            clock_size + date_width / 2.0 if date_on_right else clock_size / 2.0,
-            baseline_y,
-            font,
-            COLOR_NAMES["white"],
-            COLOR_NAMES["black"],
-            outline_width,
-        )
+        # AppKit's origin is bottom-left, so draw the date first and weekday above it.
+        for line, line_height in reversed(list(zip(date_lines, line_heights))):
+            draw_outlined_text(
+                line,
+                center_x,
+                baseline_y,
+                font,
+                COLOR_NAMES["white"],
+                COLOR_NAMES["black"],
+                outline_width,
+            )
+            baseline_y += line_height + line_gap
 
     image.unlockFocus()
     return image
@@ -5194,16 +5333,24 @@ class CocoaImagePresenter:
         bounds = self.host_view.bounds()
         clock_size = max(40.0, bounds.size.height / 10.0)
         margin = max(10.0, clock_size / 6.0)
-        date_height = max(16.0, clock_size * 0.22) if clock_date_text else 0.0
+        date_width = clock_size * 1.9 if clock_date_text else 0.0
         self.clock_view.setFrame_(
             NSMakeRect(
                 margin,
-                bounds.size.height - margin - clock_size - date_height,
+                bounds.size.height - margin - clock_size,
+                clock_size + date_width,
                 clock_size,
-                clock_size + date_height,
             )
         )
-        self.clock_view.setImage_(create_clock_overlay_image(clock_size, clock_time[0], clock_time[1], clock_date_text))
+        self.clock_view.setImage_(
+            create_clock_overlay_image(
+                clock_size,
+                clock_time[0],
+                clock_time[1],
+                clock_date_text,
+                date_on_right=True,
+            )
+        )
         self.clock_view.setAlphaValue_(1.0)
 
     def set_place_text(self, place_text: Optional[str], visible: bool, font_size: int, font_color) -> None:
@@ -5508,8 +5655,133 @@ class BackgroundMusicController:
         self.started = True
         target = self._reconstruct_through(int(row_index) - 1)
         self.last_control_row = int(row_index) - 1
-        self._switch_to(target, immediate=True)
+        restored = self.restore_resume_state(self.config.resume_audio_state)
+        if not restored:
+            self._switch_to(target, immediate=True)
+            if isinstance(self.config.resume_audio_state, dict):
+                self.overlay_callback(
+                    "Saved music position unavailable; using control-file music state",
+                    3.0,
+                )
         self._schedule_poll()
+
+    def _path_for_index(self, index: object) -> Optional[str]:
+        if self.playlist is None or not isinstance(index, int):
+            return None
+        if not 0 <= index < len(self.playlist.files):
+            return None
+        path = self.playlist.files[index]
+        try:
+            return path.relative_to(self.playlist.root).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _index_for_path(self, value: object) -> Optional[int]:
+        if self.playlist is None or not isinstance(value, str) or not value.strip():
+            return None
+        return self.playlist.index_for_path(value)
+
+    def resume_state_snapshot(self) -> Optional[dict]:
+        """Return a path-based snapshot before retained AVPlayer objects go away."""
+        if not self.started or not self.available or self.current_index is None:
+            return None
+        current_file = self._path_for_index(self.current_index)
+        if current_file is None:
+            return None
+        player = self._player()
+        elapsed = self._current_seconds(player) if player is not None else None
+        transport = self.transport
+        sequence = (
+            [path for path in (self._path_for_index(index) for index in transport.sequence) if path]
+            if transport is not None
+            else []
+        )
+        return {
+            "version": MUSIC_RESUME_STATE_VERSION,
+            "playlist": str(self.config.music_playlist or ""),
+            "current_file": current_file,
+            "elapsed_seconds": elapsed,
+            "transport": {
+                "mode": transport.mode if transport is not None else "playlist",
+                "sequence": sequence,
+                "sequence_position": transport.sequence_position if transport is not None else 0,
+                "continuation_file": self._path_for_index(
+                    transport.continuation_index if transport is not None else None
+                ),
+            },
+            "queue_resume_file": self._path_for_index(self.queue_resume_index),
+            "queue_resume_seconds": self.queue_resume_seconds,
+            "control_enabled": bool(self.control_enabled),
+            "user_enabled": bool(self.user_enabled),
+            "volume_level": int(self.volume_level),
+        }
+
+    def restore_resume_state(self, payload: object) -> bool:
+        """Restore one exact path-based audio state into the current playlist."""
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != MUSIC_RESUME_STATE_VERSION
+            or self.transport is None
+            or self.playlist is None
+        ):
+            return False
+        current_index = self._index_for_path(payload.get("current_file"))
+        if current_index is None:
+            self._warn_once("saved music title is no longer present; using control-file music state")
+            return False
+        transport_payload = payload.get("transport")
+        if not isinstance(transport_payload, dict):
+            return False
+        mode = str(transport_payload.get("mode") or "playlist")
+        sequence_paths = transport_payload.get("sequence")
+        if not isinstance(sequence_paths, list):
+            sequence_paths = []
+        sequence = [self._index_for_path(value) for value in sequence_paths]
+        if any(index is None for index in sequence):
+            self._warn_once("saved music loop or queue changed; using control-file music state")
+            return False
+        resolved_sequence = tuple(int(index) for index in sequence if index is not None)
+        continuation_index = self._index_for_path(
+            transport_payload.get("continuation_file")
+        )
+        if mode == "playlist":
+            self.transport.set_playlist(current_index)
+        elif mode == "queue" and resolved_sequence:
+            self.transport.set_queue(resolved_sequence, return_index=continuation_index)
+        elif mode in {"loop_one", "loop_all", "loop_range", "loop_line", "loop_album"} and resolved_sequence:
+            self.transport.set_loop(mode, resolved_sequence)
+        else:
+            self._warn_once("saved music transport is no longer valid; using control-file music state")
+            return False
+        if resolved_sequence and mode != "playlist":
+            try:
+                sequence_position = max(
+                    0,
+                    min(
+                        int(transport_payload.get("sequence_position", 0)),
+                        len(resolved_sequence) - 1,
+                    ),
+                )
+            except (TypeError, ValueError):
+                sequence_position = 0
+            self.transport.sequence_position = sequence_position
+            self.transport.current_index = current_index
+        self.queue_resume_index = self._index_for_path(payload.get("queue_resume_file"))
+        self.queue_resume_seconds = safe_float(payload.get("queue_resume_seconds"))
+        self.control_enabled = bool(payload.get("control_enabled", True))
+        self.user_enabled = bool(payload.get("user_enabled", True))
+        try:
+            self.volume_level = max(0, min(9, int(payload.get("volume_level", 9))))
+        except (TypeError, ValueError):
+            self.volume_level = 9
+        elapsed = safe_float(payload.get("elapsed_seconds"))
+        self._switch_to(
+            current_index,
+            resume_seconds=elapsed,
+            fade_in_from_silence=True,
+        )
+        self._apply_all_player_gains()
+        return True
 
     def synchronize_row(self, row_index: int) -> None:
         if not self.available:
@@ -5847,7 +6119,13 @@ class BackgroundMusicController:
         duration = self._duration_seconds(outgoing) if outgoing is not None else None
         return min(fade, duration / 2.0) if duration is not None else fade
 
-    def _switch_to(self, index: int, immediate=False, resume_seconds: Optional[float] = None) -> None:
+    def _switch_to(
+        self,
+        index: int,
+        immediate: bool = False,
+        resume_seconds: Optional[float] = None,
+        fade_in_from_silence: bool = False,
+    ) -> None:
         if not self.available or not 0 <= index < len(self.playlist.files):
             return
         outgoing = self._player()
@@ -5863,7 +6141,10 @@ class BackgroundMusicController:
         self.fade_envelopes[new_slot] = 0.0
         self.active_slot = new_slot
         self.current_index = index
-        fade = 0.0 if immediate or outgoing is None else self._effective_crossfade(outgoing)
+        if fade_in_from_silence:
+            fade = max(0.0, float(self.config.audio_crossfade_seconds))
+        else:
+            fade = 0.0 if immediate or outgoing is None else self._effective_crossfade(outgoing)
         self._fade(outgoing, incoming, fade)
         old_slot = 1 - self.active_slot
 
@@ -5963,6 +6244,35 @@ class GPSTrackShowApp:
         self.config = config
         self.playlist_lines = self._load_playlist_lines()
         self.stages = parse_stage_descriptors(self.playlist_lines)
+        self.control_directives: dict[int, ControlDirective] = {}
+        for row_index, line in enumerate(self.playlist_lines):
+            if not is_control_directive(line):
+                continue
+            try:
+                directive = parse_control_directive(line)
+            except ControlSyntaxError as exc:
+                warn_message(f"control line {row_index + 1}: {exc}")
+                continue
+            if directive is not None:
+                self.control_directives[row_index] = directive
+        self.control_labels = {}
+        duplicate_labels = []
+        for row_index, directive in self.control_directives.items():
+            for action in directive.actions:
+                if action.kind != "label":
+                    continue
+                key = control_label_key(action.value)
+                if key in self.control_labels:
+                    duplicate_labels.append(
+                        (str(action.value), self.control_labels[key], row_index)
+                    )
+                else:
+                    self.control_labels[key] = row_index
+        for label, first_row, duplicate_row in duplicate_labels:
+            warn_message(
+                f"duplicate slide-show label ${label} on lines {first_row + 1} and "
+                f"{duplicate_row + 1}; the first definition is used"
+            )
         self.playlist_index = 0
         self.current_date: Optional[str] = None
         self.current_overview_image = None
@@ -5988,6 +6298,8 @@ class GPSTrackShowApp:
         self.time_lapse_media_datetimes: dict[int, datetime] = {}
         self.time_lapse_media_cursor = 0
         self.time_lapse_audio_row_cursor = -1
+        self.time_lapse_control_row_cursor = -1
+        self.time_lapse_control_deferred = False
         self.time_lapse_handle = None
         self.time_lapse_last_tick = None
         self.time_lapse_current_media: Optional[tuple[int, PhotoListEntry]] = None
@@ -6019,6 +6331,7 @@ class GPSTrackShowApp:
         self.resume_standard_map_index_pending = None
         self.resume_start_pending = config.resume_index is not None
         self.completed_naturally = False
+        self.completed_replays = 0
         self.current_phase: Optional[PlaybackPhase] = None
         self.current_stage_index: Optional[int] = None
         self.current_stage_media_position: Optional[int] = None
@@ -6058,6 +6371,12 @@ class GPSTrackShowApp:
         self.quad_bootstrap_remaining = 0
         self.random_transition_mode = config.transition == Transition.RANDOM
         self.active_transition = random.choice(RANDOM_TRANSITIONS) if self.random_transition_mode else config.transition
+        self.initial_duration = float(config.duration)
+        self.initial_playback_style = str(config.initial_style)
+        self.control_pause_active = False
+        self.control_pause_resume_callback = None
+        self.control_non_display_limit = max(1000, len(self.playlist_lines) * 2)
+        self.control_flow_steps = 0
         self.transition_change_armed = False
         self.paused = False
         self.startup_preview_identity: Optional[str] = None
@@ -6082,6 +6401,11 @@ class GPSTrackShowApp:
         self.live_state_signature = None
         self.command_poll_handle = None
         self.last_command_sequence = -1
+
+        self._reconstruct_control_state_before(
+            self.playlist_index,
+            config.resume_control_state,
+        )
 
         self.app = NSApplication.sharedApplication()
         self.app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
@@ -6913,6 +7237,96 @@ class GPSTrackShowApp:
                 self._advance()
             self._show_temporary_status_overlay("Standard Slide Show", 2.0)
 
+    def _playback_style_name(self) -> str:
+        if self.time_lapse_active:
+            return "TIME_LAPSE"
+        return "RANDOM" if self.random_transition_mode else self.active_transition.value
+
+    def _assign_playback_style(self, style: str) -> None:
+        """Assign one style without moving the playlist or rendering a frame."""
+        normalized = normalize_control_transition(style)
+        self.time_lapse_active = normalized == "TIME_LAPSE"
+        if self.time_lapse_active:
+            return
+        transition = Transition(normalized)
+        self.random_transition_mode = transition == Transition.RANDOM
+        self.active_transition = (
+            random.choice(RANDOM_TRANSITIONS)
+            if self.random_transition_mode
+            else transition
+        )
+        self.transition_change_armed = True
+
+    def _select_playback_style(self, style: str, show_status: bool = True) -> None:
+        """Select a style through the same live-switch path used by t/T."""
+        normalized = normalize_control_transition(style)
+        current = self._playback_style_name()
+        if normalized == current:
+            return
+        if normalized == "TIME_LAPSE":
+            self._toggle_time_lapse_mode()
+        else:
+            transition = Transition(normalized)
+            self.random_transition_mode = transition == Transition.RANDOM
+            self.active_transition = (
+                random.choice(RANDOM_TRANSITIONS)
+                if self.random_transition_mode
+                else transition
+            )
+            self.transition_change_armed = True
+            if self.time_lapse_active:
+                self._toggle_time_lapse_mode()
+        if show_status:
+            label = normalized.replace("_", "-")
+            self._show_temporary_status_overlay(f"Style {label}", 2.0)
+            self._update_window_titles(f"Style {label}")
+
+    def _reconstruct_control_state_before(
+        self,
+        row_index: int,
+        resume_state: object = None,
+    ) -> None:
+        """Restore persistent control state without executing flow commands."""
+        duration = self.initial_duration
+        style = self.initial_playback_style
+        for index in sorted(key for key in self.control_directives if key < int(row_index)):
+            for action in self.control_directives[index].actions:
+                if action.kind == "duration":
+                    duration = float(action.value)
+                elif action.kind == "transition":
+                    style = str(action.value)
+        if isinstance(resume_state, dict) and resume_state.get("version") == 1:
+            try:
+                saved_duration = float(resume_state.get("duration"))
+            except (TypeError, ValueError):
+                saved_duration = 0.0
+            if math.isfinite(saved_duration) and saved_duration > 0.0:
+                duration = saved_duration
+            try:
+                style = normalize_control_transition(resume_state.get("transition"))
+            except ControlSyntaxError:
+                pass
+        object.__setattr__(self.config, "duration", duration)
+        self._assign_playback_style(style)
+
+    def _control_state_snapshot(self) -> dict:
+        config = getattr(self, "config", None)
+        duration = float(getattr(config, "duration", 3.0))
+        transition = (
+            self._playback_style_name()
+            if hasattr(self, "time_lapse_active")
+            else (
+                "TIME_LAPSE"
+                if getattr(config, "time_lapse_stages", False)
+                else str(getattr(getattr(config, "transition", Transition.BLEND), "value", "BLEND"))
+            )
+        )
+        return {
+            "version": 1,
+            "duration": duration,
+            "transition": transition,
+        }
+
     def _toggle_clock(self) -> None:
         """Toggle the analog clock overlay on photos."""
         object.__setattr__(self.config, "clock", not self.config.clock)
@@ -6967,20 +7381,7 @@ class GPSTrackShowApp:
         next_style = PLAYBACK_STYLE_VALUES[
             (current_index + (1 if direction >= 0 else -1)) % len(PLAYBACK_STYLE_VALUES)
         ]
-        if next_style == "TIME_LAPSE":
-            if not self.time_lapse_active:
-                self._toggle_time_lapse_mode()
-        else:
-            next_transition = Transition(next_style)
-            self.random_transition_mode = next_transition == Transition.RANDOM
-            self.active_transition = (
-                random.choice(RANDOM_TRANSITIONS)
-                if self.random_transition_mode
-                else next_transition
-            )
-            self.transition_change_armed = True
-            if self.time_lapse_active:
-                self._toggle_time_lapse_mode()
+        self._select_playback_style(next_style, show_status=False)
         label = next_style.replace("_", "-")
         debug_print(self.config, f"Playback style selected: {label}")
         self._update_window_titles(f"Style {label}")
@@ -7141,11 +7542,37 @@ class GPSTrackShowApp:
         self.pending_display_index = None
         self._advance()
 
-    def _jump_to_playlist_row(self, row_index: int) -> bool:
+    def _start_time_lapse_at_media_row(
+        self,
+        stage_index: int,
+        row_index: int,
+        entry: PhotoListEntry,
+    ) -> None:
+        """Re-enter Time-Lapse at a medium reached without its map row."""
+        stage = self.stages[stage_index]
+        self._prime_context_before_index(stage.map_index)
+        self.playlist_index = stage.map_index + 1
+        self.pending_display_index = stage.map_index
+        self.current_display_index = stage.map_index
+        self._start_time_lapse_stage(
+            stage.map_index,
+            stage.directive.filename,
+            resume_media=(row_index, entry),
+            relation=stage.directive.relation,
+        )
+
+    def _jump_to_playlist_row(
+        self,
+        row_index: int,
+        *,
+        reconstruct_control: bool = True,
+    ) -> bool:
         """Jump a running show to one exact control-file row."""
         row_index = int(row_index)
         if not 0 <= row_index < len(self.playlist_lines):
             return False
+        if reconstruct_control and hasattr(self, "control_directives"):
+            self._reconstruct_control_state_before(row_index)
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
@@ -7162,15 +7589,10 @@ class GPSTrackShowApp:
             self.music_controller.synchronize_row(row_index)
             if self.time_lapse_active:
                 entry = parse_photo_entry(self.playlist_lines[row_index])
-                self._prime_context_before_index(stage.map_index)
-                self.playlist_index = stage.map_index + 1
-                self.pending_display_index = stage.map_index
-                self.current_display_index = stage.map_index
-                self._start_time_lapse_stage(
-                    stage.map_index,
-                    stage.directive.filename,
-                    resume_media=(row_index, entry),
-                    relation=stage.directive.relation,
+                self._start_time_lapse_at_media_row(
+                    stage_index,
+                    row_index,
+                    entry,
                 )
             else:
                 self._show_standard_stage_media(stage_index, media_position)
@@ -7187,6 +7609,11 @@ class GPSTrackShowApp:
     def _step_forward(self) -> None:
         """Advance once while retaining the current automatic/manual mode."""
         debug_print(self.config, "Forward navigation requested")
+        if self._cancel_control_pause(continue_after=True):
+            return
+        if self.awaiting_intro_start:
+            self._begin_intro_playback()
+            return
         if self.time_lapse_active and self.time_lapse_stage is not None:
             if getattr(self, "time_lapse_stage_map_preview_active", False):
                 if self.active_callback is not None:
@@ -7217,7 +7644,8 @@ class GPSTrackShowApp:
                 fraction, row_index, entry = self.time_lapse_media_queue[self.time_lapse_media_cursor]
                 self.time_lapse_media_cursor += 1
                 self.time_lapse_progress = min(1.0, fraction)
-                self._start_time_lapse_media(row_index, entry)
+                if not self._start_time_lapse_media(row_index, entry) and self.time_lapse_control_deferred:
+                    return
                 self._continue_time_lapse_after_navigation()
                 return
             self.time_lapse_progress = 1.0
@@ -7290,6 +7718,7 @@ class GPSTrackShowApp:
     def _step_backward(self) -> None:
         """Restore the previous displayed state without changing playback mode."""
         debug_print(self.config, "Backward navigation requested")
+        self._cancel_control_pause(continue_after=False)
         if self.time_lapse_active and self.time_lapse_stage is not None:
             if self.time_lapse_handle is not None:
                 self.time_lapse_handle.cancel()
@@ -7332,7 +7761,8 @@ class GPSTrackShowApp:
                 fraction, row_index, entry = self.time_lapse_media_queue[target_media_index]
                 self.time_lapse_progress = min(1.0, fraction)
                 self.time_lapse_media_cursor = target_media_index + 1
-                self._start_time_lapse_media(row_index, entry)
+                if not self._start_time_lapse_media(row_index, entry) and self.time_lapse_control_deferred:
+                    return
                 self._continue_time_lapse_after_navigation()
                 return
             if self.time_lapse_stage.relation in {None, ""}:
@@ -8113,13 +8543,17 @@ class GPSTrackShowApp:
         self._show_intro_phase(PlaybackPhase.INTRO_INFO)
 
     def _begin_intro_playback(self) -> None:
-        """Remove the startup help and begin the timed Intro sequence."""
+        """Advance the waiting title slide and begin normal timed playback."""
         if not self.awaiting_intro_start:
             return
+        if self.active_callback is not None:
+            self.active_callback.cancel()
+            self.active_callback = None
         self.awaiting_intro_start = False
         self._hide_startup_hint()
         self.music_controller.start(self.playlist_index)
-        self._show_intro_phase(PlaybackPhase.INTRO_INFO)
+        self.music_controller.set_slideshow_paused(False)
+        self._show_intro_phase(PlaybackPhase.INTRO_OVERVIEW)
 
     def _show_intro_phase(self, phase: PlaybackPhase) -> None:
         """Display either Intro phase and retain deterministic navigation."""
@@ -8130,7 +8564,7 @@ class GPSTrackShowApp:
         if phase == PlaybackPhase.INTRO_INFO:
             image = self.intro_information_image or self.intro_overview_image
             next_callback = (
-                None
+                self._begin_intro_playback
                 if self.awaiting_intro_start
                 else lambda: self._show_intro_phase(PlaybackPhase.INTRO_OVERVIEW)
             )
@@ -8174,6 +8608,84 @@ class GPSTrackShowApp:
                 persistent=True,
                 wait_for_start=True,
             )
+            self._schedule_callback(
+                INTRO_AUTO_ADVANCE_SECONDS,
+                self._begin_intro_playback,
+            )
+
+    def _restart_slideshow_from_title(self) -> None:
+        """Reset transient playback state and replay the complete title sequence."""
+        self.completed_replays += 1
+        if self.active_callback is not None:
+            self.active_callback.cancel()
+            self.active_callback = None
+        self._cancel_time_lapse_stage()
+        self.control_pause_active = False
+        self.control_pause_resume_callback = None
+        object.__setattr__(self.config, "duration", self.initial_duration)
+        self._assign_playback_style(self.initial_playback_style)
+        self.music_controller.set_slideshow_paused(True)
+        self.music_controller.synchronize_row(-1)
+        self.current_state = None
+        self.current_display_index = None
+        self.pending_display_index = None
+        self.current_phase = None
+        self.current_stage_index = None
+        self.current_stage_media_position = None
+        self.current_track_image = None
+        self.current_track_path = None
+        self.current_track_metadata = None
+        self.current_elevation_profile_image = None
+        self.playlist_index = self.start_playlist_index
+        self._prime_context_before_index(self.start_playlist_index)
+        self.completed_naturally = False
+        self.intro_available = True
+        self.intro_was_shown = False
+        self.awaiting_intro_start = False
+        self._start_intro_sequence()
+
+    def _show_black_end_slide(self) -> None:
+        """Finish naturally on a retained black slide until the user quits."""
+        if self.active_callback is not None:
+            self.active_callback.cancel()
+            self.active_callback = None
+        self._cancel_time_lapse_stage()
+        self.awaiting_intro_start = False
+        self._hide_startup_hint()
+        self.music_controller.set_slideshow_paused(True)
+        self.completed_naturally = True
+        self.current_phase = None
+        self.current_stage_index = None
+        self.current_stage_media_position = None
+        self.current_display_index = None
+        targets = []
+        for role, presenter in (
+            ("photo", self.photo_presenter),
+            ("map", self.map_presenter),
+        ):
+            if presenter is None:
+                continue
+            bounds = presenter.host_view.bounds()
+            targets.append(
+                WindowTarget(
+                    role,
+                    make_blank_canvas(
+                        bounds.size.width,
+                        bounds.size.height,
+                        COLOR_NAMES["black"],
+                    ),
+                    Transition.FADE,
+                )
+            )
+        self._display_state(
+            DisplayState(
+                targets=targets,
+                next_callback=None,
+                auto_delay=None,
+                description="End",
+                playlist_index=len(self.playlist_lines),
+            )
+        )
 
     def _prime_standard_resume_map_context(self) -> None:
         """Restore the track-map role before resuming directly on a standard medium."""
@@ -8312,6 +8824,7 @@ class GPSTrackShowApp:
 
     def _display_state(self, state: DisplayState) -> None:
         """Display one slideshow state without retaining older rendered images."""
+        self.control_flow_steps = 0
         self.music_controller.set_video_active(
             any(target.presenter_name == "photo" and target.video_path is not None for target in state.targets)
         )
@@ -8761,6 +9274,7 @@ class GPSTrackShowApp:
         self.current_stage_index = stage_index_for_playlist_row(self.stages, map_index)
         self.current_stage_media_position = None
         self.time_lapse_audio_row_cursor = map_index
+        self.time_lapse_control_row_cursor = map_index
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
         self.time_lapse_media_image = None
@@ -8859,7 +9373,8 @@ class GPSTrackShowApp:
                 if row_index == resume_media[0]:
                     self.time_lapse_progress = min(1.0, fraction)
                     self.time_lapse_media_cursor = index + 1
-                    self._start_time_lapse_media(row_index, entry)
+                    if not self._start_time_lapse_media(row_index, entry) and self.time_lapse_control_deferred:
+                        return
                     break
         if relation is not None:
             self.time_lapse_progress = 1.0
@@ -9097,6 +9612,8 @@ class GPSTrackShowApp:
         _fraction, row_index, entry = self.time_lapse_media_queue[self.time_lapse_media_cursor]
         self.time_lapse_media_cursor += 1
         if not self._start_time_lapse_media(row_index, entry):
+            if self.time_lapse_control_deferred:
+                return
             self._advance_special_time_lapse()
             return
         if not self.manual_mode and not self.paused:
@@ -9152,7 +9669,8 @@ class GPSTrackShowApp:
         if event_due:
             _fraction, row_index, entry = self.time_lapse_media_queue[self.time_lapse_media_cursor]
             self.time_lapse_media_cursor += 1
-            self._start_time_lapse_media(row_index, entry)
+            if not self._start_time_lapse_media(row_index, entry) and self.time_lapse_control_deferred:
+                return
             minimum_pending = time_lapse_media_minimum_pending(
                 self.time_lapse_current_media is not None,
                 self.time_lapse_media_deadline,
@@ -9170,7 +9688,46 @@ class GPSTrackShowApp:
             return
         self.time_lapse_handle = self.schedule_callback(0.020, self._time_lapse_tick)
 
-    def _start_time_lapse_media(self, row_index: int, entry: PhotoListEntry) -> bool:
+    def _start_time_lapse_media(
+        self,
+        row_index: int,
+        entry: PhotoListEntry,
+        *,
+        controls_synced: bool = False,
+    ) -> bool:
+        if not controls_synced:
+            state = {"asynchronous": False, "result": False}
+
+            def continue_start() -> None:
+                state["result"] = self._start_time_lapse_media(
+                    row_index,
+                    entry,
+                    controls_synced=True,
+                )
+                if not state["asynchronous"] or not state["result"]:
+                    return
+                self.time_lapse_control_deferred = False
+                if self.time_lapse_stage is None or not self.time_lapse_active:
+                    return
+                if self.time_lapse_stage.relation is not None:
+                    if not self.manual_mode and not self.paused:
+                        self._schedule_special_time_lapse_advance(
+                            self.time_lapse_media_remaining or self.config.duration
+                        )
+                elif not self.manual_mode and not self.paused:
+                    self.time_lapse_handle = self.schedule_callback(
+                        0.020,
+                        self._time_lapse_tick,
+                    )
+
+            deferred = self._sync_time_lapse_controls_through(
+                row_index,
+                continue_start,
+            )
+            state["asynchronous"] = deferred
+            self.time_lapse_control_deferred = deferred
+            return False if deferred else bool(state["result"])
+        self.control_flow_steps = 0
         path = resolve_path(self.config.photodir, entry.source_name)
         try:
             image = load_media_preview(path)
@@ -9239,6 +9796,16 @@ class GPSTrackShowApp:
     def _finish_time_lapse_stage(self):
         if self.time_lapse_stage is None:
             return
+        target_row = self.time_lapse_stage.next_index - 1
+        if any(
+            self.time_lapse_control_row_cursor < index <= target_row
+            for index in self.control_directives
+        ):
+            self._sync_time_lapse_controls_through(
+                target_row,
+                self._finish_time_lapse_stage,
+            )
+            return
         self._sync_time_lapse_audio_through(self.time_lapse_stage.next_index - 1)
         next_date_text = self.time_lapse_stage.next_date_text
         self.time_lapse_overview_preview_active = False
@@ -9274,6 +9841,40 @@ class GPSTrackShowApp:
             if is_music_directive(self.playlist_lines[index]) or index == target:
                 self.music_controller.synchronize_row(index)
         self.time_lapse_audio_row_cursor = target
+
+    def _sync_time_lapse_controls_through(
+        self,
+        row_index: int,
+        continuation: Callable[[], None],
+    ) -> bool:
+        """Execute CONTROL rows crossed internally by a Time-Lapse stage."""
+        target = max(0, min(int(row_index), len(self.playlist_lines) - 1))
+        indexes = [
+            index
+            for index in sorted(self.control_directives)
+            if self.time_lapse_control_row_cursor < index <= target
+        ]
+        deferred = {"value": False}
+
+        def process(position: int) -> None:
+            if position >= len(indexes):
+                self.time_lapse_control_row_cursor = max(
+                    self.time_lapse_control_row_cursor,
+                    target,
+                )
+                continuation()
+                return
+            index = indexes[position]
+            self.time_lapse_control_row_cursor = index
+            if self._execute_control_actions(
+                self.control_directives[index],
+                index,
+                on_complete=lambda: process(position + 1),
+            ):
+                deferred["value"] = True
+
+        process(0)
+        return deferred["value"]
 
     def _stop_time_lapse_video(self):
         music_controller = getattr(self, "music_controller", None)
@@ -9358,73 +9959,272 @@ class GPSTrackShowApp:
             player.play()
         return True
 
+    def _handle_playlist_end(self) -> None:
+        """Apply the configured natural or explicit end behavior."""
+        if should_restart_slideshow(
+            self.config.end_behavior,
+            self.completed_replays,
+        ):
+            self._restart_slideshow_from_title()
+        else:
+            self._show_black_end_slide()
+
+    def _cancel_control_pause(self, continue_after: bool = False) -> bool:
+        """Cancel a #PAUSE timer and optionally run its continuation now."""
+        if not getattr(self, "control_pause_active", False):
+            return False
+        callback = self.control_pause_resume_callback
+        self.control_pause_active = False
+        self.control_pause_resume_callback = None
+        if self.active_callback is not None:
+            self.active_callback.cancel()
+            self.active_callback = None
+        if continue_after and callback is not None:
+            callback()
+        return True
+
+    def _schedule_control_pause(self, seconds: float, callback: Callable[[], None]) -> None:
+        """Hold slideshow progression while intentionally leaving music running."""
+        self._cancel_control_pause(False)
+        self.control_pause_active = True
+        self.control_pause_resume_callback = callback
+
+        def finish_pause():
+            if not self.control_pause_active:
+                return
+            continuation = self.control_pause_resume_callback
+            self.control_pause_active = False
+            self.control_pause_resume_callback = None
+            self.active_callback = None
+            if continuation is not None:
+                continuation()
+
+        self._schedule_callback(max(0.0, float(seconds)), finish_pause)
+        self._show_temporary_status_overlay(f"Pause {float(seconds):g}s", 2.0)
+
+    def _guard_control_flow(self) -> bool:
+        self.control_flow_steps += 1
+        if self.control_flow_steps <= self.control_non_display_limit:
+            return True
+        warn_message("slide-show control loop contains no displayable row or timed pause")
+        self.manual_mode = True
+        self._show_temporary_status_overlay("Control loop stopped", 3.0)
+        return False
+
+    def _goto_control_label(self, label: object) -> bool:
+        target = self.control_labels.get(control_label_key(label))
+        if target is None:
+            warn_message(f"slide-show label ${label} is not defined")
+            self._show_temporary_status_overlay(f"Label ${label} not found", 3.0)
+            return False
+        if not self._guard_control_flow():
+            return True
+        self._schedule_callback(
+            0.0,
+            lambda: self._jump_to_playlist_row(target, reconstruct_control=False),
+        )
+        return True
+
+    def _execute_control_actions(
+        self,
+        directive: ControlDirective,
+        row_index: int,
+        action_index: int = 0,
+        on_complete: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Execute ordered CONTROL actions; return True when playback was deferred."""
+        actions = directive.actions
+        position = int(action_index)
+        while position < len(actions):
+            action = actions[position]
+            kind = action.kind
+            if kind == "label":
+                position += 1
+                continue
+            if kind == "duration":
+                object.__setattr__(self.config, "duration", float(action.value))
+                self._show_temporary_status_overlay(
+                    f"Duration {float(action.value):g}s",
+                    2.0,
+                )
+                position += 1
+                continue
+            if kind == "transition":
+                target_style = normalize_control_transition(action.value)
+                current_style = self._playback_style_name()
+                next_row = row_index + 1
+                if target_style != current_style:
+                    if self.time_lapse_stage is not None and target_style != "TIME_LAPSE":
+                        self._assign_playback_style(target_style)
+                        def leave_time_lapse() -> None:
+                            self._cancel_time_lapse_stage()
+                            self.playlist_index = next_row
+                            self._schedule_callback(0.0, self._advance)
+
+                        self._execute_control_actions(
+                            directive,
+                            row_index,
+                            position + 1,
+                            leave_time_lapse,
+                        )
+                        return True
+                    if self.time_lapse_stage is None and target_style == "TIME_LAPSE":
+                        next_display_row = next(
+                            (
+                                index
+                                for index in range(next_row, len(self.playlist_lines))
+                                if parse_map_directive(self.playlist_lines[index]) is not None
+                                or not self.playlist_lines[index].startswith("#")
+                            ),
+                            None,
+                        )
+                        if next_display_row is not None:
+                            stage_index = stage_index_for_playlist_row(self.stages, next_display_row)
+                            stage = self.stages[stage_index] if stage_index is not None else None
+                            if stage is not None and next_display_row in stage.media_indexes:
+                                self._assign_playback_style(target_style)
+                                def enter_time_lapse() -> None:
+                                    self._schedule_callback(
+                                        0.0,
+                                        lambda row=next_display_row: self._jump_to_playlist_row(
+                                            row,
+                                            reconstruct_control=False,
+                                        ),
+                                    )
+
+                                self._execute_control_actions(
+                                    directive,
+                                    row_index,
+                                    position + 1,
+                                    enter_time_lapse,
+                                )
+                                return True
+                        self._assign_playback_style(target_style)
+                    else:
+                        self._assign_playback_style(target_style)
+                self._show_temporary_status_overlay(
+                    f"Style {target_style.replace('_', '-')}",
+                    2.0,
+                )
+                position += 1
+                continue
+            if kind == "pause":
+                if not self._guard_control_flow():
+                    return True
+                if float(action.value) > 0.0:
+                    self.control_flow_steps = 0
+                completion = on_complete or self._advance
+                continuation = lambda pos=position + 1: self._execute_control_actions(
+                    directive,
+                    row_index,
+                    pos,
+                    completion,
+                )
+                self._schedule_control_pause(float(action.value), continuation)
+                return True
+            if kind == "goto":
+                return self._goto_control_label(action.value)
+            if kind == "end":
+                self._handle_playlist_end()
+                return True
+            position += 1
+        if on_complete is not None:
+            on_complete()
+        return False
+
     def _advance(self) -> None:
         debug_print(self.config, f"Advance called at playlist index {self.playlist_index}")
         if not self.running:
             return
-        if self.playlist_index >= len(self.playlist_lines):
-            if self.config.repeat:
-                self._prime_context_before_index(self.start_playlist_index)
-                self.playlist_index = self.start_playlist_index
-            else:
-                self.completed_naturally = True
-                self.quit()
+        self._cancel_control_pause(False)
+        while self.running:
+            if self.playlist_index >= len(self.playlist_lines):
+                self._handle_playlist_end()
                 return
 
-        row_index = self.playlist_index
-        line = self.playlist_lines[row_index]
-        content = line.strip()
-        self.music_controller.synchronize_row(row_index)
-        self.playlist_index += 1
-        debug_print(self.config, f"Processing line: {line}")
-        if is_music_directive(content):
-            self._advance()
-            return
-        if content.startswith("#Overviewmap:"):
-            self._handle_overview(content.partition(":")[2].strip())
-            self._advance()
-            return
-        if content.startswith("#Datum:"):
-            self.current_date = content.partition(":")[2].strip()
-            if self.active_transition == Transition.QUAD:
-                self._reset_photo_layouts(Transition.QUAD)
-            elif self.active_transition == Transition.COLLAGE:
-                self._reset_photo_layouts(Transition.COLLAGE)
-            self._advance()
-            return
-        map_directive = parse_map_directive(line)
-        if map_directive is not None:
-            self.pending_display_index = row_index
-            if self.time_lapse_active:
-                self.current_display_index = row_index
-                start_fraction = 0.0
-                resume_media = None
-                if self.resume_start_pending:
-                    start_fraction = self.resume_progress_pending or 0.0
-                    media_index = self.resume_media_index_pending
-                    if (
-                        media_index is not None
-                        and 0 <= media_index < len(self.playlist_lines)
-                        and not self.playlist_lines[media_index].startswith("#")
-                    ):
-                        resume_media = (media_index, parse_photo_entry(self.playlist_lines[media_index]))
-                    self.resume_start_pending = False
-                    self.resume_progress_pending = None
-                    self.resume_media_index_pending = None
-                self._start_time_lapse_stage(
-                    row_index,
-                    map_directive.filename,
-                    start_fraction=start_fraction,
-                    resume_media=resume_media,
-                    relation=map_directive.relation,
-                )
+            row_index = self.playlist_index
+            line = self.playlist_lines[row_index]
+            content = line.strip()
+            self.music_controller.synchronize_row(row_index)
+            self.playlist_index += 1
+            debug_print(self.config, f"Processing line: {line}")
+            if is_music_directive(content):
+                if not self._guard_control_flow():
+                    return
+                continue
+            if is_control_directive(content):
+                directive = self.control_directives.get(row_index)
+                if directive is None:
+                    continue
+                if not self._guard_control_flow():
+                    return
+                if self._execute_control_actions(directive, row_index):
+                    return
+                continue
+            if content.startswith("#Overviewmap:"):
+                self._handle_overview(content.partition(":")[2].strip())
+                if not self._guard_control_flow():
+                    return
+                continue
+            if content.startswith("#Datum:"):
+                self.current_date = content.partition(":")[2].strip()
+                if self.active_transition == Transition.QUAD:
+                    self._reset_photo_layouts(Transition.QUAD)
+                elif self.active_transition == Transition.COLLAGE:
+                    self._reset_photo_layouts(Transition.COLLAGE)
+                if not self._guard_control_flow():
+                    return
+                continue
+            map_directive = parse_map_directive(line)
+            if map_directive is not None:
+                self.pending_display_index = row_index
+                if self.time_lapse_active:
+                    self.current_display_index = row_index
+                    start_fraction = 0.0
+                    resume_media = None
+                    if self.resume_start_pending:
+                        start_fraction = self.resume_progress_pending or 0.0
+                        media_index = self.resume_media_index_pending
+                        if (
+                            media_index is not None
+                            and 0 <= media_index < len(self.playlist_lines)
+                            and not self.playlist_lines[media_index].startswith("#")
+                        ):
+                            resume_media = (media_index, parse_photo_entry(self.playlist_lines[media_index]))
+                        self.resume_start_pending = False
+                        self.resume_progress_pending = None
+                        self.resume_media_index_pending = None
+                    self.control_flow_steps = 0
+                    self._start_time_lapse_stage(
+                        row_index,
+                        map_directive.filename,
+                        start_fraction=start_fraction,
+                        resume_media=resume_media,
+                        relation=map_directive.relation,
+                    )
+                    return
+                self.control_flow_steps = 0
+                self._handle_map(map_directive.filename, map_directive.relation)
+                self.resume_start_pending = False
                 return
-            self._handle_map(map_directive.filename, map_directive.relation)
+            entry = parse_photo_entry(line)
+            if self.time_lapse_active and self.time_lapse_stage is None:
+                stage_index = stage_index_for_playlist_row(self.stages, row_index)
+                stage = self.stages[stage_index] if stage_index is not None else None
+                if stage is not None and row_index in stage.media_indexes:
+                    self.resume_start_pending = False
+                    self.control_flow_steps = 0
+                    self._start_time_lapse_at_media_row(
+                        stage_index,
+                        row_index,
+                        entry,
+                    )
+                    return
+            self.pending_display_index = row_index
             self.resume_start_pending = False
+            self.control_flow_steps = 0
+            self._handle_photo(entry)
             return
-        self.pending_display_index = row_index
-        self.resume_start_pending = False
-        self._handle_photo(parse_photo_entry(line))
 
     def _handle_overview(self, filename: str) -> None:
         image_path = resolve_path(self._track_asset_dir(), filename)
@@ -9881,14 +10681,87 @@ class GPSTrackShowApp:
     def _handle_sigint(self, _signum: int, _frame: object) -> None:
         self.schedule_callback(0.0, self.quit)
 
+    def _checkpoint_display_snapshot(
+        self,
+        playlist_index: int,
+        media_index: Optional[int],
+    ) -> dict:
+        """Capture human-readable media details without extracting metadata."""
+        row_index = media_index if isinstance(media_index, int) else playlist_index
+        if 0 <= row_index < len(self.playlist_lines):
+            line = self.playlist_lines[row_index]
+            if not line.startswith("#"):
+                entry = parse_photo_entry(line)
+                media_path = resolve_path(
+                    getattr(self.config, "photodir", self.config.inputlist.parent),
+                    entry.source_name,
+                )
+                metadata = try_read_photo_metadata(
+                    media_sidecar_path(media_path),
+                    media_path,
+                ) or {}
+                raw_place = metadata.get("place")
+                if not isinstance(raw_place, str) or not raw_place.strip():
+                    raw_place = entry.place or ""
+                media_date = metadata.get("datetime_iso")
+                if not isinstance(media_date, str) or not media_date.strip():
+                    media_date = " ".join(
+                        value
+                        for value in (getattr(self, "current_date", None), entry.time_text)
+                        if isinstance(value, str) and value.strip()
+                    )
+                return {
+                    "media_name": Path(entry.source_name).name,
+                    "place": str(raw_place or "").strip(),
+                    "media_date": str(media_date or "").strip(),
+                    "asset_path": str(media_path),
+                }
+        directive = (
+            parse_map_directive(self.playlist_lines[playlist_index])
+            if 0 <= playlist_index < len(self.playlist_lines)
+            else None
+        )
+        stage_name = ""
+        current_track_metadata = getattr(self, "current_track_metadata", None)
+        if isinstance(current_track_metadata, dict):
+            stage_name = track_display_title(
+                current_track_metadata,
+                getattr(self.config, "track_title_mode", "endpoint_places"),
+            ) or ""
+        if not stage_name and directive is not None:
+            stage_name = Path(directive.filename).stem
+        return {
+            "media_name": stage_name,
+            "place": "",
+            "media_date": str(getattr(self, "current_date", None) or "").strip(),
+            "asset_path": (
+                str(resolve_path(self._track_asset_dir(), directive.filename))
+                if directive is not None
+                else ""
+            ),
+        }
+
     def _resume_state_payload(self) -> dict:
         """Capture a stable control-list position before Cocoa objects are released."""
+        control_file = self.config.inputlist.resolve(strict=False)
+        control_identity = {"path": str(control_file)}
+        try:
+            control_stat = control_file.stat()
+            control_identity.update(
+                {
+                    "size": int(control_stat.st_size),
+                    "mtime_ns": int(control_stat.st_mtime_ns),
+                }
+            )
+        except OSError:
+            pass
         if self.completed_naturally:
             return {
-                "version": 1,
+                "version": SLIDESHOW_CHECKPOINT_VERSION,
                 "completed": True,
-                "control_file": str(self.config.inputlist),
-                "saved_at": datetime.now().astimezone().isoformat(),
+                "control_file": str(control_file),
+                "control_file_identity": control_identity,
+                "stopped_at": datetime.now().astimezone().isoformat(),
             }
 
         media_index = None
@@ -9917,10 +10790,15 @@ class GPSTrackShowApp:
                 media_index = playlist_index
 
         line_text = self.playlist_lines[playlist_index] if 0 <= playlist_index < len(self.playlist_lines) else None
+        display_snapshot = self._checkpoint_display_snapshot(
+            playlist_index,
+            media_index,
+        )
         return {
-            "version": 2,
+            "version": SLIDESHOW_CHECKPOINT_VERSION,
             "completed": False,
-            "control_file": str(self.config.inputlist),
+            "control_file": str(control_file),
+            "control_file_identity": control_identity,
             "playlist_index": playlist_index,
             "line_text": line_text,
             "mode": "time-lapse" if self.time_lapse_active else "standard",
@@ -9947,7 +10825,17 @@ class GPSTrackShowApp:
             ),
             "time_lapse_progress": progress,
             "media_index": media_index,
-            "saved_at": datetime.now().astimezone().isoformat(),
+            "stopped_at": datetime.now().astimezone().isoformat(),
+            "display": display_snapshot,
+            "audio": (
+                self.music_controller.resume_state_snapshot()
+                if hasattr(
+                    getattr(self, "music_controller", None),
+                    "resume_state_snapshot",
+                )
+                else None
+            ),
+            "control": self._control_state_snapshot(),
         }
 
     def _publish_live_state(self) -> None:

@@ -3720,6 +3720,8 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
                 entry.update({"type": "media_map", "relation": "media"})
             elif normalized == "music":
                 entry.update({"type": "music", "name": ""})
+            elif normalized == "control":
+                entry.update({"type": "control", "name": ""})
         else:
             parts = [part.strip() for part in content.split("|")]
             if parts:

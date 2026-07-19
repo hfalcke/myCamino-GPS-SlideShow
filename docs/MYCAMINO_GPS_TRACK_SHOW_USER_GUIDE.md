@@ -483,13 +483,14 @@ Finder. Finder opens the containing folder with the selected image, video, or
 map file already highlighted. The Previews checkbox remains available at the
 top left when the editor window is resized.
 
-Music control uses separate `MUS` rows rather than an extra column. Press
-**Insert Row** or Command-I, choose `MUS` in the Type field, and enter the
-comma-separated commands in **File / Date / Map**. A nonmodal command reference
-opens for a `MUS` row. The same reference is available from the small **Help**
-link beside **No Music** in the main window. The filter popup offers All Rows,
-No Media, Media, Maps, Music control, each individual image/video/map type, and
-Date. **Reset Filter** returns to All Rows. The selected row remains visible
+Music control uses separate `MUS` rows rather than an extra column. Slide-show
+flow and timing use `CTL` rows. Press **Insert Row** or Command-I, choose the
+desired Type, and enter the comma-separated commands in **File / Date / Map**.
+A nonmodal command reference opens for a `MUS` or `CTL` row. The music reference
+is also available from the small **Help** link beside **No Music** in the main
+window. The filter popup offers All Rows, No Media, Media, Maps,
+`MUS - Music control`, `CTL - Slide-show control`, each individual
+image/video/map type, and Date. **Reset Filter** returns to All Rows. The selected row remains visible
 where possible; otherwise the nearest preceding matching row is selected.
 Filtering never changes the saved row order, and search uses only visible rows.
 
@@ -643,6 +644,26 @@ individual files or album folders. Click **Help** beside **No Music** for the
 complete command reference and the labels currently available in the selected
 playlist.
 
+`#JUMP $LABEL` and `#GOTO $LABEL` are equivalent music commands.
+
+## Slide-Show Control Commands
+
+The control-file editor also supports `CTL – Slide-show control` rows, saved as
+`#CONTROL: Parameters`. Editing a CTL row opens a command reference. Commands
+and `$LABEL` names are case-insensitive, and multiple commands are separated by
+commas.
+
+- `#LABEL $NAME` defines a destination in the slide-show list.
+- `#GOTO $NAME` or `#JUMP $NAME` continues from that destination.
+- `#DURATION NN` changes how long following slides and map insets remain visible.
+- `#TRANSITION STYLE` selects `TIME_LAPSE`, `BLEND`, `FADE`, `SWITCH`, `EXPAND`, `COLLAGE`, `QUAD`, or `RANDOM`, like pressing `t` or `Shift-t`.
+- `#PAUSE NN` holds the current picture for the requested seconds while music continues.
+- `#END` applies the Adventure's configured black, loop-once, or loop-forever ending.
+
+Duration and transition settings remain active until another command changes
+them or the show restarts from its title page. Use the editor's CTL filter to
+find these rows quickly.
+
 The Music section contains:
 
 - Audio folder icon: open the project's fixed `audio` folder in Finder. Copy
@@ -676,11 +697,18 @@ The Music section contains:
 The Start Slide Show section contains:
 
 - Start: launches from the beginning using the initial style saved in Settings.
-- Continue: launches at the last automatically saved stage, display phase,
-  medium, and Time-Lapse progress. It is disabled until such a position exists.
+- Continue: opens a table of up to twenty automatically saved checkpoints,
+  newest first. The table shows the last playback time, image or map, place,
+  media date, and availability. Select a valid entry and press Return,
+  double-click it, or choose **Play**. **Abort** and Escape leave the GUI
+  unchanged.
 - The initial style defaults to Time-Lapse. During playback, `t` cycles forward
   and `Shift-t` backward through Time-Lapse, Blend, Fade, Switch, Expand,
   Collage, Quad, and Random.
+- Settings > Slide Show > **At end** controls completion. **Black final slide**
+  ends on black, **Loop once** replays the complete show once and then ends on
+  black, and **Loop forever** continuously replays it. Loop forever is the
+  default. Every replay starts again with the title slide.
 - A fresh Start first shows the Adventure title, date/place/distance summary,
   description, and title image directly over the Tour Overview without a
   background panel. The text is black with a light readability shadow, and the
@@ -691,7 +719,9 @@ The Start Slide Show section contains:
   five displayed lines are centered. At show startup, the temporary `h` help
   hint is placed at the bottom. The information disappears without fading the
   unchanged background map through black, followed by the first Stage Map.
-  Continue and automatic repeat do not replay this introduction.
+  Press Space or Right/Down to advance from the title immediately. Without a
+  key press, it advances automatically after 30 seconds. Continue does not
+  replay the introduction, while end-of-show loops do.
 - In one-window mode each Standard stage is Stage Map, marked Tour Overview,
   then media. Cursor navigation crosses stage boundaries in both directions;
   Command-cursor jumps directly between Stage Maps.
@@ -725,8 +755,8 @@ The Start Slide Show section contains:
 The control-file editor also offers **Start Slide Show Here** in the
 right-click menu. It starts at the selected map, media, date, or music row. If
 the table has unsaved edits, choose **Save and Start** first. This is a one-time
-start location; the previously saved Continue position is not replaced until
-the running player later autosaves its actual position.
+start location; the existing Continue history is not changed until the running
+player later records where it actually stopped.
 
 Window behavior is **Automatic** by default. A computer with one display starts
 with one slide-show window. At the beginning of every new Time-Lapse stage, the
@@ -766,11 +796,16 @@ The slide show reads the control file, media files, map images, and sidecar
 metadata.
 
 When a slide show is stopped before reaching its end, the player returns its
-current control-file row and, for Time-Lapse, its stage progress and visible
-medium. The main GUI stores this position automatically in the adventure file.
-Use **Continue** to return to that position, or **Start** to begin at the
-beginning without a confirmation dialog. A show that runs normally to its end
-clears the saved resume position.
+current control-file row, stage and phase, visible medium, Time-Lapse progress,
+exact background-music state, active display duration, and transition style. The main GUI adds this checkpoint to the
+Adventure's newest-first history and keeps at most twenty. **Continue** lets
+you choose any still-valid checkpoint; stale entries remain visible with a
+reason but cannot be played. **Start** begins at the beginning without deleting
+history. A show that reaches its natural end adds no checkpoint and leaves
+earlier history unchanged. Music restoration includes the current title and
+elapsed time, queue or loop, control-file audio gate, manual Audio Off state,
+and `#VOLUME` level. If songs or playlist entries changed, the slide show still
+resumes and reconstructs music from preceding `#MUSIC:` directives.
 
 Common slide-show keys:
 

@@ -17,6 +17,7 @@ from GPSTrackShow import (
     clear_corner_rect_options,
     config_from_options,
     derive_clock_date_text,
+    clock_date_lines,
     dynamic_stage_header_lines,
     endpoint_tangent,
     external_jump_command_row,
@@ -34,6 +35,7 @@ from GPSTrackShow import (
     first_media_coordinate,
     should_restart_time_lapse_stage_at_overview,
     should_restart_time_lapse_stage_intro,
+    should_restart_slideshow,
     pilgrim_orientation_for_tangent,
     pilgrim_motion_threshold,
     relation_title_band,
@@ -973,6 +975,32 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             self.assertEqual(config.initial_style, "TIME_LAPSE")
             self.assertEqual(config.transition.value, "BLEND")
             self.assertEqual(config.audio_crossfade_seconds, 2.0)
+            self.assertEqual(config.end_behavior, "loop_forever")
+            resume_control = {"version": 1, "duration": 8.0, "transition": "FADE"}
+            resumed_config = config_from_options(
+                project_dir,
+                inputlist=control_file,
+                resume_control_state=resume_control,
+            )
+            self.assertEqual(resumed_config.resume_control_state, resume_control)
+            self.assertFalse(resumed_config.time_lapse_stages)
+            self.assertEqual(resumed_config.initial_style, "TIME_LAPSE")
+            self.assertEqual(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    end_behavior="loop_once",
+                ).end_behavior,
+                "loop_once",
+            )
+            self.assertEqual(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    repeat=False,
+                ).end_behavior,
+                "black",
+            )
             self.assertEqual(config.music_volume_percent, 65.0)
             self.assertEqual(config.video_volume_percent, 100.0)
             self.assertTrue(config.use_normalized_videos)
@@ -1040,6 +1068,12 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
                     project_dir,
                     inputlist=control_file,
                     audio_crossfade_seconds=31.0,
+                )
+            with self.assertRaises(ValueError):
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    end_behavior="unknown",
                 )
 
     def test_stage_descriptors_and_intro_metadata(self):
@@ -1256,16 +1290,73 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         app.playlist_index = 7
         calls = []
         app._hide_startup_hint = lambda: calls.append("hide")
+        app.active_callback = None
         app.music_controller = SimpleNamespace(
-            start=lambda index: calls.append(("music", index))
+            start=lambda index: calls.append(("music", index)),
+            set_slideshow_paused=lambda paused: calls.append(("paused", paused)),
         )
         app._show_intro_phase = lambda phase: calls.append(phase)
         app._begin_intro_playback()
         self.assertFalse(app.awaiting_intro_start)
         self.assertEqual(
             calls,
-            ["hide", ("music", 7), PlaybackPhase.INTRO_INFO],
+            ["hide", ("music", 7), ("paused", False), PlaybackPhase.INTRO_OVERVIEW],
         )
+
+    def test_end_behavior_restarts_at_the_requested_frequency(self):
+        self.assertFalse(should_restart_slideshow("black", 0))
+        self.assertTrue(should_restart_slideshow("loop_once", 0))
+        self.assertFalse(should_restart_slideshow("loop_once", 1))
+        self.assertTrue(should_restart_slideshow("loop_forever", 0))
+        self.assertTrue(should_restart_slideshow("loop_forever", 99))
+
+    def test_playlist_end_dispatches_to_restart_or_black_slide(self):
+        for behavior, replay_count, expected in (
+            ("loop_forever", 8, "restart"),
+            ("loop_once", 0, "restart"),
+            ("loop_once", 1, "black"),
+            ("black", 0, "black"),
+        ):
+            app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+            app.config = SimpleNamespace(debug=False, end_behavior=behavior)
+            app.running = True
+            app.playlist_lines = ["photo.jpeg"]
+            app.playlist_index = 1
+            app.completed_replays = replay_count
+            calls = []
+            app._restart_slideshow_from_title = lambda: calls.append("restart")
+            app._show_black_end_slide = lambda: calls.append("black")
+            app._advance()
+            self.assertEqual(calls, [expected])
+
+    def test_waiting_title_schedules_thirty_seconds_and_right_advances(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.stages = []
+        app.playlist_index = 0
+        app.intro_information_image = object()
+        app.intro_overview_image = object()
+        app.map_presenter = None
+        app.awaiting_intro_start = True
+        app.current_phase = None
+        app.current_stage_index = None
+        app.current_stage_media_position = None
+        app.pending_display_index = None
+        displayed = []
+        scheduled = []
+        app._display_state = displayed.append
+        app._show_startup_hint = lambda **kwargs: None
+        app._schedule_callback = lambda seconds, callback: scheduled.append(
+            (seconds, callback)
+        )
+        app._show_intro_phase(PlaybackPhase.INTRO_INFO)
+        self.assertEqual(scheduled[0][0], 30.0)
+        self.assertEqual(displayed[0].description, "Adventure introduction")
+
+        calls = []
+        app.config = SimpleNamespace(debug=False)
+        app._begin_intro_playback = lambda: calls.append("advance")
+        app._step_forward()
+        self.assertEqual(calls, ["advance"])
 
     def test_pilgrim_stands_and_resumes_with_frame_three(self):
         state = PilgrimWalkState()
@@ -1295,7 +1386,12 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertEqual(derive_clock_date_text({}, "23.05.2020"), "23.05.2020")
         self.assertEqual(
             derive_clock_date_text({}, "Samstag, 23.05.2020"),
-            "23.05.2020",
+            "Samstag, 23.05.2020",
+        )
+        self.assertEqual(clock_date_lines("23.05.2020"), ("Saturday", "23.05.2020"))
+        self.assertEqual(
+            clock_date_lines("Samstag, 23.05.2020"),
+            ("Samstag", "23.05.2020"),
         )
 
 

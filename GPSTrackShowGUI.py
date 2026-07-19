@@ -201,7 +201,15 @@ from audio_playlist import (
     load_audio_playlist,
     updated_playlist_text,
 )
-from slideshow_control_format import MusicSyntaxError, is_music_directive, parse_music_parameters
+from slideshow_control_format import (
+    CONTROL_TRANSITIONS,
+    ControlSyntaxError,
+    MusicSyntaxError,
+    control_labels,
+    parse_control_parameters,
+    parse_music_parameters,
+    serialize_control_parameters,
+)
 from map_overlay import MAP_CONTENT_VERSION
 from workflow_assistant import (
     assistant_bubble_size,
@@ -310,6 +318,7 @@ CONTROL_ROW_TYPE_KEYWORDS = {
     "LOC": "MediaMap",
     "DAT": "Datum",
     "MUS": "MUSIC",
+    "CTL": "CONTROL",
 }
 CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "IMG": "Image",
@@ -321,6 +330,7 @@ CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "LOC": "Media location map",
     "DAT": "Date",
     "MUS": "Music control",
+    "CTL": "Slide-show control",
 }
 CONTROL_ROW_TYPES = tuple(CONTROL_ROW_TYPE_DESCRIPTIONS)
 CONTROL_ROW_TYPE_CHOICES = tuple(
@@ -333,6 +343,7 @@ CONTROL_TABLE_FILTERS = (
     ("media", "Media"),
     ("maps", "Maps"),
     ("mus", "MUS – Music control"),
+    ("ctl", "CTL – Slide-show control"),
     ("img", "IMG – Image"),
     ("vid", "VID – Video"),
     ("map", "MAP – Overview map"),
@@ -353,6 +364,83 @@ PH_COLLECTION_TYPE_SMART_ALBUM = 2
 PH_COLLECTION_SUBTYPE_ANY = 9223372036854775807
 PH_ASSET_MEDIA_TYPE_IMAGE = 1
 PROJECT_AUDIO_DIRECTORY_NAME = "audio"
+SLIDESHOW_CHECKPOINT_VERSION = 4
+SLIDESHOW_CHECKPOINT_HISTORY_LIMIT = 20
+
+
+def normalize_slideshow_resume_history(value: object) -> list[dict]:
+    """Keep only current, non-completed checkpoints without migrating legacy data."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if (
+            isinstance(item, dict)
+            and item.get("version") == SLIDESHOW_CHECKPOINT_VERSION
+            and not item.get("completed")
+        ):
+            result.append(dict(item))
+        if len(result) >= SLIDESHOW_CHECKPOINT_HISTORY_LIMIT:
+            break
+    return result
+
+
+def append_slideshow_checkpoint(history: object, checkpoint: object) -> list[dict]:
+    """Prepend one current checkpoint and retain at most twenty entries."""
+    current = normalize_slideshow_resume_history(history)
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("version") != SLIDESHOW_CHECKPOINT_VERSION
+        or checkpoint.get("completed")
+    ):
+        return current
+    return [dict(checkpoint), *current][:SLIDESHOW_CHECKPOINT_HISTORY_LIMIT]
+
+
+def validated_slideshow_resume_position(
+    position: object,
+    control_file_path: str | Path,
+) -> Optional[dict]:
+    """Return a current checkpoint only while its exact control file is intact."""
+    if (
+        not isinstance(position, dict)
+        or position.get("version") != SLIDESHOW_CHECKPOINT_VERSION
+        or position.get("completed")
+    ):
+        return None
+    try:
+        stored_control = Path(str(position.get("control_file", ""))).expanduser().resolve(strict=False)
+        current_control = Path(control_file_path).expanduser().resolve(strict=False)
+        playlist_index = int(position["playlist_index"])
+        current_stat = current_control.stat()
+        lines = [
+            line.strip()
+            for line in current_control.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if stored_control != current_control or not 0 <= playlist_index < len(lines):
+        return None
+    identity = position.get("control_file_identity")
+    if not isinstance(identity, dict):
+        return None
+    try:
+        identity_path = Path(str(identity["path"])).expanduser().resolve(strict=False)
+        identity_size = int(identity["size"])
+        identity_mtime = int(identity["mtime_ns"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        identity_path != current_control
+        or identity_size != int(current_stat.st_size)
+        or identity_mtime != int(current_stat.st_mtime_ns)
+    ):
+        return None
+    stored_line = position.get("line_text")
+    if not isinstance(stored_line, str) or stored_line != lines[playlist_index]:
+        return None
+    return dict(position)
 
 
 def control_file_update_requires_review(plan) -> bool:
@@ -586,6 +674,8 @@ def parse_slideshow_control_line(line: str) -> dict:
             row_type = "DAT"
         elif normalized == "music":
             row_type = "MUS"
+        elif normalized == "control":
+            row_type = "CTL"
         else:
             row_type = keyword.upper() if keyword else "#"
         return {
@@ -618,7 +708,12 @@ def serialize_slideshow_control_row(row: dict) -> str:
     """Serialize one editable slideshow row back to the sorted-list format."""
     row_type = str(row.get("type", "")).strip().upper()
     name = str(row.get("name", "")).strip()
-    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT"}:
+    if row_type == "CTL" and name:
+        try:
+            name = serialize_control_parameters(parse_control_parameters(name))
+        except ControlSyntaxError:
+            pass
+    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "CTL"}:
         keyword = str(row.get("keyword", "")).strip()
         if not keyword:
             keyword = CONTROL_ROW_TYPE_KEYWORDS.get(row_type, row_type)
@@ -665,7 +760,7 @@ def visible_control_row_indexes(rows, filter_key="all", hide_media=None):
     filter_key = str(filter_key or "all").casefold()
     if filter_key == "all":
         return list(range(len(rows)))
-    exact = {"mus", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
+    exact = {"mus", "ctl", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
     if filter_key in exact:
         return [
             index for index, row in enumerate(rows)
@@ -840,6 +935,56 @@ class GPSTrackShowGUIMediaBrowserDataSource(GPSTrackShowGUITableDataSource):
         )
 
 
+class GPSTrackShowGUIResumeDataSource(GPSTrackShowGUITableDataSource):
+    """Datasource that dims unavailable checkpoints and updates Play state."""
+
+    def initWithController_(self, controller):
+        self = objc.super(GPSTrackShowGUIResumeDataSource, self).init()
+        if self is None:
+            return None
+        self.controller = controller
+        return self
+
+    def tableViewSelectionDidChange_(self, _notification):
+        self.controller.resumeSelectionDidChange_(None)
+
+    def tableView_willDisplayCell_forTableColumn_row_(
+        self, _table_view, cell, _column, row_index
+    ):
+        available = (
+            0 <= row_index < len(self.rows)
+            and bool(self.rows[row_index].get("available"))
+        )
+        cell.setTextColor_(
+            NSColor.controlTextColor()
+            if available
+            else NSColor.disabledControlTextColor()
+        )
+
+
+class ResumeCheckpointTableView(NSTableView):
+    """Checkpoint table with Return-to-play and Escape-to-abort behavior."""
+
+    def initWithController_(self, controller):
+        self = objc.super(ResumeCheckpointTableView, self).initWithFrame_(
+            NSMakeRect(0, 0, 100, 100)
+        )
+        if self is None:
+            return None
+        self.controller = controller
+        return self
+
+    def keyDown_(self, event):
+        characters = str(event.charactersIgnoringModifiers() or "")
+        if characters in {"\r", "\n"}:
+            self.controller.playSelectedResumeCheckpoint_(self)
+            return
+        if characters == "\x1b":
+            self.controller.abortResumeSelection_(self)
+            return
+        objc.super(ResumeCheckpointTableView, self).keyDown_(event)
+
+
 class GPSTrackShowGUIMediaUpdatePreviewDataSource(GPSTrackShowGUITableDataSource):
     """Datasource for the selective media-update preview."""
 
@@ -920,8 +1065,12 @@ class SlideShowControlTableDataSource(NSObject):
             return
         self.controller._suspend_control_table_sync("selection")
         for model_index in self.controller._selected_control_table_indexes():
-            if str(self.controller.control_table_rows[model_index].get("type", "")).upper() == "MUS":
+            row_type = str(self.controller.control_table_rows[model_index].get("type", "")).upper()
+            if row_type == "MUS":
                 self.controller.showMusicDirectiveHelp_(table_view)
+                break
+            if row_type == "CTL":
+                self.controller.showControlDirectiveHelp_(table_view)
                 break
 
     def tableView_willDisplayCell_forTableColumn_row_(self, _table_view, cell, _table_column, row_index):
@@ -932,7 +1081,7 @@ class SlideShowControlTableDataSource(NSObject):
         base_font = NSFont.systemFontOfSize_(13.0)
         if row_type == "DAT":
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSBoldFontMask)
-        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS"}:
+        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS", "CTL"}:
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSItalicFontMask)
         else:
             font = base_font
@@ -1191,6 +1340,21 @@ class GPSTrackShowGUIAlbumSelectionDelegate(NSObject):
 
     def windowShouldClose_(self, _sender):
         self.controller.albumSelectionCancel_(None)
+        return False
+
+
+class GPSTrackShowGUIResumeSelectionDelegate(NSObject):
+    """Keep the Continue checkpoint chooser modal and cancel safely."""
+
+    def initWithController_(self, controller):
+        self = objc.super(GPSTrackShowGUIResumeSelectionDelegate, self).init()
+        if self is None:
+            return None
+        self.controller = controller
+        return self
+
+    def windowShouldClose_(self, _sender):
+        self.controller.abortResumeSelection_(None)
         return False
 
 
@@ -1764,7 +1928,7 @@ class GPXTrackerController(NSObject):
         self.parameters = default_parameters()
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
-        self.slideshow_resume_position = None
+        self.slideshow_resume_history = []
         self.project_dirty = False
         self.skip_next_project_dir_dirty = False
         self.adventure_autosave_timer = None
@@ -1790,6 +1954,13 @@ class GPXTrackerController(NSObject):
         self.slideshow_process = None
         self.album_selection_data_source = None
         self.album_selection_delegate = None
+        self.resume_selection_window = None
+        self.resume_selection_table = None
+        self.resume_selection_rows = []
+        self.resume_selection_result = None
+        self.resume_selection_data_source = None
+        self.resume_selection_delegate = None
+        self.resume_selection_play_button = None
         self.geolocations_window = None
         self.geolocations_text_view = None
         self.geolocations_cancel_button = None
@@ -1859,6 +2030,8 @@ class GPXTrackerController(NSObject):
         self.control_table_last_snapshot_time = 0.0
         self.music_directive_help_window = None
         self.music_directive_help_text = None
+        self.control_directive_help_window = None
+        self.control_directive_help_text = None
         self.saved_project_payload = None
         self.media_viewer_window = None
         self.media_viewer_view = None
@@ -2508,7 +2681,9 @@ class GPXTrackerController(NSObject):
         self.slideshow_label.setToolTip_("Choose Standard or Time-Lapse playback before starting.")
         self.slideshow_label.setToolTip_("The initial playback style is selected in Settings. Use t and Shift-t during playback to change it.")
         self.slideshow_start_button.setToolTip_("Launch the selected slide-show type from the beginning.")
-        self.slideshow_continue_button.setToolTip_("Continue the selected slide-show type from its last automatically saved position.")
+        self.slideshow_continue_button.setToolTip_(
+            "Choose one of the last twenty automatically saved slide-show checkpoints, including its music position."
+        )
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
         self.music_label.setToolTip_("The active playlist inside the project's fixed audio folder.")
         self.music_field.setToolTip_(
@@ -4536,7 +4711,7 @@ class GPXTrackerController(NSObject):
             "track_map_base": self.track_map_base or project_filename_base(self._current_project_name()),
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
             "parameters": parameter_payload(self.parameters),
-            "slideshow_resume_position": self.slideshow_resume_position,
+            "slideshow_resume_history": list(self.slideshow_resume_history),
             "music_source": self._stored_optional_project_path(self.music_source),
             "music_playlist": self._stored_optional_project_path(self.music_playlist),
             "workflow_assistant": dict(self.workflow_assistant_state),
@@ -4828,7 +5003,7 @@ class GPXTrackerController(NSObject):
             self.description_text.setString_("")
             self.title_image = None
             self.title_image_field.setStringValue_("")
-            self.slideshow_resume_position = None
+            self.slideshow_resume_history = []
             assistant_enabled = bool(self.workflow_assistant_state.get("enabled", True))
             self.workflow_assistant_state = normalize_assistant_state(None, existing_adventure=False)
             self.workflow_assistant_state["enabled"] = assistant_enabled
@@ -4899,8 +5074,9 @@ class GPXTrackerController(NSObject):
         self.last_picture_import_directory = (
             Path(last_import_directory).expanduser().resolve(strict=False) if last_import_directory else None
         )
-        loaded_resume_position = data.get("slideshow_resume_position")
-        self.slideshow_resume_position = loaded_resume_position if isinstance(loaded_resume_position, dict) else None
+        self.slideshow_resume_history = normalize_slideshow_resume_history(
+            data.get("slideshow_resume_history")
+        )
         self.music_source = self._ensure_project_audio_directory(show_errors=True)
         loaded_playlist = self._resolve_optional_project_path(
             data.get("music_playlist")
@@ -5416,13 +5592,13 @@ class GPXTrackerController(NSObject):
             "7. If no control file exists, Adventure Processing creates it after successful map generation. If an edited control file already exists, the program asks before opening Update Control File and never replaces it automatically. GPX journeys combine media with measured stages; media-only journeys group located media by date. Missing media GPS can be inferred when its exposure time falls inside exactly one timed GPX track.\n"
             "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. For later additions or corrections, press Update Control File instead of recreating the complete list. It checks map references and automatically finds imported, missing, invalid, legacy, and changed media. One review shows required reference corrections and recommended media updates. Map images themselves are rendered in Map Generation. Choose Other Media deliberately rechecks otherwise current files; changed GPS can trigger a targeted place-name update.\n"
-            "11. Music is a separate optional section and new Adventures start with No Music selected. Every project has a fixed audio folder, which is created automatically and recreated if missing. Clear No Music, click the folder icon, and copy audio files or complete album directories into that folder. Choose selects one of the .playlist files stored there; without a playlist, titles play alphabetically. Create Playlist makes another named playlist, and Update Playlist appends newly found audio without replacing your edits. Insert MUS rows in the control-file table to add #MUSIC commands for jumps, queues, loops, gate control, and internal volume. A manual Audio Off with the a key always has priority. Normalize Video Audio is always available: it prepares reusable copies without modifying originals or delaying slide-show startup. Press n during playback to switch normalized video sound on or off.\n"
+            "11. Music is a separate optional section and new Adventures start with No Music selected. Every project has a fixed audio folder, which is created automatically and recreated if missing. Clear No Music, click the folder icon, and copy audio files or complete album directories into that folder. Choose selects one of the .playlist files stored there; without a playlist, titles play alphabetically. Create Playlist makes another named playlist, and Update Playlist appends newly found audio without replacing your edits. Insert MUS rows for #MUSIC commands that control playlist titles, jumps, loops, volume, and audio on/off. Insert CTL rows for #CONTROL commands that define slide-show labels and jumps, change display duration or transition style, pause, or end the show. Editing either row type opens its command reference. A manual Audio Off with the a key always has priority. Normalize Video Audio is always available: it prepares reusable copies without modifying originals or delaying slide-show startup. Press n during playback to switch normalized video sound on or off.\n"
             "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
             "13. Update Metadata Extraction in the Photos and Video Clips section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
-            "14. Press Start to begin at the start, or Continue to resume from the last automatically saved stage, phase, medium, and Time-Lapse position. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
-            "15. In the control-file editor, use the row-type filter or Reset Filter, and press Start Slide Show Here at the bottom or in the context menu to launch once from that exact map, medium, date, or music directive. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
+            "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
+            "15. In the control-file editor, use the row-type filter or Reset Filter, and press Start Slide Show Here at the bottom or in the context menu to launch once from that exact map, medium, date, music directive, or slide-show control row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
             "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
-            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Press a during either show to pause or resume background audio.\n\n"
+            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Press Space or Right/Down to leave the title immediately; otherwise it advances automatically after 30 seconds. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Press a during either show to pause or resume background audio.\n\n"
             "Workflow Assistant:\n"
             "- Assistant in the header is enabled for new Adventures and offers a recommended action for the next incomplete step. Return activates the default action.\n"
             "- It guides Project directory, Adventure name, the two explicit GPX or photo-only choices, explicit media acceptance/import, metadata using the visible place-name option, combined control/map creation, and the first slide-show start.\n"
@@ -5431,7 +5607,7 @@ class GPXTrackerController(NSObject):
             "- The Adventure file stores the explicit GPX, slide-show list, generated map family, folder, and other settings.\n"
             "- The GPX track file contains the travel route.\n"
             "- The trackimages folder contains background maps plus companion information used to draw measured routes or media-derived positions and titles at display time. Media-only Adventures contain one map per dated stage and a shared overview.\n"
-            "- The slide-show list controls the final order of photos, videos, date headings, maps, and optional #MUSIC directives.\n"
+            "- The slide-show list controls the final order of photos, videos, date headings, maps, optional #MUSIC audio directives, and optional #CONTROL timing/flow directives.\n"
             "- A .playlist file controls music order and names synchronization positions.\n"
             "- Small companion files next to photos, videos, and maps store dates, positions, and place names used by the program.\n\n"
             "The colored marks at the left of each section show whether the minimum required step is complete. "
@@ -6974,19 +7150,38 @@ class GPXTrackerController(NSObject):
         lines = [serialize_slideshow_control_row(row) for row in self.control_table_rows]
         return "\n".join(lines) + ("\n" if lines else "")
 
-    def _validate_control_table_music_rows(self):
+    def _validate_control_table_directive_rows(self):
+        serialized_lines = []
         for index, row in enumerate(self.control_table_rows, start=1):
             row_type = str(row.get("type", "")).strip().upper()
             if not row_type:
                 show_alert(f"Row {index} has no type.", "Choose a Type before saving the control file.")
                 return False
-            if row_type != "MUS":
-                continue
-            try:
-                parse_music_parameters(str(row.get("name", "")))
-            except MusicSyntaxError as exc:
-                show_alert(f"Invalid music directive in row {index}.", str(exc))
-                return False
+            serialized_lines.append(serialize_slideshow_control_row(row))
+            if row_type == "MUS":
+                try:
+                    parse_music_parameters(str(row.get("name", "")))
+                except MusicSyntaxError as exc:
+                    show_alert(f"Invalid music directive in row {index}.", str(exc))
+                    return False
+            elif row_type == "CTL":
+                try:
+                    parse_control_parameters(str(row.get("name", "")))
+                except ControlSyntaxError as exc:
+                    show_alert(f"Invalid slide-show control directive in row {index}.", str(exc))
+                    return False
+        try:
+            _labels, duplicates = control_labels(serialized_lines)
+        except ControlSyntaxError as exc:
+            show_alert("Invalid slide-show control directive.", str(exc))
+            return False
+        if duplicates:
+            label, first_row, duplicate_row = duplicates[0]
+            show_alert(
+                f"Duplicate slide-show label ${label}.",
+                f"Rows {first_row + 1} and {duplicate_row + 1} define the same label. Labels must be unique.",
+            )
+            return False
         return True
 
     @objc.IBAction
@@ -7883,10 +8078,20 @@ class GPXTrackerController(NSObject):
         if not 0 <= row_index < len(lines):
             show_alert("The selected control-file row is no longer available.")
             return
+        try:
+            control_stat = control_path.stat()
+        except OSError as exc:
+            show_alert("Could not inspect the slide show control file.", str(exc))
+            return
         transient_position = {
-            "version": 2,
+            "version": SLIDESHOW_CHECKPOINT_VERSION,
             "completed": False,
             "control_file": str(control_path.resolve(strict=False)),
+            "control_file_identity": {
+                "path": str(control_path.resolve(strict=False)),
+                "size": int(control_stat.st_size),
+                "mtime_ns": int(control_stat.st_mtime_ns),
+            },
             "playlist_index": row_index,
             "line_text": lines[row_index],
         }
@@ -8169,12 +8374,21 @@ class GPXTrackerController(NSObject):
             except MusicSyntaxError as exc:
                 show_alert("Invalid #MUSIC directive.", str(exc))
                 return
+        if str(candidate.get("type", "")).upper() == "CTL" and str(candidate.get("name", "")).strip():
+            try:
+                directive = parse_control_parameters(str(candidate.get("name", "")))
+            except ControlSyntaxError as exc:
+                show_alert("Invalid #CONTROL directive.", str(exc))
+                return
+            candidate["name"] = serialize_control_parameters(directive)
         self._push_control_table_undo()
         self.control_table_rows[row_index] = candidate
         if self.control_table_view is not None:
             self.control_table_view.setNeedsDisplay_(True)
         if str(candidate.get("type", "")).upper() == "MUS":
             self.performSelector_withObject_afterDelay_("showMusicDirectiveHelp:", None, 0.01)
+        elif str(candidate.get("type", "")).upper() == "CTL":
+            self.performSelector_withObject_afterDelay_("showControlDirectiveHelp:", None, 0.01)
         self.performSelector_withObject_afterDelay_(
             "reloadControlTableAfterEditing:",
             None,
@@ -8233,7 +8447,7 @@ class GPXTrackerController(NSObject):
             "put in double quotes; commas require quotes. Commands and $labels are "
             "case-insensitive.\n\n"
             "$LABEL or pathname   queue titles, then resume the interrupted title\n"
-            "#JUMP $LABEL         continue the playlist from a label\n"
+            "#JUMP/#GOTO $LABEL   continue the playlist from a label\n"
             "#ON / #OFF           open or close the control-file audio gate\n"
             "#CONTINUE            cancel a queue or loop without a hard cut\n"
             "#LOOPLINE            loop later labels/files on this line\n"
@@ -8246,6 +8460,29 @@ class GPXTrackerController(NSObject):
             "Example:\n"
             '#ON, #LOOPLINE, $INTRO, "Song1.mp3"\n\n'
             f"Available labels:\n{label_text}"
+        )
+
+    def _control_directive_help_content(self):
+        styles = ", ".join(CONTROL_TRANSITIONS)
+        return (
+            "#CONTROL: commands\n\n"
+            "Slide-show control rows change playback timing, style, or flow. "
+            "Separate multiple commands with commas; commands and $labels are "
+            "case-insensitive.\n\n"
+            "#LABEL $NAME          define a jump destination\n"
+            "#GOTO $NAME           jump to a label and continue\n"
+            "#JUMP $NAME           alias for #GOTO\n"
+            "#DURATION NN          set following media display time in seconds\n"
+            "#TRANSITION STYLE     select the following playback style\n"
+            "#PAUSE NN             hold the current picture for NN seconds\n"
+            "#END                  apply the configured end behavior\n\n"
+            f"Styles:\n{styles}\n\n"
+            "TIME-LAPSE, TIME_LAPSE, and TIMELAPSE are equivalent. A pause "
+            "does not pause background music.\n\n"
+            "Examples:\n"
+            "#LABEL $CHAPTER2\n"
+            "#DURATION 5, #TRANSITION FADE\n"
+            "#GOTO $CHAPTER2"
         )
 
     def _position_music_directive_help_window(self, anchor_view=None):
@@ -8333,6 +8570,42 @@ class GPXTrackerController(NSObject):
         self.music_directive_help_text.setString_(self._music_directive_help_content())
         self._position_music_directive_help_window(_sender)
         self.music_directive_help_window.orderFront_(None)
+
+    def _position_control_directive_help_window(self, anchor_view=None):
+        """Reuse the proven music-help placement for the CONTROL panel."""
+        music_window = self.music_directive_help_window
+        self.music_directive_help_window = self.control_directive_help_window
+        try:
+            self._position_music_directive_help_window(anchor_view)
+        finally:
+            self.music_directive_help_window = music_window
+
+    def showControlDirectiveHelp_(self, _sender):
+        """Raise the retained, nonmodal #CONTROL syntax reference."""
+        if self.control_directive_help_window is None:
+            window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(260.0, 180.0, 390.0, 280.0),
+                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+                NSBackingStoreBuffered,
+                False,
+            )
+            window.setTitle_("Slide-Show Control Help")
+            window.setReleasedWhenClosed_(False)
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8.0, 8.0, 374.0, 264.0))
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            scroll.setHasVerticalScroller_(True)
+            text_view = NSTextView.alloc().initWithFrame_(scroll.bounds())
+            text_view.setEditable_(False)
+            text_view.setSelectable_(True)
+            text_view.setFont_(NSFont.systemFontOfSize_(13.0))
+            disable_field_editor_text_checking(text_view)
+            scroll.setDocumentView_(text_view)
+            window.contentView().addSubview_(scroll)
+            self.control_directive_help_window = window
+            self.control_directive_help_text = text_view
+        self.control_directive_help_text.setString_(self._control_directive_help_content())
+        self._position_control_directive_help_window(_sender)
+        self.control_directive_help_window.orderFront_(None)
 
     @objc.IBAction
     def moveControlRowsUp_(self, _sender):
@@ -8441,7 +8714,7 @@ class GPXTrackerController(NSObject):
         if self.control_table_path is None:
             show_alert("No slide show control file is loaded.")
             return False
-        if not self._validate_control_table_music_rows():
+        if not self._validate_control_table_directive_rows():
             return False
         control_text = self._control_table_text()
         try:
@@ -8559,6 +8832,8 @@ class GPXTrackerController(NSObject):
             self.control_table_window.orderOut_(None)
         if self.music_directive_help_window is not None:
             self.music_directive_help_window.orderOut_(None)
+        if self.control_directive_help_window is not None:
+            self.control_directive_help_window.orderOut_(None)
 
     def _collect_media_candidates(self, paths, images_only=False):
         allowed = IMAGE_EXTENSIONS if images_only else MEDIA_EXTENSIONS
@@ -10882,7 +11157,9 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def continueSelectedSlideShow_(self, _sender):
-        self._start_slide_show(continue_previous=True)
+        checkpoint = self._choose_slideshow_resume_checkpoint()
+        if checkpoint is not None:
+            self._start_slide_show(transient_resume_position=checkpoint)
 
     @objc.IBAction
     def startSlideShow_(self, _sender):
@@ -11072,31 +11349,247 @@ class GPXTrackerController(NSObject):
             return
         self.set_status(f"Opened {playlist_path.name} in TextEdit.")
 
-    def _validated_slideshow_resume_position(self, control_file_path):
-        position = self.slideshow_resume_position
-        if not isinstance(position, dict) or position.get("completed"):
-            return None
+    @staticmethod
+    def _format_resume_datetime(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
         try:
-            stored_control = Path(str(position.get("control_file", ""))).expanduser().resolve(strict=False)
-            current_control = Path(control_file_path).expanduser().resolve(strict=False)
-            playlist_index = int(position["playlist_index"])
-            lines = [line.strip() for line in current_control.read_text(encoding="utf-8").splitlines() if line.strip()]
-        except (KeyError, OSError, TypeError, ValueError):
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+        local = parsed.astimezone() if parsed.tzinfo is not None else parsed
+        timezone_name = local.tzname() or ""
+        return local.strftime("%d.%m.%Y %H:%M") + (
+            f" {timezone_name}" if timezone_name else ""
+        )
+
+    def _resume_checkpoint_status(self, checkpoint, control_file_path):
+        valid = self._validated_slideshow_resume_position(
+            checkpoint,
+            control_file_path,
+        )
+        if valid is None:
+            return False, "Control file or row changed"
+        try:
+            row_index = int(valid["playlist_index"])
+            line = control_file_path.read_text(encoding="utf-8").splitlines()
+            lines = [item.strip() for item in line if item.strip()]
+            content = lines[row_index]
+        except (OSError, TypeError, ValueError, IndexError):
+            return False, "Control row unavailable"
+        if not content.startswith("#"):
+            try:
+                source_name = parse_slideshow_control_line(content).get("name", "")
+                media_path = (self.current_project_dir / source_name).resolve(strict=False)
+            except Exception:
+                return False, "Media row is invalid"
+            if not media_path.is_file():
+                return False, "Media file missing"
+        elif parse_slideshow_control_line(content).get("type") in {
+            "MAP",
+            "TRK",
+            "BEF",
+            "AFT",
+            "LOC",
+        }:
+            map_name = parse_slideshow_control_line(content).get("name", "")
+            map_path = Path(map_name).expanduser()
+            if not map_path.is_absolute():
+                track_dir = self._track_images_dir()
+                map_path = (track_dir / map_path) if track_dir is not None else map_path
+            if resolve_track_map_variant(map_path, prefer_time_lapse=True) is None:
+                return False, "Map file missing"
+        status = (
+            "Recovered after unexpected player exit"
+            if checkpoint.get("approximate")
+            else "Ready"
+        )
+        audio = checkpoint.get("audio")
+        if isinstance(audio, dict) and self.music_source is not None:
+            playlist = load_audio_playlist(self.music_source, self.music_playlist)
+            if playlist.index_for_path(audio.get("current_file")) is None:
+                return True, status + "; music will use control directives"
+        return True, status
+
+    def _resume_checkpoint_rows(self, control_file_path):
+        rows = []
+        checkpoints = normalize_slideshow_resume_history(
+            self.slideshow_resume_history
+        )
+        for checkpoint in checkpoints:
+            available, status = self._resume_checkpoint_status(
+                checkpoint,
+                control_file_path,
+            )
+            display = checkpoint.get("display")
+            if not isinstance(display, dict):
+                display = {}
+            rows.append(
+                {
+                    "stopped_at": self._format_resume_datetime(
+                        checkpoint.get("stopped_at")
+                    ),
+                    "media_name": str(display.get("media_name") or ""),
+                    "place": str(display.get("place") or ""),
+                    "media_date": self._format_resume_datetime(
+                        display.get("media_date")
+                    ),
+                    "status": status,
+                    "available": available,
+                    "checkpoint": checkpoint,
+                }
+            )
+        return rows
+
+    def _cleanup_resume_selection_window(self):
+        """Hide the retained chooser without releasing PyObjC objects in a callback."""
+        if self.resume_selection_window is not None:
+            self.resume_selection_window.orderOut_(None)
+
+    def _run_retained_resume_selection_window(self):
+        """Refresh and run the retained chooser, returning its selected checkpoint."""
+        columns = (
+            "stopped_at",
+            "media_name",
+            "place",
+            "media_date",
+            "status",
+        )
+        self.resume_selection_data_source.setRows_columns_(
+            self.resume_selection_rows,
+            columns,
+        )
+        self.resume_selection_table.reloadData()
+        self.resume_selection_table.selectRowIndexes_byExtendingSelection_(
+            NSIndexSet.indexSetWithIndex_(0),
+            False,
+        )
+        self.resumeSelectionDidChange_(None)
+        self.resume_selection_window.makeKeyAndOrderFront_(None)
+        NSApp().activateIgnoringOtherApps_(True)
+        NSApp().runModalForWindow_(self.resume_selection_window)
+        result = self.resume_selection_result
+        self._cleanup_resume_selection_window()
+        return result
+
+    def _choose_slideshow_resume_checkpoint(self):
+        control_file_path = self._control_file_path()
+        if control_file_path is None or not control_file_path.is_file():
+            show_alert("Slide show control file does not exist.")
             return None
-        if stored_control != current_control or not 0 <= playlist_index < len(lines):
+        self.resume_selection_rows = self._resume_checkpoint_rows(control_file_path)
+        if not self.resume_selection_rows:
+            show_alert("No Continue checkpoints are available.")
             return None
-        stored_line = position.get("line_text")
-        if isinstance(stored_line, str) and stored_line != lines[playlist_index]:
-            return None
-        return dict(position)
+        self.resume_selection_result = None
+        if self.resume_selection_window is not None:
+            return self._run_retained_resume_selection_window()
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(120.0, 120.0, 1080.0, 500.0),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setTitle_("Continue Slide Show")
+        content = window.contentView()
+        title = self._make_label(
+            "Choose one of the last saved playback positions.",
+            14.0,
+            bold=True,
+        )
+        title.setFrame_(NSMakeRect(18.0, 458.0, 700.0, 24.0))
+        content.addSubview_(title)
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(18.0, 68.0, 1044.0, 378.0)
+        )
+        scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(True)
+        table = ResumeCheckpointTableView.alloc().initWithController_(self)
+        columns = (
+            ("stopped_at", "Last playback", 175.0),
+            ("media_name", "Image / media", 220.0),
+            ("place", "Place", 300.0),
+            ("media_date", "Media date", 185.0),
+            ("status", "Status", 155.0),
+        )
+        for identifier, heading, width in columns:
+            column = NSTableColumn.alloc().initWithIdentifier_(nsstring(identifier))
+            column.setWidth_(width)
+            column.headerCell().setStringValue_(heading)
+            table.addTableColumn_(column)
+        data_source = GPSTrackShowGUIResumeDataSource.alloc().initWithController_(self)
+        data_source.setRows_columns_(
+            self.resume_selection_rows,
+            [item[0] for item in columns],
+        )
+        table.setDataSource_(data_source)
+        table.setDelegate_(data_source)
+        table.setAllowsMultipleSelection_(False)
+        table.setUsesAlternatingRowBackgroundColors_(True)
+        table.setTarget_(self)
+        table.setDoubleAction_("playSelectedResumeCheckpoint:")
+        scroll.setDocumentView_(table)
+        content.addSubview_(scroll)
+        play_button = self._make_button("Play", "playSelectedResumeCheckpoint:")
+        play_button.setFrame_(NSMakeRect(832.0, 20.0, 110.0, FIELD_HEIGHT))
+        play_button.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        content.addSubview_(play_button)
+        abort_button = self._make_button("Abort", "abortResumeSelection:")
+        abort_button.setFrame_(NSMakeRect(952.0, 20.0, 110.0, FIELD_HEIGHT))
+        abort_button.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+        content.addSubview_(abort_button)
+        self.resume_selection_window = window
+        self.resume_selection_table = table
+        self.resume_selection_data_source = data_source
+        self.resume_selection_play_button = play_button
+        self.resume_selection_delegate = (
+            GPSTrackShowGUIResumeSelectionDelegate.alloc().initWithController_(self)
+        )
+        window.setDelegate_(self.resume_selection_delegate)
+        return self._run_retained_resume_selection_window()
+
+    @objc.IBAction
+    def resumeSelectionDidChange_(self, _sender):
+        row = (
+            int(self.resume_selection_table.selectedRow())
+            if self.resume_selection_table is not None
+            else -1
+        )
+        available = (
+            0 <= row < len(self.resume_selection_rows)
+            and bool(self.resume_selection_rows[row].get("available"))
+        )
+        if self.resume_selection_play_button is not None:
+            self.resume_selection_play_button.setEnabled_(available)
+
+    @objc.IBAction
+    def playSelectedResumeCheckpoint_(self, _sender):
+        if self.resume_selection_table is None:
+            return
+        row = int(self.resume_selection_table.selectedRow())
+        if not 0 <= row < len(self.resume_selection_rows):
+            return
+        selected = self.resume_selection_rows[row]
+        if not selected.get("available"):
+            show_alert("This checkpoint is unavailable.", selected.get("status", ""))
+            return
+        self.resume_selection_result = dict(selected["checkpoint"])
+        NSApp().stopModal()
+
+    @objc.IBAction
+    def abortResumeSelection_(self, _sender):
+        self.resume_selection_result = None
+        NSApp().stopModal()
+
+    def _validated_slideshow_resume_position(self, position, control_file_path):
+        return validated_slideshow_resume_position(position, control_file_path)
 
     def _update_slideshow_continue_button(self):
         if not hasattr(self, "slideshow_continue_button"):
             return
-        position = self.slideshow_resume_position
-        self.slideshow_continue_button.setEnabled_(
-            isinstance(position, dict) and not bool(position.get("completed"))
-        )
+        self.slideshow_continue_button.setEnabled_(bool(self.slideshow_resume_history))
 
     def _start_slide_show(
         self,
@@ -11132,17 +11625,28 @@ class GPXTrackerController(NSObject):
             dict(transient_resume_position)
             if isinstance(transient_resume_position, dict)
             else (
-                self._validated_slideshow_resume_position(control_file_path)
+                next(
+                    (
+                        valid
+                        for item in self.slideshow_resume_history
+                        if (
+                            valid := self._validated_slideshow_resume_position(
+                                item,
+                                control_file_path,
+                            )
+                        )
+                        is not None
+                    ),
+                    None,
+                )
                 if continue_previous
                 else None
             )
         )
         if continue_previous and resume_position is None:
-            self.slideshow_resume_position = None
-            self.mark_dirty(immediate=True)
             show_alert(
                 "No saved slide-show position is available.",
-                "Use Start to begin at the start of the current slide-show control file.",
+                "No current checkpoint matches this control file. Use Start to begin at the start.",
             )
             self._update_slideshow_continue_button()
             return
@@ -11175,14 +11679,6 @@ class GPXTrackerController(NSObject):
             self.workflow_assistant_state["slideshow_started"] = True
             self.mark_dirty(immediate=True)
             self.refresh_workflow_assistant()
-            if (
-                not continue_previous
-                and transient_resume_position is None
-                and self.slideshow_resume_position is not None
-            ):
-                self.slideshow_resume_position = None
-                self._update_slideshow_continue_button()
-                self.mark_dirty(immediate=True)
         except Exception as exc:
             show_alert("Could not start slide show.", str(exc))
             self.set_status("Slide show failed to start.")
@@ -11289,6 +11785,10 @@ class GPXTrackerController(NSObject):
             self.slideshow_command_file = None
         resume_state = result.get("resume_state")
         if isinstance(resume_state, dict):
+            if resume_state.get("live") and not resume_state.get("completed"):
+                resume_state = dict(resume_state)
+                resume_state["stopped_at"] = datetime.now().astimezone().isoformat()
+                resume_state["approximate"] = True
             if was_synchronized and not resume_state.get("completed"):
                 final_state = dict(resume_state)
                 final_state["active_row"] = final_state.get("media_index")
@@ -11296,13 +11796,18 @@ class GPXTrackerController(NSObject):
                     final_state["active_row"] = final_state.get("playlist_index")
                 self.slideshow_live_state = final_state
                 self._apply_slideshow_live_state()
-            new_position = None if resume_state.get("completed") else resume_state
-            if new_position != self.slideshow_resume_position:
-                self.slideshow_resume_position = new_position
+            old_history = list(self.slideshow_resume_history)
+            self.slideshow_resume_history = append_slideshow_checkpoint(
+                self.slideshow_resume_history,
+                resume_state,
+            )
+            if self.slideshow_resume_history != old_history:
                 self._update_slideshow_continue_button()
                 if self.save_project_configuration():
-                    suffix = " Resume position saved automatically." if new_position is not None else " Resume position cleared."
-                    self.set_status(str(result.get("message", "Slide show closed.")) + suffix)
+                    self.set_status(
+                        str(result.get("message", "Slide show closed."))
+                        + " Continue checkpoint saved automatically."
+                    )
                     self.control_table_sync_enabled = False
                     return
         self.control_table_sync_enabled = False
@@ -11319,21 +11824,6 @@ class GPXTrackerController(NSObject):
     ):
         settings = self.parameters
         initial_style = str(settings["slideshow.transition"]).upper()
-        if isinstance(resume_position, dict):
-            saved_style = str(resume_position.get("style") or "").strip().upper()
-            if saved_style in {
-                "TIME_LAPSE",
-                "BLEND",
-                "FADE",
-                "SWITCH",
-                "EXPAND",
-                "COLLAGE",
-                "QUAD",
-                "RANDOM",
-            }:
-                initial_style = saved_style
-            elif str(resume_position.get("mode") or "").casefold() == "time-lapse":
-                initial_style = "TIME_LAPSE"
         args = [
             str(project_dir),
             "--inputlist",
@@ -11447,8 +11937,9 @@ class GPXTrackerController(NSObject):
             args.append("--no-mapwindow")
         if settings["slideshow.display_swap"]:
             args.append("--switch-display")
-        if settings["slideshow.repeat"]:
-            args.append("--repeat")
+        args.extend(
+            ["--end-behavior", str(settings["slideshow.end_behavior"])]
+        )
         if settings["slideshow.manual_start"]:
             args.append("--keypressed")
         fullscreen_mode = settings["slideshow.fullscreen"]
@@ -11471,6 +11962,22 @@ class GPXTrackerController(NSObject):
             phase = resume_position.get("phase")
             if isinstance(phase, str) and phase:
                 args.extend(["--resume-phase", phase])
+            audio_state = resume_position.get("audio")
+            if isinstance(audio_state, dict):
+                args.extend(
+                    [
+                        "--resume-audio-state",
+                        json.dumps(audio_state, ensure_ascii=False, separators=(",", ":")),
+                    ]
+                )
+            control_state = resume_position.get("control")
+            if isinstance(control_state, dict):
+                args.extend(
+                    [
+                        "--resume-control-state",
+                        json.dumps(control_state, separators=(",", ":")),
+                    ]
+                )
         if getattr(sys, "frozen", False):
             executable = self._bundled_slideshow_executable()
             if executable is None:
@@ -13090,6 +13597,14 @@ class GPXTrackerController(NSObject):
                 pass
             self.music_directive_help_window = None
             self.music_directive_help_text = None
+        if self.control_directive_help_window is not None:
+            try:
+                self.control_directive_help_window.orderOut_(None)
+                self.control_directive_help_window.close()
+            except Exception:
+                pass
+            self.control_directive_help_window = None
+            self.control_directive_help_text = None
         if self.main_help_window is not None:
             try:
                 self.main_help_window.orderOut_(None)

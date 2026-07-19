@@ -1,8 +1,11 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from GPXEditor import (
     GPXEditorController,
+    PlotView,
+    TrackInspectorController,
     compact_elevation_status,
     compact_xy_status,
     elevation_distance_range_for_map_extent,
@@ -14,6 +17,82 @@ from GPXEditor import (
     normalize_inspector_timestamp_edit,
     visible_simplified_polyline_runs,
 )
+
+
+class InspectorPointSelectionTests(unittest.TestCase):
+    def make_controller(self, rows, *, suppressed=False, marker=4):
+        track = object()
+        plot = SimpleNamespace(
+            marker=marker,
+            move_cursor_to_track_point=Mock(),
+            setNeedsDisplay_=Mock(),
+        )
+        parent = SimpleNamespace(refresh_elevation_profile_for_plot_view=Mock())
+        controller = SimpleNamespace(
+            suppress_selection_change=suppressed,
+            update_info_label=Mock(),
+            selected_row_indexes=Mock(return_value=list(rows)),
+            plot_view=plot,
+            track=track,
+            parent=parent,
+        )
+        return controller, plot, parent, track
+
+    def test_manual_table_selection_replaces_marker_without_stealing_focus(self):
+        controller, plot, _parent, track = self.make_controller([7, 8, 9])
+
+        TrackInspectorController.selection_changed(controller)
+
+        self.assertIsNone(plot.marker)
+        plot.move_cursor_to_track_point.assert_called_once_with(
+            track,
+            9,
+            controller,
+            sync_table=False,
+            focus_plot=False,
+        )
+
+    def test_empty_manual_selection_clears_marker_and_redraws_both_plots(self):
+        controller, plot, parent, _track = self.make_controller([])
+
+        TrackInspectorController.selection_changed(controller)
+
+        self.assertIsNone(plot.marker)
+        plot.move_cursor_to_track_point.assert_not_called()
+        plot.setNeedsDisplay_.assert_called_once_with(True)
+        parent.refresh_elevation_profile_for_plot_view.assert_called_once_with(plot)
+
+    def test_programmatic_map_selection_keeps_marker(self):
+        controller, plot, parent, _track = self.make_controller(
+            [2, 3, 4],
+            suppressed=True,
+            marker=2,
+        )
+
+        TrackInspectorController.selection_changed(controller)
+
+        self.assertEqual(plot.marker, 2)
+        controller.update_info_label.assert_not_called()
+        plot.move_cursor_to_track_point.assert_not_called()
+        parent.refresh_elevation_profile_for_plot_view.assert_not_called()
+
+    def test_disjoint_table_selection_produces_separate_plot_ranges(self):
+        track = object()
+        inspector = SimpleNamespace(
+            track=track,
+            selected_row_indexes=lambda: [2, 3, 7, 9, 10],
+        )
+        plot = SimpleNamespace(
+            marker=None,
+            cursor=None,
+            inspector=inspector,
+            group_point_indexes=lambda indexes: PlotView.group_point_indexes(None, indexes),
+        )
+
+        self.assertEqual(
+            PlotView.selected_ranges_for_track(plot, track),
+            [(2, 3), (7, 7), (9, 10)],
+        )
 
 
 class InspectorTableDocumentSizeTests(unittest.TestCase):
