@@ -9,7 +9,7 @@ services:
       - /var/lib/mycamino/releases:/releases:ro
     networks: [public]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health/', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8003/health/', headers={'Host': 'localhost', 'X-Forwarded-Proto': 'https'}), timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

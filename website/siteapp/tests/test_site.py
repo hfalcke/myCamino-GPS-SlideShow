@@ -52,16 +52,24 @@ class PublicSiteTests(TestCase):
         self.assertEqual(BetaRegistration.objects.count(), 1)
         self.assertEqual(len(mail.outbox), 1)
 
-    def test_verification_establishes_download_session_and_consumes_token(self):
+    def test_verification_establishes_download_session_and_remains_usable_until_expiry(self):
         token = "known-verification-token"
         registration = BetaRegistration.objects.create(email="walker@example.org", consent_at=timezone.now(), token_digest=digest_token(token), token_expires_at=timezone.now()+timezone.timedelta(hours=1))
         response = self.client.get(reverse("verify-beta", args=[token]))
         self.assertRedirects(response, reverse("protected-download"), fetch_redirect_response=False)
         registration.refresh_from_db()
         self.assertIsNotNone(registration.verified_at)
-        self.assertEqual(registration.token_digest, "")
+        self.assertEqual(registration.token_digest, digest_token(token))
+        self.assertGreater(registration.token_expires_at, timezone.now())
         self.assertEqual(registration.download_count, 1)
         self.assertEqual(self.client.get(reverse("authorize-download")).status_code, 204)
+        second_browser = self.client_class()
+        self.assertRedirects(
+            second_browser.get(reverse("verify-beta", args=[token])),
+            reverse("protected-download"),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(second_browser.get(reverse("authorize-download")).status_code, 204)
 
     def test_expired_token_does_not_authorize(self):
         token = "expired"

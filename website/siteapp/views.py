@@ -107,10 +107,9 @@ def verify_beta(request, token):
         messages.error(request, "This beta link has expired. Request a new one below.")
         return redirect("beta-download")
     with transaction.atomic():
-        registration.verified_at = now
-        registration.token_digest = ""
-        registration.token_expires_at = None
-        registration.save(update_fields=["verified_at", "token_digest", "token_expires_at", "updated_at"])
+        if registration.verified_at is None:
+            registration.verified_at = now
+            registration.save(update_fields=["verified_at", "updated_at"])
     request.session["beta_registration_id"] = registration.pk
     request.session.set_expiry(settings.DOWNLOAD_SESSION_SECONDS)
     count_download(registration)
