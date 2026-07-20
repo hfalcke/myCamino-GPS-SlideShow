@@ -1,18 +1,26 @@
 # myCamino GPX Editor User Guide
 
+## License and source code
+
+The GPX Editor is part of the GPL-3.0-or-later licensed myCamino project. Open
+**Help** and use **License**, **Third-Party Notices**, or **Source Code** to read
+the documents included with the installed application.
+
 `myCamino GPX Editor` edits one or more GPX files and saves one combined GPX
 file in the current table order. It is a native macOS Cocoa application and can
 run standalone or be opened from `myCamino GPS Track Show`.
 
-Start standalone with:
+After installation, start the editor by clicking the **myCamino GPX Editor**
+icon in Applications. Because the beta is unsigned, Control-click the icon and
+choose **Open** on the first launch; after that, a normal click opens it.
+
+Experts working directly from the source code can instead use the command-line
+interface (CLI):
 
 ```bash
 ./.venv/bin/python GPXEditor.py
 ./.venv/bin/python GPXEditor.py input.gpx --output-file output.gpx
 ```
-
-When installed from the DMG, launch `myCamino GPX Editor.app` directly for
-standalone GPX work.
 
 When opened from the main GPS Track Show GUI, it receives input GPX files and a
 default output file automatically.

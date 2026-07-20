@@ -1,0 +1,37 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="myCamino turns GPS tracks, photographs, videos, maps and music into an interactive replay of a multi-day adventure.">
+  <meta name="theme-color" content="#1d2824">
+  <title>{% block title %}myCamino GPS SlideShow{% endblock %}</title>
+  <link rel="icon" href="{% static 'siteapp/images/mycamino-logo.png' %}">
+  <link rel="stylesheet" href="{% static 'siteapp/site.css' %}">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="{% url 'home' %}">
+      <img src="{% static 'siteapp/images/mycamino-logo.png' %}" alt="" width="48" height="48">
+      <span><strong>myCamino</strong><small>GPS SlideShow</small></span>
+    </a>
+    <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button>
+    <nav id="site-nav" aria-label="Main navigation">
+      <a href="{% url 'home' %}">Home</a>
+      <a href="{% url 'documentation' %}">Documentation</a>
+      <a href="{% url 'faq' %}">FAQ</a>
+      <a href="{% url 'contact' %}">Contact</a>
+      <a class="nav-download" href="{% url 'beta-download' %}">Get the beta</a>
+    </nav>
+  </header>
+  {% if messages %}<div class="messages" role="status">{% for message in messages %}<p class="message {{ message.tags }}">{{ message }}</p>{% endfor %}</div>{% endif %}
+  <main id="main">{% block content %}{% endblock %}</main>
+  <footer class="site-footer">
+    <div><strong>myCamino GPS SlideShow</strong><br><span>Free and open-source software for the long way home.</span></div>
+    <nav aria-label="Legal navigation"><a href="{% url 'privacy' %}">Privacy</a><a href="{% url 'imprint' %}">Imprint</a><a href="https://github.com/hfalcke/myCamino-GPS-SlideShow">Source code</a></nav>
+    <p>GPL-3.0-or-later · No analytics · No advertising cookies</p>
+  </footer>
+  <script src="{% static 'siteapp/site.js' %}" defer></script>
+</body>
+</html>

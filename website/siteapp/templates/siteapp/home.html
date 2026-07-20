@@ -1,0 +1,74 @@
+{% extends "siteapp/base.html" %}{% load static %}
+{% block body_class %}home-page{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="hero-panel">
+    <p class="eyebrow">Your trail. Your photographs. Your story.</p>
+    <h1>Walk it once.<br>Relive every stage.</h1>
+    <p class="lead">myCamino turns the GPS trail and precious photographs from a multi-day adventure into a vivid, animated slide show.</p>
+    <div class="actions"><a class="button primary" href="{% url 'beta-download' %}">Join the macOS beta</a><a class="button ghost" href="{% url 'documentation' %}">Explore the workflow</a></div>
+    <p class="availability">Apple Silicon Mac · Unsigned beta · Free under GPL-3.0-or-later</p>
+  </div>
+  <a class="scroll-cue" href="#features">Discover the journey <span aria-hidden="true">↓</span></a>
+</section>
+
+<section id="features" class="section intro-section">
+  <p class="eyebrow">Built for the serious backpacker</p>
+  <h2>Your adventure was more than a folder of photographs.</h2>
+  <p class="section-lead">Reconnect every stage, summit, village and quiet hour. myCamino matches your media to the journey, draws it over OpenStreetMap and lets time move along the trail again.</p>
+  <div class="feature-grid">
+    <article><span class="feature-number">01</span><h3>Journey-aware replay</h3><p>Combine GPX tracks with photographs and videos, then watch a moving time-lapse marker retrace each day on the map.</p></article>
+    <article><span class="feature-number">02</span><h3>Automated, not rigid</h3><p>Let the assistant prepare metadata, maps and stages—then rearrange files, music, tracks and timing until the story is yours.</p></article>
+    <article><span class="feature-number">03</span><h3>A real GPX workshop</h3><p>Inspect, reorder, split, join, smooth, correct and export tracks in the included native GPX Editor.</p></article>
+  </div>
+</section>
+
+<a class="story-teaser" href="#programmer-testimony">
+  <picture>
+    <source srcset="{% static 'siteapp/images/programmer-camino.webp' %}" type="image/webp">
+    <img src="{% static 'siteapp/images/programmer-camino.jpg' %}" alt="A lone walker on the Camino at dawn" loading="lazy">
+  </picture>
+  <span><small>From the programmer</small><strong>“Walking the Camino over 2300 km …”</strong><em>Read the story behind myCamino ↓</em></span>
+</a>
+
+<section class="section showcase">
+  <div class="showcase-copy"><p class="eyebrow">Maps meet memories</p><h2>See where every photograph belongs.</h2><p>Stage maps, tour overviews, elevation profiles and media locations create the geographic spine of the show. Standard and Time-Lapse presentations remain under your control throughout.</p><ul class="check-list"><li>OpenStreetMap and Esri map presets</li><li>GPS-aware photograph and video placement</li><li>Optional place names, music and PDF track summaries</li><li>Resume exactly where the last show stopped</li></ul></div>
+  <div class="screen-card slideshow-gallery" data-gallery aria-label="Time-Lapse slide-show gallery">
+    <figure class="gallery-slide is-active"><img src="{% static 'siteapp/images/collage.webp' %}" alt="A myCamino slide-show collage from a walking journey" loading="lazy"><figcaption>A generated stage collage brings together place, date and photographs.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-overview.webp' %}" alt="Time-Lapse stage map with the full Camino overview inset"><figcaption>Keep the whole 2,300 km journey in view while a stage begins.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-elevation.webp' %}" alt="Time-Lapse map with an elevation profile over the current stage"><figcaption>Follow the stage route together with its animated elevation profile.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-sunrise.webp' %}" alt="A sunrise photograph displayed over its position on the Time-Lapse map"><figcaption>See each photograph in the place and moment where it belongs.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-photo-mountains.webp' %}" alt="A mountain landscape displayed over its position on the animated Time-Lapse map"><figcaption>Watch the route advance as photographs from the mountain stage appear.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-photo-horses.webp' %}" alt="Horses on a green hillside displayed over the animated Time-Lapse map"><figcaption>Relive photographs and changing locations together as the day unfolds.</figcaption></figure>
+    <div class="gallery-controls" aria-label="Choose gallery image">
+      <button class="is-active" type="button" data-slide aria-label="Show collage" aria-current="true"></button>
+      <button type="button" data-slide aria-label="Show journey overview"></button>
+      <button type="button" data-slide aria-label="Show elevation profile"></button>
+      <button type="button" data-slide aria-label="Show sunrise photograph"></button>
+      <button type="button" data-slide aria-label="Show mountain photograph"></button>
+      <button type="button" data-slide aria-label="Show horses photograph"></button>
+      <button class="gallery-toggle" type="button">Pause</button>
+    </div>
+  </div>
+</section>
+
+<section class="section showcase reverse">
+  <div class="showcase-copy"><p class="eyebrow">Power when you need it</p><h2>Take charge of the trail.</h2><p>The standalone myCamino GPX Editor turns scattered recordings into a coherent adventure. Keep the original geometry safe while inspecting details and creating the route the slide show should follow.</p><a class="text-link" href="{% url 'documentation-detail' 'gpx-editor' %}">Read the GPX Editor guide →</a></div>
+  <figure class="screen-card"><img src="{% static 'siteapp/images/gpx-editor.webp' %}" alt="myCamino GPX Editor displaying tracks over a map" loading="lazy"><figcaption>Arrange and edit track stages directly on the map.</figcaption></figure>
+</section>
+
+<section id="programmer-testimony" class="section programmer-testimony">
+  <div class="testimony-heading"><p class="eyebrow">Why I made myCamino</p><h2>A long walk, thousands of photographs, and one weekend experiment.</h2></div>
+  <blockquote>
+    <p>Walking the Camino over 2,300 km, over five years, and having taken thousands of pictures and over a hundred GPS tracks, I was looking for a program to display maps, tracks, and pictures together. The slick commercial products I found weren’t up to the job, and with time I couldn’t remember where pictures were taken and when. So I never watched my pictures.</p>
+    <p>As a physicist and someone with over 40 years of experience in computer programming, I thought I had to do it myself. The opportunity arose when I started a little experiment in AI-assisted programming. For my own education and research, I wanted to find out whether it worked. It did—and the little weekend experiment grew bigger and bigger, taking more weekends, but in the end I got what I wanted.</p>
+    <p>Now I am happy to leave it to others to use and enjoy for free. Please note that this program is in a testing phase. It comes with no warranty or promises. You can help the community make it better by letting me know when you find an error. I have tested it a lot, but there are probably still many undetected bugs. Try it, and let me know whether it was useful.</p>
+    <footer>— Heino Falcke</footer>
+  </blockquote>
+</section>
+
+<section class="section open-source">
+  <div><p class="eyebrow">Free as the trail</p><h2>Open source, with the exact source included.</h2></div>
+  <div><p>myCamino is free to use, study, modify and redistribute under GPL-3.0-or-later. Each release DMG includes the corresponding myCamino source, FFmpeg source information and third-party notices.</p><div class="actions"><a class="button primary" href="{% url 'beta-download' %}">Request the beta</a><a class="button ghost" href="https://github.com/hfalcke/myCamino-GPS-SlideShow">View on GitHub</a></div></div>
+</section>
+{% endblock %}

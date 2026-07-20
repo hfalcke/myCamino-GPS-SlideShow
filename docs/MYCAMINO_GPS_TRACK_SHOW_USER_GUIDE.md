@@ -1,5 +1,13 @@
 # myCamino GPS Track Show User Guide
 
+## License and source code
+
+myCamino is free and open-source software licensed under GPL-3.0-or-later.
+Choose **Help**, then **License**, **Third-Party Notices**, or **Source Code** to
+read the documents installed with the application. Release DMGs also contain
+the exact source archive used for that build. Donations may be invited in the
+future, but are voluntary and do not change available features or GPL rights.
+
 `myCamino GPS Track Show` helps you assemble one adventure from GPX tracks,
 photos, videos, map images, geolocation metadata, and a final slide-show
 control file.
@@ -7,13 +15,19 @@ control file.
 An adventure is one project directory. The project directory contains all files
 created or imported by the workflow.
 
-Start the GUI with:
+After installation, start the application by clicking the
+**myCamino GPS Track Show** icon in Applications. Because the beta is unsigned,
+Control-click the icon and choose **Open** on the first launch; after that, a
+normal click opens it.
+
+Experts working directly from the source code can instead use the command-line
+interface (CLI):
 
 ```bash
 ./.venv/bin/python GPSTrackShowGUI.py
 ```
 
-You can also preload a project:
+Experts can also preload a project:
 
 ```bash
 ./.venv/bin/python GPSTrackShowGUI.py --project-directory /path/to/project
@@ -78,10 +92,6 @@ rows offer Use Existing Media, Import More, or Not Yet, followed by one
 Continue button. Return activates the recommended choice. Click
 its `x`, or clear **Assistant** in the header, to disable it for the active
 Adventure. Choices and completed steps are saved automatically.
-
-Existing Adventures without the newer confirmation fields are treated as
-already confirmed, so onboarding does not unexpectedly restart. Genuinely
-missing GPX files, maps, media, or control files can still reactivate a step.
 
 ## Adventure Section
 
@@ -224,8 +234,7 @@ The PNG stores the basemap and its reserved header area; the slideshow, map
 viewer, and PDF export draw routes, location dots, endpoints, and titles from
 the matching map information. Therefore changing route colors, line widths,
 point styles, or header visibility in Settings no longer requires downloading
-the basemap again. Maps made by older versions remain usable and keep their
-already printed route until they are updated once.
+the basemap again.
 
 GPX-stage maps reserve a 25% taller black header. By default their title uses
 the reverse-geocoded start and destination of the track (`PLACE1 - PLACE2`);
@@ -256,7 +265,7 @@ locations and must not be interpreted as a measured walking route.
 2. Accept media already in the project folder or import more.
 3. Metadata preparation starts automatically. Keep **Add place names** selected
    unless you only want metadata; current sidecars are reused and only missing,
-   invalid, legacy, or changed metadata is extracted.
+   invalid, or changed metadata is extracted.
 4. Map Generation starts automatically. Media are grouped by date and the
    program creates one overview plus Standard and Time-Lapse variants for every
    located stage.
@@ -340,7 +349,7 @@ Controls:
 - Import: choose images and videos to import into the project directory.
 - View: open the project media browser.
 - Folder icon: open project media in Finder.
-- Update Metadata Extraction: refresh only missing, invalid, legacy, or changed
+- Update Metadata Extraction: refresh only missing, invalid, or changed
   companion metadata. The button is separated at the right of the section
   because it is a maintenance action rather than an import/view action.
 - If current Track Map sidecars are missing start or destination place names,
@@ -387,7 +396,7 @@ Media browser window:
 - Double-click a row or press View to open the media viewer.
 - The normal **Update Control File** workflow analyzes clear changes automatically.
   Use **Choose Other Media...** only when you deliberately want to re-read an
-  older or otherwise unchanged file.
+  otherwise unchanged file.
 
 Media viewer window:
 
@@ -416,7 +425,7 @@ Controls:
 - Edit: open the editable control-file table.
 - Update Control File: check Track Map references and media together. It adds,
   replaces, or removes map references that no longer agree with the current
-  generated maps, finds imported, missing, invalid, legacy, or changed media,
+  generated maps, finds imported, missing, invalid, or changed media,
   and shows one review before writing. It does not render maps; use
   **Generate and Update Maps** for that.
 
@@ -524,16 +533,6 @@ Files created:
   original extension, for example `IMG_4104.mov.json` or
   `IMG_4104.jpeg.json`.
 
-Older projects created before this naming convention can be migrated without
-losing their saved place names by running:
-
-```bash
-./.venv/bin/python GetGeoLocations.py /path/to/project --migrate-media-sidecars
-```
-
-The migration never changes image or video files. Unclear old metadata files
-are preserved with a `.legacy-sidecar` name for review.
-
 The status line below the buttons says either `No control file available yet`
 or shows statistics such as number of images, videos, track maps, date rows,
 whether an overview map is present, how many images have place names, and the
@@ -605,15 +604,8 @@ Update Control File:
 - If maps or their summary are outdated, it asks you to run **Generate and
   Update Maps** first. Metadata can still be refreshed, but track-dependent
   media placement waits for current map information.
-- Scans for clearly new, changed, or legacy media and analyzes those files immediately.
+- Scans for clearly new or changed media and analyzes those files immediately.
   Current files intentionally omitted from the control list are not proposed.
-- Rechecks older sidecars whose freshness is Unknown once. The processing
-  window labels this as `Legacy sidecar: extracting metadata once to establish
-  file signature`. Successful updates add a file signature and metadata source
-  so later scans recognize them as Current.
-- This legacy verification does not reverse-geocode media merely because its
-  unchanged GPS lacks a place name. Use **Update Metadata Extraction** with
-  **Add place names** selected for that separate task.
 - Use **Choose Other Media...** and **Recheck Selected** to inspect a Current
   file again when you nevertheless suspect its embedded metadata changed.
 - Shows old/new date, GPS, place, and proposed control section before writing;
@@ -778,7 +770,7 @@ duration for each static phase. Left/Right step through these visible phases;
 going left from the overview enters the previous stage rather than merely
 rewinding the moving marker. In Standard playback,
 the track map is shown once at the beginning of each stage. The Settings option
-**Track map before each medium** can restore the older behavior of showing the
+**Track map before each medium** can show the
 marked track map before every photo or video; it is off by default.
 
 Press `w` during playback to switch between one window and a separate overview
@@ -885,11 +877,10 @@ can restart audio until `a` is pressed again. The crossfade duration is set in
 The time-lapse uses the recorded GPX point times where available. Missing times
 are estimated along the travelled distance; when a track has no usable duration,
 it uses a walking speed of 3.5 km/h. Creating or playing a time-lapse does not
-change the GPX file or its map information. Track maps created or updated with
-the current version include cumulative distance, elevation, and timing data.
-Older projects can be migrated once without recreating their map PNG files. If
-that information is unavailable, the player uses its safe distance-based
-fallback instead of changing project files while it starts.
+change the GPX file or its map information. Track maps include cumulative
+distance, elevation, and timing data. If that information is unavailable, the
+player uses its safe distance-based fallback instead of changing project files
+while it starts.
 
 The position marker normally continues moving while a photo or video is shown.
 If it reaches the scheduled position of another medium before the current one
@@ -911,7 +902,8 @@ do not count as extra travelled stages.
 
 ## Standalone GPX Editor App
 
-The DMG also contains `myCamino GPX Editor.app`. This is the same GPX editor
+The DMG also contains `myCamino GPX Editor.app`. Start it by clicking the
+**myCamino GPX Editor** icon in Applications. This is the same GPX editor
 that opens from Add & Edit Tracks, but it can also be launched directly for GPX
 work that is not part of a slide-show project. Its gear button edits GPX
 processing, PDF export, and map-service settings. Standalone settings are kept

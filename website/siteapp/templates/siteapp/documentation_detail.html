@@ -1,0 +1,4 @@
+{% extends "siteapp/base.html" %}
+{% block body_class %}docs-page{% endblock %}
+{% block title %}{{ title }} guide · myCamino{% endblock %}
+{% block content %}<section class="docs-layout"><aside class="docs-nav"><a href="{% url 'documentation' %}">← All documentation</a><h2>{{ title }}</h2><a href="{% url 'documentation-detail' 'slideshow' %}">GPS Track Show</a><a href="{% url 'documentation-detail' 'gpx-editor' %}">GPX Editor</a></aside><article class="prose">{{ guide_html }}</article></section>{% endblock %}

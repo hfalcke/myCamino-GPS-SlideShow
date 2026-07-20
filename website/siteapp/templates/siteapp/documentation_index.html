@@ -1,0 +1,10 @@
+{% extends "siteapp/base.html" %}{% load static %}
+{% block title %}Documentation · myCamino{% endblock %}
+{% block content %}
+<section class="page-hero compact"><div><p class="eyebrow">Documentation</p><h1>From trail folder to living journey.</h1><p>Start with the guided workflow, then go as deep as your adventure demands.</p></div></section>
+<section class="section card-grid">
+  <a class="guide-card" href="{% url 'documentation-detail' 'slideshow' %}"><span>01</span><h2>GPS Track Show</h2><p>Create an Adventure, import tracks and media, generate maps, arrange the control file and run the show.</p><strong>Open the user guide →</strong></a>
+  <a class="guide-card" href="{% url 'documentation-detail' 'gpx-editor' %}"><span>02</span><h2>GPX Editor</h2><p>Combine, inspect, correct, split, join, plot and export the GPS tracks that shape the journey.</p><strong>Open the editor guide →</strong></a>
+  <article class="guide-card visual"><img src="{% static 'siteapp/images/main-gui.webp' %}" alt="The myCamino adventure setup window" loading="lazy"></article>
+</section>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "siteapp/base.html" %}
+{% block title %}FAQ · myCamino{% endblock %}
+{% block content %}<section class="page-hero compact"><div><p class="eyebrow">Questions from the trail</p><h1>Frequently asked questions.</h1></div></section><section class="section faq-list">
+<details open><summary>What kind of journey is myCamino for?</summary><p>It is designed around multi-day walking and backpacking adventures, but any trip with photographs and optional GPS tracks can become an Adventure.</p></details>
+<details><summary>Which Macs are supported?</summary><p>The current beta is a native macOS build for Apple Silicon Macs. Intel Macs and other operating systems are not supported by this beta.</p></details>
+<details><summary>Why does macOS warn me when I open it?</summary><p>The beta is not Apple-notarized. Copy the app to Applications, Control-click it, select Open and confirm. This is required only for the first launch.</p></details>
+<details><summary>Do I need a GPX track?</summary><p>No. myCamino can build stages from GPS positions embedded in your photographs and videos. GPX recordings provide the richest route replay and statistics.</p></details>
+<details><summary>Are my photographs uploaded?</summary><p>No. Your media remain in your local Adventure folder. Internet requests are used for map tiles and, when enabled, place-name lookup.</p></details>
+<details><summary>Can I change the automated result?</summary><p>Yes. Rearrange media, tracks and music, edit the slide-show control file, tune map and playback settings, or correct tracks in the GPX Editor.</p></details>
+<details><summary>Is myCamino really free?</summary><p>Yes. It is free and open-source under GPL-3.0-or-later. The release includes its corresponding source and third-party license information.</p></details>
+<details><summary>Where can I report a beta problem?</summary><p>Use the <a href="{% url 'contact' %}">contact form</a> and include what you were doing, your macOS version and the wording of any error.</p></details>
+</section>{% endblock %}

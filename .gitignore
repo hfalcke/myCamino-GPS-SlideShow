@@ -7,3 +7,6 @@ build/
 .venv.*
 readme/
 __pycache__/
+website/db.sqlite3
+website/staticfiles/
+website/.pytest_cache/
