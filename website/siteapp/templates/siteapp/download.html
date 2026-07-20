@@ -1,13 +1,24 @@
 {% extends "siteapp/base.html" %}
 {% block title %}Download the beta · myCamino{% endblock %}
 {% block content %}
-<section class="page-hero compact"><div><p class="eyebrow">Private beta</p><h1>Bring your journey back to life.</h1><p>Leave your email to receive a verification link for the latest Apple-Silicon macOS beta.</p></div></section>
+<section class="page-hero compact"><div><p class="eyebrow">Private beta</p><h1>Bring your journey back to life.</h1><p>Leave your email to receive a verification link for the latest Apple-Silicon macOS beta.</p><p class="hero-install-alert"><strong>Unsigned beta:</strong> recent macOS versions require approval through Privacy &amp; Security. <a href="#install-beta">Read the installation steps before downloading ↓</a></p></div></section>
 <section class="section form-layout">
+  <article id="install-beta" class="install-notice" aria-labelledby="install-heading">
+    <div><p class="eyebrow">Important before downloading</p><h2 id="install-heading">This beta is unsigned. Recent macOS versions require an extra approval step.</h2><p>If macOS says Apple cannot check the app for malicious software, this is the expected Gatekeeper warning for this beta. Do not choose <strong>Move to Bin</strong> if you intend to run myCamino.</p></div>
+    <ol>
+      <li>Copy <strong>myCamino GPS Track Show.app</strong> and, if wanted, <strong>myCamino GPX Editor.app</strong> from the DMG into <strong>Applications</strong>.</li>
+      <li>Try to open the app. At the warning, choose <strong>Done</strong> or dismiss it—not <strong>Move to Bin</strong>.</li>
+      <li>Within about one hour, open <strong>Apple menu → System Settings → Privacy &amp; Security</strong> (<em>Datenschutz &amp; Sicherheit</em>) and scroll down to <strong>Security</strong>.</li>
+      <li>Find the message about myCamino and click <strong>Open Anyway</strong> (<em>Dennoch öffnen</em>). Authenticate, then confirm <strong>Open</strong>.</li>
+      <li>Repeat these steps separately for the GPX Editor if you use it. Future launches work with a normal double-click.</li>
+    </ol>
+    <p class="install-safety"><strong>Security check:</strong> only override Gatekeeper for the DMG downloaded from this website, and compare its SHA-256 checksum with the release card below. See <a href="https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac">Apple’s official instructions</a>.</p>
+  </article>
   <div class="form-panel"><h2>Request beta access</h2><form method="post" novalidate>{% csrf_token %}{{ form.website }}
     <div class="field"><label for="{{ form.email.id_for_label }}">Email address</label>{{ form.email }}{{ form.email.errors }}</div>
     <div class="check-field">{{ form.consent }}<label for="{{ form.consent.id_for_label }}">{{ form.consent.label }}</label>{{ form.consent.errors }}</div>
     {% if form.non_field_errors %}{{ form.non_field_errors }}{% endif %}<button class="button primary" type="submit">Email my download link</button>
   </form><p class="fine-print">We use your address only for beta access, essential beta communication and feedback. The link expires after 24 hours.</p></div>
-  <aside class="release-card"><p class="eyebrow">Current release</p>{% if release %}<h2>{{ release.label }}</h2><dl><div><dt>Platform</dt><dd>macOS · Apple Silicon</dd></div><div><dt>Size</dt><dd>{{ release.file_size|filesizeformat }}</dd></div><div><dt>Released</dt><dd>{{ release.release_date|date:"j F Y" }}</dd></div></dl><p><strong>SHA-256</strong><code>{{ release.sha256 }}</code></p>{% else %}<p>No beta release is active.</p>{% endif %}<p class="warning"><strong>Unsigned beta:</strong> after copying the app to Applications, Control-click it, choose Open and confirm the first launch.</p></aside>
+  <aside class="release-card"><p class="eyebrow">Current release</p>{% if release %}<h2>{{ release.label }}</h2><dl><div><dt>Platform</dt><dd>macOS · Apple Silicon</dd></div><div><dt>Size</dt><dd>{{ release.file_size|filesizeformat }}</dd></div><div><dt>Released</dt><dd>{{ release.release_date|date:"j F Y" }}</dd></div></dl><p><strong>SHA-256</strong><code>{{ release.sha256 }}</code></p>{% else %}<p>No beta release is active.</p>{% endif %}<p class="warning"><strong>Unsigned beta:</strong> the Gatekeeper warning is expected. Follow the <a href="#install-beta">prominent installation steps above</a>, including <strong>Privacy &amp; Security → Open Anyway</strong>.</p></aside>
 </section>
 {% endblock %}

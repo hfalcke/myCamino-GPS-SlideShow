@@ -30,3 +30,6 @@
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.guide-card{transition:none}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{transition:none!important;animation:none!important}}
 .docs-page .site-header{background:#111a17}.docs-page .docs-layout{padding-top:10rem}
+.availability a{color:#fff;font-weight:750}.install-notice{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,.8fr) minmax(320px,1.2fr);gap:clamp(1.5rem,5vw,4rem);padding:clamp(1.4rem,4vw,3rem);background:#fff8e8;border:2px solid var(--gold);box-shadow:0 16px 50px rgba(72,48,14,.12)}.install-notice h2{font-size:clamp(1.8rem,3vw,2.8rem);margin-bottom:1rem}.install-notice ol{margin:0;padding-left:1.5rem}.install-notice li{padding:.35rem 0}.install-safety{grid-column:1/-1;margin:0;padding-top:1rem;border-top:1px solid rgba(80,55,20,.2)}
+@media(max-width:800px){.install-notice{grid-template-columns:1fr}.install-safety{grid-column:auto}}
+.page-hero .hero-install-alert{margin-top:1.4rem;padding:.75rem 1rem;border-left:4px solid var(--gold-light);background:rgba(10,22,18,.7);font-size:.98rem}.hero-install-alert a{color:#fff;font-weight:800}

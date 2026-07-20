@@ -37,6 +37,12 @@ def issue_verification(registration, request):
         subject="Your myCamino beta download",
         body=("Thank you for joining the myCamino beta.\n\n"
               f"Verify your email and download the current macOS beta here:\n{url}\n\n"
+              "IMPORTANT — unsigned beta installation:\n"
+              "If macOS says Apple cannot check myCamino for malicious software, dismiss the warning "
+              "without moving the app to the Bin. Then open Apple menu > System Settings > Privacy & Security, "
+              "scroll to Security, click Open Anyway, authenticate, and confirm Open. Approve the GPS Track Show "
+              "and GPX Editor separately. Full instructions and the release checksum are on the download page:\n"
+              f"{settings.PUBLIC_BASE_URL}/download/#install-beta\n\n"
               "This link expires in 24 hours. myCamino is GPL-3.0-or-later software."),
         from_email=settings.DEFAULT_FROM_EMAIL,
         to=[registration.email],

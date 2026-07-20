@@ -17,8 +17,13 @@ created or imported by the workflow.
 
 After installation, start the application by clicking the
 **myCamino GPS Track Show** icon in Applications. Because the beta is unsigned,
-Control-click the icon and choose **Open** on the first launch; after that, a
-normal click opens it.
+macOS may say that Apple cannot check it for malicious software. Dismiss that
+warning without moving the app to the Bin. Within about one hour, open **Apple
+menu → System Settings → Privacy & Security**, scroll to **Security**, click
+**Open Anyway**, authenticate, and confirm **Open**. After this one-time
+approval, a normal click opens it. Only approve a DMG obtained from the official
+myCamino website whose SHA-256 checksum matches the value published there. See
+[Apple's Gatekeeper instructions](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac).
 
 Experts working directly from the source code can instead use the command-line
 interface (CLI):

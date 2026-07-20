@@ -26,6 +26,7 @@ class PublicSiteTests(TestCase):
         self.assertContains(response, "data-gallery")
         self.assertContains(response, "timelapse-photo-mountains.webp")
         self.assertContains(response, "timelapse-photo-horses.webp")
+        self.assertContains(response, "Read the required installation steps")
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
 
@@ -44,6 +45,18 @@ class PublicSiteTests(TestCase):
         self.assertEqual(len(registration.token_digest), 64)
         self.assertNotIn("walker@example.org", registration.token_digest)
         self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("System Settings > Privacy & Security", mail.outbox[0].body)
+        self.assertIn("Open Anyway", mail.outbox[0].body)
+
+    def test_unsigned_beta_installation_steps_are_prominent(self):
+        response = self.client.get(reverse("beta-download"))
+        self.assertContains(response, 'id="install-beta"')
+        self.assertContains(response, "Read the installation steps before downloading")
+        self.assertContains(response, "Apple cannot check the app for malicious software")
+        self.assertContains(response, "Privacy &amp; Security")
+        self.assertContains(response, "Open Anyway")
+        self.assertContains(response, "Dennoch öffnen")
+        self.assertContains(response, "Apple’s official instructions")
 
     def test_duplicate_registration_respects_cooldown(self):
         data = {"email": "walker@example.org", "consent": "on", "website": ""}
