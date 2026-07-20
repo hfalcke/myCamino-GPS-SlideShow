@@ -1,13 +1,18 @@
 import hashlib
 import hmac
 import secrets
+import logging
 
 from django.conf import settings
 from django.core.mail import EmailMessage
+from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
 
-from .models import BetaRegistration, ContactMessage
+from .models import BetaRegistration, ContactMessage, DownloadEvent
+
+
+logger = logging.getLogger(__name__)
 
 
 def digest_token(token):
@@ -57,5 +62,28 @@ def deliver_contact(contact):
     return True
 
 
-def count_download(registration):
-    BetaRegistration.objects.filter(pk=registration.pk).update(download_count=F("download_count") + 1, last_download_at=timezone.now())
+def refresh_operator_exports():
+    try:
+        from .exports import export_operator_data
+        export_operator_data()
+    except Exception:
+        logger.exception("Could not refresh myCamino operator export files")
+
+
+def count_download(registration, request, release):
+    now = timezone.now()
+    with transaction.atomic():
+        DownloadEvent.objects.create(
+            registration=registration,
+            release=release,
+            ip_digest=digest_ip(request),
+            user_agent=request.META.get("HTTP_USER_AGENT", "")[:2000],
+            request_method=request.META.get("HTTP_X_FORWARDED_METHOD", request.method)[:12],
+            request_uri=request.META.get("HTTP_X_FORWARDED_URI", request.get_full_path())[:2000],
+            range_header=request.META.get("HTTP_RANGE", "")[:255],
+        )
+        BetaRegistration.objects.filter(pk=registration.pk).update(
+            download_count=F("download_count") + 1,
+            last_download_at=now,
+        )
+    refresh_operator_exports()

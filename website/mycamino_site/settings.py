@@ -78,6 +78,7 @@ CONTACT_RECIPIENT = os.environ.get("CONTACT_RECIPIENT", "mycamino@heinofalcke.de
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://mycamino.heinofalcke.de").rstrip("/")
 DEFAULT_DOCS_ROOT = BASE_DIR / "docs" if (BASE_DIR / "docs").is_dir() else REPO_ROOT / "docs"
 DOCS_ROOT = Path(os.environ.get("MYCAMINO_DOCS_ROOT", DEFAULT_DOCS_ROOT))
+MYCAMINO_EXPORT_ROOT = Path(os.environ.get("MYCAMINO_EXPORT_ROOT", BASE_DIR / "exports"))
 DOWNLOAD_SESSION_SECONDS = 24 * 60 * 60
 VERIFY_TOKEN_SECONDS = 24 * 60 * 60
 VERIFY_RESEND_SECONDS = 10 * 60

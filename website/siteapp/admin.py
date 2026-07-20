@@ -1,6 +1,6 @@
 from django.contrib import admin, messages
 
-from .models import BetaRegistration, ContactMessage, Release
+from .models import BetaRegistration, ContactMessage, DownloadEvent, Release
 from .services import deliver_contact
 
 
@@ -41,3 +41,20 @@ class ReleaseAdmin(admin.ModelAdmin):
         if obj.is_active:
             Release.objects.exclude(pk=obj.pk).update(is_active=False)
         super().save_model(request, obj, form, change)
+
+
+@admin.register(DownloadEvent)
+class DownloadEventAdmin(admin.ModelAdmin):
+    list_display = ("requested_at", "registration", "release", "request_method", "range_header")
+    list_filter = ("requested_at", "release")
+    search_fields = ("registration__email", "user_agent", "request_uri", "ip_digest")
+    readonly_fields = (
+        "registration", "release", "requested_at", "ip_digest", "user_agent",
+        "request_method", "request_uri", "range_header",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

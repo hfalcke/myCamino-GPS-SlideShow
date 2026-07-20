@@ -9,7 +9,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from siteapp.models import BetaRegistration, ContactMessage, Release
+from siteapp.models import BetaRegistration, ContactMessage, DownloadEvent, Release
 from siteapp.services import digest_token
 
 
@@ -54,6 +54,10 @@ class PublicSiteTests(TestCase):
 
     def test_verification_establishes_download_session_and_remains_usable_until_expiry(self):
         token = "known-verification-token"
+        Release.objects.create(
+            label="Test beta", file_name="test.dmg", release_date="2026-07-20",
+            file_size=123, sha256="a" * 64, is_active=True,
+        )
         registration = BetaRegistration.objects.create(email="walker@example.org", consent_at=timezone.now(), token_digest=digest_token(token), token_expires_at=timezone.now()+timezone.timedelta(hours=1))
         response = self.client.get(reverse("verify-beta", args=[token]))
         self.assertRedirects(response, reverse("protected-download"), fetch_redirect_response=False)
@@ -61,8 +65,17 @@ class PublicSiteTests(TestCase):
         self.assertIsNotNone(registration.verified_at)
         self.assertEqual(registration.token_digest, digest_token(token))
         self.assertGreater(registration.token_expires_at, timezone.now())
+        self.assertEqual(registration.download_count, 0)
+        self.assertEqual(self.client.get(
+            reverse("authorize-download"),
+            HTTP_USER_AGENT="Trail Browser", HTTP_X_FORWARDED_METHOD="GET",
+            HTTP_X_FORWARDED_URI="/downloads/myCamino-GPS-Track-Show.dmg", HTTP_RANGE="bytes=0-1023",
+        ).status_code, 204)
+        registration.refresh_from_db()
         self.assertEqual(registration.download_count, 1)
-        self.assertEqual(self.client.get(reverse("authorize-download")).status_code, 204)
+        event = DownloadEvent.objects.get()
+        self.assertEqual(event.range_header, "bytes=0-1023")
+        self.assertEqual(event.request_uri, "/downloads/myCamino-GPS-Track-Show.dmg")
         second_browser = self.client_class()
         self.assertRedirects(
             second_browser.get(reverse("verify-beta", args=[token])),
@@ -70,6 +83,8 @@ class PublicSiteTests(TestCase):
             fetch_redirect_response=False,
         )
         self.assertEqual(second_browser.get(reverse("authorize-download")).status_code, 204)
+        registration.refresh_from_db()
+        self.assertEqual(registration.download_count, 2)
 
     def test_expired_token_does_not_authorize(self):
         token = "expired"
@@ -112,3 +127,30 @@ class MaintenanceTests(TestCase):
         self.assertTrue(release.is_active)
         self.assertEqual(release.sha256, hashlib.sha256(b"release-content").hexdigest())
         self.assertEqual(Release.objects.filter(is_active=True).count(), 1)
+
+    def test_operator_exports_are_excel_compatible_and_include_audit_data(self):
+        registration = BetaRegistration.objects.create(
+            email="walker@example.org", consent_at=timezone.now(), verified_at=timezone.now(),
+            download_count=1, last_download_at=timezone.now(),
+        )
+        release = Release.objects.create(
+            label="Test beta", file_name="test.dmg", release_date="2026-07-20",
+            file_size=123, sha256="b" * 64, is_active=True,
+        )
+        DownloadEvent.objects.create(
+            registration=registration, release=release, ip_digest="hash", user_agent="Browser",
+            request_method="GET", request_uri="/downloads/test.dmg", range_header="bytes=0-10",
+        )
+        ContactMessage.objects.create(
+            name="=unsafe", email="walker@example.org", subject="Question", message="Hello",
+            consent_at=timezone.now(),
+        )
+        with tempfile.TemporaryDirectory() as directory, override_settings(MYCAMINO_EXPORT_ROOT=directory):
+            call_command("export_operator_data")
+            registrations = (Path(directory) / "beta-registrations.csv").read_text(encoding="utf-8-sig")
+            contacts = (Path(directory) / "contact-messages.csv").read_text(encoding="utf-8-sig")
+            log = (Path(directory) / "download-requests.log").read_text(encoding="utf-8-sig")
+        self.assertIn("walker@example.org", registrations)
+        self.assertIn("'=unsafe", contacts)
+        self.assertIn("Total authorized download requests: 1", log)
+        self.assertIn("bytes=0-10", log)

@@ -10,3 +10,4 @@ __pycache__/
 website/db.sqlite3
 website/staticfiles/
 website/.pytest_cache/
+website/exports/

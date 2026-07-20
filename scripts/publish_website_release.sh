@@ -25,6 +25,7 @@ actual_sha="$(sha256sum "$tmp" | awk '{print $1}')"
 actual_size="$(stat -c '%s' "$tmp")"
 [[ "$actual_sha" == "$expected_sha" && "$actual_size" == "$expected_size" ]]
 mv "$tmp" "$final"
+chmod 0644 "$final"
 cd /opt/mycamino/site
 docker compose exec -T web python manage.py register_release "/releases/$name" --label "$label" --date "$release_date"
 ln -sfn "$name" /var/lib/mycamino/releases/.latest.dmg.next

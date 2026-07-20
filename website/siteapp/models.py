@@ -56,3 +56,20 @@ class Release(models.Model):
 
     def __str__(self):
         return self.label
+
+
+class DownloadEvent(models.Model):
+    registration = models.ForeignKey(BetaRegistration, on_delete=models.CASCADE, related_name="download_events")
+    release = models.ForeignKey(Release, on_delete=models.SET_NULL, null=True, blank=True, related_name="download_events")
+    requested_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    ip_digest = models.CharField(max_length=64, blank=True)
+    user_agent = models.TextField(blank=True)
+    request_method = models.CharField(max_length=12, blank=True)
+    request_uri = models.TextField(blank=True)
+    range_header = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ("-requested_at",)
+
+    def __str__(self):
+        return f"{self.registration.email} — {self.requested_at:%Y-%m-%d %H:%M:%S}"

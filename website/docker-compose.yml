@@ -4,9 +4,12 @@ services:
     container_name: mycamino-site
     restart: unless-stopped
     env_file: [./mycamino.env]
+    environment:
+      MYCAMINO_EXPORT_ROOT: /exports
     volumes:
       - /var/lib/mycamino/database:/data
       - /var/lib/mycamino/releases:/releases:ro
+      - /var/lib/mycamino/exports:/exports
     networks: [public]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8003/health/', headers={'Host': 'localhost', 'X-Forwarded-Proto': 'https'}), timeout=3)"]

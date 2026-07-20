@@ -14,7 +14,7 @@ from django.views.decorators.http import require_GET, require_http_methods
 
 from .forms import BetaRegistrationForm, ContactForm
 from .models import BetaRegistration, ContactMessage, Release
-from .services import count_download, deliver_contact, digest_ip, digest_token, issue_verification
+from .services import count_download, deliver_contact, digest_ip, digest_token, issue_verification, refresh_operator_exports
 
 
 def latest_release():
@@ -94,6 +94,7 @@ def beta_download(request):
                 issue_verification(registration, request)
             except Exception:
                 pass
+        refresh_operator_exports()
         messages.success(request, "If the address can receive beta mail, a download link will arrive shortly.")
         return redirect("beta-download")
     return page(request, "siteapp/download.html", form=form)
@@ -112,16 +113,17 @@ def verify_beta(request, token):
             registration.save(update_fields=["verified_at", "updated_at"])
     request.session["beta_registration_id"] = registration.pk
     request.session.set_expiry(settings.DOWNLOAD_SESSION_SECONDS)
-    count_download(registration)
     return redirect("protected-download")
 
 
 @require_GET
 def authorize_download(request):
     registration_id = request.session.get("beta_registration_id")
-    allowed = BetaRegistration.objects.filter(pk=registration_id, is_active=True, verified_at__isnull=False).exists()
-    if not allowed or not latest_release():
+    registration = BetaRegistration.objects.filter(pk=registration_id, is_active=True, verified_at__isnull=False).first()
+    release = latest_release()
+    if not registration or not release:
         return HttpResponse("Beta access required", status=401)
+    count_download(registration, request, release)
     response = HttpResponse(status=204)
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -147,6 +149,7 @@ def contact(request):
             consent_at=timezone.now(), ip_digest=digest_ip(request),
         )
         deliver_contact(contact_message)
+        refresh_operator_exports()
         messages.success(request, "Thank you. Your message has been received.")
         return redirect("contact")
     return page(request, "siteapp/contact.html", form=form)
