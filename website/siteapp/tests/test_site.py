@@ -26,6 +26,7 @@ class PublicSiteTests(TestCase):
         self.assertContains(response, "data-gallery")
         self.assertContains(response, "timelapse-photo-mountains.webp")
         self.assertContains(response, "timelapse-photo-horses.webp")
+        self.assertContains(response, "fullscreen-picture.webp")
         self.assertContains(response, "Read the required installation steps")
         self.assertContains(response, "Download (free beta-test)")
         self.assertNotContains(response, "Join the macOS beta")
@@ -37,6 +38,7 @@ class PublicSiteTests(TestCase):
             "timelapse-overview.webp",
             "timelapse-elevation.webp",
             "collage.webp",
+            "fullscreen-picture.webp",
         )
         positions = [html.index(image) for image in gallery_order]
         self.assertEqual(positions, sorted(positions))
