@@ -13,7 +13,11 @@ TMP_ROOT="$(mktemp -d /tmp/mycamino-dmg-root.XXXXXX)"
 PREVIOUS_BUILD_ROOT="$(mktemp -d /tmp/mycamino-previous-builds.XXXXXX)"
 FFMPEG_SOURCE_ARCHIVE="build/third-party-sources/ffmpeg-8.1.1.tar.xz"
 LICENSE_BUNDLE="build/license_bundle"
-PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-/tmp/mycamino-pyinstaller-cache}"
+PYINSTALLER_CACHE_OWNED=0
+if [[ -z "${PYINSTALLER_CONFIG_DIR:-}" ]]; then
+  PYINSTALLER_CONFIG_DIR="$(mktemp -d /tmp/mycamino-pyinstaller-cache.XXXXXX)"
+  PYINSTALLER_CACHE_OWNED=1
+fi
 export PYINSTALLER_CONFIG_DIR
 VERIFY_MOUNT=""
 
@@ -23,6 +27,9 @@ cleanup() {
   fi
   rm -rf "$TMP_ROOT"
   rm -rf "$PREVIOUS_BUILD_ROOT"
+  if [[ "$PYINSTALLER_CACHE_OWNED" -eq 1 && -d "$PYINSTALLER_CONFIG_DIR" ]]; then
+    rm -rf "$PYINSTALLER_CONFIG_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -96,17 +103,17 @@ echo "==> Preparing licenses and corresponding source"
 
 echo "==> Building bundled slide-show player"
 move_previous_build_product "GPSTrackShow"
-"$PYINSTALLER" --noconfirm GPSTrackShow.spec
+"$PYINSTALLER" --clean --noconfirm GPSTrackShow.spec
 
 echo "==> Building standalone GPX editor"
 move_previous_build_product "myCamino GPX Editor"
 move_previous_build_product "myCamino GPX Editor.app"
-"$PYINSTALLER" --noconfirm "myCamino GPX Editor.spec"
+"$PYINSTALLER" --clean --noconfirm "myCamino GPX Editor.spec"
 
 echo "==> Building ${APP_NAME}.app"
 move_previous_build_product "$APP_NAME"
 move_previous_build_product "${APP_NAME}.app"
-"$PYINSTALLER" --noconfirm "${APP_NAME}.spec"
+"$PYINSTALLER" --clean --noconfirm "${APP_NAME}.spec"
 
 echo "==> Preparing DMG root"
 cp -R "dist/${APP_NAME}.app" "$TMP_ROOT/"
