@@ -1,0 +1,64 @@
+name: Feature request
+description: Suggest a concrete improvement to myCamino.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the journey-planning or presentation problem first, then the change you would find useful. GitHub issues are public; use the [contact form](https://mycamino.heinofalcke.de/contact/) for private information.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Slide-show preparation
+        - Slide-show playback
+        - Maps and Time-Lapse
+        - GPX Editor
+        - Media, music, or video
+        - Website, documentation, or download
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and why is the current behavior insufficient?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the result rather than prescribing internal implementation details.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any current workaround or alternative approach.
+
+  - type: textarea
+    id: journey
+    attributes:
+      label: Relevance to a multi-day journey
+      description: Explain how this would help with GPS tracks, maps, photographs, videos, music, or presentation control.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched the existing issues for a similar request.
+          required: true
+        - label: I understand that this request and its attachments are public.
+          required: true

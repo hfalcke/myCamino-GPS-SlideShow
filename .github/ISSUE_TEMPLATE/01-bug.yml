@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a reproducible problem in the current myCamino beta.
+title: "[Bug]: "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing myCamino. GitHub issues are public: do not include private photographs, email addresses, access links, passwords, or other personal data. For a private report, use the [contact form](https://mycamino.heinofalcke.de/contact/).
+
+  - type: dropdown
+    id: application
+    attributes:
+      label: Application
+      options:
+        - myCamino GPS Track Show
+        - myCamino GPX Editor
+        - Website or download
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: release
+    attributes:
+      label: Beta release
+      description: Enter the release date or version shown by myCamino or on the download page.
+      placeholder: YYYY-MM-DD or version identifier
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS and Mac model
+      placeholder: macOS 15.5, MacBook Pro with Apple M3 Pro
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest sequence of actions that causes the problem.
+      placeholder: |
+        1. Open ...
+        2. Choose ...
+        3. Press ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include the exact error wording, if any.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Often
+        - Sometimes
+        - Once
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Additional diagnostics
+      description: Add a short, non-sensitive log excerpt or screenshot if it helps. Remove paths, names, coordinates, and other personal data first.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched the existing issues for the same problem.
+          required: true
+        - label: I am testing the current beta on an Apple-Silicon Mac.
+          required: true
+        - label: I understand that this report and its attachments are public.
+          required: true

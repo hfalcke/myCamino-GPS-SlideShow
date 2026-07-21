@@ -34,8 +34,13 @@ notarized by Apple. macOS therefore requires explicit approval through
 **System Settings → Privacy & Security → Open Anyway** for both applications.
 Read the complete installation instructions before overriding this warning.
 
-The software is in beta testing and is supplied without warranty. Reproducible
-bug reports can be submitted through the project website.
+The software is in beta testing and is supplied without warranty. Use the
+[structured bug-report form](https://github.com/hfalcke/myCamino-GPS-SlideShow/issues/new?template=01-bug.yml)
+for reproducible problems or the
+[feature-request form](https://github.com/hfalcke/myCamino-GPS-SlideShow/issues/new?template=02-feature-request.yml)
+for proposed improvements. Reports containing personal material or security
+information should instead use the private
+[project contact form](https://mycamino.heinofalcke.de/contact/).
 
 ## Download and documentation
 

@@ -45,6 +45,13 @@ class PublicSiteTests(TestCase):
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
 
+        faq = self.client.get(reverse("faq"))
+        contact = self.client.get(reverse("contact"))
+        for report_page in (faq, contact):
+            self.assertContains(report_page, "template=01-bug.yml")
+            self.assertContains(report_page, "template=02-feature-request.yml")
+        self.assertContains(contact, "private form")
+
     def test_workflow_guides_prefer_app_icons_and_omit_migration_notes(self):
         for guide in ("slideshow", "gpx-editor"):
             response = self.client.get(reverse("documentation-detail", args=[guide]))

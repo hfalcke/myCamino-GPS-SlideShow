@@ -97,7 +97,13 @@ from AppKit import (
 )
 from Foundation import NSDate, NSIndexSet, NSObject, NSAttributedString, NSMakeSize, NSNotificationCenter, NSRunLoop, NSString, NSURL, NSPredicate, NSTimer, NSUserDefaults
 
-from beta_notice import BETA_NOTICE_PREFERENCE_KEY, BETA_NOTICE_VERSION, BUG_REPORT_URL, beta_notice_should_be_shown
+from beta_notice import (
+    BETA_NOTICE_PREFERENCE_KEY,
+    BETA_NOTICE_VERSION,
+    BUG_REPORT_URL,
+    FEATURE_REQUEST_URL,
+    beta_notice_should_be_shown,
+)
 
 try:
     from AVFoundation import AVPlayer
@@ -5635,6 +5641,7 @@ class GPXTrackerController(NSObject):
             "FREE BETA-TEST SOFTWARE — NO WARRANTY\n"
             "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
+            f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Editing an existing name offers Rename or Copy, optionally including its GPX, control file, and generated maps.\n"
@@ -5668,14 +5675,14 @@ class GPXTrackerController(NSObject):
         )
         if self.main_help_window is None:
             window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(220.0, 180.0, 680.0, 520.0),
+                NSMakeRect(180.0, 180.0, 860.0, 520.0),
                 NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
                 NSBackingStoreBuffered,
                 False,
             )
             window.setTitle_("myCamino GPS Track Show Help")
             content = window.contentView()
-            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(18.0, 58.0, 644.0, 444.0))
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(18.0, 58.0, 824.0, 444.0))
             scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             scroll.setHasVerticalScroller_(True)
             scroll.setHasHorizontalScroller_(False)
@@ -5700,10 +5707,13 @@ class GPXTrackerController(NSObject):
             source_button.setFrame_(NSMakeRect(303.0, 18.0, 105.0, FIELD_HEIGHT))
             content.addSubview_(source_button)
             bug_button = self._make_button("Report a Bug", "openBugReport:")
-            bug_button.setFrame_(NSMakeRect(418.0, 18.0, 120.0, FIELD_HEIGHT))
+            bug_button.setFrame_(NSMakeRect(438.0, 18.0, 120.0, FIELD_HEIGHT))
             content.addSubview_(bug_button)
+            feature_button = self._make_button("Request a Feature", "openFeatureRequest:")
+            feature_button.setFrame_(NSMakeRect(568.0, 18.0, 150.0, FIELD_HEIGHT))
+            content.addSubview_(feature_button)
             close_button = self._make_button("Close", "closeMainHelp:")
-            close_button.setFrame_(NSMakeRect(562.0, 18.0, 100.0, FIELD_HEIGHT))
+            close_button.setFrame_(NSMakeRect(742.0, 18.0, 100.0, FIELD_HEIGHT))
             close_button.setAutoresizingMask_(0)
             content.addSubview_(close_button)
             self.main_help_window = window
@@ -5757,6 +5767,10 @@ class GPXTrackerController(NSObject):
     @objc.IBAction
     def openBugReport_(self, _sender):
         NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(BUG_REPORT_URL))
+
+    @objc.IBAction
+    def openFeatureRequest_(self, _sender):
+        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(FEATURE_REQUEST_URL))
 
     def show_first_launch_beta_notice(self):
         """Show the beta and warranty warning once for this notice version."""

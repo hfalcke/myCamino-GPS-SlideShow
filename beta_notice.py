@@ -2,7 +2,8 @@
 
 BETA_NOTICE_VERSION = 1
 BETA_NOTICE_PREFERENCE_KEY = "myCaminoBetaNoticeVersion"
-BUG_REPORT_URL = "https://mycamino.heinofalcke.de/contact/"
+BUG_REPORT_URL = "https://github.com/hfalcke/myCamino-GPS-SlideShow/issues/new?template=01-bug.yml"
+FEATURE_REQUEST_URL = "https://github.com/hfalcke/myCamino-GPS-SlideShow/issues/new?template=02-feature-request.yml"
 
 
 def beta_notice_should_be_shown(stored_version):

@@ -93,7 +93,13 @@ from Foundation import (
     NSUserDefaults,
 )
 
-from beta_notice import BETA_NOTICE_PREFERENCE_KEY, BETA_NOTICE_VERSION, BUG_REPORT_URL, beta_notice_should_be_shown
+from beta_notice import (
+    BETA_NOTICE_PREFERENCE_KEY,
+    BETA_NOTICE_VERSION,
+    BUG_REPORT_URL,
+    FEATURE_REQUEST_URL,
+    beta_notice_should_be_shown,
+)
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
 from basemap_tile_utils import tolerate_missing_tiles
 from adventure_parameters import (
@@ -7817,6 +7823,7 @@ class GPXEditorController(NSObject):
             "FREE BETA-TEST SOFTWARE — NO WARRANTY\n"
             "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
+            f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "Add Tracks loads GPX files into the table. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
             "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint inspector. Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, sorting applies to the full table. Drag selected rows to reorder tracks. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
@@ -7881,6 +7888,10 @@ class GPXEditorController(NSObject):
     def openBugReport_(self, _sender):
         NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(BUG_REPORT_URL))
 
+    @objc.IBAction
+    def openFeatureRequest_(self, _sender):
+        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(FEATURE_REQUEST_URL))
+
     def show_first_launch_beta_notice(self):
         """Show the beta and warranty warning once for this notice version."""
         defaults = NSUserDefaults.standardUserDefaults()
@@ -7908,14 +7919,14 @@ class GPXEditorController(NSObject):
             self.help_window.orderFrontRegardless()
             return
         window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(220, 180, 760, 560),
+            NSMakeRect(180, 180, 900, 560),
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
             NSBackingStoreBuffered,
             False,
         )
         window.setReleasedWhenClosed_(False)
         window.setTitle_(title)
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(18, 58, 724, 484))
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(18, 58, 864, 484))
         scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         scroll.setHasVerticalScroller_(True)
         scroll.setHasHorizontalScroller_(False)
@@ -7938,6 +7949,7 @@ class GPXEditorController(NSObject):
             ("Third-Party Notices", "showThirdPartyNotices:", 128, 170),
             ("Source Code", "showSourceCodeInfo:", 308, 120),
             ("Report a Bug", "openBugReport:", 438, 120),
+            ("Request a Feature", "openFeatureRequest:", 568, 150),
         ):
             button = NSButton.alloc().initWithFrame_(NSMakeRect(x_pos, 18, width, 28))
             button.setTitle_(title)

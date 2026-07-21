@@ -7,6 +7,7 @@ import GPSTrackShowGUI as gui
 from beta_notice import (
     BETA_NOTICE_VERSION,
     BUG_REPORT_URL,
+    FEATURE_REQUEST_URL,
     beta_notice_should_be_shown,
 )
 
@@ -18,8 +19,15 @@ class BetaNoticeTests(unittest.TestCase):
         self.assertFalse(beta_notice_should_be_shown(BETA_NOTICE_VERSION))
         self.assertFalse(beta_notice_should_be_shown(BETA_NOTICE_VERSION + 1))
 
-    def test_bug_reports_use_public_contact_form(self):
-        self.assertEqual(BUG_REPORT_URL, "https://mycamino.heinofalcke.de/contact/")
+    def test_public_report_links_use_structured_github_forms(self):
+        self.assertEqual(
+            BUG_REPORT_URL,
+            "https://github.com/hfalcke/myCamino-GPS-SlideShow/issues/new?template=01-bug.yml",
+        )
+        self.assertEqual(
+            FEATURE_REQUEST_URL,
+            "https://github.com/hfalcke/myCamino-GPS-SlideShow/issues/new?template=02-feature-request.yml",
+        )
 
     def test_first_launch_acknowledges_notice_and_opens_report_link_on_request(self):
         class Defaults:
