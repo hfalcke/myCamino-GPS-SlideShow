@@ -17,7 +17,7 @@ import time
 import traceback
 import warnings
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -200,6 +200,23 @@ def external_jump_command_row(
     return sequence, row
 
 
+def external_settings_command(
+    payload: object,
+    last_sequence: int,
+) -> Optional[tuple[int, dict]]:
+    """Validate one GUI-to-player live Settings update."""
+    if not isinstance(payload, dict) or payload.get("command") != "settings":
+        return None
+    try:
+        sequence = int(payload.get("sequence", -1))
+    except (TypeError, ValueError):
+        return None
+    values = payload.get("values")
+    if sequence <= int(last_sequence) or not isinstance(values, dict):
+        return None
+    return sequence, dict(values)
+
+
 def should_show_stage_overview_preview(
     has_map_presenter: bool,
     show_with_map_presenter: bool,
@@ -255,6 +272,7 @@ MUSIC_RESUME_STATE_VERSION = 1
 DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
 MEMORY_WATCHDOG_INTERVAL_SECONDS = 5.0
+HELP_OVERLAY_PERSISTENCE_SECONDS = 5.0
 GIBIBYTE = 1024**3
 DEFAULT_DOT_COLOR_NAME = "red"
 DEFAULT_DOT_SIZE = 6
@@ -269,12 +287,12 @@ KEY_HELP_LINES = [
     "left / up             previous image",
     "Cmd + arrows          jump to previous/next stage",
     "m                     toggle auto/manual mode",
-    "p                     toggle place-name overlay",
     "e                     toggle elevation profiles",
     "a                     toggle background audio",
     "n                     toggle normalized/original video audio",
     "+ / -                 change duration in auto mode",
-    "c                     toggle analog clock overlay",
+    "c                     toggle the complete clock/title/statistics header",
+    "s                     open Slide Show settings in the myCamino window",
     "t / T                 next / previous playback style",
     "f                     toggle fullscreen/window mode",
     "w                     toggle single/separate overview windows",
@@ -282,6 +300,7 @@ KEY_HELP_LINES = [
     "D                     toggle memory debug display",
     "i                     show photo metadata overlay",
     "h                     show this key help",
+    "Settings              customize header lines, statistics, and background layout",
     "q or Esc              quit",
 ]
 STARTUP_HINT_TEXT = (
@@ -315,8 +334,11 @@ def pilgrim_motion_threshold(width: float, height: float) -> float:
 
 
 def time_lapse_marker_style(configured_style: str, *, overview: bool) -> str:
-    """Keep the overview arrow while allowing a pilgrim on the stage map."""
-    return "arrow" if overview else configured_style
+    """Use transport symbols on both maps while keeping pilgrims stage-local."""
+    normalized = str(configured_style or "pilgrim").strip().casefold()
+    if overview and normalized == "pilgrim":
+        return "arrow"
+    return normalized if normalized in {"pilgrim", "bike", "car", "plane", "arrow"} else "arrow"
 
 
 @dataclass
@@ -445,7 +467,12 @@ class Config:
     fullscreen: bool
     window_swap: bool
     clock: bool
-    placenames: bool
+    header_stage_name: bool
+    header_track_details: bool
+    header_place_name: bool
+    header_track_stats: bool
+    header_background: str
+    header_shadow_color: tuple[float, float, float, float]
     elevation_profile: bool
     debug: bool
     keypressed: bool
@@ -524,6 +551,9 @@ class WindowTarget:
     photo_identity: Optional[str] = None
     video_path: Optional[Path] = None
     video_duration: Optional[float] = None
+    header_lines: tuple[str, ...] = ()
+    header_metrics: tuple[str, ...] = ()
+    header_metadata: Optional[dict] = None
 
 
 @dataclass
@@ -801,9 +831,9 @@ def parse_args(argv: list[str]) -> Config:
     )
     parser.add_argument(
         "--time-lapse-marker",
-        choices=("pilgrim", "arrow"),
+        choices=("pilgrim", "bike", "car", "plane", "arrow"),
         default="pilgrim",
-        help="Moving Time-Lapse marker: walking pilgrim or traditional arrow (default: pilgrim).",
+        help="Moving Time-Lapse marker: pilgrim, bicycle, car, airplane, or arrow (default: pilgrim).",
     )
     parser.add_argument(
         "--time-lapse-overview-fullscreen",
@@ -838,6 +868,12 @@ def parse_args(argv: list[str]) -> Config:
         help="Initial playback style (case-insensitive).",
     )
     parser.add_argument("--background-color", default="black", help="Background color.")
+    parser.add_argument("--header-stage-name", choices=("on", "off"), default="on", help="Show the stage name in the centered slide-show header.")
+    parser.add_argument("--header-track-details", choices=("on", "off"), default="on", help="Show track length and duration in the centered slide-show header.")
+    parser.add_argument("--header-place-name", choices=("on", "off"), default="on", help="Show the current place in the centered slide-show header.")
+    parser.add_argument("--header-track-stats", choices=("on", "off"), default="on", help="Show track statistics at the right of the slide-show header.")
+    parser.add_argument("--header-background", choices=("black", "transparent", "off"), default="black", help="Header layout for all media and maps; black uses the selected background color and fits content below it, while transparent and off remain full-frame.")
+    parser.add_argument("--header-shadow-color", default="black", help="Shadow color used for header text, clock, time, and date.")
     parser.add_argument("--dot-color", default=DEFAULT_DOT_COLOR_NAME, help="GPS marker color.")
     parser.add_argument("--dot-size", type=int, default=DEFAULT_DOT_SIZE, help="GPS marker radius in pixels.")
     parser.add_argument("--gpx-overlay", choices=("line", "hidden"), default="line", help="Dynamic GPX route overlay mode.")
@@ -885,8 +921,7 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument("--fullscreen", "-f", action="store_true", default=None, help="Start slideshow windows fullscreen.")
     parser.add_argument("--no-fullscreen", action="store_false", dest="fullscreen", default=None, help="Start in windowed mode.")
     parser.add_argument("--switch-display", "-s", action="store_true", dest="window_swap", help="Switch photo/map display assignment at startup.")
-    parser.add_argument("--clock", "-c", choices=["on", "off"], default="on", help="Show analog clock on photos when time is known.")
-    parser.add_argument("--placenames", "-p", choices=["on", "off"], default="on", help="Show place names from photo metadata on photos.")
+    parser.add_argument("--clock", "-c", choices=["on", "off"], default="on", help="Include the analog clock in the header when time is known.")
     parser.add_argument("--elevation-profile", action="store_true", default=True, help="Show a cached elevation profile at the beginning of each GPX stage (default).")
     parser.add_argument("--no-elevation-profile", action="store_false", dest="elevation_profile", help="Do not show elevation profiles at stage starts.")
     parser.add_argument(
@@ -1025,7 +1060,12 @@ def parse_args(argv: list[str]) -> Config:
         fullscreen=fullscreen_enabled,
         window_swap=bool(args.window_swap),
         clock=args.clock == "on",
-        placenames=args.placenames == "on",
+        header_stage_name=args.header_stage_name == "on",
+        header_track_details=args.header_track_details == "on",
+        header_place_name=args.header_place_name == "on",
+        header_track_stats=args.header_track_stats == "on",
+        header_background=str(args.header_background),
+        header_shadow_color=parse_color(args.header_shadow_color, parser, "--header-shadow-color"),
         elevation_profile=bool(args.elevation_profile),
         debug=bool(args.debug),
         keypressed=bool(args.keypressed),
@@ -1189,7 +1229,12 @@ def config_from_options(
     fullscreen: Optional[bool] = None,
     window_swap: bool = False,
     clock: bool = True,
-    placenames: bool = True,
+    header_stage_name: bool = True,
+    header_track_details: bool = True,
+    header_place_name: bool = True,
+    header_track_stats: bool = True,
+    header_background: str = "black",
+    header_shadow_color: str | tuple[float, ...] | list[float] = "black",
     elevation_profile: bool = True,
     debug: bool = False,
     keypressed: bool = False,
@@ -1275,8 +1320,8 @@ def config_from_options(
         time_lapse_media_min_fraction = time_lapse_media_max_fraction
     if not 0 < time_lapse_media_min_fraction <= 1:
         raise ValueError("time_lapse_media_min_fraction must be greater than 0 and at most 1")
-    if time_lapse_marker not in {"pilgrim", "arrow"}:
-        raise ValueError("time_lapse_marker must be 'pilgrim' or 'arrow'")
+    if time_lapse_marker not in {"pilgrim", "bike", "car", "plane", "arrow"}:
+        raise ValueError("time_lapse_marker must be pilgrim, bike, car, plane, or arrow")
     if dot_size < 1:
         raise ValueError("dot_size must be at least 1")
     if gpx_overlay_mode not in {"line", "hidden"}:
@@ -1287,6 +1332,8 @@ def config_from_options(
         raise ValueError("route_width and media_point_size must be positive and endpoint_size non-negative")
     if map_header_font_factor <= 0:
         raise ValueError("map_header_font_factor must be greater than 0")
+    if header_background not in {"black", "transparent", "off"}:
+        raise ValueError("header_background must be black, transparent, or off")
     if track_title_mode not in {"endpoint_places", "track_name"}:
         raise ValueError("track_title_mode must be endpoint_places or track_name")
     if arrow_length < 0:
@@ -1355,7 +1402,12 @@ def config_from_options(
         fullscreen=fullscreen_enabled,
         window_swap=bool(window_swap),
         clock=bool(clock),
-        placenames=bool(placenames),
+        header_stage_name=bool(header_stage_name),
+        header_track_details=bool(header_track_details),
+        header_place_name=bool(header_place_name),
+        header_track_stats=bool(header_track_stats),
+        header_background=str(header_background),
+        header_shadow_color=parse_color_option(header_shadow_color, "header_shadow_color"),
         elevation_profile=bool(elevation_profile),
         debug=bool(debug),
         keypressed=bool(keypressed),
@@ -1541,15 +1593,11 @@ def time_lapse_clock_layout(
 ) -> tuple[tuple[float, float, float, float], float]:
     """Fit the complete clock and date inside the map's top header when possible."""
     image_x, image_y, image_width, image_height = image_rect
-    _plot_x, plot_y, _plot_width, plot_height = map_plot_rect(image_rect, metadata)
-    header_bottom = plot_y + plot_height
-    header_height = image_y + image_height - header_bottom
-    has_axes = (
-        isinstance(metadata, dict)
-        and isinstance(metadata.get("axes_box_fraction"), dict)
-        and header_height >= 24.0
+    _header_x, header_bottom, _header_width, header_height = runtime_header_band(
+        image_rect,
+        metadata,
     )
-    if has_axes:
+    if header_height >= 24.0:
         stroke_width = max(1.5, header_height / 30.0)
         margin = stroke_width * 1.5 + 1.0
         available_height = max(1.0, header_height - 2.0 * margin)
@@ -1580,6 +1628,85 @@ def time_lapse_clock_layout(
     ), clock_size
 
 
+def runtime_header_band(
+    image_rect: tuple[float, float, float, float],
+    metadata: Optional[dict],
+) -> tuple[float, float, float, float]:
+    """Return the common header band for maps and full-window media."""
+    image_x, image_y, image_width, image_height = image_rect
+    axes = metadata.get("axes_box_fraction") if isinstance(metadata, dict) else None
+    if isinstance(axes, dict):
+        try:
+            axes_top = float(axes["bottom"]) + float(axes["height"])
+        except (KeyError, TypeError, ValueError):
+            axes_top = 1.0
+        reserved_height = image_height * max(0.0, 1.0 - axes_top)
+        if reserved_height >= 24.0:
+            return image_x, image_y + image_height - reserved_height, image_width, reserved_height
+    try:
+        fraction = float(metadata.get("runtime_header_fraction", 0.12)) if isinstance(metadata, dict) else 0.12
+    except (TypeError, ValueError):
+        fraction = 0.12
+    header_height = image_height * max(0.08, min(0.20, fraction))
+    return image_x, image_y + image_height - header_height, image_width, header_height
+
+
+def header_content_rect(
+    outer_rect: tuple[float, float, float, float],
+    metadata: Optional[dict],
+    background_style: str,
+    visible: bool = True,
+) -> tuple[float, float, float, float]:
+    """Return the full frame, or the area below an opaque black header."""
+    if not visible or str(background_style or "off").strip().casefold() != "black":
+        return outer_rect
+    outer_x, outer_y, outer_width, _outer_height = outer_rect
+    _header_x, header_y, _header_width, _header_height = runtime_header_band(
+        outer_rect,
+        metadata,
+    )
+    return (
+        outer_x,
+        outer_y,
+        outer_width,
+        max(1.0, header_y - outer_y),
+    )
+
+
+def map_image_rect_and_scale(
+    outer_rect: tuple[float, float, float, float],
+    image_size: tuple[float, float],
+    metadata: Optional[dict],
+    background_style: str,
+    visible: bool = True,
+) -> tuple[tuple[float, float, float, float], tuple[float, float]]:
+    """Fit a map for a header while retaining full width in black mode."""
+    available = header_content_rect(
+        outer_rect,
+        metadata,
+        background_style,
+        visible,
+    )
+    available_x, available_y, available_width, available_height = available
+    image_width, image_height = image_size
+    if visible and str(background_style or "off").strip().casefold() == "black":
+        return available, (
+            available_width / max(image_width, 1.0),
+            available_height / max(image_height, 1.0),
+        )
+    scale = min(
+        available_width / max(image_width, 1.0),
+        available_height / max(image_height, 1.0),
+    )
+    width, height = image_width * scale, image_height * scale
+    return (
+        available_x + (available_width - width) / 2.0,
+        available_y + (available_height - height) / 2.0,
+        width,
+        height,
+    ), (scale, scale)
+
+
 def time_lapse_header_title_font_size(
     image_rect: tuple[float, float, float, float],
     metadata: Optional[dict],
@@ -1588,18 +1715,146 @@ def time_lapse_header_title_font_size(
 ) -> float:
     """Return the stage-title font size for the displayed map header."""
     image_x, image_y, image_width, image_height = image_rect
-    _plot_x, plot_y, _plot_width, plot_height = map_plot_rect(
+    _header_x, _header_y, _header_width, header_height = runtime_header_band(
         (image_x, image_y, image_width, image_height),
         metadata,
     )
-    header_height = max(1.0, image_y + image_height - (plot_y + plot_height))
-    requested = max(9.0, 14.0 * float(font_factor))
+    display_scale = max(
+        0.65,
+        min(max(1.0, image_width) / 1920.0, max(1.0, image_height) / 1080.0),
+    )
+    requested = max(9.0, 14.0 * float(font_factor)) * display_scale
     padding = max(2.0, header_height * 0.055)
     usable_height = max(1.0, header_height - 2.0 * padding)
     return max(
         8.0,
         min(requested, usable_height / (max(1, int(row_count)) + 0.35)),
     )
+
+
+def runtime_header_text_shadow_color(
+    background_style: str,
+    shadow_color: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Return the common title/clock shadow for the selected header layout."""
+    alpha = 0.5 if str(background_style or "off").strip().casefold() == "off" else 0.0
+    return (
+        float(shadow_color[0]),
+        float(shadow_color[1]),
+        float(shadow_color[2]),
+        alpha,
+    )
+
+
+def draw_runtime_header(
+    image_rect: tuple[float, float, float, float],
+    metadata: Optional[dict],
+    header_lines: tuple[str, ...],
+    metrics_lines: tuple[str, ...],
+    *,
+    font_color,
+    font_factor: float,
+    base_font_size: float,
+    background_style: str,
+    background_color: tuple[float, float, float, float],
+    shadow_color: tuple[float, float, float, float],
+) -> None:
+    """Draw the shared clock/title/statistics header background and text."""
+    header_x, header_y, header_width, header_height = runtime_header_band(image_rect, metadata)
+    style = str(background_style or "off").strip().casefold()
+    if style in {"black", "transparent"}:
+        alpha = 0.48 if style == "transparent" else 1.0
+        NSColor.colorWithSRGBRed_green_blue_alpha_(
+            float(background_color[0]),
+            float(background_color[1]),
+            float(background_color[2]),
+            alpha,
+        ).setFill()
+        NSBezierPath.fillRect_(NSMakeRect(header_x, header_y, header_width, header_height))
+    text_shadow_color = runtime_header_text_shadow_color(
+        style,
+        shadow_color,
+    )
+    padding = max(2.0, header_height * 0.055)
+    usable_height = max(1.0, header_height - 2.0 * padding)
+
+    display_scale = max(
+        0.65,
+        min(max(1.0, header_width) / 1920.0, max(1.0, image_rect[3]) / 1080.0),
+    )
+    title_lines = tuple(str(line).strip() for line in header_lines[:3] if str(line).strip())
+    if title_lines:
+        # Always reserve the same three rows. Selected non-empty values are
+        # packed from the top, so disabling one option never leaves a gap.
+        row_height = usable_height / 3.0
+        requested = max(9.0, 14.0 * float(font_factor)) * display_scale
+        first_size = max(8.0, min(requested * 1.12, row_height * 0.88))
+        title_top = header_y + header_height - padding
+        for index, line in enumerate(title_lines):
+            font_size = first_size if index == 0 else max(8.0, min(requested * 0.86, row_height * 0.78))
+            font = NSFont.boldSystemFontOfSize_(font_size)
+            text_height = NSString.stringWithString_(line).sizeWithAttributes_({NSFontAttributeName: font}).height
+            baseline = title_top - (index + 1) * row_height + max(0.0, (row_height - text_height) / 2.0)
+            draw_shadowed_text(
+                line,
+                header_x + header_width / 2.0,
+                baseline,
+                font,
+                font_color,
+                "center",
+                text_shadow_color,
+            )
+
+    if metrics_lines:
+        font_size = max(8.0, min(float(base_font_size) * 0.62 * display_scale, usable_height / 3.35))
+        font = NSFont.boldSystemFontOfSize_(font_size)
+        line_height = max(font_size + 1.0, usable_height / 3.0)
+        right_x = header_x + header_width - max(5.0, header_width * 0.012)
+        parsed = [tuple(part.strip() for part in str(line).partition(":")[::2]) for line in metrics_lines[:3]]
+        values = [value for _label, value in parsed] or ["8000 m"]
+        value_width = max(
+            NSString.stringWithString_(value).sizeWithAttributes_({NSFontAttributeName: font}).width
+            for value in values
+        )
+        colon_x = right_x - value_width - max(5.0, font_size * 0.45)
+        top = header_y + header_height - padding
+        for index, (label, value) in enumerate(parsed):
+            baseline = top - (index + 1) * line_height
+            draw_shadowed_text(f"{label}:", colon_x, baseline, font, font_color, "right", text_shadow_color)
+            draw_shadowed_text(value, right_x, baseline, font, font_color, "right", text_shadow_color)
+
+
+def create_runtime_header_overlay_image(
+    width: float,
+    height: float,
+    metadata: Optional[dict],
+    header_lines: tuple[str, ...],
+    metrics_lines: tuple[str, ...],
+    font_color,
+    font_factor: float,
+    base_font_size: float,
+    background_style: str,
+    background_color: tuple[float, float, float, float],
+    shadow_color: tuple[float, float, float, float],
+    reference_rect: Optional[tuple[float, float, float, float]] = None,
+):
+    """Create the header layer used over full-window photos and videos."""
+    image = NSImage.alloc().initWithSize_(NSMakeSize(width, height))
+    image.lockFocus()
+    draw_runtime_header(
+        reference_rect or (0.0, 0.0, width, height),
+        metadata,
+        header_lines,
+        metrics_lines,
+        font_color=font_color,
+        font_factor=font_factor,
+        base_font_size=base_font_size,
+        background_style=background_style,
+        background_color=background_color,
+        shadow_color=shadow_color,
+    )
+    image.unlockFocus()
+    return image
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
@@ -1780,6 +2035,73 @@ def format_time_lapse_metrics(total_km: float, stage_km: float, elevation_m: Opt
     )
 
 
+def photo_track_metrics(
+    metadata: Optional[dict],
+    latitude: Optional[float],
+    longitude: Optional[float],
+    distance_before_stage_km: float,
+    media_datetime: Optional[datetime] = None,
+) -> tuple[str, ...]:
+    """Return Time-Lapse-equivalent statistics at a photograph position."""
+    if not isinstance(metadata, dict):
+        return ()
+    points = metadata.get("timed_track_points")
+    candidates: list[dict] = []
+    for point in points if isinstance(points, list) else ():
+        if not isinstance(point, dict):
+            continue
+        point_lat = safe_float(point.get("lat", point.get("latitude")))
+        point_lon = safe_float(point.get("lon", point.get("longitude")))
+        stage_km = safe_float(point.get("cumulative_distance_km"))
+        if point_lat is None or point_lon is None or stage_km is None:
+            continue
+        candidates.append({
+            "lat": point_lat,
+            "lon": point_lon,
+            "stage_km": max(0.0, stage_km),
+            "elevation_m": safe_float(point.get("elevation_m", point.get("elevation"))),
+            "time": parse_iso_datetime(point.get("time_iso", point.get("time"))),
+        })
+    selected = None
+    if candidates and isinstance(media_datetime, datetime):
+        timed = [candidate for candidate in candidates if isinstance(candidate["time"], datetime)]
+        if timed:
+            selected = min(
+                timed,
+                key=lambda candidate: abs(
+                    (
+                        align_datetime_timezone(media_datetime, candidate["time"])
+                        - candidate["time"]
+                    ).total_seconds()
+                ),
+            )
+    if selected is None and candidates and latitude is not None and longitude is not None:
+        selected = min(
+            candidates,
+            key=lambda candidate: haversine_km(
+                float(latitude),
+                float(longitude),
+                candidate["lat"],
+                candidate["lon"],
+            ),
+        )
+    if selected is None and candidates:
+        selected = candidates[-1]
+    if selected is None:
+        stage_km = track_length_from_metadata(metadata)
+        if stage_km <= 0.0:
+            return ()
+        elevation_m = None
+    else:
+        stage_km = selected["stage_km"]
+        elevation_m = selected["elevation_m"]
+    return format_time_lapse_metrics(
+        max(0.0, float(distance_before_stage_km)) + stage_km,
+        stage_km,
+        elevation_m,
+    )
+
+
 def track_length_from_metadata(metadata: Optional[dict]) -> float:
     """Return a stage length from modern or legacy plot metadata."""
     if not isinstance(metadata, dict):
@@ -1923,6 +2245,43 @@ def dynamic_stage_header_lines(
     return scene.header_lines
 
 
+def selected_stage_header_lines(
+    metadata: object,
+    config: Config,
+    *,
+    place_text: Optional[str] = None,
+    relation_title: Optional[str] = None,
+) -> tuple[str, ...]:
+    """Return the selected title fields, compacted into at most three rows."""
+    payload = metadata if isinstance(metadata, dict) else {}
+    scene = scene_from_metadata(payload, show_header=True)
+    if scene.stage_kind == "gpx_track":
+        available = track_header_lines(
+            payload,
+            getattr(config, "track_title_mode", "endpoint_places"),
+            omit_date=True,
+            details_override=relation_title,
+        )
+        stage_name = available[0] if available else ""
+        track_details = available[1] if len(available) > 1 else ""
+    else:
+        stage_name = str(
+            payload.get("media_stage_name")
+            or payload.get("track_name")
+            or (scene.header_lines[0] if scene.header_lines else "")
+        ).strip()
+        track_details = str(relation_title or "").strip()
+    concise_place = " · ".join(
+        part.strip() for part in str(place_text or "").splitlines() if part.strip()
+    )
+    selected = (
+        stage_name if getattr(config, "header_stage_name", True) else "",
+        track_details if getattr(config, "header_track_details", True) else "",
+        concise_place if getattr(config, "header_place_name", True) else "",
+    )
+    return tuple(value for value in selected if value)[:3]
+
+
 def track_metadata_supports_clock(metadata: object) -> bool:
     """Return whether a GPX or media stage can display a meaningful clock."""
     if not isinstance(metadata, dict):
@@ -1999,8 +2358,13 @@ if APPKIT_AVAILABLE:
             self.metrics_lines = ()
             self.metrics_total_distance_km = 0.0
             self.relation_title = None
+            self.header_lines = ()
+            self.header_background_style = "black"
+            self.unified_header_enabled = True
             self.overlay_font_size = 30.0
             self.overlay_font_color = COLOR_NAMES["white"]
+            self.overlay_background_color = COLOR_NAMES["black"]
+            self.overlay_shadow_color = COLOR_NAMES["black"]
             self.map_header_font_factor = 2.2
             self.header_row_count = 3
             self.clock_overlay_key = None
@@ -2042,7 +2406,7 @@ if APPKIT_AVAILABLE:
                 self.clock_overlay_image = None
                 return
             bounds = self.bounds()
-            image_rect, _scale = self.imageRectAndScale()
+            image_rect = self.headerReferenceRect()
             frame, clock_size = time_lapse_clock_layout(
                 (
                     float(image_rect.origin.x),
@@ -2070,7 +2434,9 @@ if APPKIT_AVAILABLE:
                 str(date_text or ""),
                 round(clock_size, 2),
                 round(date_font_size, 2),
-                True,
+                tuple(round(float(value), 4) for value in self.overlay_font_color),
+                tuple(round(float(value), 4) for value in self.overlay_shadow_color),
+                str(self.header_background_style),
             )
             if key != self.clock_overlay_key:
                 self.clock_overlay_image = create_clock_overlay_image(
@@ -2080,6 +2446,9 @@ if APPKIT_AVAILABLE:
                     date_text,
                     date_on_right=True,
                     date_font_size=date_font_size,
+                    font_color=self.overlay_font_color,
+                    shadow_color=self.overlay_shadow_color,
+                    background_style=self.header_background_style,
                 )
                 self.clock_view.setImage_(self.clock_overlay_image)
                 self.clock_overlay_key = key
@@ -2112,6 +2481,7 @@ if APPKIT_AVAILABLE:
             self.place_text = None
             self.metrics_lines = ()
             self.relation_title = None
+            self.header_lines = ()
             self.media_clear_rects = None
             self.media_placement_cache_key = None
             self.pilgrim_frames = []
@@ -2120,12 +2490,30 @@ if APPKIT_AVAILABLE:
         def imageRectAndScale(self):
             bounds = self.bounds()
             if self.map_image is None:
-                return bounds, 1.0
+                return bounds, (1.0, 1.0)
             image_w, image_h = image_size_tuple(self.map_image)
-            # Match CocoaImagePresenter's normal map presentation exactly.
-            scale = min(bounds.size.width / max(image_w, 1.0), bounds.size.height / max(image_h, 1.0))
-            width, height = image_w * scale, image_h * scale
-            return NSMakeRect((bounds.size.width - width) / 2.0, (bounds.size.height - height) / 2.0, width, height), scale
+            image_tuple, scale = map_image_rect_and_scale(
+                (0.0, 0.0, float(bounds.size.width), float(bounds.size.height)),
+                (image_w, image_h),
+                self.map_metadata,
+                self.header_background_style,
+                True,
+            )
+            return NSMakeRect(*image_tuple), scale
+
+        def headerReferenceRect(self):
+            """Align overlays to the image top unless a separate band is used."""
+            if str(self.header_background_style).strip().casefold() == "black":
+                return self.bounds()
+            image_rect, _scale = self.imageRectAndScale()
+            return image_rect
+
+        @staticmethod
+        def _scale_components(scale):
+            if isinstance(scale, (tuple, list)) and len(scale) == 2:
+                return float(scale[0]), float(scale[1])
+            value = float(scale)
+            return value, value
 
         def imagePixelForLat_lon_(self, lat, lon):
             if self.map_metadata is None:
@@ -2141,7 +2529,11 @@ if APPKIT_AVAILABLE:
             if pixel is None:
                 return None
             _image_w, image_h = image_size_tuple(self.map_image)
-            return image_rect.origin.x + pixel[0] * scale, image_rect.origin.y + (image_h - pixel[1]) * scale
+            scale_x, scale_y = self._scale_components(scale)
+            return (
+                image_rect.origin.x + pixel[0] * scale_x,
+                image_rect.origin.y + (image_h - pixel[1]) * scale_y,
+            )
 
         def fixedStageTangent(self):
             """Keep the arrow perpendicular to the stage start/end line."""
@@ -2160,44 +2552,61 @@ if APPKIT_AVAILABLE:
             if pixel is None:
                 return None
             _image_w, image_h = image_size_tuple(self.map_image)
+            scale_x, scale_y = self._scale_components(scale)
             view_point = (
-                image_rect.origin.x + pixel[0] * scale,
-                image_rect.origin.y + (image_h - pixel[1]) * scale,
+                image_rect.origin.x + pixel[0] * scale_x,
+                image_rect.origin.y + (image_h - pixel[1]) * scale_y,
             )
-            NSGraphicsContext.saveGraphicsState()
-            try:
-                transform = NSAffineTransform.transform()
-                transform.translateXBy_yBy_(image_rect.origin.x, image_rect.origin.y)
-                transform.scaleXBy_yBy_(scale, scale)
-                transform.concat()
-                use_pilgrim = self.marker_style == "pilgrim" and len(self.pilgrim_frames) == 9
-                if use_pilgrim:
-                    frame_index = self.pilgrim_walk_state.update(
-                        view_point,
-                        time.monotonic(),
-                        pilgrim_motion_threshold(self.bounds().size.width, self.bounds().size.height),
+            view_height = float(self.bounds().size.height)
+            view_pixel_y = view_height - view_point[1]
+            tangent = self.stage_tangent
+            display_tangent = None
+            if tangent is not None:
+                tangent_x = float(tangent[0]) * scale_x
+                tangent_y = float(tangent[1]) * scale_y
+                tangent_length = math.hypot(tangent_x, tangent_y)
+                if tangent_length > 0.0:
+                    display_tangent = (
+                        tangent_x / tangent_length,
+                        tangent_y / tangent_length,
                     )
-                    if self.arrow_factor > 0:
-                        draw_pilgrim_at_marker(
-                            pixel[0],
-                            pixel[1],
-                            image_h,
-                            self.pilgrim_frames[frame_index],
-                            self.marker_radius,
-                            self.arrow_factor,
-                            self.pilgrim_rotation_degrees,
-                            self.pilgrim_mirrored,
-                        )
-                    draw_marker_at(pixel[0], pixel[1], image_h, self.marker_color, self.marker_radius)
-                else:
-                    tangent = self.stage_tangent
-                    if tangent is not None and self.arrow_factor > 0:
-                        draw_open_arrow_at_marker(
-                            pixel[0], pixel[1], image_h, tangent, self.marker_color, self.marker_radius, self.arrow_factor
-                        )
-                    draw_marker_at(pixel[0], pixel[1], image_h, self.marker_color, self.marker_radius)
-            finally:
-                NSGraphicsContext.restoreGraphicsState()
+            use_pilgrim = self.marker_style == "pilgrim" and len(self.pilgrim_frames) == 9
+            if use_pilgrim:
+                frame_index = self.pilgrim_walk_state.update(
+                    view_point,
+                    time.monotonic(),
+                    pilgrim_motion_threshold(self.bounds().size.width, self.bounds().size.height),
+                )
+                if self.arrow_factor > 0:
+                    rotation, mirrored = pilgrim_orientation_for_tangent(display_tangent)
+                    draw_pilgrim_at_marker(
+                        view_point[0],
+                        view_pixel_y,
+                        view_height,
+                        self.pilgrim_frames[frame_index],
+                        self.marker_radius,
+                        self.arrow_factor,
+                        rotation,
+                        mirrored,
+                    )
+                draw_marker_at(view_point[0], view_pixel_y, view_height, self.marker_color, self.marker_radius)
+            else:
+                if self.marker_style in {"bike", "car", "plane"}:
+                    draw_transport_marker_at(
+                        view_point[0],
+                        view_pixel_y,
+                        view_height,
+                        self.marker_style,
+                        display_tangent,
+                        self.marker_color,
+                        self.marker_radius,
+                        self.arrow_factor,
+                    )
+                elif display_tangent is not None and self.arrow_factor > 0:
+                    draw_open_arrow_at_marker(
+                        view_point[0], view_pixel_y, view_height, display_tangent, self.marker_color, self.marker_radius, self.arrow_factor
+                    )
+                draw_marker_at(view_point[0], view_pixel_y, view_height, self.marker_color, self.marker_radius)
             return view_point
 
         def mediaPlacementGeometry(self):
@@ -2288,7 +2697,27 @@ if APPKIT_AVAILABLE:
             if image_width <= 0.0 or image_height <= 0.0:
                 return
 
-            if self.relation_title:
+            if self.unified_header_enabled:
+                header_rect = self.headerReferenceRect()
+                draw_runtime_header(
+                    (
+                        float(header_rect.origin.x),
+                        float(header_rect.origin.y),
+                        float(header_rect.size.width),
+                        float(header_rect.size.height),
+                    ),
+                    self.map_metadata,
+                    tuple(self.header_lines),
+                    tuple(self.metrics_lines),
+                    font_color=self.overlay_font_color,
+                    font_factor=self.map_header_font_factor,
+                    base_font_size=self.overlay_font_size,
+                    background_style=self.header_background_style,
+                    background_color=self.overlay_background_color,
+                    shadow_color=self.overlay_shadow_color,
+                )
+
+            if self.relation_title and not self.unified_header_enabled:
                 title_x, title_y, title_width, title_height = relation_title_band(
                     (
                         float(image_rect.origin.x),
@@ -2315,7 +2744,7 @@ if APPKIT_AVAILABLE:
                     "center",
                 )
 
-            if self.metrics_lines:
+            if self.metrics_lines and not self.unified_header_enabled:
                 axes = self.map_metadata.get("axes_box_fraction") if isinstance(self.map_metadata, dict) else None
                 if isinstance(axes, dict):
                     try:
@@ -2431,6 +2860,7 @@ if APPKIT_AVAILABLE:
                     font,
                     self.overlay_font_color,
                     "center",
+                    None if self.header_background_style == "off" else (0.0, 0.0, 0.0, 0.0),
                 )
 
         def drawRect_(self, _dirty_rect):
@@ -2456,32 +2886,29 @@ if APPKIT_AVAILABLE:
             if self.media_marker_latlon is not None:
                 marker_pixel = self.imagePixelForLat_lon_(self.media_marker_latlon[0], self.media_marker_latlon[1])
                 if marker_pixel is not None:
-                    NSGraphicsContext.saveGraphicsState()
-                    try:
-                        transform = NSAffineTransform.transform()
-                        transform.translateXBy_yBy_(image_rect.origin.x, image_rect.origin.y)
-                        transform.scaleXBy_yBy_(scale, scale)
-                        transform.concat()
-                        if self.media_marker_fixed_arrow and self.arrow_factor > 0:
-                            draw_open_arrow_at_marker(
-                                marker_pixel[0],
-                                marker_pixel[1],
-                                image_h,
-                                (math.sqrt(0.5), -math.sqrt(0.5)),
-                                COLOR_NAMES["red"],
-                                self.marker_radius,
-                                self.arrow_factor,
-                            )
-                        draw_marker_at(
-                            marker_pixel[0],
-                            marker_pixel[1],
-                            image_h,
+                    scale_x, scale_y = self._scale_components(scale)
+                    view_x = image_rect.origin.x + marker_pixel[0] * scale_x
+                    view_y = image_rect.origin.y + (image_h - marker_pixel[1]) * scale_y
+                    view_height = float(bounds.size.height)
+                    view_pixel_y = view_height - view_y
+                    if self.media_marker_fixed_arrow and self.arrow_factor > 0:
+                        draw_open_arrow_at_marker(
+                            view_x,
+                            view_pixel_y,
+                            view_height,
+                            (math.sqrt(0.5), -math.sqrt(0.5)),
                             COLOR_NAMES["red"],
                             self.marker_radius,
-                            COLOR_NAMES["white"],
+                            self.arrow_factor,
                         )
-                    finally:
-                        NSGraphicsContext.restoreGraphicsState()
+                    draw_marker_at(
+                        view_x,
+                        view_pixel_y,
+                        view_height,
+                        COLOR_NAMES["red"],
+                        self.marker_radius,
+                        COLOR_NAMES["white"],
+                    )
             # Draw the moving marker last, so it remains visible when it passes
             # directly over the fixed media-location marker.
             if self.arrow_latlon is not None:
@@ -2977,6 +3404,179 @@ def draw_pilgrim_at_marker(
             NSCompositingOperationSourceOver,
             1.0,
         )
+    finally:
+        NSGraphicsContext.restoreGraphicsState()
+
+
+def transport_marker_orientation(
+    style: str,
+    tangent: Optional[tuple[float, float]],
+) -> tuple[float, bool]:
+    """Use the pilgrim convention so vehicles follow the route without inversion."""
+    if style in {"bike", "car"}:
+        return pilgrim_orientation_for_tangent(tangent)
+    direction = tangent or (1.0, 0.0)
+    return (
+        math.degrees(math.atan2(-float(direction[1]), float(direction[0]))),
+        False,
+    )
+
+
+def draw_transport_marker_at(
+    pixel_x: float,
+    pixel_y: float,
+    image_height: float,
+    style: str,
+    tangent: Optional[tuple[float, float]],
+    color: tuple[float, float, float, float],
+    radius: int,
+    size_factor: float,
+) -> None:
+    """Draw a compact bicycle, car, or airplane aligned with the route."""
+    if style not in {"bike", "car", "plane"} or size_factor <= 0.0:
+        return
+    size = max(float(radius) * 5.0, float(image_height) * 0.055 * float(size_factor))
+    rotation, mirrored = transport_marker_orientation(style, tangent)
+    outline_width = max(1.5, size * 0.055)
+    local_offset = float(radius) * 1.5 + size * ({"car": 0.32, "bike": 0.24}.get(style, 0.0))
+
+    def marker_point(point: tuple[float, float]) -> tuple[float, float]:
+        return point[0], point[1] + local_offset
+
+    def marker_rect(x: float, y: float, width: float, height: float):
+        return NSMakeRect(x, y + local_offset, width, height)
+
+    NSGraphicsContext.saveGraphicsState()
+    try:
+        transform = NSAffineTransform.transform()
+        transform.translateXBy_yBy_(float(pixel_x), float(image_height) - float(pixel_y))
+        transform.rotateByDegrees_(rotation)
+        if mirrored:
+            transform.scaleXBy_yBy_(-1.0, 1.0)
+        transform.concat()
+        if style == "car":
+            # A top-view silhouette stays readable at every route angle. Its
+            # nose points along +X, the same native facing direction as the
+            # pilgrim artwork.
+            for wheel_x in (-size * 0.31, size * 0.31):
+                for wheel_y in (-size * 0.27, size * 0.27):
+                    wheel = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        marker_rect(
+                            wheel_x - size * 0.10,
+                            wheel_y - size * 0.055,
+                            size * 0.20,
+                            size * 0.11,
+                        ),
+                        size * 0.035,
+                        size * 0.035,
+                    )
+                    ns_color(COLOR_NAMES["black"]).setFill()
+                    wheel.fill()
+            body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                marker_rect(-size * 0.50, -size * 0.23, size, size * 0.46),
+                size * 0.16,
+                size * 0.16,
+            )
+            ns_color(color).setFill()
+            body.fill()
+            ns_color(COLOR_NAMES["black"]).setStroke()
+            body.setLineWidth_(outline_width)
+            body.stroke()
+
+            windows = NSBezierPath.bezierPath()
+            windows.moveToPoint_(marker_point((-size * 0.22, -size * 0.17)))
+            windows.lineToPoint_(marker_point((size * 0.19, -size * 0.15)))
+            windows.lineToPoint_(marker_point((size * 0.28, 0.0)))
+            windows.lineToPoint_(marker_point((size * 0.19, size * 0.15)))
+            windows.lineToPoint_(marker_point((-size * 0.22, size * 0.17)))
+            windows.lineToPoint_(marker_point((-size * 0.29, 0.0)))
+            windows.closePath()
+            NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.62).setFill()
+            windows.fill()
+            for light_y in (-size * 0.13, size * 0.13):
+                headlight = NSBezierPath.bezierPathWithOvalInRect_(
+                    marker_rect(size * 0.43, light_y - size * 0.035, size * 0.07, size * 0.07)
+                )
+                ns_color(COLOR_NAMES["yellow"]).setFill()
+                headlight.fill()
+                tail_light = NSBezierPath.bezierPathWithOvalInRect_(
+                    marker_rect(-size * 0.50, light_y - size * 0.035, size * 0.07, size * 0.07)
+                )
+                ns_color(COLOR_NAMES["red"]).setFill()
+                tail_light.fill()
+        elif style == "bike":
+            wheel_radius = size * 0.22
+            wheel_centers = (-size * 0.29, size * 0.29)
+            for wheel_x in wheel_centers:
+                wheel = NSBezierPath.bezierPathWithOvalInRect_(
+                    marker_rect(wheel_x - wheel_radius, -wheel_radius, wheel_radius * 2.0, wheel_radius * 2.0)
+                )
+                ns_color(COLOR_NAMES["black"]).setStroke()
+                wheel.setLineWidth_(outline_width * 2.0)
+                wheel.stroke()
+                ns_color(color).setStroke()
+                wheel.setLineWidth_(outline_width)
+                wheel.stroke()
+            frame = NSBezierPath.bezierPath()
+            for start, end in (
+                ((-size * 0.29, 0.0), (0.0, size * 0.05)),
+                ((0.0, size * 0.05), (size * 0.29, 0.0)),
+                ((0.0, size * 0.05), (-size * 0.09, size * 0.30)),
+                ((-size * 0.09, size * 0.30), (-size * 0.29, 0.0)),
+                ((-size * 0.09, size * 0.30), (size * 0.17, size * 0.30)),
+                ((size * 0.17, size * 0.30), (size * 0.29, 0.0)),
+                ((size * 0.17, size * 0.30), (size * 0.25, size * 0.40)),
+                ((size * 0.25, size * 0.40), (size * 0.34, size * 0.40)),
+            ):
+                frame.moveToPoint_(marker_point(start))
+                frame.lineToPoint_(marker_point(end))
+            configure_round_stroke(frame)
+            ns_color(COLOR_NAMES["black"]).setStroke()
+            frame.setLineWidth_(outline_width * 2.2)
+            frame.stroke()
+            ns_color(color).setStroke()
+            frame.setLineWidth_(outline_width)
+            frame.stroke()
+            seat = NSBezierPath.bezierPath()
+            seat.moveToPoint_(marker_point((-size * 0.16, size * 0.33)))
+            seat.lineToPoint_(marker_point((-size * 0.03, size * 0.33)))
+            configure_round_stroke(seat)
+            ns_color(COLOR_NAMES["black"]).setStroke()
+            seat.setLineWidth_(outline_width * 1.8)
+            seat.stroke()
+            crank = NSBezierPath.bezierPathWithOvalInRect_(
+                marker_rect(-size * 0.045, size * 0.005, size * 0.09, size * 0.09)
+            )
+            ns_color(COLOR_NAMES["black"]).setStroke()
+            crank.setLineWidth_(outline_width)
+            crank.stroke()
+        else:
+            plane = NSBezierPath.bezierPath()
+            plane_points = (
+                (size * 0.52, 0.0),
+                (size * 0.06, size * 0.11),
+                (-size * 0.16, size * 0.44),
+                (-size * 0.28, size * 0.44),
+                (-size * 0.20, size * 0.08),
+                (-size * 0.50, size * 0.14),
+                (-size * 0.52, 0.0),
+                (-size * 0.50, -size * 0.14),
+                (-size * 0.20, -size * 0.08),
+                (-size * 0.28, -size * 0.44),
+                (-size * 0.16, -size * 0.44),
+                (size * 0.06, -size * 0.11),
+            )
+            for index, point in enumerate(plane_points):
+                if index == 0:
+                    plane.moveToPoint_(marker_point(point))
+                else:
+                    plane.lineToPoint_(marker_point(point))
+            plane.closePath()
+            ns_color(color).setFill()
+            plane.fill()
+            ns_color(COLOR_NAMES["black"]).setStroke()
+            plane.setLineWidth_(outline_width)
+            plane.stroke()
     finally:
         NSGraphicsContext.restoreGraphicsState()
 
@@ -3583,34 +4183,33 @@ def create_memory_overlay_image(width: float, height: float, memory_text: str, w
     return image
 
 
-def create_place_overlay_image(width: float, height: float, place_text: str, font_size: int, font_color):
-    """Create a centered place-name overlay near the top of the photo view."""
+def create_place_overlay_image(
+    width: float,
+    height: float,
+    place_text: str,
+    font_size: int,
+    font_color,
+    metadata: Optional[dict] = None,
+    font_factor: float = 2.2,
+    background_style: str = "off",
+):
+    """Create a place-name row aligned with the common three-row header."""
     image = NSImage.alloc().initWithSize_(NSMakeSize(width, height))
     image.lockFocus()
-    font = NSFont.fontWithName_size_("Arial Bold", float(font_size)) or NSFont.boldSystemFontOfSize_(float(font_size))
-    outline_width = max(1.0, font_size / 12.0)
-    lines = [line.strip() for line in str(place_text).splitlines() if line.strip()] or [str(place_text)]
-    line_sizes = [
-        NSString.stringWithString_(line).sizeWithAttributes_(
-            {
-                NSFontAttributeName: font,
-                NSForegroundColorAttributeName: ns_color(font_color),
-            }
-        )
-        for line in lines
-    ]
-    line_height = max((size.height for size in line_sizes), default=float(font_size)) + max(4.0, font_size * 0.12)
-    top_y = max(10.0, height - line_height * len(lines) - 18.0)
-    for index, line in enumerate(lines):
-        draw_outlined_text(
-            line,
-            width / 2.0,
-            top_y + (len(lines) - 1 - index) * line_height,
-            font,
-            font_color,
-            COLOR_NAMES["black"],
-            outline_width,
-        )
+    _header_x, header_y, _header_width, header_height = runtime_header_band(
+        (0.0, 0.0, width, height),
+        metadata,
+    )
+    row_height = header_height / 3.0
+    requested = max(9.0, 14.0 * float(font_factor))
+    base_size = max(8.0, min(requested, header_height / 3.35))
+    place_font_size = max(8.0, min(base_size * 0.82, row_height * 0.82))
+    font = NSFont.boldSystemFontOfSize_(place_font_size)
+    text = " - ".join(line.strip() for line in str(place_text).splitlines() if line.strip())
+    text_size = NSString.stringWithString_(text).sizeWithAttributes_({NSFontAttributeName: font})
+    baseline = header_y + max(1.0, (row_height - text_size.height) / 2.0)
+    shadow_color = None if str(background_style).casefold() == "off" else (0.0, 0.0, 0.0, 0.0)
+    draw_shadowed_text(text, width / 2.0, baseline, font, font_color, "center", shadow_color)
     image.unlockFocus()
     return image
 
@@ -3734,8 +4333,11 @@ def create_clock_overlay_image(
     *,
     date_on_right: bool = False,
     date_font_size: Optional[float] = None,
+    font_color: tuple[float, float, float, float] = COLOR_NAMES["white"],
+    shadow_color: tuple[float, float, float, float] = COLOR_NAMES["black"],
+    background_style: str = "off",
 ):
-    """Create a transparent analog clock with weekday above its date."""
+    """Create an analog clock whose drop shadow matches the title header."""
     import math
 
     weekday_text, calendar_date_text = clock_date_lines(date_text)
@@ -3756,9 +4358,19 @@ def create_clock_overlay_image(
     image.lockFocus()
 
     stroke_width = max(1.5, clock_size / 30.0)
+    effective_shadow_color = runtime_header_text_shadow_color(
+        background_style,
+        shadow_color,
+    )
+    NSGraphicsContext.saveGraphicsState()
     shadow = NSShadow.alloc().init()
-    shadow.setShadowColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.5))
-    shadow.setShadowOffset_(NSMakeSize(stroke_width, -stroke_width))
+    shadow.setShadowColor_(
+        NSColor.colorWithSRGBRed_green_blue_alpha_(
+            *effective_shadow_color,
+        )
+    )
+    shadow_offset = max(1.0, clock_size / 48.0)
+    shadow.setShadowOffset_(NSMakeSize(shadow_offset, -shadow_offset))
     shadow.setShadowBlurRadius_(0.0)
     shadow.set()
     # Reserve the one-line-width bottom-right offset so the shadow is not clipped.
@@ -3772,7 +4384,7 @@ def create_clock_overlay_image(
     NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.45).setFill()
     face = NSBezierPath.bezierPathWithOvalInRect_(face_rect)
     face.fill()
-    ns_color(COLOR_NAMES["white"]).setStroke()
+    ns_color(font_color).setStroke()
     face.setLineWidth_(stroke_width)
     face.stroke()
 
@@ -3810,7 +4422,9 @@ def create_clock_overlay_image(
         hand.stroke()
 
     hub_rect = NSMakeRect(center_x - 2.5, center_y - 2.5, 5.0, 5.0)
+    ns_color(font_color).setFill()
     NSBezierPath.bezierPathWithOvalInRect_(hub_rect).fill()
+    NSGraphicsContext.restoreGraphicsState()
 
     if date_lines:
         requested_font_size = max(
@@ -3826,7 +4440,6 @@ def create_clock_overlay_image(
             )
         font_size = requested_font_size
         font = NSFont.boldSystemFontOfSize_(font_size)
-        outline_width = max(1.0, font_size / 10.0)
         attributes = {NSFontAttributeName: font}
         line_heights = [
             float(NSString.stringWithString_(line).sizeWithAttributes_(attributes).height)
@@ -3848,14 +4461,14 @@ def create_clock_overlay_image(
         )
         # AppKit's origin is bottom-left, so draw the date first and weekday above it.
         for line, line_height in reversed(list(zip(date_lines, line_heights))):
-            draw_outlined_text(
+            draw_shadowed_text(
                 line,
                 center_x,
                 baseline_y,
                 font,
-                COLOR_NAMES["white"],
-                COLOR_NAMES["black"],
-                outline_width,
+                font_color,
+                "center",
+                effective_shadow_color,
             )
             baseline_y += line_height + line_gap
 
@@ -4637,15 +5250,19 @@ def draw_dynamic_map_overlay(
                     "center",
                 )
 
-        header_lines = dynamic_stage_header_lines(
-            metadata,
-            config,
-            relation_title=relation_title,
-            clock_visible=(
-                omit_track_date
-                if scene.stage_kind == "gpx_track"
-                else omit_media_date
-            ),
+        header_lines = (
+            dynamic_stage_header_lines(
+                metadata,
+                config,
+                relation_title=relation_title,
+                clock_visible=(
+                    omit_track_date
+                    if scene.stage_kind == "gpx_track"
+                    else omit_media_date
+                ),
+            )
+            if scene.header_lines
+            else ()
         )
         if header_lines:
             title_box = (
@@ -5014,6 +5631,9 @@ if APPKIT_AVAILABLE:
         def windowDidExitFullScreen_(self, _notification) -> None:
             self.controller.window_did_exit_fullscreen(self.role)
 
+        def windowDidResize_(self, _notification) -> None:
+            self.controller.window_did_resize(self.role)
+
 
     class ScheduledCallback:
         """Small wrapper around NSTimer so callbacks can be cancelled."""
@@ -5055,6 +5675,17 @@ class CocoaImagePresenter:
         self.help_visible = False
         self.clock_time: Optional[tuple[int, int]] = None
         self.clock_date_text: Optional[str] = None
+        self.header_metadata: Optional[dict] = None
+        self.header_lines: tuple[str, ...] = ()
+        self.header_metrics: tuple[str, ...] = ()
+        self.header_visible = False
+        self.header_font_size = 30.0
+        self.header_font_color = COLOR_NAMES["white"]
+        self.header_shadow_color = COLOR_NAMES["black"]
+        self.header_font_factor = 2.2
+        self.header_background_style = "black"
+        self.header_reference_image = None
+        self.header_reference_fills_frame = False
         self.place_visible = False
         self.place_text: Optional[str] = None
         self.info_visible = False
@@ -5072,12 +5703,14 @@ class CocoaImagePresenter:
         self.last_media_rect = None
         self.video_view = None
         self.video_player = None
+        self.video_uses_full_frame = False
 
         host_view.setWantsLayer_(True)
         host_view.layer().setBackgroundColor_(background_cgcolor(background_color))
 
         self.primary_view = self._make_image_view(host_view.bounds())
         self.overlay_view = self._make_image_view(host_view.bounds())
+        self.header_view = self._make_image_view(host_view.bounds())
         self.clock_view = self._make_image_view(host_view.bounds())
         self.place_view = self._make_image_view(host_view.bounds())
         self.info_view = self._make_image_view(host_view.bounds())
@@ -5094,6 +5727,7 @@ class CocoaImagePresenter:
         host_view.addSubview_(self.primary_view)
         host_view.addSubview_(self.fade_view)
         host_view.addSubview_(self.overlay_view)
+        host_view.addSubview_(self.header_view)
         host_view.addSubview_(self.clock_view)
         host_view.addSubview_(self.place_view)
         host_view.addSubview_(self.info_view)
@@ -5102,6 +5736,7 @@ class CocoaImagePresenter:
         host_view.addSubview_(self.startup_hint_view)
         host_view.addSubview_(self.help_view)
         self.overlay_view.setAlphaValue_(0.0)
+        self.header_view.setAlphaValue_(0.0)
         self.clock_view.setAlphaValue_(0.0)
         self.place_view.setAlphaValue_(0.0)
         self.info_view.setAlphaValue_(0.0)
@@ -5129,6 +5764,7 @@ class CocoaImagePresenter:
         for view in (
             self.primary_view,
             self.overlay_view,
+            self.header_view,
             self.clock_view,
             self.place_view,
             self.info_view,
@@ -5144,6 +5780,7 @@ class CocoaImagePresenter:
         for view_name in (
             "primary_view",
             "overlay_view",
+            "header_view",
             "clock_view",
             "place_view",
             "info_view",
@@ -5174,6 +5811,7 @@ class CocoaImagePresenter:
             self.video_player = None
         self.video_original_path = None
         self.video_playback_path = None
+        self.video_uses_full_frame = False
         if self.video_view is not None:
             try:
                 if hasattr(self.video_view, "setPlayer_"):
@@ -5189,6 +5827,7 @@ class CocoaImagePresenter:
         """Keep controls and text overlays above an optional video layer."""
         for view in (
             self.overlay_view,
+            self.header_view,
             self.clock_view,
             self.place_view,
             self.info_view,
@@ -5213,7 +5852,8 @@ class CocoaImagePresenter:
         if not AVKIT_VIDEO_AVAILABLE or AVPlayer is None or AVPlayerView is None:
             warn_message(f"video playback is unavailable because AVKit bindings are missing: {video_path}")
             return
-        rect = frame_rect if frame_rect is not None else self.host_view.bounds()
+        self.video_uses_full_frame = frame_rect is None
+        rect = frame_rect if frame_rect is not None else self._content_frame()
         actual_path = playback_path or video_path
         player = AVPlayer.playerWithURL_(NSURL.fileURLWithPath_(str(actual_path)))
         player.setVolume_(max(0.0, min(1.0, float(volume))))
@@ -5273,7 +5913,7 @@ class CocoaImagePresenter:
         self.overlay_view.setAlphaValue_(0.0)
 
     def _base_canvas(self, mode: Transition):
-        bounds = self.host_view.bounds()
+        bounds = self._content_frame()
         needs_reset = (
             self.layout_canvas is None
             or self.layout_mode != mode
@@ -5285,6 +5925,25 @@ class CocoaImagePresenter:
             if mode == Transition.QUAD:
                 draw_quad_dividers(self.layout_canvas, bounds.size.width, bounds.size.height)
         return self.layout_canvas
+
+    def _content_frame(self):
+        """Return the current host coordinates available to media."""
+        bounds = self.host_view.bounds()
+        rect = header_content_rect(
+            (0.0, 0.0, float(bounds.size.width), float(bounds.size.height)),
+            self.header_metadata,
+            self.header_background_style,
+            self.header_visible,
+        )
+        return NSMakeRect(*rect)
+
+    def _apply_header_layout(self) -> None:
+        """Apply the selected full-frame or black-header media geometry."""
+        frame = self._content_frame()
+        for view in (self.primary_view, self.overlay_view, self.fade_view):
+            view.setFrame_(frame)
+        if self.video_view is not None and self.video_uses_full_frame:
+            self.video_view.setFrame_(frame)
 
     def set_help_visible(self, visible: bool) -> None:
         """Show or hide the key-help overlay."""
@@ -5330,16 +5989,23 @@ class CocoaImagePresenter:
             self.clock_view.setAlphaValue_(0.0)
             self.clock_view.setImage_(None)
             return
-        bounds = self.host_view.bounds()
-        clock_size = max(40.0, bounds.size.height / 10.0)
-        margin = max(10.0, clock_size / 6.0)
-        date_width = clock_size * 1.9 if clock_date_text else 0.0
+        bounds = self._header_reference_rect()
+        frame, clock_size = time_lapse_clock_layout(
+            (
+                float(bounds.origin.x),
+                float(bounds.origin.y),
+                float(bounds.size.width),
+                float(bounds.size.height),
+            ),
+            self.header_metadata,
+            bool(clock_date_text),
+        )
         self.clock_view.setFrame_(
             NSMakeRect(
-                margin,
-                bounds.size.height - margin - clock_size,
-                clock_size + date_width,
-                clock_size,
+                frame[0],
+                frame[1],
+                frame[2],
+                frame[3],
             )
         )
         self.clock_view.setImage_(
@@ -5349,9 +6015,119 @@ class CocoaImagePresenter:
                 clock_time[1],
                 clock_date_text,
                 date_on_right=True,
+                date_font_size=time_lapse_header_title_font_size(
+                    (
+                        float(bounds.origin.x),
+                        float(bounds.origin.y),
+                        float(bounds.size.width),
+                        float(bounds.size.height),
+                    ),
+                    self.header_metadata,
+                    self.header_font_factor,
+                    3,
+                ),
+                font_color=self.header_font_color,
+                shadow_color=self.header_shadow_color,
+                background_style=self.header_background_style,
             )
         )
         self.clock_view.setAlphaValue_(1.0)
+
+    def set_header_reference_image(self, image, fills_frame: bool = False) -> None:
+        """Select the image whose fitted top edge anchors overlay headers."""
+        self.header_reference_image = image
+        self.header_reference_fills_frame = bool(fills_frame)
+
+    def _header_reference_rect(self):
+        bounds = self.host_view.bounds()
+        if self.header_background_style == "black":
+            return bounds
+        frame = self._content_frame()
+        if self.header_reference_fills_frame or self.header_reference_image is None:
+            return frame
+        image_width, image_height = image_size_tuple(self.header_reference_image)
+        draw_width, draw_height = aspect_fit_rect(
+            image_width,
+            image_height,
+            float(frame.size.width),
+            float(frame.size.height),
+        )
+        return NSMakeRect(
+            float(frame.origin.x) + (float(frame.size.width) - draw_width) / 2.0,
+            float(frame.origin.y) + (float(frame.size.height) - draw_height) / 2.0,
+            draw_width,
+            draw_height,
+        )
+
+    def set_header(
+        self,
+        header_lines: tuple[str, ...],
+        metrics_lines: tuple[str, ...],
+        metadata: Optional[dict],
+        visible: bool,
+        font_size: float,
+        font_color,
+        font_factor: float,
+        background_style: str,
+        shadow_color,
+    ) -> None:
+        """Show the shared stage header over full-window media."""
+        self.header_lines = tuple(header_lines)
+        self.header_metrics = tuple(metrics_lines)
+        self.header_metadata = metadata
+        self.header_visible = bool(visible)
+        self.header_font_size = float(font_size)
+        self.header_font_color = font_color
+        self.header_shadow_color = shadow_color
+        self.header_font_factor = float(font_factor)
+        self.header_background_style = str(background_style)
+        self._apply_header_layout()
+        if not visible or (not header_lines and not metrics_lines and background_style == "off"):
+            self.header_view.setAlphaValue_(0.0)
+            self.header_view.setImage_(None)
+            return
+        bounds = self.host_view.bounds()
+        reference = self._header_reference_rect()
+        self.header_view.setFrame_(bounds)
+        self.header_view.setImage_(
+            create_runtime_header_overlay_image(
+                float(bounds.size.width),
+                float(bounds.size.height),
+                metadata,
+                tuple(header_lines),
+                tuple(metrics_lines),
+                font_color,
+                font_factor,
+                font_size,
+                background_style,
+                self.background_color,
+                shadow_color,
+                (
+                    float(reference.origin.x),
+                    float(reference.origin.y),
+                    float(reference.size.width),
+                    float(reference.size.height),
+                ),
+            )
+        )
+        self.header_view.setAlphaValue_(1.0)
+
+    def refresh_header_layout(self) -> None:
+        """Rebuild retained header layers for the present host-view size."""
+        self.set_header(
+            self.header_lines,
+            self.header_metrics,
+            self.header_metadata,
+            self.header_visible,
+            self.header_font_size,
+            self.header_font_color,
+            self.header_font_factor,
+            self.header_background_style,
+            self.header_shadow_color,
+        )
+        self.set_clock_time(self.clock_time, self.clock_date_text)
+        if self.help_visible:
+            self.set_help_visible(True)
 
     def set_place_text(self, place_text: Optional[str], visible: bool, font_size: int, font_color) -> None:
         """Show or hide the place-name overlay near the top of the presenter."""
@@ -5363,7 +6139,18 @@ class CocoaImagePresenter:
             return
         bounds = self.host_view.bounds()
         self.place_view.setFrame_(bounds)
-        self.place_view.setImage_(create_place_overlay_image(bounds.size.width, bounds.size.height, place_text, font_size, font_color))
+        self.place_view.setImage_(
+            create_place_overlay_image(
+                bounds.size.width,
+                bounds.size.height,
+                place_text,
+                font_size,
+                font_color,
+                self.header_metadata,
+                self.header_font_factor,
+                getattr(self, "header_background_style", "black"),
+            )
+        )
         self.place_view.setAlphaValue_(1.0)
 
     def set_info_text(self, info_text: Optional[str]) -> None:
@@ -5463,14 +6250,14 @@ class CocoaImagePresenter:
         self.current_image = image
         self.primary_view.setImage_(image)
         self.overlay_view.setAlphaValue_(0.0)
-        self.overlay_view.setFrame_(self.host_view.bounds())
+        self.overlay_view.setFrame_(self._content_frame())
         self.fade_view.setAlphaValue_(0.0)
         if on_complete is not None:
             on_complete()
 
     def _transition_blend(self, image, on_complete: Optional[Callable[[], None]]) -> None:
         self.overlay_view.setImage_(image)
-        self.overlay_view.setFrame_(self.host_view.bounds())
+        self.overlay_view.setFrame_(self._content_frame())
         self.overlay_view.setAlphaValue_(0.0)
 
         def step(index: int) -> None:
@@ -5504,7 +6291,7 @@ class CocoaImagePresenter:
         fade_out(1)
 
     def _transition_expand(self, image, on_complete: Optional[Callable[[], None]]) -> None:
-        bounds = self.host_view.bounds()
+        bounds = self._content_frame()
         full_width = bounds.size.width
         full_height = bounds.size.height
         self.overlay_view.setImage_(image)
@@ -5513,8 +6300,8 @@ class CocoaImagePresenter:
             scale = max(0.02, index / TRANSITION_STEPS)
             width = full_width * scale
             height = full_height * scale
-            x_pos = (full_width - width) / 2.0
-            y_pos = (full_height - height) / 2.0
+            x_pos = bounds.origin.x + (full_width - width) / 2.0
+            y_pos = bounds.origin.y + (full_height - height) / 2.0
             self.overlay_view.setFrame_(NSMakeRect(x_pos, y_pos, width, height))
             self.overlay_view.setAlphaValue_(1.0)
             if index < TRANSITION_STEPS:
@@ -5525,7 +6312,7 @@ class CocoaImagePresenter:
         step(1)
 
     def _transition_wipe(self, image, on_complete: Optional[Callable[[], None]]) -> None:
-        bounds = self.host_view.bounds()
+        bounds = self._content_frame()
         current_image = self.current_image if self.current_image is not None else make_blank_canvas(bounds.size.width, bounds.size.height, self.background_color)
 
         def step(index: int) -> None:
@@ -5542,7 +6329,7 @@ class CocoaImagePresenter:
         step(1)
 
     def _transition_collage(self, image, on_complete: Optional[Callable[[], None]], media_is_video: bool = False) -> None:
-        bounds = self.host_view.bounds()
+        bounds = self._content_frame()
         if self.collage_count >= self.collage_max_images:
             self.layout_canvas = None
             self.collage_count = 0
@@ -5557,7 +6344,12 @@ class CocoaImagePresenter:
             self.collage_slot_index,
             rotate_item=not media_is_video,
         )
-        self.last_media_rect = media_rect
+        self.last_media_rect = NSMakeRect(
+            bounds.origin.x + media_rect.origin.x,
+            bounds.origin.y + media_rect.origin.y,
+            media_rect.size.width,
+            media_rect.size.height,
+        )
         self.collage_count += 1
         self.collage_slot_index = (self.collage_slot_index + 1) % 5
         display_image = copy_image(collage_image)
@@ -5565,11 +6357,12 @@ class CocoaImagePresenter:
         self.primary_view.setImage_(display_image)
         self.overlay_view.setAlphaValue_(0.0)
         self.fade_view.setAlphaValue_(0.0)
+        self._raise_overlay_views()
         if on_complete is not None:
             self.pending_handles.append(self.schedule_callback(0.0, on_complete))
 
     def _transition_quad(self, image, on_complete: Optional[Callable[[], None]]) -> None:
-        bounds = self.host_view.bounds()
+        bounds = self._content_frame()
         canvas = self._base_canvas(Transition.QUAD)
         quad_image, media_rect = create_quad_canvas(
             image,
@@ -5579,13 +6372,19 @@ class CocoaImagePresenter:
             self.quad_index,
             self.background_color,
         )
-        self.last_media_rect = media_rect
+        self.last_media_rect = NSMakeRect(
+            bounds.origin.x + media_rect.origin.x,
+            bounds.origin.y + media_rect.origin.y,
+            media_rect.size.width,
+            media_rect.size.height,
+        )
         self.quad_index = (self.quad_index + 1) % 4
         display_image = copy_image(quad_image)
         self.current_image = display_image
         self.primary_view.setImage_(display_image)
         self.overlay_view.setAlphaValue_(0.0)
         self.fade_view.setAlphaValue_(0.0)
+        self._raise_overlay_views()
         if on_complete is not None:
             self.pending_handles.append(self.schedule_callback(0.0, on_complete))
 
@@ -6290,6 +7089,7 @@ class GPSTrackShowApp:
         self.current_track_metadata: Optional[dict] = None
         self.current_elevation_profile_image = None
         self.elevation_profiles_enabled = bool(config.elevation_profile)
+        self.header_visible = True
         self.time_lapse_active = bool(config.time_lapse_stages)
         self.time_lapse_stage: Optional[TimeLapseStage] = None
         self.time_lapse_points: list[dict] = []
@@ -6364,7 +7164,6 @@ class GPSTrackShowApp:
         self.active_photo_presenter: Optional[CocoaImagePresenter] = None
         self.transition_overlay_deadline = 0.0
         self.transition_overlay_hide_handle = None
-        self.help_overlay_deadline = 0.0
         self.help_overlay_hide_handle = None
         self.duration_overlay_hide_handle = None
         self.startup_hint_hide_handle = None
@@ -6398,6 +7197,7 @@ class GPSTrackShowApp:
         )
         self.video_normalization_manifest = load_video_normalization_manifest(config.photodir)
         self.live_state_sequence = 0
+        self.settings_request_sequence = 0
         self.live_state_signature = None
         self.command_poll_handle = None
         self.last_command_sequence = -1
@@ -6736,8 +7536,8 @@ class GPSTrackShowApp:
             if chars in {"c", "C"} or raw_chars in {"c", "C"}:
                 self._toggle_clock()
                 return None
-            if chars in {"p", "P"} or raw_chars in {"p", "P"}:
-                self._toggle_placenames()
+            if chars in {"s", "S"} or raw_chars in {"s", "S"}:
+                self._publish_settings_request()
                 return None
             if chars in {"e", "E"} or raw_chars in {"e", "E"}:
                 self._toggle_elevation_profiles()
@@ -6815,13 +7615,12 @@ class GPSTrackShowApp:
             raw_chars = event.characters()
             if chars in {"h", "H"} or raw_chars in {"h", "H"}:
                 self.help_key_down = False
-                remaining = self.help_overlay_deadline - time.monotonic()
-                if remaining <= 0:
-                    self._set_help_overlay_visible(False)
-                else:
-                    if self.help_overlay_hide_handle is not None:
-                        self.help_overlay_hide_handle.cancel()
-                    self.help_overlay_hide_handle = self.schedule_callback(remaining, lambda: self._set_help_overlay_visible(False))
+                if self.help_overlay_hide_handle is not None:
+                    self.help_overlay_hide_handle.cancel()
+                self.help_overlay_hide_handle = self.schedule_callback(
+                    HELP_OVERLAY_PERSISTENCE_SECONDS,
+                    lambda: self._set_help_overlay_visible(False),
+                )
                 return None
             if chars in {"i", "I"} or raw_chars in {"i", "I"}:
                 self.info_key_down = False
@@ -6848,7 +7647,6 @@ class GPSTrackShowApp:
                     self.help_overlay_hide_handle.cancel()
                     self.help_overlay_hide_handle = None
                 self._set_help_overlay_visible(True)
-                self.help_overlay_deadline = time.monotonic() + 3.0
                 return None
             return handler(event)
 
@@ -7328,19 +8126,11 @@ class GPSTrackShowApp:
         }
 
     def _toggle_clock(self) -> None:
-        """Toggle the analog clock overlay on photos."""
-        object.__setattr__(self.config, "clock", not self.config.clock)
-        state_text = "on" if self.config.clock else "off"
-        debug_print(self.config, f"Clock overlay toggled {state_text}")
-        self._update_window_titles(f"Clock {state_text}")
-        self._refresh_photo_overlays()
-
-    def _toggle_placenames(self) -> None:
-        """Toggle place-name overlays on photos."""
-        object.__setattr__(self.config, "placenames", not self.config.placenames)
-        state_text = "on" if self.config.placenames else "off"
-        debug_print(self.config, f"Place-name overlay toggled {state_text}")
-        self._update_window_titles(f"Place names {state_text}")
+        """Toggle the complete configured header for this playback session."""
+        self.header_visible = not self.header_visible
+        state_text = "on" if self.header_visible else "off"
+        debug_print(self.config, f"Header toggled {state_text}")
+        self._update_window_titles(f"Header {state_text}")
         self._refresh_photo_overlays()
 
     def _toggle_elevation_profiles(self) -> None:
@@ -7406,29 +8196,43 @@ class GPSTrackShowApp:
         return self.photo_presenter if presenter_name == "photo" else self.map_presenter
 
     def _refresh_photo_overlays(self) -> None:
-        """Refresh clock and place overlays without redrawing the current image."""
+        """Refresh the unified header without redrawing the current image."""
         if self.time_lapse_active and self.time_lapse_stage is not None:
             self._set_time_lapse_views()
             return
         photo_target = self.role_targets.get("photo")
         active_presenter = self._presenter_for_role("photo") if photo_target is not None else None
         if active_presenter is not None and photo_target is not None:
-            active_presenter.set_clock_time(
-                photo_target.clock_time if self.config.clock else None,
-                photo_target.clock_date_text if self.config.clock else None,
+            header_lines = selected_stage_header_lines(
+                photo_target.header_metadata,
+                self.config,
+                place_text=photo_target.place_text,
             )
-            active_presenter.set_place_text(
-                photo_target.place_text,
-                bool(self.config.placenames),
+            active_presenter.set_header(
+                header_lines,
+                (
+                    photo_target.header_metrics
+                    if getattr(self.config, "header_track_stats", True)
+                    else ()
+                ),
+                photo_target.header_metadata,
+                bool(self.header_visible),
                 self.config.font_size,
                 self.config.font_color,
+                self.config.map_header_font_factor,
+                getattr(self.config, "header_background", "black"),
+                getattr(self.config, "header_shadow_color", COLOR_NAMES["black"]),
+            )
+            active_presenter.set_clock_time(
+                photo_target.clock_time if self.header_visible and self.config.clock else None,
+                photo_target.clock_date_text if self.header_visible and self.config.clock else None,
             )
         if self.photo_presenter is not None and self.photo_presenter is not active_presenter:
             self.photo_presenter.set_clock_time(None)
-            self.photo_presenter.set_place_text(None, False, self.config.font_size, self.config.font_color)
+            self.photo_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.map_presenter is not None and self.map_presenter is not active_presenter:
             self.map_presenter.set_clock_time(None)
-            self.map_presenter.set_place_text(None, False, self.config.font_size, self.config.font_color)
+            self.map_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
 
     def _continue_time_lapse_after_navigation(self) -> None:
         """Resume animation after one arrow-key step without changing playback mode."""
@@ -7970,20 +8774,9 @@ class GPSTrackShowApp:
         self._update_window_titles()
         swap_targets = []
         if old_photo_target is not None and photo_image is not None:
-            swap_targets.append(
-                WindowTarget(
-                    "photo",
-                    photo_image,
-                    Transition.SWITCH,
-                    old_photo_target.clock_time,
-                    old_photo_target.clock_date_text,
-                    old_photo_target.place_text,
-                    old_photo_target.info_text,
-                    old_photo_target.photo_identity,
-                )
-            )
+            swap_targets.append(replace(old_photo_target, image=photo_image, transition=Transition.SWITCH))
         if old_map_target is not None and map_image is not None:
-            swap_targets.append(WindowTarget("map", map_image, Transition.SWITCH))
+            swap_targets.append(replace(old_map_target, image=map_image, transition=Transition.SWITCH))
         if swap_targets:
             self._show_targets(swap_targets, on_complete=None)
             self.role_targets = {target.presenter_name: target for target in swap_targets}
@@ -7995,14 +8788,17 @@ class GPSTrackShowApp:
         """Toggle fullscreen/window mode."""
         self.fullscreen_active = not self.fullscreen_active
         debug_print(self.config, f"Toggling fullscreen: active={self.fullscreen_active}")
+        self._refresh_header_layouts()
         if self.config.join_windows or not self.config.mapwindow or self.map_window is None:
             if self.photo_window is not None:
                 self.photo_window.toggleFullScreen_(None)
+                self.schedule_callback(0.05, self._refresh_header_layouts)
             return
 
         screens = self._available_screens()
         if self.photo_window is not None:
             self.photo_window.toggleFullScreen_(None)
+            self.schedule_callback(0.05, self._refresh_header_layouts)
         if len(screens) > 1 and self.map_window is not None:
             self.schedule_callback(0.15, lambda: self.map_window.toggleFullScreen_(None))
         elif self.map_window is not None:
@@ -8012,6 +8808,18 @@ class GPSTrackShowApp:
             self.map_window.orderFrontRegardless()
         if not self.fullscreen_active:
             self.schedule_callback(0.3, self._apply_screen_layout)
+
+    def _refresh_header_layouts(self) -> None:
+        """Regenerate size-dependent header layers after window geometry changes."""
+        if getattr(self, "time_lapse_active", False) and getattr(self, "time_lapse_stage", None) is not None:
+            self._set_time_lapse_views()
+            return
+        for presenter in (
+            getattr(self, "photo_presenter", None),
+            getattr(self, "map_presenter", None),
+        ):
+            if presenter is not None:
+                presenter.refresh_header_layout()
 
     def schedule_callback(self, delay_seconds: float, callback: Callable[[], None]):
         debug_print(self.config, f"Scheduling callback in {delay_seconds:.3f}s for {getattr(callback, '__name__', repr(callback))}")
@@ -8049,11 +8857,17 @@ class GPSTrackShowApp:
         """Arm a waiting first overview only after its native window is visible."""
         role = str(role)
         self.fullscreen_window_roles.add(role)
+        self._refresh_header_layouts()
         self._finish_first_overview_fullscreen_wait(role)
 
     def window_did_exit_fullscreen(self, role: str) -> None:
         """Forget native fullscreen readiness after a window leaves that mode."""
         self.fullscreen_window_roles.discard(str(role))
+        self._refresh_header_layouts()
+
+    def window_did_resize(self, _role: str) -> None:
+        """Immediately rebuild overlays for the window's new backing size."""
+        self._refresh_header_layouts()
 
     def _first_overview_fullscreen_role(self, first_overview: bool) -> Optional[str]:
         """Return the stage-window role whose fullscreen transition is pending."""
@@ -8605,7 +9419,6 @@ class GPSTrackShowApp:
         if phase == PlaybackPhase.INTRO_INFO and self.awaiting_intro_start:
             self._show_startup_hint(
                 bottom=True,
-                persistent=True,
                 wait_for_start=True,
             )
             self._schedule_callback(
@@ -8779,7 +9592,6 @@ class GPSTrackShowApp:
         self,
         *,
         bottom: bool = False,
-        persistent: bool = False,
         wait_for_start: bool = False,
     ) -> None:
         """Show the temporary startup help hint on the photo screen."""
@@ -8792,11 +9604,10 @@ class GPSTrackShowApp:
             bottom=bottom,
             wait_for_start=wait_for_start,
         )
-        if not persistent:
-            self.startup_hint_hide_handle = self.schedule_callback(
-                5.0,
-                self._hide_startup_hint,
-            )
+        self.startup_hint_hide_handle = self.schedule_callback(
+            HELP_OVERLAY_PERSISTENCE_SECONDS,
+            self._hide_startup_hint,
+        )
 
     def _show_initial_photo_preview(self) -> None:
         """If a separate map window exists, preload the first photo in the photo window."""
@@ -9127,8 +9938,27 @@ class GPSTrackShowApp:
             stage_view.media_draw_frame = self.time_lapse_media_draw_frame
             stage_view.media_marker_latlon = self.time_lapse_media_marker_latlon
             stage_view.media_marker_fixed_arrow = media_map_stage
-            stage_view.place_text = self.time_lapse_place_text if self.config.placenames else None
-            stage_view.metrics_lines = metrics_lines
+            stage_view.place_text = None
+            stage_view.header_lines = (
+                selected_stage_header_lines(
+                    self.current_track_metadata,
+                    self.config,
+                    place_text=self.time_lapse_place_text,
+                    relation_title=(self.time_lapse_stage.relation if special_stage else None),
+                )
+                if self.header_visible
+                else ()
+            )
+            stage_view.metrics_lines = (
+                metrics_lines
+                if self.header_visible and getattr(self.config, "header_track_stats", True)
+                else ()
+            )
+            stage_view.header_background_style = (
+                getattr(self.config, "header_background", "black")
+                if self.header_visible
+                else "off"
+            )
             stage_view.metrics_total_distance_km = max(
                 self._time_lapse_total_distance(),
                 self.time_lapse_stage_start_distance_km + stage_distance_km,
@@ -9136,33 +9966,15 @@ class GPSTrackShowApp:
             stage_view.relation_title = None
             stage_view.overlay_font_size = self.config.font_size
             stage_view.overlay_font_color = self.config.font_color
+            stage_view.overlay_background_color = self.config.background_color
+            stage_view.overlay_shadow_color = self.config.header_shadow_color
             stage_view.map_header_font_factor = self.config.map_header_font_factor
-            stage_view.header_row_count = max(
-                1,
-                len(
-                    dynamic_stage_header_lines(
-                        self.current_track_metadata,
-                        self.config,
-                        relation_title=(
-                            self.time_lapse_stage.relation
-                            if special_stage
-                            else None
-                        ),
-                        clock_visible=(
-                            self.config.clock
-                            and track_metadata_supports_clock(
-                                self.current_track_metadata
-                            )
-                        ),
-                    )
-                )
-                + 1,
-            )
+            stage_view.header_row_count = 3
             stage_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(self.current_track_image, self.current_track_metadata, self.time_lapse_points, arrow, self.time_lapse_media_image, False)
             stage_view._update_clock_overlay(
                 self.time_lapse_clock_time,
                 self.time_lapse_clock_date_text,
-                self.config.clock,
+                bool(self.header_visible and self.config.clock),
             )
             if self.time_lapse_video_view is not None and self.time_lapse_media_image is not None:
                 old_superview = self.time_lapse_video_view.superview()
@@ -9176,7 +9988,6 @@ class GPSTrackShowApp:
                 _outer_rect, content_rect = stage_view.mediaRectsForImage_(self.time_lapse_media_image)
                 self.time_lapse_video_view.setFrame_(content_rect)
         if overview_view is not None:
-            overview_view._update_clock_overlay(None, None, False)
             overview_view.setHidden_(False)
             overview_view.marker_color = self.config.dot_color
             overview_view.marker_radius = self.config.dot_size
@@ -9198,8 +10009,33 @@ class GPSTrackShowApp:
             )
             overview_view.media_marker_fixed_arrow = media_map_stage
             overview_view.place_text = None
-            overview_view.metrics_lines = ()
+            overview_view.metrics_lines = (
+                metrics_lines
+                if self.header_visible and getattr(self.config, "header_track_stats", True)
+                else ()
+            )
+            overview_view.header_lines = (
+                selected_stage_header_lines(
+                    self.current_track_metadata,
+                    self.config,
+                    place_text=self.time_lapse_place_text,
+                    relation_title=(self.time_lapse_stage.relation if special_stage else None),
+                )
+                if self.header_visible
+                else ()
+            )
+            overview_view.header_background_style = (
+                getattr(self.config, "header_background", "black")
+                if self.header_visible
+                else "off"
+            )
             overview_view.relation_title = None
+            overview_view.overlay_font_size = self.config.font_size
+            overview_view.overlay_font_color = self.config.font_color
+            overview_view.overlay_background_color = self.config.background_color
+            overview_view.overlay_shadow_color = self.config.header_shadow_color
+            overview_view.map_header_font_factor = self.config.map_header_font_factor
+            overview_view.header_row_count = 3
             overview_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(
                 self.current_stage_overview_image or self.current_overview_image,
                 self.current_overview_metadata,
@@ -9207,6 +10043,11 @@ class GPSTrackShowApp:
                 arrow,
                 None,
                 False,
+            )
+            overview_view._update_clock_overlay(
+                self.time_lapse_clock_time,
+                self.time_lapse_clock_date_text,
+                bool(self.header_visible and self.config.clock),
             )
         self._publish_live_state()
 
@@ -9297,6 +10138,7 @@ class GPSTrackShowApp:
             self.current_track_image,
             self.current_track_metadata,
             self.config,
+            show_header=False,
             reserve_place_row=True,
             omit_track_date=(
                 self.config.clock
@@ -10445,18 +11287,41 @@ class GPSTrackShowApp:
         photo_transition = self._effective_photo_transition()
         photo_identity = str(photo_path.resolve())
 
+        header_lines = selected_stage_header_lines(
+            self.current_track_metadata,
+            self.config,
+            place_text=place_text,
+        )
+        distance_before_stage = 0.0
+        if self.current_stage_index is not None and 0 <= self.current_stage_index < len(self.stages):
+            distance_before_stage = self._time_lapse_distance_before_stage(
+                self.stages[self.current_stage_index].map_index
+            )
+        # Retain available statistics even when currently hidden so a live
+        # Settings Apply can reveal them without advancing to another medium.
+        header_metrics = photo_track_metrics(
+            self.current_track_metadata,
+            latitude,
+            longitude,
+            distance_before_stage,
+            parse_iso_datetime(photo_metadata.get("datetime_iso")),
+        )
+
         def make_photo_target(transition: Transition) -> WindowTarget:
             return WindowTarget(
-                "photo",
-                photo_image,
-                transition,
-                clock_time,
-                clock_date_text,
-                place_text,
-                info_text,
-                photo_identity,
-                video_path,
-                video_delay if video_path is not None else None,
+                presenter_name="photo",
+                image=photo_image,
+                transition=transition,
+                clock_time=clock_time,
+                clock_date_text=clock_date_text,
+                place_text=place_text,
+                info_text=info_text,
+                photo_identity=photo_identity,
+                video_path=video_path,
+                video_duration=video_delay if video_path is not None else None,
+                header_lines=header_lines,
+                header_metrics=header_metrics,
+                header_metadata=self.current_track_metadata,
             )
 
         preview_duplicate = (
@@ -10594,7 +11459,6 @@ class GPSTrackShowApp:
 
         active_photo_presenter = None
         active_info_presenter = None
-        active_place_presenter = None
         for target in targets:
             if (
                 self.config.mapwindow
@@ -10610,20 +11474,34 @@ class GPSTrackShowApp:
             if target.presenter_name == "photo":
                 active_photo_presenter = presenter
                 active_info_presenter = presenter
-                active_place_presenter = presenter
             debug_print(self.config, f"Sending image to presenter '{target.presenter_name}' with transition {target.transition}")
-            presenter.set_clock_time(
-                target.clock_time if target.presenter_name == "photo" and self.config.clock else None,
-                target.clock_date_text if target.presenter_name == "photo" and self.config.clock else None,
+            effective_transition = Transition.SWITCH if target.presenter_name == "map" else target.transition
+            full_window_header = target.presenter_name == "photo"
+            presenter.set_header_reference_image(
+                target.image,
+                effective_transition in {Transition.COLLAGE, Transition.QUAD},
             )
-            presenter.set_place_text(
-                target.place_text if target.presenter_name == "photo" else None,
-                bool(target.presenter_name == "photo" and self.config.placenames),
+            presenter.set_header(
+                target.header_lines,
+                (
+                    target.header_metrics
+                    if getattr(self.config, "header_track_stats", True)
+                    else ()
+                ),
+                target.header_metadata,
+                bool(full_window_header and self.header_visible),
                 self.config.font_size,
                 self.config.font_color,
+                self.config.map_header_font_factor,
+                getattr(self.config, "header_background", "black"),
+                getattr(self.config, "header_shadow_color", COLOR_NAMES["black"]),
             )
+            presenter.set_clock_time(
+                target.clock_time if full_window_header and self.header_visible and self.config.clock else None,
+                target.clock_date_text if full_window_header and self.header_visible and self.config.clock else None,
+            )
+            presenter.set_place_text(None, False, self.config.font_size, self.config.font_color)
             presenter.set_info_text(target.info_text if target.presenter_name == "photo" else None)
-            effective_transition = Transition.SWITCH if target.presenter_name == "map" else target.transition
             if target.presenter_name == "photo":
                 def photo_complete(current_presenter=presenter, current_target=target, transition=effective_transition) -> None:
                     time_lapse_running = self.time_lapse_active and self.time_lapse_stage is not None
@@ -10655,16 +11533,14 @@ class GPSTrackShowApp:
             self._set_transition_overlay_visible(True)
         if self.photo_presenter is not None and self.photo_presenter is not active_photo_presenter:
             self.photo_presenter.set_clock_time(None)
+            self.photo_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.map_presenter is not None and self.map_presenter is not active_photo_presenter:
             self.map_presenter.set_clock_time(None)
+            self.map_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.photo_presenter is not None and self.photo_presenter is not active_info_presenter:
             self.photo_presenter.set_info_text(None)
         if self.map_presenter is not None and self.map_presenter is not active_info_presenter:
             self.map_presenter.set_info_text(None)
-        if self.photo_presenter is not None and self.photo_presenter is not active_place_presenter:
-            self.photo_presenter.set_place_text(None, False, self.config.font_size, self.config.font_color)
-        if self.map_presenter is not None and self.map_presenter is not active_place_presenter:
-            self.map_presenter.set_place_text(None, False, self.config.font_size, self.config.font_color)
         if self.photo_presenter is not None and self.photo_presenter is not active_photo_presenter:
             self.photo_presenter.set_status_visible(False)
         if self.map_presenter is not None and self.map_presenter is not active_photo_presenter:
@@ -10866,6 +11742,14 @@ class GPSTrackShowApp:
                 "control_file": str(self.config.inputlist.resolve(strict=False)),
             }
         )
+        if self.settings_request_sequence:
+            payload.update(
+                {
+                    "request": "open_settings",
+                    "settings_section": "Slide Show",
+                    "request_sequence": self.settings_request_sequence,
+                }
+            )
         try:
             stat = self.config.inputlist.stat()
             payload["control_file_signature"] = {
@@ -10875,6 +11759,121 @@ class GPSTrackShowApp:
             write_json_atomic(self.config.state_file, payload)
         except Exception as exc:
             debug_exception(self.config, "write live slideshow state", exc)
+
+    def _publish_settings_request(self) -> None:
+        """Ask the parent myCamino GUI to open its Slide Show settings."""
+        if self.config.state_file is None:
+            self._show_temporary_status_overlay(
+                "Slide Show settings are available in the myCamino window",
+                3.0,
+            )
+            return
+        self.settings_request_sequence += 1
+        self.live_state_sequence += 1
+        payload = self._resume_state_payload()
+        payload.update(
+            {
+                "live": True,
+                "sequence": self.live_state_sequence,
+                "request": "open_settings",
+                "settings_section": "Slide Show",
+                "request_sequence": self.settings_request_sequence,
+                "control_file": str(self.config.inputlist.resolve(strict=False)),
+            }
+        )
+        try:
+            write_json_atomic(self.config.state_file, payload)
+            self._show_temporary_status_overlay("Opening Slide Show settings", 2.0)
+        except Exception as exc:
+            debug_exception(self.config, "request Slide Show settings", exc)
+
+    def _apply_runtime_settings(self, values: dict) -> None:
+        """Apply supported Adventure settings without restarting playback."""
+        simple_values = {
+            "slideshow.clock": ("clock", bool),
+            "slideshow.header_stage_name": ("header_stage_name", bool),
+            "slideshow.header_track_details": ("header_track_details", bool),
+            "slideshow.header_place_name": ("header_place_name", bool),
+            "slideshow.header_track_stats": ("header_track_stats", bool),
+            "slideshow.header_background": ("header_background", str),
+            "slideshow.font_size": ("font_size", int),
+            "slideshow.marker_radius": ("dot_size", int),
+            "slideshow.arrow_scale": ("arrow_length", float),
+            "slideshow.transition_duration_ms": ("transition_duration_ms", int),
+            "slideshow.collage_max_images": ("collage_max_images", int),
+            "timelapse.stage_duration_seconds": ("time_lapse_duration", float),
+            "timelapse.media_min_fraction": ("time_lapse_media_min_fraction", float),
+            "timelapse.marker_style": ("time_lapse_marker", str),
+            "timelapse.overview_as_media": ("time_lapse_overview_as_media", bool),
+            "timelapse.overview_on_stage_map_dual": ("time_lapse_overview_on_stage_map_dual", bool),
+            "trackmaps.gpx_overlay": ("gpx_overlay_mode", str),
+            "trackmaps.route_width": ("route_width", float),
+            "trackmaps.font_factor": ("map_header_font_factor", float),
+        }
+        for key, (attribute, converter) in simple_values.items():
+            if key in values:
+                converted = converter(values[key])
+                if attribute == "header_background":
+                    converted = "black" if converted == "reserved" else converted
+                    if converted not in {"off", "transparent", "black"}:
+                        continue
+                object.__setattr__(self.config, attribute, converted)
+
+        color_values = {
+            "slideshow.background_color": "background_color",
+            "slideshow.font_color": "font_color",
+            "slideshow.header_shadow_color": "header_shadow_color",
+            "slideshow.marker_color": "dot_color",
+            "trackmaps.route_color": "route_color",
+        }
+        for key, attribute in color_values.items():
+            if key in values:
+                try:
+                    object.__setattr__(
+                        self.config,
+                        attribute,
+                        parse_color_option(values[key], key),
+                    )
+                except ValueError:
+                    continue
+
+        if "slideshow.media_duration_seconds" in values:
+            object.__setattr__(
+                self.config,
+                "duration",
+                max(0.1, float(values["slideshow.media_duration_seconds"])),
+            )
+        if "slideshow.collage_size_range" in values:
+            try:
+                collage_min, collage_max = parse_percentage_range_option(
+                    str(values["slideshow.collage_size_range"])
+                )
+                object.__setattr__(self.config, "collage_size_min", collage_min)
+                object.__setattr__(self.config, "collage_size_max", collage_max)
+            except ValueError:
+                pass
+        if "slideshow.transition" in values:
+            try:
+                self._select_playback_style(
+                    str(values["slideshow.transition"]).upper(),
+                    show_status=False,
+                )
+            except (ControlSyntaxError, ValueError):
+                pass
+
+        for presenter in (self.photo_presenter, self.map_presenter):
+            if presenter is None:
+                continue
+            presenter.background_color = self.config.background_color
+            presenter.transition_duration_ms = self.config.transition_duration_ms
+            presenter.collage_size_min = self.config.collage_size_min
+            presenter.collage_size_max = self.config.collage_size_max
+            presenter.collage_max_images = self.config.collage_max_images
+            presenter.host_view.layer().setBackgroundColor_(
+                background_cgcolor(self.config.background_color)
+            )
+        self._refresh_photo_overlays()
+        self._show_temporary_status_overlay("Settings applied", 2.0)
 
     def _poll_external_commands(self) -> None:
         """Consume editor-to-player commands without sharing the live-state file."""
@@ -10893,6 +11892,14 @@ class GPSTrackShowApp:
             if command is not None:
                 self.last_command_sequence, row_index = command
                 self._jump_to_playlist_row(row_index)
+            else:
+                settings_command = external_settings_command(
+                    payload,
+                    self.last_command_sequence,
+                )
+                if settings_command is not None:
+                    self.last_command_sequence, values = settings_command
+                    self._apply_runtime_settings(values)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
         if self.running:

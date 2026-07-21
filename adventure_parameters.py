@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-PARAMETER_SCHEMA_VERSION = 12
+PARAMETER_SCHEMA_VERSION = 16
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class ParameterSpec:
     choices: tuple[tuple[str, str], ...] = ()
     advanced: bool = False
     unit: str = ""
+    subsection: str = ""
 
 
 def _choice(*items: tuple[str, str]) -> tuple[tuple[str, str], ...]:
@@ -35,13 +36,18 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.transition", "Slide Show", "Initial style", "time_lapse", "choice", "Initial playback style. Use t/T during playback to cycle through all styles.", choices=_choice(("time_lapse", "Time-Lapse"), ("blend", "Blend"), ("fade", "Fade"), ("switch", "Switch"), ("expand", "Expand"), ("collage", "Collage"), ("quad", "Quad"), ("random", "Random"))),
     ParameterSpec("slideshow.transition_duration_ms", "Slide Show", "Transition duration", 700, "int", "Duration of animated image transitions.", 0, 10000, advanced=True, unit="ms"),
     ParameterSpec("slideshow.background_color", "Slide Show", "Background color", "#000000", "color", "Color behind maps and media."),
-    ParameterSpec("slideshow.font_color", "Slide Show", "Font color", "#FFFFFF", "color", "Color used for slide-show text overlays."),
-    ParameterSpec("slideshow.font_size", "Slide Show", "Font size", 30, "int", "Base overlay font size.", 8, 200, unit="pt"),
     ParameterSpec("slideshow.marker_color", "Slide Show", "Marker color", "#FF0000", "color", "Color of the moving GPS marker."),
     ParameterSpec("slideshow.marker_radius", "Slide Show", "Marker radius", 6, "int", "Radius of the GPS marker.", 1, 100, unit="px"),
     ParameterSpec("slideshow.arrow_scale", "Slide Show", "Arrow scale", 1.0, "float", "Scale factor for the direction arrow; zero hides it.", 0.0, 10.0),
-    ParameterSpec("slideshow.clock", "Slide Show", "Show clock", True, "bool", "Show the analog clock when timing is available."),
-    ParameterSpec("slideshow.place_names", "Slide Show", "Show place names", True, "bool", "Show reverse-geocoded place names."),
+    ParameterSpec("slideshow.font_color", "Slide Show", "Font color", "#FFFFFF", "color", "Color used for header text, clock marks and hands, time, and date.", subsection="Header"),
+    ParameterSpec("slideshow.header_shadow_color", "Slide Show", "Shadow color", "#000000", "color", "Color used for header text, clock, time, and date shadows.", subsection="Header"),
+    ParameterSpec("slideshow.font_size", "Slide Show", "Font size", 30, "int", "Base header font size.", 8, 200, unit="pt", subsection="Header"),
+    ParameterSpec("slideshow.clock", "Slide Show", "Clock", True, "bool", "Show the analog clock at the left of the slide-show header when timing is available.", subsection="Header"),
+    ParameterSpec("slideshow.header_stage_name", "Slide Show", "Stage name", True, "bool", "Show the stage name as the first available line in the middle of the header.", subsection="Header"),
+    ParameterSpec("slideshow.header_track_details", "Slide Show", "Track length & duration", True, "bool", "Show the stage track length and duration as the next available header line.", subsection="Header"),
+    ParameterSpec("slideshow.header_place_name", "Slide Show", "Place name", True, "bool", "Show the current reverse-geocoded place as the next available header line.", subsection="Header"),
+    ParameterSpec("slideshow.header_track_stats", "Slide Show", "Track statistics", True, "bool", "Show total distance, stage distance, and elevation at the right of the header when available.", subsection="Header"),
+    ParameterSpec("slideshow.header_background", "Slide Show", "Header layout", "black", "choice", "Use one layout for photos, Time-Lapse maps, and overview maps. No box and Semi-transparent remain full-frame; Header area fits content below an opaque band in the selected background color.", choices=_choice(("off", "No box"), ("transparent", "Semi-transparent overlay"), ("black", "Header area (background color)")), subsection="Header"),
     ParameterSpec("slideshow.elevation_profile", "Slide Show", "Show elevation profile", True, "bool", "Show the cached min/max elevation profile in the Stage Map at the beginning of every GPX track."),
     ParameterSpec("slideshow.fullscreen", "Slide Show", "Fullscreen", "auto", "choice", "Choose automatic, always-on, or windowed startup.", choices=_choice(("auto", "Auto"), ("on", "On"), ("off", "Off"))),
     ParameterSpec("slideshow.window_mode", "Slide Show", "Window mode", "auto", "choice", "Automatic uses one window on one screen and a separate overview window when multiple screens are available.", choices=_choice(("auto", "Automatic"), ("single", "Single window"), ("multiple", "Separate overview window"))),
@@ -62,11 +68,11 @@ PARAMETER_SPECS = (
     ParameterSpec("audio.video_normalization_max_boost_db", "Audio", "Maximum video boost", 12.0, "float", "Maximum gain applied to a quiet video during normalization.", 0.0, 30.0, unit="dB"),
     ParameterSpec("audio.video_normalization_true_peak_db", "Audio", "Maximum true peak", -1.5, "float", "True-peak ceiling used while preparing normalized video audio.", -10.0, 0.0, unit="dBTP"),
 
-    ParameterSpec("timelapse.stage_duration_seconds", "Time-Lapse", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s"),
-    ParameterSpec("timelapse.media_min_fraction", "Time-Lapse", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%"),
-    ParameterSpec("timelapse.overview_as_media", "Time-Lapse", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage."),
-    ParameterSpec("timelapse.overview_on_stage_map_dual", "Time-Lapse", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active."),
-    ParameterSpec("timelapse.marker_style", "Time-Lapse", "Moving marker", "pilgrim", "choice", "Show a walking pilgrim or the traditional arrow at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("arrow", "Arrow"))),
+    ParameterSpec("timelapse.stage_duration_seconds", "Slide Show", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s", subsection="Time-Lapse"),
+    ParameterSpec("timelapse.media_min_fraction", "Slide Show", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%", subsection="Time-Lapse"),
+    ParameterSpec("timelapse.overview_as_media", "Slide Show", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage.", subsection="Time-Lapse"),
+    ParameterSpec("timelapse.overview_on_stage_map_dual", "Slide Show", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active.", subsection="Time-Lapse"),
+    ParameterSpec("timelapse.marker_style", "Slide Show", "Moving marker", "pilgrim", "choice", "Choose the moving symbol shown at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("bike", "Bicycle"), ("car", "Car"), ("plane", "Airplane"), ("arrow", "Arrow")), subsection="Time-Lapse"),
 
     ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
     ParameterSpec("trackmaps.route_source", "Map Generation", "Journey source", "automatic", "choice", "Use GPX tracks when available, require GPX tracks, or build date stages from media locations.", choices=_choice(("automatic", "Automatic"), ("gpx", "GPX tracks"), ("media", "Media locations"))),
@@ -260,6 +266,20 @@ def normalize_parameters(raw: Any) -> dict[str, Any]:
     values = raw.get("values", {}) if isinstance(raw, dict) and isinstance(raw.get("values"), dict) else raw
     values = values if isinstance(values, dict) else {}
     values = dict(values)
+    if "slideshow.header_background" not in values and "timelapse.header_background" in values:
+        values["slideshow.header_background"] = values["timelapse.header_background"]
+    values.pop("timelapse.header_background", None)
+    if str(values.get("slideshow.header_background", "")).strip().casefold() == "reserved":
+        values["slideshow.header_background"] = "black"
+    if "slideshow.header_title" in values:
+        legacy_title = values.pop("slideshow.header_title")
+        values.setdefault("slideshow.header_stage_name", legacy_title)
+        values.setdefault("slideshow.header_track_details", legacy_title)
+    if "slideshow.place_names" in values:
+        values.setdefault(
+            "slideshow.header_place_name",
+            values.pop("slideshow.place_names"),
+        )
     if "slideshow.start_mode" in values:
         start_mode = str(values.get("slideshow.start_mode") or "").strip().casefold()
         if start_mode == "time_lapse":

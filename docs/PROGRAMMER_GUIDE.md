@@ -1,5 +1,22 @@
 # myCamino GPS Track Show Programmer Guide
 
+## Licensing and release artifacts
+
+Original project content is GPL-3.0-or-later, copyright 2026 Heino Falcke.
+`LICENSE`, `COPYRIGHT`, `SOURCE_CODE.md`, and `THIRD_PARTY_NOTICES.md` are the
+repository-level declarations. New first-party source files should include
+`SPDX-License-Identifier: GPL-3.0-or-later`.
+
+`scripts/prepare_license_bundle.py` collects the exact Python runtime package
+versions and their supplied license files, locates the Python license, verifies
+the pinned FFmpeg source checksum, and creates an archive from the actual Git
+worktree. `build_dmg.sh` runs this before PyInstaller, embeds the resulting
+documents in every application, copies the source archives into the DMG, and
+mounts the completed DMG to verify required resources. Keep the explicit
+runtime distribution list synchronized with dependencies added to the
+PyInstaller specifications; a release intentionally fails if a required
+license cannot be found.
+
 This project is a native macOS/PyObjC workflow for building a GPS-aware photo
 and video slide show from one adventure: a project directory, one combined GPX
 track file, imported media, generated map images, geolocation metadata, and a
@@ -867,9 +884,19 @@ the 20 ms timer only when playback was already automatic and unpaused.
 
 `TimeLapseMapView` owns a retained clock `NSImageView` above its optional
 AVPlayer child. Clock content is rebuilt only when time, date, or view height
-changes, not on each 20 ms tick. `create_clock_overlay_image(...)` applies a
-50%-opaque black shadow offset down/right by one stroke width before drawing
-the white clock and date. The clock time comes from the interpolated current
+changes, not on each 20 ms tick. `draw_runtime_header(...)` is shared with the
+full-window media presenter, keeping its compact three-line title area, clock
+geometry, and three track-statistics rows identical across every playback
+style.
+Generated Time-Lapse basemaps continue beneath the runtime header. Off and
+Semi-transparent retain the full presentation frame and anchor overlays to the
+fitted image edge. Header area creates a real band in the configured slideshow
+background color and fits media beneath it; Time-Lapse maps use independent X/Y
+display scales so all map pixels remain visible across the complete screen
+width without regenerating map assets. GPS overlays use the same display scales.
+`create_clock_overlay_image(...)` applies the configured shadow color at 50%
+opacity, offset down/right by one stroke width, before drawing the clock and
+date in the configured header font color. The clock time comes from the interpolated current
 track-point time. Once progress reaches the track endpoint,
 `time_lapse_clock_datetime(...)` advances it to the current medium's later
 capture timestamp while leaving the marker at the endpoint. The view draws the
@@ -928,14 +955,10 @@ values only. GPX files are changed only by an explicit GPX Editor save.
 
 Track-map sidecars include `timed_track_points`, an ordered list of latitude,
 longitude, ISO timestamp, estimated-time flag, elevation in metres, and
-cumulative stage distance in kilometres. Use
-`gpx_tracks_table.upgrade_timed_track_sidecars(...)` to add that payload to
-matching current sidecars without rerendering a PNG. It verifies the existing
-track fingerprint first and reports unsafe matches instead of guessing. This is
-an explicit one-time migration or maintenance API; it is not called when the
-slide show starts. Automatic and manual Map Generation write the complete
-payload as part of normal map generation, while the player remains read-only and falls
-back to in-memory distance-based timing for legacy or foreign sidecars.
+cumulative stage distance in kilometres. Automatic and manual Map Generation
+write this complete payload as part of normal map generation. The player stays
+read-only and can calculate distance-based timing in memory when imported map
+metadata does not contain timed points.
 
 The Adventure settings window now persists the global slide-show parameters in
 `.adv` files: media and stage durations, time-lapse media minimum size,
@@ -943,7 +966,8 @@ transition, background/marker/arrow styling, font and clock/place overlays,
 fullscreen/display swap/map-window/joined-window/end-behavior options, and collage
 size and maximum. Playback key changes remain session-only by design.
 
-`timelapse.marker_style` selects `pilgrim` (default) or `arrow`. The player
+`timelapse.marker_style` selects `pilgrim` (default), `bike`, `car`, `plane`,
+or `arrow`. The player
 loads `pilgrim-frame00-rigged-512.png` through
 `pilgrim-frame08-rigged-512.png` once and draws retained images in
 `TimeLapseMapView`. Frame 0 is the standing pose; movement after a stationary
@@ -951,9 +975,10 @@ interval resumes at frame 3. Motion tolerance scales with the map view
 diagonal, and the 0.1-second sprite cadence is independent of the 50 Hz GPS
 position updates. The view calculates and caches one orientation per stage
 from the same fixed normal used by the arrow. It mirrors the right-facing
-source frames when their transformed facing direction opposes the route.
-Only the stage-map view uses this setting; the overview view always retains the
-arrow. Missing animation assets fall back to the arrow.
+source frames when their transformed facing direction opposes the route. The
+bicycle, car, and airplane are drawn as vector markers and rotate with the
+route. They remain visible on the overview; the animated pilgrim is represented
+there by an arrow. Missing pilgrim animation assets also fall back to the arrow.
 
 ## GPXEditor Architecture
 
@@ -1126,10 +1151,14 @@ For a complete tested release, use:
 `release.sh` shows the current branch and worktree, asks for confirmation, runs
 `git diff --check` and the complete unit-test suite, calls `build_dmg.sh`, then
 stages all repository changes, commits them, and pushes the current branch to
-its configured upstream. Use `--yes` for a non-interactive invocation. The DMG
-remains at `dist/myCamino-GPS-Track-Show.dmg`; `dist/` is ignored and therefore
-the binary is not pushed to GitHub. A failed test or DMG build occurs before
-Git staging and prevents the commit.
+its configured upstream. After that push succeeds, it calls
+`scripts/publish_website_release.sh`, which uploads the verified DMG, validates
+its size and SHA-256 on the server, registers its metadata, and atomically
+changes the protected website download to the new artifact. Use `--yes` for a
+non-interactive invocation. The DMG also remains at
+`dist/myCamino-GPS-Track-Show.dmg`; `dist/` is ignored and therefore the binary
+is not pushed to GitHub. A failed test or DMG build occurs before Git staging
+and prevents the commit.
 
 Relevant specs:
 

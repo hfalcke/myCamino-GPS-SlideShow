@@ -6,7 +6,7 @@
     <p class="eyebrow">Your trail. Your photographs. Your story.</p>
     <h1>Walk it once.<br>Relive every stage.</h1>
     <p class="lead">myCamino turns the GPS trail and precious photographs from a multi-day adventure into a vivid, animated slide show.</p>
-    <div class="actions"><a class="button primary" href="{% url 'beta-download' %}">Join the macOS beta</a><a class="button ghost" href="{% url 'documentation' %}">Explore the workflow</a></div>
+    <div class="actions"><a class="button primary" href="{% url 'beta-download' %}">Download (free beta-test)</a><a class="button ghost" href="{% url 'documentation' %}">Explore the workflow</a></div>
     <p class="availability">Apple Silicon Mac · Unsigned beta · Free under GPL-3.0-or-later · <a href="{% url 'beta-download' %}#install-beta">Read the required installation steps</a></p>
   </div>
   <a class="scroll-cue" href="#features">Discover the journey <span aria-hidden="true">↓</span></a>
@@ -34,19 +34,19 @@
 <section class="section showcase">
   <div class="showcase-copy"><p class="eyebrow">Maps meet memories</p><h2>See where every photograph belongs.</h2><p>Stage maps, tour overviews, elevation profiles and media locations create the geographic spine of the show. Standard and Time-Lapse presentations remain under your control throughout.</p><ul class="check-list"><li>OpenStreetMap and Esri map presets</li><li>GPS-aware photograph and video placement</li><li>Optional place names, music and PDF track summaries</li><li>Resume exactly where the last show stopped</li></ul></div>
   <div class="screen-card slideshow-gallery" data-gallery aria-label="Time-Lapse slide-show gallery">
-    <figure class="gallery-slide is-active"><img src="{% static 'siteapp/images/collage.webp' %}" alt="A myCamino slide-show collage from a walking journey" loading="lazy"><figcaption>A generated stage collage brings together place, date and photographs.</figcaption></figure>
-    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-overview.webp' %}" alt="Time-Lapse stage map with the full Camino overview inset"><figcaption>Keep the whole 2,300 km journey in view while a stage begins.</figcaption></figure>
-    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-elevation.webp' %}" alt="Time-Lapse map with an elevation profile over the current stage"><figcaption>Follow the stage route together with its animated elevation profile.</figcaption></figure>
-    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-sunrise.webp' %}" alt="A sunrise photograph displayed over its position on the Time-Lapse map"><figcaption>See each photograph in the place and moment where it belongs.</figcaption></figure>
+    <figure class="gallery-slide is-active"><img src="{% static 'siteapp/images/timelapse-sunrise.webp' %}" alt="A sunrise photograph displayed over its position on the Time-Lapse map"><figcaption>See each photograph in the place and moment where it belongs.</figcaption></figure>
     <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-photo-mountains.webp' %}" alt="A mountain landscape displayed over its position on the animated Time-Lapse map"><figcaption>Watch the route advance as photographs from the mountain stage appear.</figcaption></figure>
     <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-photo-horses.webp' %}" alt="Horses on a green hillside displayed over the animated Time-Lapse map"><figcaption>Relive photographs and changing locations together as the day unfolds.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-overview.webp' %}" alt="Time-Lapse stage map with the full Camino overview inset"><figcaption>Keep the whole 2,300 km journey in view while a stage begins.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/timelapse-elevation.webp' %}" alt="Time-Lapse map with an elevation profile over the current stage"><figcaption>Follow the stage route together with its animated elevation profile.</figcaption></figure>
+    <figure class="gallery-slide" hidden><img src="{% static 'siteapp/images/collage.webp' %}" alt="A myCamino slide-show collage from a walking journey" loading="lazy"><figcaption>A generated stage collage brings together place, date and photographs.</figcaption></figure>
     <div class="gallery-controls" aria-label="Choose gallery image">
-      <button class="is-active" type="button" data-slide aria-label="Show collage" aria-current="true"></button>
-      <button type="button" data-slide aria-label="Show journey overview"></button>
-      <button type="button" data-slide aria-label="Show elevation profile"></button>
-      <button type="button" data-slide aria-label="Show sunrise photograph"></button>
+      <button class="is-active" type="button" data-slide aria-label="Show sunrise photograph" aria-current="true"></button>
       <button type="button" data-slide aria-label="Show mountain photograph"></button>
       <button type="button" data-slide aria-label="Show horses photograph"></button>
+      <button type="button" data-slide aria-label="Show journey overview"></button>
+      <button type="button" data-slide aria-label="Show elevation profile"></button>
+      <button type="button" data-slide aria-label="Show collage"></button>
       <button class="gallery-toggle" type="button">Pause</button>
     </div>
   </div>

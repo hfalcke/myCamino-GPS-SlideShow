@@ -27,6 +27,19 @@ class PublicSiteTests(TestCase):
         self.assertContains(response, "timelapse-photo-mountains.webp")
         self.assertContains(response, "timelapse-photo-horses.webp")
         self.assertContains(response, "Read the required installation steps")
+        self.assertContains(response, "Download (free beta-test)")
+        self.assertNotContains(response, "Join the macOS beta")
+        html = response.content.decode()
+        gallery_order = (
+            "timelapse-sunrise.webp",
+            "timelapse-photo-mountains.webp",
+            "timelapse-photo-horses.webp",
+            "timelapse-overview.webp",
+            "timelapse-elevation.webp",
+            "collage.webp",
+        )
+        positions = [html.index(image) for image in gallery_order]
+        self.assertEqual(positions, sorted(positions))
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
 

@@ -53,6 +53,7 @@ from GPSTrackShow import (
     track_display_title,
     track_header_lines,
     track_metadata_supports_clock,
+    transport_marker_orientation,
 )
 from track_map_layout_utils import best_unframed_media_layout
 
@@ -61,6 +62,27 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
     def test_first_stage_overview_gets_window_startup_grace(self):
         self.assertEqual(time_lapse_overview_display_seconds(3.0, True), 4.0)
         self.assertEqual(time_lapse_overview_display_seconds(3.0, False), 3.0)
+
+    def test_car_and_bike_use_the_pilgrim_route_orientation(self):
+        for style in ("car", "bike"):
+            self.assertEqual(
+                transport_marker_orientation(style, (1.0, 0.0)),
+                pilgrim_orientation_for_tangent((1.0, 0.0)),
+            )
+            self.assertEqual(
+                transport_marker_orientation(style, (-1.0, 0.0)),
+                pilgrim_orientation_for_tangent((-1.0, 0.0)),
+            )
+            self.assertEqual(
+                transport_marker_orientation(style, (0.0, 1.0)),
+                pilgrim_orientation_for_tangent((0.0, 1.0)),
+            )
+        plane_rotation, plane_mirrored = transport_marker_orientation(
+            "plane",
+            (0.0, 1.0),
+        )
+        self.assertEqual(plane_rotation, -90.0)
+        self.assertFalse(plane_mirrored)
 
     def test_zero_progress_resume_restarts_stage_intro_even_with_saved_media(self):
         self.assertTrue(
@@ -950,10 +972,13 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertAlmostEqual(rotation, 90.0)
         self.assertTrue(mirrored)
 
-    def test_overview_always_uses_arrow_marker(self):
+    def test_overview_uses_transport_symbols_but_not_the_pilgrim(self):
         self.assertEqual(time_lapse_marker_style("pilgrim", overview=False), "pilgrim")
         self.assertEqual(time_lapse_marker_style("pilgrim", overview=True), "arrow")
         self.assertEqual(time_lapse_marker_style("arrow", overview=True), "arrow")
+        for style in ("bike", "car", "plane"):
+            self.assertEqual(time_lapse_marker_style(style, overview=False), style)
+            self.assertEqual(time_lapse_marker_style(style, overview=True), style)
 
     def test_default_and_validation_for_media_fraction(self):
         with TemporaryDirectory() as temp_dir:
@@ -1030,6 +1055,15 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
                 time_lapse_marker="arrow",
             )
             self.assertEqual(arrow_config.time_lapse_marker, "arrow")
+            for marker_style in ("bike", "car", "plane"):
+                self.assertEqual(
+                    config_from_options(
+                        project_dir,
+                        inputlist=control_file,
+                        time_lapse_marker=marker_style,
+                    ).time_lapse_marker,
+                    marker_style,
+                )
             self.assertTrue(
                 config_from_options(
                     project_dir,

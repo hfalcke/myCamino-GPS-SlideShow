@@ -13,6 +13,8 @@ a = Analysis(
     datas=([
         (f'pilgrim-frame{index:02d}-rigged-512.png', '.')
         for index in range(9)
+    ] + [
+        ('build/license_bundle/app_resources/licenses', 'licenses'),
     ] + ([(str(ffmpeg_license), 'licenses/ffmpeg')] if ffmpeg_license.is_file() else [])),
     hiddenimports=[],
     hookspath=[],

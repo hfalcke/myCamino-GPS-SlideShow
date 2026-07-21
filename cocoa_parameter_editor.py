@@ -10,6 +10,8 @@ import objc
 from AppKit import (
     NSApp,
     NSBackingStoreBuffered,
+    NSBox,
+    NSBoxSeparator,
     NSButton,
     NSButtonTypeSwitch,
     NSColor,
@@ -20,6 +22,7 @@ from AppKit import (
     NSFont,
     NSImage,
     NSImageOnly,
+    NSMakePoint,
     NSMakeRect,
     NSPopUpButton,
     NSScrollView,
@@ -263,14 +266,39 @@ class CocoaParameterEditor(NSObject):
         specs = visible_specs_for_section(self.current_section, self.draft, self.show_advanced)
         visible_height = max(300.0, float(self.form_scroll.contentSize().height))
         row_height = 64.0
-        document_height = max(visible_height, 24.0 + row_height * len(specs))
+        subsection_count = sum(
+            1
+            for index, spec in enumerate(specs)
+            if spec.subsection
+            and (index == 0 or specs[index - 1].subsection != spec.subsection)
+        )
+        subsection_height = 38.0
+        document_height = max(
+            visible_height,
+            24.0 + row_height * len(specs) + subsection_height * subsection_count,
+        )
         document_width = max(520.0, float(self.form_scroll.contentSize().width))
         form_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, document_width, document_height))
         self.controls = {}
         self.steppers = {}
         self.tag_to_key = {}
+        cursor_y = document_height - 18.0
+        previous_subsection = ""
         for row, spec in enumerate(specs):
-            y = document_height - 18.0 - (row + 1) * row_height
+            if spec.subsection and spec.subsection != previous_subsection:
+                cursor_y -= subsection_height
+                separator = NSBox.alloc().initWithFrame_(
+                    NSMakeRect(16.0, cursor_y + 30.0, max(100.0, document_width - 32.0), 1.0)
+                )
+                separator.setBoxType_(NSBoxSeparator)
+                form_view.addSubview_(separator)
+                subsection_label = self._make_label(spec.subsection, 12.0, True)
+                subsection_label.setTextColor_(NSColor.secondaryLabelColor())
+                subsection_label.setFrame_(NSMakeRect(16.0, cursor_y + 5.0, 240.0, 20.0))
+                form_view.addSubview_(subsection_label)
+            previous_subsection = spec.subsection
+            cursor_y -= row_height
+            y = cursor_y
             label = self._make_label(spec.label, 13.0, True)
             label.setFrame_(NSMakeRect(16.0, y + 34.0, 215.0, 20.0))
             label.setToolTip_(spec.help_text)
@@ -441,6 +469,31 @@ class CocoaParameterEditor(NSObject):
     def refreshSection_(self, _payload):
         self._render_section()
 
+    def _render_section_preserving_key(self, key):
+        """Rebuild controls without moving the edited field in the viewport."""
+        clip_view = self.form_scroll.contentView()
+        old_origin = clip_view.bounds().origin
+        old_control = self.controls.get(key)
+        old_offset = (
+            float(old_control.frame().origin.y) - float(old_origin.y)
+            if old_control is not None
+            else None
+        )
+        self._render_section()
+        new_control = self.controls.get(key)
+        document = self.form_scroll.documentView()
+        if old_offset is None or new_control is None or document is None:
+            return
+        maximum_y = max(
+            0.0,
+            float(document.frame().size.height) - float(clip_view.bounds().size.height),
+        )
+        target_y = float(new_control.frame().origin.y) - old_offset
+        clip_view.scrollToPoint_(
+            NSMakePoint(float(old_origin.x), max(0.0, min(maximum_y, target_y)))
+        )
+        self.form_scroll.reflectScrolledClipView_(clip_view)
+
     @objc.IBAction
     def stepperChanged_(self, sender):
         key = self.tag_to_key.get(int(sender.tag()))
@@ -457,7 +510,7 @@ class CocoaParameterEditor(NSObject):
         key = self.tag_to_key.get(int(sender.tag()))
         if key is not None:
             self.draft[key] = SPECS_BY_KEY[key].default
-            self._render_section()
+            self._render_section_preserving_key(key)
 
     @objc.IBAction
     def resetAll_(self, _sender):

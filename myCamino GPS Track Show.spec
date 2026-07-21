@@ -35,6 +35,7 @@ a = Analysis(
         ('docs', 'docs'),
         ('myCaminoTrackLogo.PNG', '.'),
         ('MyCaminoLogo-ohneText.png', '.'),
+        ('build/license_bundle/app_resources/licenses', 'licenses'),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],

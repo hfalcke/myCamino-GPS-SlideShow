@@ -1304,6 +1304,7 @@ def render_track_plot(
             1.0 - (2.0 * side_margin_px / width_px),
             max(0.60, (heading_bottom_px - bottom_margin_px) / height_px),
         ]
+
     else:
         title_font_size = max(label_font_size(len(tracks)) * font_factor + 2.0, 10.0)
         subtitle_font_size = max(label_font_size(len(tracks)) * font_factor, 9.0)
@@ -1328,6 +1329,20 @@ def render_track_plot(
             bottom_margin_px / height_px,
             1.0 - (2.0 * side_margin_px / width_px),
             max(0.60, (heading_bottom_px - bottom_margin_px) / height_px),
+        ]
+
+    runtime_header_fraction = max(
+        0.08,
+        min(0.20, 1.0 - (axes_box[1] + axes_box[3])),
+    )
+    if not overview_mode and map_layout == "time-lapse":
+        # Time-Lapse headers are drawn by the player. Let the map continue
+        # behind them so Black, Semi-transparent, and Off are real choices.
+        axes_box = [
+            side_margin_px / width_px,
+            bottom_margin_px / height_px,
+            1.0 - (2.0 * side_margin_px / width_px),
+            1.0 - ((2.0 * bottom_margin_px) / height_px),
         ]
 
     plot_area_size = (
@@ -1520,6 +1535,7 @@ def render_track_plot(
             "width": axes_box[2],
             "height": axes_box[3],
         },
+        "runtime_header_fraction": runtime_header_fraction,
         "extent_mercator": {
             "min_x": min_x,
             "max_x": max_x,

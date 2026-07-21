@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 
-MAP_CONTENT_VERSION = 5
+MAP_CONTENT_VERSION = 6
 DYNAMIC_OVERLAY_MIN_VERSION = 3
 GPX_OVERLAY_MODES = frozenset({"line", "hidden"})
 MEDIA_OVERLAY_MODES = frozenset({"dots", "interpolated", "hidden"})

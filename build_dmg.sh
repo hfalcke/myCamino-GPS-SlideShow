@@ -10,11 +10,19 @@ APP_NAME="myCamino GPS Track Show"
 DMG_NAME="myCamino-GPS-Track-Show.dmg"
 DMG_PATH="dist/${DMG_NAME}"
 TMP_ROOT="$(mktemp -d /tmp/mycamino-dmg-root.XXXXXX)"
+PREVIOUS_BUILD_ROOT="$(mktemp -d /tmp/mycamino-previous-builds.XXXXXX)"
+FFMPEG_SOURCE_ARCHIVE="build/third-party-sources/ffmpeg-8.1.1.tar.xz"
+LICENSE_BUNDLE="build/license_bundle"
 PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-/tmp/mycamino-pyinstaller-cache}"
 export PYINSTALLER_CONFIG_DIR
+VERIFY_MOUNT=""
 
 cleanup() {
+  if [[ -n "$VERIFY_MOUNT" && -d "$VERIFY_MOUNT" ]]; then
+    hdiutil detach "$VERIFY_MOUNT" >/dev/null || true
+  fi
   rm -rf "$TMP_ROOT"
+  rm -rf "$PREVIOUS_BUILD_ROOT"
 }
 trap cleanup EXIT
 
@@ -27,6 +35,14 @@ detach_existing_dmg_mounts() {
   done
 }
 
+move_previous_build_product() {
+  local product="$1"
+  local source="dist/${product}"
+  [[ -e "$source" ]] || return 0
+  echo "==> Moving previous build product aside: ${source}"
+  mv "$source" "$PREVIOUS_BUILD_ROOT/${product}"
+}
+
 echo "==> Building app icon"
 "$PYTHON" - <<'PY'
 from pathlib import Path
@@ -36,28 +52,21 @@ source = Image.open("MyCaminoLogo-ohneText.png").convert("RGBA")
 bbox = source.getbbox()
 if bbox:
     source = source.crop(bbox)
-iconset = Path("build/appicon.iconset")
-iconset.mkdir(parents=True, exist_ok=True)
-for name, size in [
-    ("icon_16x16.png", 16),
-    ("icon_16x16@2x.png", 32),
-    ("icon_32x32.png", 32),
-    ("icon_32x32@2x.png", 64),
-    ("icon_128x128.png", 128),
-    ("icon_128x128@2x.png", 256),
-    ("icon_256x256.png", 256),
-    ("icon_256x256@2x.png", 512),
-    ("icon_512x512.png", 512),
-    ("icon_512x512@2x.png", 1024),
-]:
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    target = int(size * 0.96)
-    scale = min(target / source.width, target / source.height)
-    resized = source.resize((max(1, round(source.width * scale)), max(1, round(source.height * scale))), Image.Resampling.LANCZOS)
-    canvas.alpha_composite(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
-    canvas.save(iconset / name)
+size = 1024
+canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+target = int(size * 0.96)
+scale = min(target / source.width, target / source.height)
+resized = source.resize(
+    (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
+    Image.Resampling.LANCZOS,
+)
+canvas.alpha_composite(
+    resized, ((size - resized.width) // 2, (size - resized.height) // 2)
+)
+output = Path("build/MyCaminoLogo-ohneText.icns")
+output.parent.mkdir(parents=True, exist_ok=True)
+canvas.save(output, format="ICNS")
 PY
-iconutil -c icns build/appicon.iconset -o build/MyCaminoLogo-ohneText.icns
 
 echo "==> Checking Python syntax"
 "$PYTHON" -m py_compile \
@@ -69,30 +78,49 @@ echo "==> Checking Python syntax"
   GetGeoLocations.py \
   gpx_tracks_table.py \
   GPSTrackShow.py \
-  video_audio_normalization.py
+  video_audio_normalization.py \
+  license_resources.py \
+  scripts/prepare_license_bundle.py
+
+echo "==> Fetching and verifying corresponding FFmpeg source"
+scripts/build_ffmpeg_lgpl.sh --source-only
 
 if [[ ! -x "vendor/ffmpeg/ffmpeg" ]]; then
   echo "==> Building pinned LGPL FFmpeg for normalized video audio"
   scripts/build_ffmpeg_lgpl.sh
 fi
 
+echo "==> Preparing licenses and corresponding source"
+"$PYTHON" scripts/prepare_license_bundle.py \
+  --ffmpeg-source "$FFMPEG_SOURCE_ARCHIVE"
+
 echo "==> Building bundled slide-show player"
+move_previous_build_product "GPSTrackShow"
 "$PYINSTALLER" --noconfirm GPSTrackShow.spec
 
 echo "==> Building standalone GPX editor"
+move_previous_build_product "myCamino GPX Editor"
+move_previous_build_product "myCamino GPX Editor.app"
 "$PYINSTALLER" --noconfirm "myCamino GPX Editor.spec"
 
 echo "==> Building ${APP_NAME}.app"
+move_previous_build_product "$APP_NAME"
+move_previous_build_product "${APP_NAME}.app"
 "$PYINSTALLER" --noconfirm "${APP_NAME}.spec"
 
 echo "==> Preparing DMG root"
 cp -R "dist/${APP_NAME}.app" "$TMP_ROOT/"
 cp -R "dist/myCamino GPX Editor.app" "$TMP_ROOT/"
-if [[ -f "dist/DMG_README.txt" ]]; then
-  cp "dist/DMG_README.txt" "$TMP_ROOT/README.txt"
-else
-  printf '%s\n' "Drag ${APP_NAME}.app to Applications." > "$TMP_ROOT/README.txt"
-fi
+cp "DMG_README.txt" "$TMP_ROOT/README.txt"
+cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/GPL-3.0.txt" \
+  "$TMP_ROOT/License — GPL-3.0.txt"
+cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/Third-Party Notices.txt" \
+  "$TMP_ROOT/Third-Party Notices.txt"
+cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/Source Code Information.txt" \
+  "$TMP_ROOT/Source Code Information.txt"
+cp -R "$LICENSE_BUNDLE/app_resources/licenses" "$TMP_ROOT/Licenses"
+cp "$LICENSE_BUNDLE"/source/myCamino-source-*.tar.gz "$TMP_ROOT/"
+cp "$LICENSE_BUNDLE/source/ffmpeg-8.1.1.tar.xz" "$TMP_ROOT/"
 ln -s /Applications "$TMP_ROOT/Applications"
 
 detach_existing_dmg_mounts
@@ -107,5 +135,33 @@ hdiutil create \
 
 echo "==> Verifying ${DMG_PATH}"
 hdiutil verify "$DMG_PATH"
+
+echo "==> Mounting DMG and checking distributed license resources"
+VERIFY_MOUNT="$(hdiutil attach -nobrowse -readonly "$DMG_PATH" | awk '/\/Volumes\// {sub(/^.*\/Volumes\//, "/Volumes/"); print; exit}')"
+[[ -n "$VERIFY_MOUNT" && -d "$VERIFY_MOUNT" ]] || {
+  echo "Error: could not determine the mounted DMG path." >&2
+  exit 1
+}
+for required in \
+  "$VERIFY_MOUNT/License — GPL-3.0.txt" \
+  "$VERIFY_MOUNT/Third-Party Notices.txt" \
+  "$VERIFY_MOUNT/Source Code Information.txt" \
+  "$VERIFY_MOUNT/myCamino GPS Track Show.app/Contents/Resources/licenses/myCamino/GPL-3.0.txt" \
+  "$VERIFY_MOUNT/myCamino GPX Editor.app/Contents/Resources/licenses/myCamino/GPL-3.0.txt"; do
+  [[ -f "$required" ]] || {
+    echo "Error: required DMG resource is missing: $required" >&2
+    exit 1
+  }
+done
+find "$VERIFY_MOUNT" -maxdepth 1 -name 'myCamino-source-*.tar.gz' -type f | grep -q . || {
+  echo "Error: the corresponding myCamino source archive is missing." >&2
+  exit 1
+}
+[[ -f "$VERIFY_MOUNT/ffmpeg-8.1.1.tar.xz" ]] || {
+  echo "Error: the corresponding FFmpeg source archive is missing." >&2
+  exit 1
+}
+hdiutil detach "$VERIFY_MOUNT" >/dev/null
+VERIFY_MOUNT=""
 
 echo "==> Done: ${ROOT_DIR}/${DMG_PATH}"

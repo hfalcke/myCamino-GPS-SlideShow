@@ -27,9 +27,12 @@ Environment overrides:
   PYTHON=path          Python interpreter used for tests.
   PYINSTALLER=path     Passed through to build_dmg.sh.
   REMOTE=name          Git remote to push to (default: origin).
+  MYCAMINO_DEPLOY_HOST Remote SSH destination used by the website publisher.
+  MYCAMINO_SSH_KEY     SSH private key used by the website publisher.
 
-The script tests and builds before committing. The verified DMG is left in
-dist/myCamino-GPS-Track-Show.dmg; dist/ is intentionally not committed.
+The script tests, commits the exact source, builds from that commit, pushes the
+Git branch, and atomically publishes the verified DMG as the website's active
+download. The local DMG remains in dist/ and is intentionally not committed.
 EOF
 }
 
@@ -62,6 +65,7 @@ done
 }
 [[ -x "$PYTHON" ]] || { echo "Error: Python is not executable: $PYTHON" >&2; exit 1; }
 [[ -x "./build_dmg.sh" ]] || { echo "Error: ./build_dmg.sh is missing or not executable." >&2; exit 1; }
+[[ -x "./scripts/publish_website_release.sh" ]] || { echo "Error: website release publisher is missing or not executable." >&2; exit 1; }
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Error: not inside a Git worktree." >&2; exit 1; }
 git remote get-url "$REMOTE" >/dev/null 2>&1 || { echo "Error: Git remote '$REMOTE' does not exist." >&2; exit 1; }
 
@@ -86,7 +90,7 @@ git status --short
 echo
 
 if [[ "$ASSUME_YES" -ne 1 ]]; then
-  read -r -p "Run tests, build the DMG, commit all changes, and push? [y/N] " answer
+  read -r -p "Run tests, commit the source, build the DMG, push, and publish it to the website? [y/N] " answer
   case "$answer" in
     y|Y|yes|YES) ;;
     *) echo "Release cancelled."; exit 0 ;;
@@ -94,14 +98,10 @@ if [[ "$ASSUME_YES" -ne 1 ]]; then
 fi
 
 echo "==> Checking patch formatting"
-git diff --check
+git --no-pager diff --check
 
 echo "==> Running test suite"
 "$PYTHON" -m unittest discover -s tests
-
-echo "==> Building and verifying DMG"
-./build_dmg.sh
-[[ -f "$DMG_PATH" ]] || { echo "Error: expected DMG was not created: $DMG_PATH" >&2; exit 1; }
 
 echo "==> Staging all repository changes"
 git add --all
@@ -109,11 +109,22 @@ git add --all
 if git diff --cached --quiet; then
   echo "==> No source changes to commit; the DMG was built successfully."
 else
-  git diff --cached --check
+  git --no-pager diff --cached --check
   git status --short
   echo "==> Creating commit"
   git commit -m "$COMMIT_MESSAGE"
 fi
+
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  echo "Error: tracked or untracked source changes remain after committing." >&2
+  echo "The DMG must be built from a clean, identifiable source revision." >&2
+  git status --short >&2
+  exit 1
+fi
+
+echo "==> Building and verifying DMG from $(git rev-parse --short HEAD)"
+./build_dmg.sh
+[[ -f "$DMG_PATH" ]] || { echo "Error: expected DMG was not created: $DMG_PATH" >&2; exit 1; }
 
 echo "==> Pushing $BRANCH to $REMOTE"
 if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
@@ -127,6 +138,9 @@ else
     exit 1
   fi
 fi
+
+echo "==> Publishing verified DMG to mycamino.heinofalcke.de"
+./scripts/publish_website_release.sh "$DMG_PATH"
 
 echo "==> Release complete"
 echo "Commit: $(git rev-parse --short HEAD)"

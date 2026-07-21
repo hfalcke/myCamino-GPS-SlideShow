@@ -26,3 +26,8 @@ until the legal operator name, postal address and email are configured.
 Caddy authenticates the public DMG route against Django, rewrites it to
 `latest.dmg`, and serves the file with HTTP range support. The release
 directory has no unprotected public route.
+
+The repository-level `release.sh` automatically invokes
+`scripts/publish_website_release.sh` after the source branch has been pushed.
+The publisher uploads to a temporary name, verifies size and SHA-256 on the
+server, registers the release, and only then switches `latest.dmg`.

@@ -95,7 +95,9 @@ from AppKit import (
     NSTerminateCancel,
     NSTerminateNow,
 )
-from Foundation import NSDate, NSIndexSet, NSObject, NSAttributedString, NSMakeSize, NSNotificationCenter, NSRunLoop, NSString, NSURL, NSPredicate, NSTimer
+from Foundation import NSDate, NSIndexSet, NSObject, NSAttributedString, NSMakeSize, NSNotificationCenter, NSRunLoop, NSString, NSURL, NSPredicate, NSTimer, NSUserDefaults
+
+from beta_notice import BETA_NOTICE_PREFERENCE_KEY, BETA_NOTICE_VERSION, BUG_REPORT_URL, beta_notice_should_be_shown
 
 try:
     from AVFoundation import AVPlayer
@@ -220,6 +222,7 @@ from workflow_assistant import (
     normalize_assistant_state,
     relocated_bubble_geometry,
 )
+from license_resources import read_license_document
 
 
 class ProjectStatusRefreshSuperseded(Exception):
@@ -529,6 +532,23 @@ def control_file_signature(path):
 def slideshow_process_is_running(process):
     """Return whether an optional player subprocess is still active."""
     return process is not None and process.poll() is None
+
+
+def slideshow_settings_command_payload(parameters, changed_keys, sequence):
+    """Build the primitive JSON payload used for a live Settings Apply."""
+    values = {
+        key: parameters[key]
+        for key in changed_keys
+        if key in parameters
+    }
+    if not values:
+        return None
+    return {
+        "version": 1,
+        "sequence": int(sequence),
+        "command": "settings",
+        "values": values,
+    }
 
 
 def control_file_recovery_is_newer(control_path, recovery_path):
@@ -2018,6 +2038,7 @@ class GPXTrackerController(NSObject):
         self.slideshow_live_state = None
         self.slideshow_live_state_sequence = -1
         self.slideshow_command_file = None
+        self.slideshow_settings_request_sequence = 0
         self.slideshow_command_sequence = 0
         self.control_table_preview_checkbox = None
         self.control_table_search_field = None
@@ -2067,6 +2088,7 @@ class GPXTrackerController(NSObject):
         self.media_update_preview_apply_button = None
         self.media_update_preview_track_text = None
         self.main_help_window = None
+        self.license_document_windows = {}
         self.parameter_window = None
         self.parameter_window_delegate = None
         self.parameter_form_scroll = None
@@ -5550,7 +5572,11 @@ class GPXTrackerController(NSObject):
             editor_controller.apply_project_parameters(self.parameters)
         if changed:
             self.mark_dirty(immediate=True)
-            self.set_status(f"Applied {len(changed)} Adventure setting(s); auto-save scheduled.")
+            sent_live = self._send_running_slideshow_settings(changed)
+            self.set_status(
+                f"Applied {len(changed)} Adventure setting(s); auto-save scheduled"
+                + (" and running slide show updated." if sent_live else ".")
+            )
             if changed & {"trackmaps.route_source", "audio.enabled"}:
                 self.layout_window()
             if changed & {
@@ -5570,6 +5596,30 @@ class GPXTrackerController(NSObject):
             self.set_status("Adventure settings unchanged.")
         return True
 
+    def _send_running_slideshow_settings(self, changed_keys):
+        """Send changed settings to the active player through its command file."""
+        if not slideshow_process_is_running(getattr(self, "slideshow_process", None)):
+            return False
+        if getattr(self, "slideshow_command_file", None) is None:
+            return False
+        self.slideshow_command_sequence = max(
+            time.time_ns(),
+            getattr(self, "slideshow_command_sequence", 0) + 1,
+        )
+        payload = slideshow_settings_command_payload(
+            self.parameters,
+            changed_keys,
+            self.slideshow_command_sequence,
+        )
+        if payload is None:
+            return False
+        try:
+            atomic_write_json(self.slideshow_command_file, payload)
+        except OSError as exc:
+            self.set_status(f"Settings were saved, but could not be sent to the running slide show: {exc}")
+            return False
+        return True
+
     def _apply_parameters_from_shared_editor(self, values, _changed):
         return self._apply_parameter_values(values, propagate_to_editor=True)
 
@@ -5582,10 +5632,13 @@ class GPXTrackerController(NSObject):
     def showMainHelp_(self, _sender):
         help_text = (
             "myCamino GPS Track Show helps you build one travel slide show from tracks, photos, videos, and maps.\n\n"
+            "FREE BETA-TEST SOFTWARE — NO WARRANTY\n"
+            "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
+            f"Bug-report page: {BUG_REPORT_URL}\n\n"
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Editing an existing name offers Rename or Copy, optionally including its GPX, control file, and generated maps.\n"
-            "3. Use the gear beside the myCamino logo to adjust project settings. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Applied changes are auto-saved with the Adventure.\n"
+            "3. Use the gear beside the myCamino logo to adjust project settings. During a slide show, press s to open Settings directly at Slide Show. Header controls and Time-Lapse options are grouped in their own subsections below thin dividers. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Apply updates an active slide show immediately and auto-saves the settings with the Adventure.\n"
             "4. For a new Adventure, confirm a detected GPX file, choose other GPX files, or select No GPX file - use only photos. One detected file is used directly; several detected or selected files are joined in the GPX Editor. Cancelling a chooser leaves the source unconfirmed. The same media-only choice remains visible in the GPX Files section and is saved with the Adventure.\n"
             "5. Accept photos and videos already in the Adventure folder or import more. Existing files are skipped rather than copied again. One retained Adventure Processing window then shows metadata extraction, optional place-name lookup, map generation, and control-file work with phase headings and progress in its title. Add place names is selected by default; Skip omits only that slower phase.\n"
             "6. Map Generation automatically creates only missing or outdated maps and always creates Standard and Time-Lapse variants consecutively for each affected stage. The manual Generate and Update Maps button is mainly for repairs, changed settings, or retried downloads. Completed metadata and maps remain available if a later phase fails or is cancelled.\n"
@@ -5598,7 +5651,7 @@ class GPXTrackerController(NSObject):
             "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
             "15. In the control-file editor, use the row-type filter or Reset Filter, and press Start Slide Show Here at the bottom or in the context menu to launch once from that exact map, medium, date, music directive, or slide-show control row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
             "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
-            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Press Space or Right/Down to leave the title immediately; otherwise it advances automatically after 30 seconds. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Press a during either show to pause or resume background audio.\n\n"
+            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Its temporary help hint disappears after five seconds. Press Space or Right/Down to leave the title immediately; otherwise it advances automatically after 30 seconds. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Every playback style uses the same clock, three-line title area, and track statistics. Settings independently select stage name, track length and duration, place name, clock, and statistics. One Header layout applies to photos, Time-Lapse maps, and overview maps. No box and Semi-transparent overlay retain the full screen and align the header to the fitted image edge. Header area is the default; it uses the slideshow Background color and fits the display beneath it while maps retain the full width. Font color also controls the clock, time, and date, and Shadow color defaults to black. The Time-Lapse marker can be a pilgrim, bicycle, car, airplane, or arrow. Selected title fields are packed from the top without empty lines; the first line is larger. Press c to toggle the complete header, and a to pause or resume background audio.\n\n"
             "Workflow Assistant:\n"
             "- Assistant in the header is enabled for new Adventures and offers a recommended action for the next incomplete step. Return activates the default action.\n"
             "- It guides Project directory, Adventure name, the two explicit GPX or photo-only choices, explicit media acceptance/import, metadata using the visible place-name option, combined control/map creation, and the first slide-show start.\n"
@@ -5635,12 +5688,96 @@ class GPXTrackerController(NSObject):
             text_view.setString_(help_text)
             scroll.setDocumentView_(text_view)
             content.addSubview_(scroll)
+            license_button = self._make_button("License", "showProjectLicense:")
+            license_button.setFrame_(NSMakeRect(18.0, 18.0, 100.0, FIELD_HEIGHT))
+            content.addSubview_(license_button)
+            notices_button = self._make_button(
+                "Third-Party Notices", "showThirdPartyNotices:"
+            )
+            notices_button.setFrame_(NSMakeRect(128.0, 18.0, 170.0, FIELD_HEIGHT))
+            content.addSubview_(notices_button)
+            source_button = self._make_button("Source Code", "showSourceCodeInfo:")
+            source_button.setFrame_(NSMakeRect(303.0, 18.0, 105.0, FIELD_HEIGHT))
+            content.addSubview_(source_button)
+            bug_button = self._make_button("Report a Bug", "openBugReport:")
+            bug_button.setFrame_(NSMakeRect(418.0, 18.0, 120.0, FIELD_HEIGHT))
+            content.addSubview_(bug_button)
             close_button = self._make_button("Close", "closeMainHelp:")
             close_button.setFrame_(NSMakeRect(562.0, 18.0, 100.0, FIELD_HEIGHT))
             close_button.setAutoresizingMask_(0)
             content.addSubview_(close_button)
             self.main_help_window = window
         self.main_help_window.makeKeyAndOrderFront_(None)
+
+    def _show_project_document(self, kind, title):
+        window = self.license_document_windows.get(kind)
+        if window is not None:
+            window.makeKeyAndOrderFront_(None)
+            return
+        try:
+            document = read_license_document(kind)
+        except (OSError, ValueError) as exc:
+            self.show_alert("Document unavailable", str(exc))
+            return
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(240.0, 160.0, 760.0, 600.0),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setReleasedWhenClosed_(False)
+        window.setTitle_(title)
+        scroll = NSScrollView.alloc().initWithFrame_(window.contentView().bounds())
+        scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+        text_view = NSTextView.alloc().initWithFrame_(scroll.contentView().bounds())
+        text_view.setEditable_(False)
+        text_view.setSelectable_(True)
+        text_view.setRichText_(False)
+        text_view.setFont_(NSFont.userFixedPitchFontOfSize_(12.0))
+        text_view.setString_(document)
+        scroll.setDocumentView_(text_view)
+        window.contentView().addSubview_(scroll)
+        self.license_document_windows[kind] = window
+        window.makeKeyAndOrderFront_(None)
+
+    @objc.IBAction
+    def showProjectLicense_(self, _sender):
+        self._show_project_document("license", "myCamino License — GPL-3.0-or-later")
+
+    @objc.IBAction
+    def showThirdPartyNotices_(self, _sender):
+        self._show_project_document("third_party", "Third-Party Notices")
+
+    @objc.IBAction
+    def showSourceCodeInfo_(self, _sender):
+        self._show_project_document("source", "Source Code Information")
+
+    @objc.IBAction
+    def openBugReport_(self, _sender):
+        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(BUG_REPORT_URL))
+
+    def show_first_launch_beta_notice(self):
+        """Show the beta and warranty warning once for this notice version."""
+        defaults = NSUserDefaults.standardUserDefaults()
+        if not beta_notice_should_be_shown(defaults.integerForKey_(BETA_NOTICE_PREFERENCE_KEY)):
+            return
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Welcome to the free myCamino beta test")
+        alert.setInformativeText_(
+            "This is beta-test software supplied free of charge and without any warranty. "
+            "It may contain bugs. Please report problems so that myCamino can be improved "
+            "for everyone. The bug-report link is always available from Help."
+        )
+        alert.addButtonWithTitle_("Continue")
+        alert.addButtonWithTitle_("Report a Bug")
+        response = int(alert.runModal())
+        defaults.setInteger_forKey_(BETA_NOTICE_VERSION, BETA_NOTICE_PREFERENCE_KEY)
+        defaults.synchronize()
+        if response == 1001:
+            self.openBugReport_(None)
 
     @objc.IBAction
     def closeMainHelp_(self, _sender):
@@ -6320,14 +6457,39 @@ class GPXTrackerController(NSObject):
         )
         visible_height = max(300.0, float(self.parameter_form_scroll.contentSize().height))
         row_height = 64.0
-        document_height = max(visible_height, 24.0 + row_height * len(specs))
+        subsection_count = sum(
+            1
+            for index, spec in enumerate(specs)
+            if spec.subsection
+            and (index == 0 or specs[index - 1].subsection != spec.subsection)
+        )
+        subsection_height = 38.0
+        document_height = max(
+            visible_height,
+            24.0 + row_height * len(specs) + subsection_height * subsection_count,
+        )
         document_width = max(520.0, float(self.parameter_form_scroll.contentSize().width))
         form_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, document_width, document_height))
         self.parameter_controls = {}
         self.parameter_steppers = {}
         self.parameter_tag_to_key = {}
+        cursor_y = document_height - 18.0
+        previous_subsection = ""
         for row, spec in enumerate(specs):
-            y = document_height - 18.0 - (row + 1) * row_height
+            if spec.subsection and spec.subsection != previous_subsection:
+                cursor_y -= subsection_height
+                separator = NSBox.alloc().initWithFrame_(
+                    NSMakeRect(16.0, cursor_y + 30.0, max(100.0, document_width - 32.0), 1.0)
+                )
+                separator.setBoxType_(NSBoxSeparator)
+                form_view.addSubview_(separator)
+                subsection_label = self._make_label(spec.subsection, size=12.0, bold=True)
+                subsection_label.setTextColor_(NSColor.secondaryLabelColor())
+                subsection_label.setFrame_(NSMakeRect(16.0, cursor_y + 5.0, 240.0, 20.0))
+                form_view.addSubview_(subsection_label)
+            previous_subsection = spec.subsection
+            cursor_y -= row_height
+            y = cursor_y
             label = self._make_label(spec.label, size=13.0, bold=True)
             label.setFrame_(NSMakeRect(16.0, y + 34.0, 215.0, 20.0))
             label.setToolTip_(spec.help_text)
@@ -6462,6 +6624,10 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def showParameterEditor_(self, _sender):
+        self._show_parameter_editor_section()
+
+    def _show_parameter_editor_section(self, section=None):
+        """Open Adventure Settings, optionally selecting one section."""
         if self.parameter_editor_controller is None:
             self.parameter_editor_controller = CocoaParameterEditor.alloc().init()
             self.parameter_editor_controller.configure(
@@ -6472,6 +6638,8 @@ class GPXTrackerController(NSObject):
             )
         else:
             self.parameter_editor_controller.update_values(self.parameters)
+        if section in SECTION_ORDER:
+            self.parameter_editor_controller.current_section = section
         self.parameter_editor_controller.show()
 
     @objc.IBAction
@@ -6498,6 +6666,31 @@ class GPXTrackerController(NSObject):
     def refreshParameterSection_(self, _payload):
         self._render_parameter_section()
 
+    def _render_parameter_section_preserving_key(self, key):
+        """Rebuild the legacy parameter form without jumping away from a reset field."""
+        clip_view = self.parameter_form_scroll.contentView()
+        old_origin = clip_view.bounds().origin
+        old_control = self.parameter_controls.get(key)
+        old_offset = (
+            float(old_control.frame().origin.y) - float(old_origin.y)
+            if old_control is not None
+            else None
+        )
+        self._render_parameter_section()
+        new_control = self.parameter_controls.get(key)
+        document = self.parameter_form_scroll.documentView()
+        if old_offset is None or new_control is None or document is None:
+            return
+        maximum_y = max(
+            0.0,
+            float(document.frame().size.height) - float(clip_view.bounds().size.height),
+        )
+        target_y = float(new_control.frame().origin.y) - old_offset
+        clip_view.scrollToPoint_(
+            NSMakePoint(float(old_origin.x), max(0.0, min(maximum_y, target_y)))
+        )
+        self.parameter_form_scroll.reflectScrolledClipView_(clip_view)
+
     @objc.IBAction
     def parameterStepperChanged_(self, sender):
         key = self.parameter_tag_to_key.get(int(sender.tag()))
@@ -6518,7 +6711,7 @@ class GPXTrackerController(NSObject):
         if key is None:
             return
         self.parameter_draft[key] = SPECS_BY_KEY[key].default
-        self._render_parameter_section()
+        self._render_parameter_section_preserving_key(key)
 
     @objc.IBAction
     def resetAllParameters_(self, _sender):
@@ -11674,6 +11867,7 @@ class GPXTrackerController(NSObject):
             )
             self.slideshow_live_state = None
             self.slideshow_live_state_sequence = -1
+            self.slideshow_settings_request_sequence = 0
             self.slideshow_command_file = command_file
             self.slideshow_command_sequence = 0
             self.workflow_assistant_state["slideshow_started"] = True
@@ -11775,6 +11969,15 @@ class GPXTrackerController(NSObject):
             return
         self.slideshow_live_state_sequence = sequence
         self.slideshow_live_state = state
+        request_sequence = int(state.get("request_sequence", 0) or 0)
+        if (
+            state.get("request") == "open_settings"
+            and request_sequence > self.slideshow_settings_request_sequence
+        ):
+            self.slideshow_settings_request_sequence = request_sequence
+            self._show_parameter_editor_section(
+                state.get("settings_section") or "Slide Show"
+            )
         self._apply_slideshow_live_state()
 
     def slideShowProcessFinished_(self, result):
@@ -11844,6 +12047,8 @@ class GPXTrackerController(NSObject):
             str(settings["slideshow.background_color"]),
             "--font-color",
             str(settings["slideshow.font_color"]),
+            "--header-shadow-color",
+            str(settings["slideshow.header_shadow_color"]),
             "--font-size",
             str(settings["slideshow.font_size"]),
             "--dot-color",
@@ -11878,8 +12083,16 @@ class GPXTrackerController(NSObject):
             str(settings["trackmaps.track_title"]),
             "--clock",
             "on" if settings["slideshow.clock"] else "off",
-            "--placenames",
-            "on" if settings["slideshow.place_names"] else "off",
+            "--header-stage-name",
+            "on" if settings["slideshow.header_stage_name"] else "off",
+            "--header-track-details",
+            "on" if settings["slideshow.header_track_details"] else "off",
+            "--header-place-name",
+            "on" if settings["slideshow.header_place_name"] else "off",
+            "--header-track-stats",
+            "on" if settings["slideshow.header_track_stats"] else "off",
+            "--header-background",
+            str(settings["slideshow.header_background"]),
             "--collage-size-range",
             str(settings["slideshow.collage_size_range"]),
             "--collage-max-images",
@@ -13612,6 +13825,13 @@ class GPXTrackerController(NSObject):
             except Exception:
                 pass
             self.main_help_window = None
+        for document_window in self.license_document_windows.values():
+            try:
+                document_window.orderOut_(None)
+                document_window.close()
+            except Exception:
+                pass
+        self.license_document_windows.clear()
         if self.album_selection_window is not None:
             try:
                 NSApp().stopModal()
@@ -13652,6 +13872,7 @@ class GPSTrackShowGUIAppDelegate(NSObject):
         self.controller = GPXTrackerController.alloc().initWithProjectDirectory_projectFile_(self.project_directory, self.project_file)
         self.controller.show()
         NSApp().activateIgnoringOtherApps_(True)
+        self.controller.show_first_launch_beta_notice()
 
     def applicationWillTerminate_(self, _notification):
         if getattr(self, "controller", None) is not None:

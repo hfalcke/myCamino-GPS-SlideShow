@@ -160,13 +160,13 @@ is accepted. Setting any individual smoothing, spacing, or quality limit to
 zero disables it. The same processed geometry drives statistics, generated maps,
 PDFs, timing, and Time-Lapse motion; the original GPX points are not rewritten.
 
-The Time-Lapse **Moving marker** setting chooses between the animated walking
-pilgrim and the traditional arrow. The pilgrim is the default. It uses a
+The Time-Lapse **Moving marker** setting offers the animated walking pilgrim,
+bicycle, car, airplane, and traditional arrow. The pilgrim is the default. It uses a
 standing pose while the GPS marker remains within the screen-scaled motion
 tolerance, then resumes its walking cycle from frame 3. At the start of each
 stage it adopts the fixed arrow angle and is mirrored when necessary so that it
-faces from the stage start toward its end. This setting affects only the stage
-map; the overview map continues to show the traditional arrow.
+faces from the stage start toward its end. The overview keeps an arrow when the
+pilgrim is selected; transport symbols appear on both stage and overview maps.
 
 **Show elevation profile** is enabled by default. At the beginning of every
 GPX-backed Time-Lapse stage, the marked Tour Overview appears first inside the
@@ -235,11 +235,12 @@ plus Standard and Time-Lapse variants for every required GPX or media stage.
 Only missing or outdated maps are rendered.
 
 Newly created maps separate the downloaded basemap from the route and header.
-The PNG stores the basemap and its reserved header area; the slideshow, map
-viewer, and PDF export draw routes, location dots, endpoints, and titles from
-the matching map information. Therefore changing route colors, line widths,
-point styles, or header visibility in Settings no longer requires downloading
-the basemap again.
+The PNG stores the basemap pixels; Standard maps include their normal title
+margin while Time-Lapse basemaps fill the frame. The slideshow, map viewer, and
+PDF export draw routes, location dots, endpoints, and titles from the matching
+map information. Therefore changing route colors, line widths, point styles,
+or header visibility in Settings no longer requires downloading the basemap
+again.
 
 GPX-stage maps reserve a 25% taller black header. By default their title uses
 the reverse-geocoded start and destination of the track (`PLACE1 - PLACE2`);
@@ -714,7 +715,7 @@ The Start Slide Show section contains:
   **Use First** uses the first still image in the control file. The title image
   is limited to 35% of the screen width and height. Descriptions shorter than
   five displayed lines are centered. At show startup, the temporary `h` help
-  hint is placed at the bottom. The information disappears without fading the
+  hint is placed at the bottom and disappears after five seconds. The title information disappears without fading the
   unchanged background map through black, followed by the first Stage Map.
   Press Space or Right/Down to advance from the title immediately. Without a
   key press, it advances automatically after 30 seconds. Continue does not
@@ -736,14 +737,25 @@ The Start Slide Show section contains:
   area. The moving arrow keeps one fixed orientation, perpendicular to the line
   from the stage start to its end. While media is visible, a red dot with a
   white edge marks the route position where it first appeared. Its reverse-
-  geocoded place appears as a shadowed subtitle in the enlarged map header,
-  using the same size as the date subtitle. When the clock option is enabled,
+  geocoded place can appear as one of the three centered title lines. When the
+  clock option is enabled,
   the analog clock in the upper-left follows the moving GPX marker time
   throughout the stage rather than showing a fixed media time; the separate
   date subtitle is then omitted. The upper-right map header shows total
   travelled distance, distance within the current stage, and current height.
-  Half-transparent black shadows keep all overlay text readable; `c` and `p`
-  toggle the clock and place name respectively.
+  Fade, Blend, Collage, Quad, and every other media style use this same clock,
+  three-line title area, sizing, and track-statistics layout. Settings have
+  separate checkboxes for the clock, stage name, track length and duration,
+  place name, and statistics. Enabled title fields are packed from the top with
+  no empty rows, and the first displayed line is larger. One Header layout
+  setting controls photos, Time-Lapse maps, and overview maps. No box and
+  Semi-transparent overlay leave pictures and maps full-frame, with the header
+  aligned to the fitted picture or map edge. Header area is the default; it
+  uses the selected slideshow background color and fits the display beneath
+  it while maps remain full-width. Font color also controls the clock marks and hands, time, and
+  date. Shadow color is configurable and defaults to black. Apply changes the
+  active slide show immediately, and `c` toggles the complete configured
+  header.
 - PDF Summary: opens the same PDF export panel used by `myCamino GPX Editor`.
   It exports the current GPX track table and can optionally include overview,
   track maps, elevation profiles, and page orientation choices.
@@ -833,15 +845,18 @@ Common slide-show keys:
   Closing the overview window also returns to one-window playback without
   stopping the show.
 - `i`: show photo metadata overlay.
-- `c`, `p`, `f`, `d`, and `D`: keep their existing clock, place-name,
-  fullscreen, display-swap, and memory-debug functions.
+- `c`, `f`, `d`, and `D`: toggle the complete header, fullscreen,
+  display-swap, and memory-debug functions.
 - `e`: switch the Stage Map elevation-profile introduction on or off. The
   Adventure setting is on by default; the key changes only the running show.
 - `n`: switch subsequent videos between valid normalized copies and originals.
   If a video is active, playback resumes at the same time and in the same
   paused/playing state. If no current normalized copy exists, playback is left
   unchanged.
-- `h`: show help.
+- `h`: show help while held; it remains visible for five seconds after release.
+- `s`: open Adventure Settings directly at the combined Slide Show section in
+  the main myCamino window. Header and Time-Lapse options are grouped in their
+  own subsections, separated by thin lines. Apply updates the running show.
 - `q` or Escape: quit slide show.
 
 Because the slide show runs separately, quitting it should not close or crash

@@ -11,11 +11,35 @@ from GPSTrackShowGUI import (
     playlist_belongs_to_audio_directory,
     normalize_slideshow_resume_history,
     resolve_gui_startup_paths,
+    slideshow_settings_command_payload,
     validated_slideshow_resume_position,
 )
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_live_settings_payload_contains_only_changed_values(self):
+        payload = slideshow_settings_command_payload(
+            {
+                "slideshow.header_track_stats": True,
+                "slideshow.header_background": "transparent",
+                "slideshow.font_size": 30,
+            },
+            {
+                "slideshow.header_track_stats",
+                "slideshow.header_background",
+            },
+            42,
+        )
+        self.assertEqual(payload["command"], "settings")
+        self.assertEqual(payload["sequence"], 42)
+        self.assertEqual(
+            payload["values"],
+            {
+                "slideshow.header_background": "transparent",
+                "slideshow.header_track_stats": True,
+            },
+        )
+
     def test_resume_history_accepts_only_current_checkpoint_format(self):
         current = {"version": 4, "completed": False, "playlist_index": 4}
         self.assertEqual(

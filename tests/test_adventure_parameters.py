@@ -6,6 +6,7 @@ import unittest
 
 from adventure_parameters import (
     PARAMETER_SCHEMA_VERSION,
+    SECTION_ORDER,
     default_parameters,
     map_affecting_parameter_keys,
     normalize_parameter_value,
@@ -35,6 +36,15 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["audio.video_volume_percent"], 100.0)
         self.assertTrue(defaults["audio.use_normalized_videos"])
         self.assertTrue(defaults["slideshow.elevation_profile"])
+        self.assertTrue(defaults["slideshow.clock"])
+        self.assertTrue(defaults["slideshow.header_stage_name"])
+        self.assertTrue(defaults["slideshow.header_track_details"])
+        self.assertTrue(defaults["slideshow.header_place_name"])
+        self.assertTrue(defaults["slideshow.header_track_stats"])
+        self.assertEqual(defaults["slideshow.header_background"], "black")
+        self.assertEqual(defaults["slideshow.header_shadow_color"], "#000000")
+        self.assertNotIn("timelapse.header_background", defaults)
+        self.assertNotIn("reserved", dict(SPECS_BY_KEY["slideshow.header_background"].choices))
         self.assertEqual(defaults["audio.video_normalization_target_lufs"], -16.0)
         self.assertTrue(defaults["locations.add_place_names"])
         self.assertTrue(defaults["timelapse.overview_as_media"])
@@ -51,6 +61,35 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["trackmaps.zoom"], 16)
         self.assertNotIn("trackmaps.media_point_size", defaults)
         self.assertNotIn("trackmaps.variant", defaults)
+
+    def test_legacy_header_choices_migrate_to_three_line_settings(self):
+        values = normalize_parameters({
+            "version": 13,
+            "values": {
+                "slideshow.header_title": False,
+                "slideshow.place_names": False,
+            },
+        })
+        self.assertFalse(values["slideshow.header_stage_name"])
+        self.assertFalse(values["slideshow.header_track_details"])
+        self.assertFalse(values["slideshow.header_place_name"])
+
+    def test_removed_reserved_layout_becomes_black(self):
+        values = normalize_parameters({
+            "version": 14,
+            "values": {
+                "slideshow.header_background": "reserved",
+            },
+        })
+        self.assertEqual(values["slideshow.header_background"], "black")
+
+    def test_previous_time_lapse_layout_becomes_the_shared_layout_when_needed(self):
+        values = normalize_parameters({
+            "version": 15,
+            "values": {"timelapse.header_background": "transparent"},
+        })
+        self.assertEqual(values["slideshow.header_background"], "transparent")
+        self.assertNotIn("timelapse.header_background", values)
 
     def test_previous_default_map_zoom_migrates_to_sixteen(self):
         migrated = normalize_parameters(
@@ -146,6 +185,45 @@ class AdventureParameterTests(unittest.TestCase):
         values = default_parameters()
         self.assertGreater(len(visible_specs_for_section("GPX Processing", values)), 0)
         self.assertGreater(len(visible_specs_for_section("PDF Export", values)), 0)
+
+    def test_time_lapse_settings_are_a_slideshow_subsection(self):
+        values = default_parameters()
+        slideshow_specs = visible_specs_for_section("Slide Show", values)
+        time_lapse_specs = [spec for spec in slideshow_specs if spec.subsection == "Time-Lapse"]
+        self.assertNotIn("Time-Lapse", SECTION_ORDER)
+        self.assertTrue(time_lapse_specs)
+        self.assertEqual(
+            {spec.key for spec in time_lapse_specs},
+            {
+                "timelapse.stage_duration_seconds",
+                "timelapse.media_min_fraction",
+                "timelapse.overview_as_media",
+                "timelapse.overview_on_stage_map_dual",
+                "timelapse.marker_style",
+            },
+        )
+
+    def test_header_settings_are_grouped_together(self):
+        values = default_parameters()
+        header_keys = {
+            spec.key
+            for spec in visible_specs_for_section("Slide Show", values)
+            if spec.subsection == "Header"
+        }
+        self.assertEqual(
+            header_keys,
+            {
+                "slideshow.clock",
+                "slideshow.font_color",
+                "slideshow.font_size",
+                "slideshow.header_stage_name",
+                "slideshow.header_track_details",
+                "slideshow.header_place_name",
+                "slideshow.header_track_stats",
+                "slideshow.header_background",
+                "slideshow.header_shadow_color",
+            },
+        )
 
     def test_custom_provider_fields_follow_provider_selection(self):
         values = default_parameters()

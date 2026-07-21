@@ -90,8 +90,10 @@ from Foundation import (
     NSString,
     NSTimer,
     NSURL,
+    NSUserDefaults,
 )
 
+from beta_notice import BETA_NOTICE_PREFERENCE_KEY, BETA_NOTICE_VERSION, BUG_REPORT_URL, beta_notice_should_be_shown
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
 from basemap_tile_utils import tolerate_missing_tiles
 from adventure_parameters import (
@@ -116,6 +118,7 @@ from json_storage import atomic_write_json, load_parameter_subset, parameter_sub
 from map_provider_utils import contextily_provider, contextily_request_timeout, provider_display_name, provider_tile_url
 from map_overlay import MapOverlayScene, normalize_overlay_segments
 from track_timing_utils import timestamps_from_start
+from license_resources import read_license_document
 
 
 def process_track_snapshots(xml_snapshots: list[str], options: ProcessingOptions) -> list[ProcessedTrack]:
@@ -3800,6 +3803,7 @@ class GPXEditorController(NSObject):
         self.settings_controller = None
         self.parameter_load_warnings = []
         self.help_window = None
+        self.license_document_windows = {}
         self.did_auto_size_track_columns = False
         self.dirty = False
         self.debug = False
@@ -7810,6 +7814,9 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def help_(self, _sender):
         text = (
+            "FREE BETA-TEST SOFTWARE — NO WARRANTY\n"
+            "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
+            f"Bug-report page: {BUG_REPORT_URL}\n\n"
             "Add Tracks loads GPX files into the table. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
             "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint inspector. Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, sorting applies to the full table. Drag selected rows to reorder tracks. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
@@ -7819,6 +7826,81 @@ class GPXEditorController(NSObject):
             "The gear button edits GPX processing, PDF, and map-service settings. Set a smoothing, spacing, or quality limit to zero to disable it. A standalone editor keeps these settings for future sessions; an editor opened from an Adventure stores them with that Adventure. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
         )
         self.show_scrollable_help("myCamino GPX Editor Help", text)
+
+    def _show_project_document(self, kind, title):
+        window = self.license_document_windows.get(kind)
+        if window is not None:
+            window.makeKeyAndOrderFront_(None)
+            window.orderFrontRegardless()
+            return
+        try:
+            document = read_license_document(kind)
+        except (OSError, ValueError) as exc:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Document unavailable")
+            alert.setInformativeText_(str(exc))
+            alert.runModal()
+            return
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(240, 160, 760, 600),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setReleasedWhenClosed_(False)
+        window.setTitle_(title)
+        scroll = NSScrollView.alloc().initWithFrame_(window.contentView().bounds())
+        scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+        text_view = NSTextView.alloc().initWithFrame_(scroll.contentView().bounds())
+        text_view.setEditable_(False)
+        text_view.setSelectable_(True)
+        text_view.setRichText_(False)
+        text_view.setFont_(NSFont.userFixedPitchFontOfSize_(12.0))
+        text_view.setString_(document)
+        scroll.setDocumentView_(text_view)
+        window.contentView().addSubview_(scroll)
+        self.register_auxiliary_window(window)
+        self.license_document_windows[kind] = window
+        window.makeKeyAndOrderFront_(None)
+
+    @objc.IBAction
+    def showProjectLicense_(self, _sender):
+        self._show_project_document("license", "myCamino License — GPL-3.0-or-later")
+
+    @objc.IBAction
+    def showThirdPartyNotices_(self, _sender):
+        self._show_project_document("third_party", "Third-Party Notices")
+
+    @objc.IBAction
+    def showSourceCodeInfo_(self, _sender):
+        self._show_project_document("source", "Source Code Information")
+
+    @objc.IBAction
+    def openBugReport_(self, _sender):
+        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(BUG_REPORT_URL))
+
+    def show_first_launch_beta_notice(self):
+        """Show the beta and warranty warning once for this notice version."""
+        defaults = NSUserDefaults.standardUserDefaults()
+        if not beta_notice_should_be_shown(defaults.integerForKey_(BETA_NOTICE_PREFERENCE_KEY)):
+            return
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Welcome to the free myCamino beta test")
+        alert.setInformativeText_(
+            "This is beta-test software supplied free of charge and without any warranty. "
+            "It may contain bugs. Please report problems so that myCamino can be improved "
+            "for everyone. The bug-report link is always available from Help."
+        )
+        alert.addButtonWithTitle_("Continue")
+        alert.addButtonWithTitle_("Report a Bug")
+        response = int(alert.runModal())
+        defaults.setInteger_forKey_(BETA_NOTICE_VERSION, BETA_NOTICE_PREFERENCE_KEY)
+        defaults.synchronize()
+        if response == 1001:
+            self.openBugReport_(None)
 
     def show_scrollable_help(self, title: str, text: str):
         if self.help_window is not None and self.help_window.isVisible():
@@ -7833,7 +7915,7 @@ class GPXEditorController(NSObject):
         )
         window.setReleasedWhenClosed_(False)
         window.setTitle_(title)
-        scroll = NSScrollView.alloc().initWithFrame_(window.contentView().bounds())
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(18, 58, 724, 484))
         scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         scroll.setHasVerticalScroller_(True)
         scroll.setHasHorizontalScroller_(False)
@@ -7851,6 +7933,18 @@ class GPXEditorController(NSObject):
         text_view.textContainer().setWidthTracksTextView_(True)
         scroll.setDocumentView_(text_view)
         window.contentView().addSubview_(scroll)
+        for title, action, x_pos, width in (
+            ("License", "showProjectLicense:", 18, 100),
+            ("Third-Party Notices", "showThirdPartyNotices:", 128, 170),
+            ("Source Code", "showSourceCodeInfo:", 308, 120),
+            ("Report a Bug", "openBugReport:", 438, 120),
+        ):
+            button = NSButton.alloc().initWithFrame_(NSMakeRect(x_pos, 18, width, 28))
+            button.setTitle_(title)
+            button.setTarget_(self)
+            button.setAction_(action)
+            apply_liquid_glass_button_style(button)
+            window.contentView().addSubview_(button)
         window.makeKeyAndOrderFront_(None)
         self.register_auxiliary_window(window)
         self.help_window = window
@@ -7936,6 +8030,7 @@ class AppDelegate(NSObject):
             self.controller.set_status(f"Default save file: {self.output_path}")
         self.controller.show()
         NSApp().activateIgnoringOtherApps_(True)
+        self.controller.show_first_launch_beta_notice()
         loaded_recovery = self.controller.offer_recovery_load()
         if self.startup_paths:
             self.controller.load_gpx_paths(self.startup_paths, mark_dirty=False)
