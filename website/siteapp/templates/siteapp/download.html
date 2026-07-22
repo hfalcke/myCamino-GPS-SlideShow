@@ -14,11 +14,11 @@
     </ol>
     <p class="install-safety"><strong>Security check:</strong> only override Gatekeeper for the DMG downloaded from this website, and compare its SHA-256 checksum with the release card below. See <a href="https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac">Apple’s official instructions</a>.</p>
   </article>
-  <div class="form-panel"><h2>Request beta access</h2><form method="post" novalidate>{% csrf_token %}{{ form.website }}
+  <div class="form-panel"><h2>Request Download Link</h2><p>This is an unsigned .DMG file that is not verified by Apple. To execute it you need to release it in your security settings (see <a href="#install-beta">instructions</a>).</p><form method="post" novalidate>{% csrf_token %}{{ form.website }}
     <div class="field"><label for="{{ form.email.id_for_label }}">Email address</label>{{ form.email }}{{ form.email.errors }}</div>
     <div class="check-field">{{ form.consent }}<label for="{{ form.consent.id_for_label }}">{{ form.consent.label }}</label>{{ form.consent.errors }}</div>
     {% if form.non_field_errors %}{{ form.non_field_errors }}{% endif %}<button class="button primary" type="submit">Email my download link</button>
   </form><p class="fine-print">We use your address only for beta access, essential beta communication and feedback. The link expires after 24 hours.</p></div>
-  <aside class="release-card"><p class="eyebrow">Current release</p>{% if release %}<h2>{{ release.label }}</h2><dl><div><dt>Platform</dt><dd>macOS · Apple Silicon</dd></div><div><dt>Size</dt><dd>{{ release.file_size|filesizeformat }}</dd></div><div><dt>Released</dt><dd>{{ release.release_date|date:"j F Y" }}</dd></div></dl><p><strong>SHA-256</strong><code>{{ release.sha256 }}</code></p>{% else %}<p>No beta release is active.</p>{% endif %}<p class="warning"><strong>Unsigned beta:</strong> the Gatekeeper warning is expected. Follow the <a href="#install-beta">prominent installation steps above</a>, including <strong>Privacy &amp; Security → Open Anyway</strong>.</p></aside>
+  <aside class="release-card"><p class="eyebrow">Current release</p>{% if release %}<h2>{{ release.label }}</h2><dl><div><dt>Platform</dt><dd>macOS · Apple Silicon</dd></div><div><dt>Size</dt><dd>{{ release.file_size|filesizeformat }}</dd></div><div><dt>Released</dt><dd>{{ release.release_date|date:"j F Y" }}</dd></div></dl><p><strong>SHA-256</strong><code>{{ release.sha256 }}</code></p>{% else %}<p>No beta release is active.</p>{% endif %}<p class="warning"><strong>Unsigned beta:</strong> the Gatekeeper warning is expected. Follow the <a href="#install-beta">installation steps above</a>, including <strong>Privacy &amp; Security → Open Anyway</strong>.</p></aside>
 </section>
 {% endblock %}

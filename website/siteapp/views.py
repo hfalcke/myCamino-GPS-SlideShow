@@ -77,7 +77,10 @@ def beta_download(request):
     form = BetaRegistrationForm(request.POST or None)
     if request.method == "POST" and form.is_valid():
         if form.cleaned_data["website"] or _throttled(request, "beta"):
-            messages.success(request, "If the address can receive beta mail, a download link will arrive shortly.")
+            messages.success(
+                request,
+                "If the address can receive an e-mail, a download link for the program will arrive shortly.",
+            )
             return redirect("beta-download")
         now = timezone.now()
         registration, _ = BetaRegistration.objects.get_or_create(
@@ -95,7 +98,10 @@ def beta_download(request):
             except Exception:
                 pass
         refresh_operator_exports()
-        messages.success(request, "If the address can receive beta mail, a download link will arrive shortly.")
+        messages.success(
+            request,
+            "If the address can receive an e-mail, a download link for the program will arrive shortly.",
+        )
         return redirect("beta-download")
     return page(request, "siteapp/download.html", form=form)
 

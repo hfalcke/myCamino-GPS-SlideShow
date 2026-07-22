@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+from django.contrib.messages import get_messages
 from django.core import mail
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -61,6 +62,10 @@ class PublicSiteTests(TestCase):
 
     def test_beta_registration_normalizes_email_and_hashes_token(self):
         response = self.client.post(reverse("beta-download"), {"email": "  Walker@Example.ORG ", "consent": "on", "website": ""})
+        self.assertIn(
+            "If the address can receive an e-mail, a download link for the program will arrive shortly.",
+            [str(message) for message in get_messages(response.wsgi_request)],
+        )
         self.assertRedirects(response, reverse("beta-download"))
         registration = BetaRegistration.objects.get()
         self.assertEqual(registration.email, "walker@example.org")
@@ -70,8 +75,14 @@ class PublicSiteTests(TestCase):
         self.assertIn("System Settings > Privacy & Security", mail.outbox[0].body)
         self.assertIn("Open Anyway", mail.outbox[0].body)
 
-    def test_unsigned_beta_installation_steps_are_prominent(self):
+    def test_unsigned_beta_installation_steps_are_available(self):
         response = self.client.get(reverse("beta-download"))
+        self.assertContains(response, "Request Download Link")
+        self.assertContains(
+            response,
+            "This is an unsigned .DMG file that is not verified by Apple.",
+        )
+        self.assertContains(response, 'href="#install-beta">instructions</a>')
         self.assertContains(response, 'id="install-beta"')
         self.assertContains(response, "Read the installation steps before downloading")
         self.assertContains(response, "Apple cannot check the app for malicious software")

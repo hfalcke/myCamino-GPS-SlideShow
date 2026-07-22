@@ -34,7 +34,18 @@ scp -i "$SSH_KEY" "$PRUNER" "${REMOTE_HOST}:${REMOTE_PRUNER}"
 ssh -i "$SSH_KEY" "$REMOTE_HOST" bash -s -- "$REMOTE_TMP" "$REMOTE_FINAL" "$REMOTE_NAME" "$SHA256" "$SIZE" "$LABEL_B64" "$RELEASE_DATE" "$REMOTE_PRUNER" <<'REMOTE'
 set -euo pipefail
 tmp="$1" final="$2" name="$3" expected_sha="$4" expected_size="$5" label_b64="$6" release_date="$7" pruner="$8"
-trap 'rm -f -- "$pruner"' EXIT
+metadata_activated=0
+reconcile_on_exit() {
+  status="$?"
+  trap - EXIT HUP INT TERM
+  rm -f -- "$pruner"
+  if [[ "$metadata_activated" -eq 1 ]]; then
+    ln -sfn "$name" /var/lib/mycamino/releases/.latest.dmg.next
+    mv -Tf /var/lib/mycamino/releases/.latest.dmg.next /var/lib/mycamino/releases/latest.dmg
+  fi
+  exit "$status"
+}
+trap reconcile_on_exit EXIT HUP INT TERM
 label="$(printf '%s' "$label_b64" | base64 --decode)"
 actual_sha="$(sha256sum "$tmp" | awk '{print $1}')"
 actual_size="$(stat -c '%s' "$tmp")"
@@ -42,13 +53,18 @@ actual_size="$(stat -c '%s' "$tmp")"
 mv "$tmp" "$final"
 chmod 0644 "$final"
 cd /opt/mycamino/site
-docker compose exec -T web python manage.py register_release "/releases/$name" --label "$label" --date "$release_date"
 previous_dmg=""
 if [[ -e /var/lib/mycamino/releases/latest.dmg ]]; then
   previous_dmg="$(readlink -f /var/lib/mycamino/releases/latest.dmg)"
 fi
+echo "Registering release metadata and computing the server-side checksum ..."
+register_output="$(docker compose exec -T web python manage.py register_release "/releases/$name" --label "$label" --date "$release_date")"
+metadata_activated=1
 ln -sfn "$name" /var/lib/mycamino/releases/.latest.dmg.next
 mv -Tf /var/lib/mycamino/releases/.latest.dmg.next /var/lib/mycamino/releases/latest.dmg
+[[ "$(readlink -f /var/lib/mycamino/releases/latest.dmg)" == "$final" ]]
+printf '%s\n' "$register_output"
 bash "$pruner" /var/lib/mycamino/releases "$final" "$previous_dmg"
+echo "Release activation complete: $name"
 REMOTE
 echo "Published https://mycamino.heinofalcke.de/downloads/myCamino-GPS-Track-Show.dmg"
