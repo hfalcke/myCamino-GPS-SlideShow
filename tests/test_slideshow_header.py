@@ -11,6 +11,7 @@ from GPSTrackShow import (
     Transition,
     WindowTarget,
     config_from_options,
+    external_restart_command,
     external_settings_command,
     header_content_rect,
     map_image_rect_and_scale,
@@ -103,11 +104,26 @@ class SlideshowHeaderTests(unittest.TestCase):
         }
         self.assertEqual(
             external_settings_command(payload, 21),
-            (22, {"slideshow.header_track_stats": True}),
+            (22, {"slideshow.header_track_stats": True}, False),
         )
         self.assertIsNone(external_settings_command(payload, 22))
         self.assertIsNone(
             external_settings_command({**payload, "command": "jump"}, 21)
+        )
+
+    def test_settings_restore_and_restart_commands_are_explicit(self):
+        settings = {
+            "command": "settings",
+            "sequence": 30,
+            "values": {},
+            "restore_display": True,
+        }
+        self.assertEqual(external_settings_command(settings, 29), (30, {}, True))
+        restart = {"command": "restart", "sequence": 31}
+        self.assertEqual(external_restart_command(restart, 30), 31)
+        self.assertIsNone(external_restart_command(restart, 31))
+        self.assertIsNone(
+            external_restart_command({**restart, "command": "settings"}, 30)
         )
 
     def test_black_time_lapse_map_remains_full_width(self):

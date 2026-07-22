@@ -203,7 +203,7 @@ def external_jump_command_row(
 def external_settings_command(
     payload: object,
     last_sequence: int,
-) -> Optional[tuple[int, dict]]:
+) -> Optional[tuple[int, dict, bool]]:
     """Validate one GUI-to-player live Settings update."""
     if not isinstance(payload, dict) or payload.get("command") != "settings":
         return None
@@ -214,7 +214,21 @@ def external_settings_command(
     values = payload.get("values")
     if sequence <= int(last_sequence) or not isinstance(values, dict):
         return None
-    return sequence, dict(values)
+    return sequence, dict(values), bool(payload.get("restore_display", False))
+
+
+def external_restart_command(
+    payload: object,
+    last_sequence: int,
+) -> Optional[int]:
+    """Validate one GUI request to rebuild the currently active slide."""
+    if not isinstance(payload, dict) or payload.get("command") != "restart":
+        return None
+    try:
+        sequence = int(payload.get("sequence", -1))
+    except (TypeError, ValueError):
+        return None
+    return sequence if sequence > int(last_sequence) else None
 
 
 def should_show_stage_overview_preview(
@@ -7198,6 +7212,7 @@ class GPSTrackShowApp:
         self.video_normalization_manifest = load_video_normalization_manifest(config.photodir)
         self.live_state_sequence = 0
         self.settings_request_sequence = 0
+        self.settings_display_snapshot = None
         self.live_state_signature = None
         self.command_poll_handle = None
         self.last_command_sequence = -1
@@ -10157,6 +10172,8 @@ class GPSTrackShowApp:
                 self.current_track_metadata,
                 self.current_date,
                 self.config,
+                header_background=False,
+                show_caption=False,
             )
             if self.current_overview_metadata is not None
             and self.current_track_metadata is not None
@@ -11768,6 +11785,14 @@ class GPSTrackShowApp:
                 3.0,
             )
             return
+        self.settings_display_snapshot = {
+            "map_window": getattr(self, "map_window", None) is not None,
+            "fullscreen": bool(getattr(self, "fullscreen_active", False)),
+            "fullscreen_roles": set(
+                getattr(self, "fullscreen_window_roles", set())
+            ),
+            "screen_swap": bool(getattr(self, "screen_swap", False)),
+        }
         self.settings_request_sequence += 1
         self.live_state_sequence += 1
         payload = self._resume_state_payload()
@@ -11787,7 +11812,46 @@ class GPSTrackShowApp:
         except Exception as exc:
             debug_exception(self.config, "request Slide Show settings", exc)
 
-    def _apply_runtime_settings(self, values: dict) -> None:
+    def _restore_display_after_settings(self) -> None:
+        """Return both slideshow windows to their pre-Settings presentation."""
+        snapshot = self.settings_display_snapshot or {}
+        self.settings_display_snapshot = None
+        wants_map_window = bool(snapshot.get("map_window", self.map_window is not None))
+        if wants_map_window and self.map_window is None and not self.config.join_windows:
+            self._create_separate_map_window()
+        self.screen_swap = bool(snapshot.get("screen_swap", self.screen_swap))
+
+        windows = (
+            ("photo", self.photo_window),
+            ("map", self.map_window),
+        )
+        for _role, window in windows:
+            if window is not None:
+                window.orderFrontRegardless()
+        if self.photo_window is not None:
+            self.photo_window.makeKeyAndOrderFront_(None)
+        self.app.activateIgnoringOtherApps_(True)
+
+        if bool(snapshot.get("fullscreen", self.fullscreen_active)):
+            expected_roles = set(snapshot.get("fullscreen_roles") or ())
+            if not expected_roles:
+                expected_roles.add("photo")
+                if self.map_window is not None and len(self._available_screens()) > 1:
+                    expected_roles.add("map")
+            for index, (role, window) in enumerate(windows):
+                if window is None or role not in expected_roles:
+                    continue
+                if role not in self.fullscreen_window_roles:
+                    self.schedule_callback(
+                        0.10 + 0.20 * index,
+                        lambda current_window=window: current_window.toggleFullScreen_(None),
+                    )
+
+        self.schedule_callback(0.12, self._refresh_header_layouts)
+        if self.map_window is not None:
+            self.schedule_callback(0.35, self._refresh_separate_map_window_content)
+
+    def _apply_runtime_settings(self, values: dict, *, restore_display: bool = False) -> None:
         """Apply supported Adventure settings without restarting playback."""
         simple_values = {
             "slideshow.clock": ("clock", bool),
@@ -11874,6 +11938,21 @@ class GPSTrackShowApp:
             )
         self._refresh_photo_overlays()
         self._show_temporary_status_overlay("Settings applied", 2.0)
+        if restore_display:
+            self._restore_display_after_settings()
+
+    def _restart_current_display(self) -> None:
+        """Rebuild the active control row without starting a second player."""
+        payload = self._resume_state_payload()
+        row_index = payload.get("media_index")
+        if not isinstance(row_index, int):
+            row_index = payload.get("playlist_index")
+        if isinstance(row_index, int) and 0 <= row_index < len(self.playlist_lines):
+            self._jump_to_playlist_row(row_index)
+            self._show_temporary_status_overlay("Restarted at current position", 2.0)
+        else:
+            self._show_temporary_status_overlay("Current position is not available", 2.0)
+        self._restore_display_after_settings()
 
     def _poll_external_commands(self) -> None:
         """Consume editor-to-player commands without sharing the live-state file."""
@@ -11898,8 +11977,19 @@ class GPSTrackShowApp:
                     self.last_command_sequence,
                 )
                 if settings_command is not None:
-                    self.last_command_sequence, values = settings_command
-                    self._apply_runtime_settings(values)
+                    self.last_command_sequence, values, restore_display = settings_command
+                    self._apply_runtime_settings(
+                        values,
+                        restore_display=restore_display,
+                    )
+                else:
+                    restart_sequence = external_restart_command(
+                        payload,
+                        self.last_command_sequence,
+                    )
+                    if restart_sequence is not None:
+                        self.last_command_sequence = restart_sequence
+                        self._restart_current_display()
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
         if self.running:

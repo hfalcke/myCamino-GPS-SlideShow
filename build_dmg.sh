@@ -77,6 +77,7 @@ PY
 
 echo "==> Checking Python syntax"
 "$PYTHON" -m py_compile \
+  application_metadata.py \
   GPSTrackShowGUI.py \
   GPXEditor.py \
   adventure_parameters.py \

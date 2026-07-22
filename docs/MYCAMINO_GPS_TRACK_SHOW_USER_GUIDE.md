@@ -107,7 +107,9 @@ Controls:
 - Project directory field: type or choose the adventure folder.
 - Folder icon: opens a directory chooser. A missing selected directory is
   created when selected.
-- Adventure name: an editable menu of the Adventures in the selected folder.
+- Adventure name: a menu of the Adventures in the selected folder. A new name
+  is editable until it is first committed. Existing names are protected; click
+  **Edit** before deliberately renaming or copying an Adventure.
   Selecting one loads it immediately. The most recently modified Adventure is
   loaded automatically when a folder is chosen.
 - Description: optional two-line description.
@@ -144,6 +146,9 @@ setting together with a short explanation.
   restores all parameter defaults without changing project files or names.
 - **Apply** validates, applies, and auto-saves the draft to this adventure.
   **Cancel** discards the draft.
+- When Settings was opened with `s` from a running dual-screen show, Apply
+  returns focus to the player and restores the same windows and fullscreen
+  arrangement that were active before Settings opened.
 - Invalid entries are explained at the bottom and disable Apply.
 
 Settings cover Standard and Time-Lapse playback, Track Map appearance and
@@ -699,7 +704,8 @@ The Start Slide Show section contains:
   newest first. The table shows the last playback time, image or map, place,
   media date, and availability. Select a valid entry and press Return,
   double-click it, or choose **Play**. **Abort** and Escape leave the GUI
-  unchanged.
+  unchanged. If a slide show is already running, Continue does not launch a
+  second process; it rebuilds the running show at its current control-file row.
 - The initial style defaults to Time-Lapse. During playback, `t` cycles forward
   and `Shift-t` backward through Time-Lapse, Blend, Fade, Switch, Expand,
   Collage, Quad, and Random.
@@ -790,6 +796,10 @@ the track map is shown once at the beginning of each stage. The Settings option
 **Track map before each medium** can show the
 marked track map before every photo or video; it is off by default.
 
+On two screens, Time-Lapse uses the same single runtime header overlay for the
+Stage Map and marked Tour Overview. The Overview no longer retains a second
+embedded gray caption beneath that header.
+
 Press `w` during playback to switch between one window and a separate overview
 window. Closing only the overview window has the same effect as switching to
 one window and does not stop the slide show.
@@ -857,6 +867,7 @@ Common slide-show keys:
 - `s`: open Adventure Settings directly at the combined Slide Show section in
   the main myCamino window. Header and Time-Lapse options are grouped in their
   own subsections, separated by thin lines. Apply updates the running show.
+  It also restores the previous dual-screen/fullscreen display state.
 - `q` or Escape: quit slide show.
 
 Because the slide show runs separately, quitting it should not close or crash

@@ -736,6 +736,14 @@ that row. Cell editing or multiple selection suspends following. Time-Lapse
 animation frames do not write state unless their active row or display phase
 changed.
 
+The same command file carries sequence-numbered `settings` and `restart`
+commands. A Settings request snapshots the active map-window, screen-swap, and
+fullscreen roles in the player. The Apply acknowledgement may contain no
+changed values; its `restore_display` flag still reactivates the player,
+restores missing fullscreen roles, and redraws the retained overview. Pressing
+Continue while that player is already alive sends `restart` so the current
+control row is rebuilt instead of launching a second subprocess.
+
 `GPSTrackShowWindowDelegate` gives every Cocoa window a stable `photo` or `map`
 role. Closing the primary photo window quits playback. Closing the secondary
 map window calls `_deactivate_separate_map_window()` and reroutes playback into
@@ -827,6 +835,9 @@ overview phase.
 `draw_time_lapse_overview_media(...)` projects the active stage's repaired
 track points through the overview sidecar coordinates before the rendered
 overview is scaled into its media frame, preserving the route highlight.
+The separately displayed Time-Lapse overview is likewise rendered without an
+embedded caption because both retained map views draw the same runtime header;
+this prevents an older translucent caption from appearing underneath it.
 `timelapse.overview_as_media=false` or `--time-lapse-overview-fullscreen`
 retains the former full-window presentation. A resumed stage starts at its
 saved progress without replaying that overview. Standard single-window

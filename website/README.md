@@ -30,4 +30,13 @@ directory has no unprotected public route.
 The repository-level `release.sh` automatically invokes
 `scripts/publish_website_release.sh` after the source branch has been pushed.
 The publisher uploads to a temporary name, verifies size and SHA-256 on the
-server, registers the release, and only then switches `latest.dmg`.
+server, registers the release, and only then switches `latest.dmg`. After that
+successful switch it keeps the active DMG and the DMG that was active directly
+before the switch, and removes all other timestamped DMG files. Historical
+release metadata and download records remain in Django; unexpected files are
+never pruned.
+
+Application version and release-date metadata live in
+`application_metadata.py`. Update that file for a new program version before
+running `release.sh`; the values appear in the GUI, macOS bundle, and website
+release record.

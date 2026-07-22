@@ -104,6 +104,7 @@ from beta_notice import (
     FEATURE_REQUEST_URL,
     beta_notice_should_be_shown,
 )
+from application_metadata import compact_version_label, full_version_label
 
 try:
     from AVFoundation import AVPlayer
@@ -540,20 +541,27 @@ def slideshow_process_is_running(process):
     return process is not None and process.poll() is None
 
 
-def slideshow_settings_command_payload(parameters, changed_keys, sequence):
+def slideshow_settings_command_payload(
+    parameters,
+    changed_keys,
+    sequence,
+    *,
+    restore_display=False,
+):
     """Build the primitive JSON payload used for a live Settings Apply."""
     values = {
         key: parameters[key]
         for key in changed_keys
         if key in parameters
     }
-    if not values:
+    if not values and not restore_display:
         return None
     return {
         "version": 1,
         "sequence": int(sequence),
         "command": "settings",
         "values": values,
+        "restore_display": bool(restore_display),
     }
 
 
@@ -1942,6 +1950,7 @@ class GPXTrackerController(NSObject):
         self.project_file_menu_refreshing = False
         self.committed_adventure_name = ""
         self.adventure_name_commit_in_progress = False
+        self.adventure_name_editing_enabled = True
         self.shared_asset_warning_accepted = set()
         self.recent_adventures = self._load_recent_adventures()
         self.last_picture_import_directory = None
@@ -2045,6 +2054,7 @@ class GPXTrackerController(NSObject):
         self.slideshow_live_state_sequence = -1
         self.slideshow_command_file = None
         self.slideshow_settings_request_sequence = 0
+        self.slideshow_restore_after_settings_pending = False
         self.slideshow_command_sequence = 0
         self.control_table_preview_checkbox = None
         self.control_table_search_field = None
@@ -2207,6 +2217,12 @@ class GPXTrackerController(NSObject):
         self.title_field.setTarget_(self)
         self.title_field.setAction_("adventureNameCommitted:")
         self.root_view.addSubview_(self.title_field)
+        self.adventure_name_edit_button = self._make_button(
+            "Edit",
+            "editAdventureName:",
+        )
+        self.adventure_name_edit_button.setEnabled_(False)
+        self.root_view.addSubview_(self.adventure_name_edit_button)
 
         self.description_label = self._make_label("Description")
         self.root_view.addSubview_(self.description_label)
@@ -2247,10 +2263,15 @@ class GPXTrackerController(NSObject):
         self.root_view.addSubview_(self.title_image_default_button)
 
         self.help_button = self._make_button("Help", "showMainHelp:")
+        self.version_label = self._make_label(compact_version_label(), 9.0)
+        self.version_label.setAlignment_(1)
+        self.version_label.setTextColor_(NSColor.secondaryLabelColor())
+        self.version_label.setToolTip_(full_version_label())
         self.assistant_checkbox = self._make_checkbox("Assistant", "toggleWorkflowAssistant:")
         self.assistant_checkbox.setState_(NSControlStateValueOn)
         self.quit_button = self._make_button("Quit", "quit:")
         self.root_view.addSubview_(self.help_button)
+        self.root_view.addSubview_(self.version_label)
         self.root_view.addSubview_(self.assistant_checkbox)
         self.root_view.addSubview_(self.quit_button)
 
@@ -2643,7 +2664,10 @@ class GPXTrackerController(NSObject):
         self.project_dir_field.setToolTip_("Type or choose the project directory. The dropdown offers the last ten adventure folders. Missing directories are created when selected.")
         self.project_dir_button.setToolTip_("Choose or create the project directory.")
         self.title_field_label.setToolTip_("Select, create, rename, or copy an Adventure in the current project directory.")
-        self.title_field.setToolTip_("The dropdown lists Adventures in this directory. Commit an edited name to rename or copy the active Adventure.")
+        self.title_field.setToolTip_("The dropdown lists Adventures in this directory. Use Edit before changing the active Adventure name.")
+        self.adventure_name_edit_button.setToolTip_(
+            "Unlock the Adventure name for one rename or copy operation."
+        )
         self.description_label.setToolTip_("Optional short description of this adventure.")
         self.description_text.setToolTip_("Enter a short free-text adventure description.")
         self.title_image_label.setToolTip_(
@@ -2754,7 +2778,8 @@ class GPXTrackerController(NSObject):
         self.window.setInitialFirstResponder_(self.project_dir_field)
         self.project_dir_field.setNextKeyView_(self.project_dir_button)
         self.project_dir_button.setNextKeyView_(self.title_field)
-        self.title_field.setNextKeyView_(self.description_text)
+        self.title_field.setNextKeyView_(self.adventure_name_edit_button)
+        self.adventure_name_edit_button.setNextKeyView_(self.description_text)
         self.description_text.setNextKeyView_(self.title_image_choose_button)
         self.title_image_choose_button.setNextKeyView_(self.title_image_default_button)
         self.title_image_default_button.setNextKeyView_(self.gpx_field)
@@ -2834,7 +2859,9 @@ class GPXTrackerController(NSObject):
         help_button_x = parameter_button_x - help_button_width - INNER_GAP
         assistant_width = 92.0
         assistant_x = help_button_x - assistant_width - INNER_GAP
-        text_width = max(180.0, assistant_x - left_x - INNER_GAP)
+        version_width = 140.0
+        version_x = assistant_x - version_width - INNER_GAP
+        text_width = max(180.0, version_x - left_x - INNER_GAP)
         self.header_text_label.setFrame_(
             NSMakeRect(left_x, current_top - title_height + 13.0, text_width, 34.0)
         )
@@ -2846,6 +2873,9 @@ class GPXTrackerController(NSObject):
         )
         self.assistant_checkbox.setFrame_(
             NSMakeRect(assistant_x, current_top - title_height + 14.0, assistant_width, parameter_button_size)
+        )
+        self.version_label.setFrame_(
+            NSMakeRect(version_x, current_top - title_height + 21.0, version_width, 16.0)
         )
         self.header_logo_view.setFrame_(
             NSMakeRect(logo_x, current_top - logo_size + 26.0, logo_size, logo_size)
@@ -2872,7 +2902,19 @@ class GPXTrackerController(NSObject):
 
         row_y -= FIELD_HEIGHT + ROW_GAP
         self.title_field_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        self.title_field.setFrame_(NSMakeRect(field_x, row_y, description_width, FIELD_HEIGHT))
+        adventure_edit_width = 62.0
+        adventure_name_width = description_width - adventure_edit_width - INNER_GAP
+        self.title_field.setFrame_(
+            NSMakeRect(field_x, row_y, adventure_name_width, FIELD_HEIGHT)
+        )
+        self.adventure_name_edit_button.setFrame_(
+            NSMakeRect(
+                field_x + adventure_name_width + INNER_GAP,
+                row_y,
+                adventure_edit_width,
+                FIELD_HEIGHT,
+            )
+        )
 
         row_y -= DESCRIPTION_HEIGHT + ROW_GAP
         self.description_label.setFrame_(NSMakeRect(left_x, row_y + DESCRIPTION_HEIGHT - 18.0, LABEL_WIDTH, 18.0))
@@ -4529,6 +4571,31 @@ class GPXTrackerController(NSObject):
         }
         return details.get(stage, (None, ""))
 
+    def _set_adventure_name_editing(self, enabled):
+        """Protect a committed Adventure name from accidental typing."""
+        committed = self.current_project_file is not None
+        self.adventure_name_editing_enabled = bool(enabled or not committed)
+        self.title_field.setEditable_(self.adventure_name_editing_enabled)
+        self.title_field.setSelectable_(True)
+        self.adventure_name_edit_button.setEnabled_(
+            bool(committed and not self.adventure_name_editing_enabled)
+        )
+        self.adventure_name_edit_button.setTitle_(
+            "Editing"
+            if committed and self.adventure_name_editing_enabled
+            else "Edit"
+        )
+
+    @objc.IBAction
+    def editAdventureName_(self, _sender):
+        """Unlock the Adventure name for one deliberate edit."""
+        self._set_adventure_name_editing(True)
+        self.window.makeFirstResponder_(self.title_field)
+        self.title_field.selectText_(None)
+        self.set_status(
+            "Adventure name unlocked. Enter a new name and press Return to rename or copy it."
+        )
+
     def _assistant_detected_gpx_paths(self):
         if self.current_project_dir is None or not self.current_project_dir.is_dir():
             return []
@@ -4650,6 +4717,8 @@ class GPXTrackerController(NSObject):
             return
         target, _message = self._assistant_stage_details(stage)
         if target is not None and not self.workflow_assistant_bubble.isHidden():
+            if stage == "adventure":
+                self._set_adventure_name_editing(True)
             self.window.makeFirstResponder_(target)
 
     @objc.IBAction
@@ -5016,6 +5085,7 @@ class GPXTrackerController(NSObject):
             suggested = project_filename_base(resolved.name)
             self.title_field.setStringValue_(suggested)
             self.committed_adventure_name = ""
+            self._set_adventure_name_editing(True)
             self.track_map_base = suggested
             self._set_gpx_field_value(f"{suggested}.gpx", manual=False)
             self.current_control_file = resolved / f"{suggested}-sorted.lst"
@@ -5525,6 +5595,7 @@ class GPXTrackerController(NSObject):
             != normalized_music_playlist
         )
         self.current_project_file = record.path
+        self._set_adventure_name_editing(False)
         self._remember_recent_adventure(self.current_project_file.parent)
         self._refresh_project_file_menus()
         self.set_status(f"Loaded adventure from {self.current_project_file}")
@@ -5576,9 +5647,16 @@ class GPXTrackerController(NSObject):
         editor_controller = getattr(self, "gpx_editor_controller", None)
         if propagate_to_editor and editor_controller is not None:
             editor_controller.apply_project_parameters(self.parameters)
+        restore_slideshow_display = bool(
+            self.slideshow_restore_after_settings_pending
+            and slideshow_process_is_running(getattr(self, "slideshow_process", None))
+        )
         if changed:
             self.mark_dirty(immediate=True)
-            sent_live = self._send_running_slideshow_settings(changed)
+            sent_live = self._send_running_slideshow_settings(
+                changed,
+                restore_display=restore_slideshow_display,
+            )
             self.set_status(
                 f"Applied {len(changed)} Adventure setting(s); auto-save scheduled"
                 + (" and running slide show updated." if sent_live else ".")
@@ -5599,10 +5677,16 @@ class GPXTrackerController(NSObject):
                     self.workflow_assistant_state["journey_source_confirmed"] = self._has_existing_gpx_file()
                 self.start_async_project_status_refresh("journey source changed")
         else:
+            sent_live = self._send_running_slideshow_settings(
+                set(),
+                restore_display=restore_slideshow_display,
+            )
             self.set_status("Adventure settings unchanged.")
+        if sent_live and restore_slideshow_display:
+            self.slideshow_restore_after_settings_pending = False
         return True
 
-    def _send_running_slideshow_settings(self, changed_keys):
+    def _send_running_slideshow_settings(self, changed_keys, *, restore_display=False):
         """Send changed settings to the active player through its command file."""
         if not slideshow_process_is_running(getattr(self, "slideshow_process", None)):
             return False
@@ -5616,6 +5700,7 @@ class GPXTrackerController(NSObject):
             self.parameters,
             changed_keys,
             self.slideshow_command_sequence,
+            restore_display=restore_display,
         )
         if payload is None:
             return False
@@ -5644,7 +5729,7 @@ class GPXTrackerController(NSObject):
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
-            "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Editing an existing name offers Rename or Copy, optionally including its GPX, control file, and generated maps.\n"
+            "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Existing names are protected from accidental typing; click Edit before renaming or copying one, optionally including its GPX, control file, and generated maps.\n"
             "3. Use the gear beside the myCamino logo to adjust project settings. During a slide show, press s to open Settings directly at Slide Show. Header controls and Time-Lapse options are grouped in their own subsections below thin dividers. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Apply updates an active slide show immediately and auto-saves the settings with the Adventure.\n"
             "4. For a new Adventure, confirm a detected GPX file, choose other GPX files, or select No GPX file - use only photos. One detected file is used directly; several detected or selected files are joined in the GPX Editor. Cancelling a chooser leaves the source unconfirmed. The same media-only choice remains visible in the GPX Files section and is saved with the Adventure.\n"
             "5. Accept photos and videos already in the Adventure folder or import more. Existing files are skipped rather than copied again. One retained Adventure Processing window then shows metadata extraction, optional place-name lookup, map generation, and control-file work with phase headings and progress in its title. Add place names is selected by default; Skip omits only that slower phase.\n"
@@ -9673,6 +9758,7 @@ class GPXTrackerController(NSObject):
             self.set_status(f"Adventure {operation} completed: {target_path.name}")
         finally:
             self.adventure_name_commit_in_progress = False
+            self._set_adventure_name_editing(False)
 
     @objc.IBAction
     def controlFileCommitted_(self, _sender):
@@ -11364,6 +11450,9 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def continueSelectedSlideShow_(self, _sender):
+        if slideshow_process_is_running(getattr(self, "slideshow_process", None)):
+            self._start_slide_show(continue_previous=True)
+            return
         checkpoint = self._choose_slideshow_resume_checkpoint()
         if checkpoint is not None:
             self._start_slide_show(transient_resume_position=checkpoint)
@@ -11796,7 +11885,36 @@ class GPXTrackerController(NSObject):
     def _update_slideshow_continue_button(self):
         if not hasattr(self, "slideshow_continue_button"):
             return
-        self.slideshow_continue_button.setEnabled_(bool(self.slideshow_resume_history))
+        self.slideshow_continue_button.setEnabled_(
+            bool(self.slideshow_resume_history)
+            or slideshow_process_is_running(getattr(self, "slideshow_process", None))
+        )
+
+    def _restart_running_slideshow(self):
+        """Ask the active player to rebuild its current row in place."""
+        if not slideshow_process_is_running(getattr(self, "slideshow_process", None)):
+            return False
+        if self.slideshow_command_file is None:
+            self.set_status("The running slide show has no command channel.")
+            return False
+        self.slideshow_command_sequence = max(
+            time.time_ns(),
+            self.slideshow_command_sequence + 1,
+        )
+        try:
+            atomic_write_json(
+                self.slideshow_command_file,
+                {
+                    "version": 1,
+                    "sequence": self.slideshow_command_sequence,
+                    "command": "restart",
+                },
+            )
+        except OSError as exc:
+            self.set_status(f"Could not restart the running slide show: {exc}")
+            return False
+        self.set_status("Restarting the running slide show at its current position.")
+        return True
 
     def _start_slide_show(
         self,
@@ -11825,7 +11943,10 @@ class GPXTrackerController(NSObject):
             self.set_status("Track images directory missing.")
             return
         if self.slideshow_process is not None and self.slideshow_process.poll() is None:
-            self.set_status("Slide show is already running.")
+            if continue_previous:
+                self._restart_running_slideshow()
+            else:
+                self.set_status("Slide show is already running.")
             return
 
         resume_position = (
@@ -11884,9 +12005,11 @@ class GPXTrackerController(NSObject):
             self.slideshow_settings_request_sequence = 0
             self.slideshow_command_file = command_file
             self.slideshow_command_sequence = 0
+            self.slideshow_restore_after_settings_pending = False
             self.workflow_assistant_state["slideshow_started"] = True
             self.mark_dirty(immediate=True)
             self.refresh_workflow_assistant()
+            self._update_slideshow_continue_button()
         except Exception as exc:
             show_alert("Could not start slide show.", str(exc))
             self.set_status("Slide show failed to start.")
@@ -11989,6 +12112,7 @@ class GPXTrackerController(NSObject):
             and request_sequence > self.slideshow_settings_request_sequence
         ):
             self.slideshow_settings_request_sequence = request_sequence
+            self.slideshow_restore_after_settings_pending = True
             self._show_parameter_editor_section(
                 state.get("settings_section") or "Slide Show"
             )
@@ -12000,6 +12124,8 @@ class GPXTrackerController(NSObject):
         if active_process is not None and active_process.pid == int(result.get("pid", -1)):
             self.slideshow_process = None
             self.slideshow_command_file = None
+            self.slideshow_restore_after_settings_pending = False
+            self._update_slideshow_continue_button()
         resume_state = result.get("resume_state")
         if isinstance(resume_state, dict):
             if resume_state.get("live") and not resume_state.get("completed"):

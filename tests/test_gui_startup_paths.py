@@ -32,6 +32,7 @@ class GUIStartupPathTests(unittest.TestCase):
         )
         self.assertEqual(payload["command"], "settings")
         self.assertEqual(payload["sequence"], 42)
+        self.assertFalse(payload["restore_display"])
         self.assertEqual(
             payload["values"],
             {
@@ -39,6 +40,16 @@ class GUIStartupPathTests(unittest.TestCase):
                 "slideshow.header_track_stats": True,
             },
         )
+
+    def test_live_settings_can_acknowledge_display_restore_without_changes(self):
+        payload = slideshow_settings_command_payload(
+            {"slideshow.font_size": 30},
+            set(),
+            43,
+            restore_display=True,
+        )
+        self.assertEqual(payload["values"], {})
+        self.assertTrue(payload["restore_display"])
 
     def test_resume_history_accepts_only_current_checkpoint_format(self):
         current = {"version": 4, "completed": False, "playlist_index": 4}

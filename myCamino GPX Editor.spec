@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
+from application_metadata import APP_BUNDLE_VERSION, bundle_build_number
 
 hiddenimports = ['pyexpat', 'PIL._tkinter_finder']
 hiddenimports += collect_submodules('objc')
@@ -70,4 +71,6 @@ app = BUNDLE(
     name='myCamino GPX Editor.app',
     icon='build/MyCaminoLogo-ohneText.icns',
     bundle_identifier=None,
+    version=APP_BUNDLE_VERSION,
+    info_plist={'CFBundleVersion': bundle_build_number()},
 )
