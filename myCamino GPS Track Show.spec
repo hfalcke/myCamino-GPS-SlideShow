@@ -1,6 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import runpy
+
 from PyInstaller.utils.hooks import collect_submodules
-from application_metadata import APP_BUNDLE_VERSION, bundle_build_number
+
+PROJECT_ROOT = Path(SPECPATH).resolve()
+APPLICATION_METADATA = runpy.run_path(str(PROJECT_ROOT / 'application_metadata.py'))
+APP_BUNDLE_VERSION = APPLICATION_METADATA['APP_BUNDLE_VERSION']
+bundle_build_number = APPLICATION_METADATA['bundle_build_number']
 
 hiddenimports = ['pyexpat', 'PIL._tkinter_finder']
 hiddenimports += collect_submodules('objc')
@@ -29,7 +36,7 @@ hiddenimports += collect_submodules('geopy')
 
 a = Analysis(
     ['GPSTrackShowGUI.py'],
-    pathex=[],
+    pathex=[str(PROJECT_ROOT)],
     binaries=[],
     datas=[
         ('dist/GPSTrackShow', 'GPSTrackShow'),
