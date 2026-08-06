@@ -84,6 +84,10 @@ echo "==> Checking Python syntax"
   cocoa_parameter_editor.py \
   json_storage.py \
   GetGeoLocations.py \
+  gpx_import.py \
+  gpx_point_editing.py \
+  gpx_routing.py \
+  media_track_builder.py \
   gpx_tracks_table.py \
   GPSTrackShow.py \
   video_audio_normalization.py \

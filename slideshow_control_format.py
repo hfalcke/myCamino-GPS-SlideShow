@@ -11,6 +11,9 @@ from dataclasses import dataclass
 
 MUSIC_DIRECTIVE_PREFIX = "#MUSIC:"
 CONTROL_DIRECTIVE_PREFIX = "#CONTROL:"
+CAPTION_DIRECTIVE_PREFIX = "#CAPTION:"
+FONT_DIRECTIVE_PREFIX = "#FONT:"
+DISABLED_LINE_PREFIX = "# "
 PLAYLIST_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 CONTROL_TRANSITIONS = (
     "TIME_LAPSE",
@@ -30,6 +33,14 @@ class MusicSyntaxError(ValueError):
 
 class ControlSyntaxError(ValueError):
     """Raised when a #CONTROL directive cannot be parsed unambiguously."""
+
+
+class CaptionSyntaxError(ValueError):
+    """Raised when a #CAPTION directive cannot be parsed unambiguously."""
+
+
+class FontSyntaxError(ValueError):
+    """Raised when a #FONT directive cannot be parsed unambiguously."""
 
 
 @dataclass(frozen=True)
@@ -54,6 +65,182 @@ class ControlAction:
 class ControlDirective:
     actions: tuple[ControlAction, ...]
     source: str = ""
+
+
+@dataclass(frozen=True)
+class CaptionDirective:
+    text: str
+    vertical: str = "bottom"
+    horizontal: str = "center"
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class FontDirective:
+    size: float | None = None
+    style: str | None = None
+    family: str | None = None
+    reset: bool = False
+    source: str = ""
+
+
+def split_disabled_control_line(line: str) -> tuple[bool, str]:
+    """Return disabled state and the original line without the ``# `` prefix."""
+    text = str(line or "").rstrip("\r\n")
+    return (True, text[len(DISABLED_LINE_PREFIX) :]) if text.startswith(DISABLED_LINE_PREFIX) else (False, text)
+
+
+def disable_control_line(line: str) -> str:
+    disabled, content = split_disabled_control_line(line)
+    return str(line).rstrip("\r\n") if disabled else f"{DISABLED_LINE_PREFIX}{content}"
+
+
+def enable_control_line(line: str) -> str:
+    return split_disabled_control_line(line)[1]
+
+
+def is_disabled_control_line(line: str) -> bool:
+    return split_disabled_control_line(line)[0]
+
+
+def _csv_fields(parameters: str, directive: str, error_type: type[ValueError]) -> tuple[str, list[str]]:
+    text = str(parameters or "").strip()
+    if not text:
+        raise error_type(f"{directive} requires parameters")
+    try:
+        reader = csv.reader(io.StringIO(text), skipinitialspace=True, strict=True)
+        fields = next(reader)
+        if next(reader, None) is not None:
+            raise error_type(f"{directive} must occupy one control-file line")
+    except csv.Error as exc:
+        raise error_type(f"invalid comma-separated {directive} parameters: {exc}") from exc
+    return text, fields
+
+
+def _decode_caption_text(value: str) -> str:
+    return str(value).replace("\\n", "\n").replace("\\\\", "\\")
+
+
+def _encode_caption_text(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def _serialize_csv_fields(fields: list[str]) -> str:
+    encoded = []
+    for field in fields:
+        output = io.StringIO()
+        csv.writer(output, lineterminator="", quoting=csv.QUOTE_MINIMAL).writerow([field])
+        encoded.append(output.getvalue())
+    return ", ".join(encoded)
+
+
+def parse_caption_parameters(parameters: str) -> CaptionDirective:
+    """Parse placement commands and text following ``#CAPTION:``."""
+    source, fields = _csv_fields(parameters, "#CAPTION", CaptionSyntaxError)
+    vertical = "bottom"
+    horizontal = "center"
+    text_value = None
+    vertical_values = {"#TOP": "top", "#MIDDLE": "middle", "#BOTTOM": "bottom"}
+    horizontal_values = {"#LEFT": "left", "#CENTER": "center", "#RIGHT": "right"}
+    for field in fields:
+        token = field.strip()
+        upper = token.upper()
+        if upper in vertical_values and text_value is None:
+            vertical = vertical_values[upper]
+        elif upper in horizontal_values and text_value is None:
+            horizontal = horizontal_values[upper]
+        elif upper.startswith("#TEXT"):
+            if text_value is not None:
+                raise CaptionSyntaxError("#CAPTION contains more than one text value")
+            match = re.fullmatch(r"#TEXT(?:\s+(.*))?", token, flags=re.IGNORECASE | re.DOTALL)
+            text_value = "" if match is None else (match.group(1) or "")
+            if len(text_value) >= 2 and text_value.startswith('"') and text_value.endswith('"'):
+                text_value = text_value[1:-1]
+        elif token.startswith("#"):
+            raise CaptionSyntaxError(f"unknown caption command: {token}")
+        elif text_value is None:
+            text_value = token
+        else:
+            raise CaptionSyntaxError("caption text containing commas must be enclosed in double quotes")
+    decoded = _decode_caption_text(text_value or "")
+    if not decoded.strip():
+        raise CaptionSyntaxError("#CAPTION requires non-empty text")
+    return CaptionDirective(decoded, vertical, horizontal, source)
+
+
+def parse_caption_directive(line: str) -> CaptionDirective | None:
+    disabled, text = split_disabled_control_line(line)
+    stripped = text.strip()
+    if disabled or not stripped.upper().startswith(CAPTION_DIRECTIVE_PREFIX):
+        return None
+    return parse_caption_parameters(stripped[len(CAPTION_DIRECTIVE_PREFIX) :])
+
+
+def serialize_caption_parameters(directive: CaptionDirective) -> str:
+    fields = []
+    if directive.vertical != "bottom":
+        fields.append(f"#{directive.vertical.upper()}")
+    if directive.horizontal != "center":
+        fields.append(f"#{directive.horizontal.upper()}")
+    text = _encode_caption_text(directive.text)
+    fields.append(text)
+    return _serialize_csv_fields(fields)
+
+
+def parse_font_parameters(parameters: str) -> FontDirective:
+    """Parse partial persistent font changes following ``#FONT:``."""
+    source, fields = _csv_fields(parameters, "#FONT", FontSyntaxError)
+    if len(fields) == 1 and fields[0].strip().upper() in {"#DEFAULT", "DEFAULT"}:
+        return FontDirective(reset=True, source=source)
+    size = None
+    style = None
+    family = None
+    for field in fields:
+        token = field.strip()
+        size_match = re.fullmatch(r"#SIZE\s+(.+)", token, flags=re.IGNORECASE)
+        style_match = re.fullmatch(r"#STYLE\s+(.+)", token, flags=re.IGNORECASE)
+        family_match = re.fullmatch(r"#FAMILY\s+(.+)", token, flags=re.IGNORECASE)
+        if size_match:
+            try:
+                size = float(size_match.group(1))
+            except ValueError as exc:
+                raise FontSyntaxError("#SIZE requires a number") from exc
+            if not math.isfinite(size) or not 8.0 <= size <= 200.0:
+                raise FontSyntaxError("#SIZE must be between 8 and 200")
+        elif style_match:
+            style = style_match.group(1).strip().lower().replace("_", "-")
+            if style not in {"regular", "bold", "italic", "bold-italic"}:
+                raise FontSyntaxError("#STYLE must be REGULAR, BOLD, ITALIC, or BOLD-ITALIC")
+        elif family_match:
+            family = family_match.group(1).strip()
+            if not family:
+                raise FontSyntaxError("#FAMILY requires a font family")
+        else:
+            raise FontSyntaxError(f"unknown or malformed font command: {token}")
+    if size is None and style is None and family is None:
+        raise FontSyntaxError("#FONT requires #SIZE, #STYLE, #FAMILY, or #DEFAULT")
+    return FontDirective(size, style, family, False, source)
+
+
+def parse_font_directive(line: str) -> FontDirective | None:
+    disabled, text = split_disabled_control_line(line)
+    stripped = text.strip()
+    if disabled or not stripped.upper().startswith(FONT_DIRECTIVE_PREFIX):
+        return None
+    return parse_font_parameters(stripped[len(FONT_DIRECTIVE_PREFIX) :])
+
+
+def serialize_font_parameters(directive: FontDirective) -> str:
+    if directive.reset:
+        return "#DEFAULT"
+    fields = []
+    if directive.size is not None:
+        fields.append(f"#SIZE {float(directive.size):g}")
+    if directive.style is not None:
+        fields.append(f"#STYLE {directive.style.upper()}")
+    if directive.family is not None:
+        fields.append(f"#FAMILY {directive.family}")
+    return _serialize_csv_fields(fields)
 
 
 def normalize_playlist_label(value: object) -> str:

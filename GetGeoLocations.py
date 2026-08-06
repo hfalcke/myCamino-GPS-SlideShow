@@ -462,7 +462,7 @@ def discover_media_update_candidates(
 class TrackInfo:
     """Track summary metadata used in the sorted list output."""
 
-    start_time: datetime
+    start_time: Optional[datetime]
     track_plot_image_filename: str
     original_sequence_number: int
     length_km: Optional[float] = None
@@ -474,6 +474,8 @@ class TrackInfo:
     track_name: Optional[str] = None
     track_fingerprint: Optional[str] = None
     map_sidecar_paths: tuple[Path, ...] = ()
+    timing_status: str = "recorded"
+    has_absolute_time: bool = True
 
 
 @dataclass(frozen=True)
@@ -501,6 +503,43 @@ class TracksSummary:
     overview_image: Optional[str]
     tracks: list[TrackInfo]
     ignored_photo_names: set[str]
+
+
+def track_start_sort_value(track: TrackInfo) -> datetime:
+    """Return a stable aware datetime that sorts untimed tracks last."""
+    return track.start_time or datetime.max.replace(tzinfo=LOCAL_TIMEZONE)
+
+
+def tracks_with_untimed_context(
+    tracks: list[TrackInfo],
+    *,
+    original_order: bool,
+) -> list[TrackInfo]:
+    """Order dated tracks while attaching untimed tracks to prior source stages."""
+    source_order = sorted(tracks, key=lambda item: item.original_sequence_number)
+    if original_order:
+        return source_order
+    dated = [track for track in source_order if track.start_time is not None]
+    if not dated:
+        return source_order
+    leading: list[TrackInfo] = []
+    attached: dict[int, list[TrackInfo]] = {}
+    preceding = None
+    for track in source_order:
+        if track.start_time is not None:
+            preceding = track
+        elif preceding is None:
+            leading.append(track)
+        else:
+            attached.setdefault(id(preceding), []).append(track)
+    ordered = list(leading)
+    for track in sorted(
+        dated,
+        key=lambda item: (track_start_sort_value(item), item.original_sequence_number),
+    ):
+        ordered.append(track)
+        ordered.extend(attached.get(id(track), ()))
+    return ordered
 
 
 @dataclass(frozen=True)
@@ -1650,11 +1689,16 @@ def assign_adjacent_day_track(
 ) -> Optional[AdjacentDayAssignment]:
     """Assign media on a trackless date to a nearby previous/next stage."""
     record_day = record.photo_datetime.date()
-    if any(track.start_time.date() == record_day for track in tracks_in_order):
+    if any(
+        track.start_time is not None and track.start_time.date() == record_day
+        for track in tracks_in_order
+    ):
         return None
     has_gps = record.latitude is not None and record.longitude is not None
     candidates: list[tuple[float, int, int, AdjacentDayAssignment]] = []
     for order_index, track in enumerate(tracks_in_order):
+        if track.start_time is None:
+            continue
         day_delta = (track.start_time.date() - record_day).days
         if day_delta == 1:
             relation = "before"
@@ -1775,8 +1819,11 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
         )
         if isinstance(item.get("track_plot_image_filename"), str):
             ignored_photo_names.add(normalize_filename_for_match(str(item["track_plot_image_filename"])))
-        if start_time is None or not image_name:
+        if not image_name:
             continue
+        timing_status = str(item.get("timing_status", "") or "").strip()
+        if not timing_status:
+            timing_status = "recorded" if start_time is not None else "untimed"
         tracks.append(
             TrackInfo(
                 start_time=start_time,
@@ -1791,6 +1838,10 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
                 track_name=track_name,
                 track_fingerprint=track_fingerprint,
                 map_sidecar_paths=track_map_sidecar_candidates(item, tracks_path, photolist),
+                timing_status=timing_status,
+                has_absolute_time=bool(
+                    item.get("has_absolute_time", start_time is not None)
+                ),
             )
         )
 
@@ -1827,7 +1878,11 @@ class LazyTrackGpsResolver:
     def _candidate_tracks(self, photo_datetime: datetime) -> list[TrackInfo]:
         candidates = []
         for track in self.tracks:
-            if track.end_time is None or track.end_time < track.start_time:
+            if (
+                track.start_time is None
+                or track.end_time is None
+                or track.end_time < track.start_time
+            ):
                 continue
             try:
                 if track.start_time <= photo_datetime <= track.end_time:
@@ -2888,9 +2943,11 @@ def sort_records_for_output(
     track_date_order: dict[object, int] = {}
     tracks_in_original_order = sorted(
         tracks_summary.tracks,
-        key=lambda track: (track.original_sequence_number, track.start_time),
+        key=lambda track: track.original_sequence_number,
     )
     for track in tracks_in_original_order:
+        if track.start_time is None:
+            continue
         track_date = track.start_time.date()
         if track_date not in track_date_order:
             track_date_order[track_date] = len(track_date_order)
@@ -2916,12 +2973,14 @@ def build_control_sections(
 ) -> list[dict[str, Any]]:
     """Build ordered normal, adjacent-day, and leftover date sections."""
     tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
-    if sort_date_sections_by_tracks:
-        ordered_tracks = sorted(tracks, key=lambda track: (track.original_sequence_number, track.start_time))
-    else:
-        ordered_tracks = sorted(tracks, key=lambda track: (track.start_time, track.original_sequence_number))
+    ordered_tracks = tracks_with_untimed_context(
+        tracks,
+        original_order=bool(sort_date_sections_by_tracks),
+    )
     tracks_by_date: dict[date, list[TrackInfo]] = {}
     for track in ordered_tracks:
+        if track.start_time is None:
+            continue
         tracks_by_date.setdefault(track.start_time.date(), []).append(track)
 
     exact_records: dict[date, list[PhotoRecord]] = {}
@@ -2952,6 +3011,8 @@ def build_control_sections(
     track_groups: list[dict[str, Any]] = []
     ordered_dates: list[date] = []
     for track in ordered_tracks:
+        if track.start_time is None:
+            continue
         track_day = track.start_time.date()
         if track_day not in ordered_dates:
             ordered_dates.append(track_day)
@@ -2999,6 +3060,9 @@ def build_control_sections(
                     "date": track_day,
                     "sections": group_sections,
                     "sequence": min(track.original_sequence_number for track in day_tracks),
+                    "track_sequences": {
+                        track.original_sequence_number for track in day_tracks
+                    },
                 }
             )
 
@@ -3078,6 +3142,52 @@ def build_control_sections(
             if not track_times or media_average > (min(track_times) + max(track_times)) / 2.0:
                 insert_at += 1
             groups.insert(insert_at, media_group)
+
+    untimed_groups = []
+    preceding_dated_sequence = None
+    for track in sorted(tracks, key=lambda item: item.original_sequence_number):
+        if track.start_time is not None:
+            preceding_dated_sequence = track.original_sequence_number
+            continue
+        if not track.track_plot_image_filename:
+            continue
+        untimed_groups.append(
+            {
+                "date": None,
+                "sections": [
+                    {
+                        "date": None,
+                        "maps": [("Map", track.track_plot_image_filename)],
+                        "records": [],
+                        "relation": "untimed",
+                    }
+                ],
+                "sequence": track.original_sequence_number,
+                "untimed_anchor_sequence": preceding_dated_sequence,
+            }
+        )
+    if untimed_groups:
+        if not any(track.start_time is not None for track in ordered_tracks):
+            groups = untimed_groups + groups
+        else:
+            for untimed_group in untimed_groups:
+                anchor = untimed_group["untimed_anchor_sequence"]
+                insert_at = 0
+                if anchor is None:
+                    for index, group in enumerate(groups):
+                        if (
+                            "untimed_anchor_sequence" in group
+                            and group["untimed_anchor_sequence"] is None
+                        ):
+                            insert_at = index + 1
+                else:
+                    for index, group in enumerate(groups):
+                        if (
+                            anchor in group.get("track_sequences", set())
+                            or group.get("untimed_anchor_sequence") == anchor
+                        ):
+                            insert_at = index + 1
+                groups.insert(insert_at, untimed_group)
 
     return [section for group in groups for section in group["sections"]]
 
@@ -3648,9 +3758,19 @@ def write_sorted_output(
         elif media_overview:
             output_file.write(f"#Overviewmap: {media_overview}\n")
 
+        active_date = None
         for section in plan.sections:
-            date_datetime = datetime.combine(section["date"], datetime.min.time()).replace(tzinfo=LOCAL_TIMEZONE)
-            output_file.write(f"#Datum: {format_german_date(date_datetime)}\n")
+            if section.get("date") is not None:
+                date_datetime = datetime.combine(
+                    section["date"],
+                    datetime.min.time(),
+                ).replace(tzinfo=LOCAL_TIMEZONE)
+                output_file.write(f"#Datum: {format_german_date(date_datetime)}\n")
+                active_date = section["date"]
+            elif active_date is not None:
+                # Clear inherited date context without inventing one.
+                output_file.write("#Datum:\n")
+                active_date = None
             for keyword, filename in section["maps"]:
                 output_file.write(f"#{keyword}: {filename}\n")
             for record in section["records"]:
@@ -3822,7 +3942,12 @@ def date_order_key(day: date, tracks_summary: Optional[TracksSummary], sort_date
     if not sort_date_sections_by_tracks or tracks_summary is None or not tracks_summary.tracks:
         return (0, day)
     ordered_dates: dict[date, int] = {}
-    for track in sorted(tracks_summary.tracks, key=lambda item: (item.original_sequence_number, item.start_time)):
+    for track in sorted(
+        tracks_summary.tracks,
+        key=lambda item: item.original_sequence_number,
+    ):
+        if track.start_time is None:
+            continue
         track_day = track.start_time.date()
         if track_day not in ordered_dates:
             ordered_dates[track_day] = len(ordered_dates)
@@ -3905,13 +4030,9 @@ def _track_relative_section_insert_index(
     sort_date_sections_by_tracks: bool,
 ) -> Optional[int]:
     """Place a missing stage beside its nearest existing canonical stage."""
-    ordered_tracks = sorted(
+    ordered_tracks = tracks_with_untimed_context(
         tracks_summary.tracks,
-        key=(
-            (lambda item: (item.original_sequence_number, item.start_time))
-            if sort_date_sections_by_tracks
-            else (lambda item: (item.start_time, item.original_sequence_number))
-        ),
+        original_order=bool(sort_date_sections_by_tracks),
     )
     order = {
         _canonical_control_track_map_name(item.track_plot_image_filename): index
@@ -3950,6 +4071,25 @@ def insert_map_entry(
     sort_date_sections_by_tracks: bool,
 ) -> None:
     """Insert one missing #Map line into its date section."""
+    if track.start_time is None:
+        insert_at = _track_relative_section_insert_index(
+            entries,
+            track,
+            tracks_summary,
+            sort_date_sections_by_tracks,
+        )
+        if insert_at is None:
+            insert_at = len(entries)
+        entries.insert(
+            insert_at,
+            {
+                "line": f"#Map: {track.track_plot_image_filename}",
+                "type": "map",
+                "date": None,
+                "name": track.track_plot_image_filename,
+            },
+        )
+        return
     day = track.start_time.date()
     header_index, end_index = find_date_section(entries, day)
     if header_index is None:
@@ -4143,16 +4283,16 @@ def insert_classified_media_entry(
 ) -> None:
     """Insert merged media into an exact, adjacent, or trailing leftover section."""
     tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
-    tracks_in_order = sorted(
+    tracks_in_order = tracks_with_untimed_context(
         tracks,
-        key=(
-            (lambda track: (track.original_sequence_number, track.start_time))
-            if sort_date_sections_by_tracks
-            else (lambda track: (track.start_time, track.original_sequence_number))
-        ),
+        original_order=bool(sort_date_sections_by_tracks),
     )
     day = record.photo_datetime.date()
-    day_tracks = [track for track in tracks_in_order if track.start_time.date() == day]
+    day_tracks = [
+        track
+        for track in tracks_in_order
+        if track.start_time is not None and track.start_time.date() == day
+    ]
     if day_tracks:
         for header_index, end_index in _control_section_ranges(entries):
             if entries[header_index].get("date") != day:
@@ -4400,7 +4540,9 @@ def analyze_track_map_reference_updates(
         if not track.track_plot_image_filename:
             continue
         key = _canonical_control_track_map_name(track.track_plot_image_filename)
-        expected_map_dates.setdefault(key, set()).add(track.start_time.date())
+        expected_map_dates.setdefault(key, set()).add(
+            track.start_time.date() if track.start_time is not None else None
+        )
     expected_by_number = {
         int(track.original_sequence_number): Path(track.track_plot_image_filename).name
         for track in tracks_summary.tracks if track.track_plot_image_filename
@@ -4417,7 +4559,10 @@ def analyze_track_map_reference_updates(
         image_name = Path(track.track_plot_image_filename).name
         if not image_name or not _control_track_map_file_exists(project, image_name):
             continue
-        expected_key = (_canonical_control_track_map_name(image_name), track.start_time.date())
+        expected_key = (
+            _canonical_control_track_map_name(image_name),
+            track.start_time.date() if track.start_time is not None else None,
+        )
         if expected_key not in existing_map_keys:
             plan.missing_tracks.append(image_name)
 
@@ -4455,7 +4600,8 @@ def analyze_track_map_reference_updates(
                 )
                 date_candidates = [
                     track for track in tracks_summary.tracks
-                    if track.start_time.date() == target_date
+                    if track.start_time is not None
+                    and track.start_time.date() == target_date
                     and track.track_plot_image_filename
                 ]
             replacement = None
@@ -4485,13 +4631,9 @@ def analyze_track_map_reference_updates(
             else:
                 plan.obsolete_tracks.append(name)
 
-    ordered_tracks = sorted(
+    ordered_tracks = tracks_with_untimed_context(
         tracks_summary.tracks,
-        key=(
-            (lambda item: (item.original_sequence_number, item.start_time))
-            if sort_date_sections_by_tracks
-            else (lambda item: (item.start_time, item.original_sequence_number))
-        ),
+        original_order=bool(sort_date_sections_by_tracks),
     )
     expected_order = {
         _canonical_control_track_map_name(track.track_plot_image_filename): index
@@ -4955,12 +5097,9 @@ def _apply_track_map_reference_updates(
         reordered = {
             _canonical_control_track_map_name(name) for name in plan.reordered_tracks
         }
-        tracks = sorted(
+        tracks = tracks_with_untimed_context(
             tracks_summary.tracks,
-            key=lambda track: (
-                track.original_sequence_number if sort_date_sections_by_tracks else track.start_time,
-                track.start_time,
-            ),
+            original_order=bool(sort_date_sections_by_tracks),
         )
         for track in tracks:
             track_key = _canonical_control_track_map_name(track.track_plot_image_filename)
@@ -5273,13 +5412,9 @@ def merge_sorted_control_file(params: Params) -> Path:
             )
             existing_names.add(normalize_filename_for_match(tracks_summary.overview_image))
             inserted_maps += 1
-        track_order = sorted(
+        track_order = tracks_with_untimed_context(
             tracks_summary.tracks,
-            key=lambda track: (
-                date_order_key(track.start_time.date(), tracks_summary, params.sort_date_sections_by_tracks),
-                track.original_sequence_number if params.sort_date_sections_by_tracks else track.start_time,
-                track.track_plot_image_filename.lower(),
-            ),
+            original_order=bool(params.sort_date_sections_by_tracks),
         )
         for track in track_order:
             normalized_name = normalize_filename_for_match(track.track_plot_image_filename)

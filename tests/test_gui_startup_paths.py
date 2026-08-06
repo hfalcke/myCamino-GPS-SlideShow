@@ -1,6 +1,9 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from GPSTrackShowGUI import (
     GPXTrackerController,
@@ -17,6 +20,41 @@ from GPSTrackShowGUI import (
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_speed_sidecar_upgrade_does_not_pass_output_directory_twice(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            gpx_path = directory / "trip.gpx"
+            gpx_path.write_text("<gpx/>", encoding="utf-8")
+            (directory / "track.json").write_text(
+                json.dumps({"track_fingerprint": "one", "timed_track_points": []}),
+                encoding="utf-8",
+            )
+            statuses = []
+            controller = SimpleNamespace(
+                parameters={
+                    "gpx.running_speed_window_distance_m": 100.0,
+                    "gpx.stationary_speed_threshold_kmh": 1.5,
+                },
+                _current_single_gpx_path=lambda: gpx_path,
+                _current_project_name=lambda: "Trip",
+                _plot_common_options=lambda *_args: {
+                    "output_dir": str(directory),
+                    "gpx_running_speed_window_distance": 100.0,
+                },
+                set_status=statuses.append,
+            )
+            with patch(
+                "GPSTrackShowGUI.upgrade_timed_track_sidecars",
+                return_value={"updated": [1], "current": [], "skipped": []},
+            ) as upgrade:
+                result = GPXTrackerController._ensure_running_speed_sidecars_current(
+                    controller,
+                    directory,
+                )
+        self.assertTrue(result)
+        self.assertNotIn("output_dir", upgrade.call_args.kwargs)
+        self.assertEqual(upgrade.call_args.args[1], directory)
+
     def test_live_settings_payload_contains_only_changed_values(self):
         payload = slideshow_settings_command_payload(
             {

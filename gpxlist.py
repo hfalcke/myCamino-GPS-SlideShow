@@ -15,6 +15,7 @@ from gpx_processing import (
     parse_time,
     process_track_element,
 )
+from gpx_import import load_gpx_document
 
 
 GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
@@ -78,22 +79,14 @@ def ns_tag(local_name: str) -> str:
 
 # AI prompt: Parse one GPX file, validate that it is GPX 1.1, and return the XML root element.
 def parse_gpx_file(filename: str) -> ET.Element:
-    """Parse a GPX 1.1 file and return its root XML element."""
-    try:
-        tree = ET.parse(filename)
-    except ET.ParseError as exc:
-        raise ValueError(f"{filename}: invalid XML/GPX content: {exc}") from exc
-    except OSError as exc:
-        raise ValueError(f"{filename}: unable to read file: {exc}") from exc
-
-    root = tree.getroot()
-    if root.tag != ns_tag("gpx"):
-        raise ValueError(f"{filename}: root element is not GPX 1.1")
-
-    version = root.attrib.get("version")
-    if version != "1.1":
-        raise ValueError(f"{filename}: expected GPX version 1.1, found {version!r}")
-
+    """Parse supported GPX variants and return a canonical GPX 1.1 root."""
+    document = load_gpx_document(filename)
+    root = ET.Element(
+        ns_tag("gpx"),
+        {"version": "1.1", "creator": "myCamino gpxlist"},
+    )
+    for track in document.tracks:
+        root.append(track)
     return root
 
 

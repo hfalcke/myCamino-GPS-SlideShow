@@ -136,6 +136,57 @@ class AdjacentDayAssignmentTests(unittest.TestCase):
         )
         self.assertEqual(normal_sections[1]["records"], [])
 
+    def test_untimed_track_sections_keep_original_context_in_date_order(self):
+        leading = TrackInfo(None, "0001_leading.png", 1, timing_status="untimed", has_absolute_time=False)
+        later = track(2, datetime(2024, 7, 16, 8), "0002_later.png")
+        attached = TrackInfo(None, "0003_attached.png", 3, timing_status="untimed", has_absolute_time=False)
+        earlier = track(4, datetime(2024, 7, 15, 8), "0004_earlier.png")
+        trailing = TrackInfo(None, "0005_trailing.png", 5, timing_status="untimed", has_absolute_time=False)
+        sections = build_control_sections(
+            [],
+            TracksSummary(
+                "overview.png",
+                [leading, later, attached, earlier, trailing],
+                set(),
+            ),
+            False,
+            include_empty_track_sections=True,
+        )
+        self.assertEqual(
+            [section["maps"][0][1] for section in sections],
+            [
+                "0001_leading.png",
+                "0004_earlier.png",
+                "0005_trailing.png",
+                "0002_later.png",
+                "0003_attached.png",
+            ],
+        )
+        self.assertIsNone(sections[0]["date"])
+        self.assertIsNone(sections[-1]["date"])
+
+    def test_writer_does_not_invent_a_date_for_untimed_tracks(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "Trip-sorted.lst"
+            untimed = TrackInfo(
+                None,
+                "0001_untimed.png",
+                1,
+                timing_status="untimed",
+                has_absolute_time=False,
+            )
+            write_sorted_output(
+                [],
+                output,
+                TracksSummary("overview.png", [untimed], set()),
+                False,
+            )
+
+            text = output.read_text(encoding="utf-8")
+            self.assertIn("#Map: 0001_untimed.png", text)
+            self.assertNotIn("#Datum:", text)
+
     def test_leftover_date_receives_media_map_directive(self):
         stage = track(1, datetime(2024, 7, 15, 8), "0001_track.png")
         records = [photo("far.jpg", datetime(2024, 7, 12, 10), 10.0, 10.0)]

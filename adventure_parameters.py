@@ -7,8 +7,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from gpx_processing import (
+    DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+    DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
+)
 
-PARAMETER_SCHEMA_VERSION = 16
+
+PARAMETER_SCHEMA_VERSION = 18
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,8 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.font_color", "Slide Show", "Font color", "#FFFFFF", "color", "Color used for header text, clock marks and hands, time, and date.", subsection="Header"),
     ParameterSpec("slideshow.header_shadow_color", "Slide Show", "Shadow color", "#000000", "color", "Color used for header text, clock, time, and date shadows.", subsection="Header"),
     ParameterSpec("slideshow.font_size", "Slide Show", "Font size", 30, "int", "Base header font size.", 8, 200, unit="pt", subsection="Header"),
+    ParameterSpec("slideshow.font_family", "Slide Show", "Font family", "System", "str", "Font family used for automatic headers and #CAPTION text.", subsection="Header"),
+    ParameterSpec("slideshow.font_style", "Slide Show", "Font style", "bold", "choice", "Default style used for automatic headers and #CAPTION text.", choices=_choice(("regular", "Regular"), ("bold", "Bold"), ("italic", "Italic"), ("bold-italic", "Bold Italic")), subsection="Header"),
     ParameterSpec("slideshow.clock", "Slide Show", "Clock", True, "bool", "Show the analog clock at the left of the slide-show header when timing is available.", subsection="Header"),
     ParameterSpec("slideshow.header_stage_name", "Slide Show", "Stage name", True, "bool", "Show the stage name as the first available line in the middle of the header.", subsection="Header"),
     ParameterSpec("slideshow.header_track_details", "Slide Show", "Track length & duration", True, "bool", "Show the stage track length and duration as the next available header line.", subsection="Header"),
@@ -73,6 +80,7 @@ PARAMETER_SPECS = (
     ParameterSpec("timelapse.overview_as_media", "Slide Show", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.overview_on_stage_map_dual", "Slide Show", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.marker_style", "Slide Show", "Moving marker", "pilgrim", "choice", "Choose the moving symbol shown at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("bike", "Bicycle"), ("car", "Car"), ("plane", "Airplane"), ("arrow", "Arrow")), subsection="Time-Lapse"),
+    ParameterSpec("slideshow.speedometer", "Slide Show", "Show speedometer", True, "bool", "Show distance-smoothed moving speed in Time-Lapse when recorded timing is available.", subsection="Time-Lapse"),
 
     ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
     ParameterSpec("trackmaps.route_source", "Map Generation", "Journey source", "automatic", "choice", "Use GPX tracks when available, require GPX tracks, or build date stages from media locations.", choices=_choice(("automatic", "Automatic"), ("gpx", "GPX tracks"), ("media", "Media locations"))),
@@ -101,6 +109,8 @@ PARAMETER_SPECS = (
     ParameterSpec("gpx.maximum_vertical_accuracy_m", "GPX Processing", "Maximum vertical error", 20.0, "float", "Ignore elevations whose explicit vertical uncertainty exceeds this value. Set to zero to disable.", 0.0, 10000.0, unit="m"),
     ParameterSpec("gpx.maximum_hdop", "GPX Processing", "Maximum HDOP", 20.0, "float", "Reject coordinates above this horizontal dilution of precision. Set to zero to disable.", 0.0, 10000.0),
     ParameterSpec("gpx.maximum_vdop", "GPX Processing", "Maximum VDOP", 20.0, "float", "Ignore elevations above this vertical dilution of precision. Set to zero to disable.", 0.0, 10000.0),
+    ParameterSpec("gpx.running_speed_window_distance_m", "GPX Processing", "Running-speed window", DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M, "float", "Calculate each displayed speed over this centered route distance.", 0.0, 10000.0, unit="m"),
+    ParameterSpec("gpx.stationary_speed_threshold_kmh", "GPX Processing", "Stationary speed threshold", DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH, "float", "Intervals slower than this are excluded from moving-average speed. Set to zero to include them.", 0.0, 100.0, unit="km/h"),
     ParameterSpec("gpx.editor_autosave_seconds", "GPX Processing", "Editor autosave interval", 300.0, "float", "Interval between GPX Editor recovery saves.", 10.0, 86400.0, unit="s"),
     ParameterSpec("gpx.map_padding_fraction", "GPX Processing", "Map padding", 0.08, "fraction", "Padding around tracks in interactive maps.", 0.0, 1.0, unit="%"),
     ParameterSpec("gpx.overview_zoom", "GPX Processing", "Overview zoom", 8, "int", "Default GPX Editor overview tile zoom.", 0, 22),
@@ -304,6 +314,17 @@ def normalize_parameters(raw: Any) -> dict[str, Any]:
         pre_zoom_16_schema = True
     if pre_zoom_16_schema and values.get("trackmaps.zoom") == 15:
         values["trackmaps.zoom"] = 16
+    try:
+        pre_speed_window_500_schema = int(source_version or 1) < 17
+    except (TypeError, ValueError):
+        pre_speed_window_500_schema = True
+    if (
+        pre_speed_window_500_schema
+        and values.get("gpx.running_speed_window_distance_m") == 100.0
+    ):
+        values["gpx.running_speed_window_distance_m"] = (
+            DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M
+        )
     normalized = default_parameters()
     for spec in PARAMETER_SPECS:
         if spec.key not in values:

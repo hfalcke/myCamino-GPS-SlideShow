@@ -3,9 +3,9 @@ name: myCamino website
 on:
   push:
     branches: [main]
-    paths: ["website/**", "docs/**", ".github/workflows/mycamino-site.yml"]
+    paths: ["website/**", "docs/**", "scripts/publish_website_release.sh", ".github/workflows/mycamino-site.yml"]
   pull_request:
-    paths: ["website/**", "docs/**", ".github/workflows/mycamino-site.yml"]
+    paths: ["website/**", "docs/**", "scripts/publish_website_release.sh", ".github/workflows/mycamino-site.yml"]
   workflow_dispatch:
 
 permissions:

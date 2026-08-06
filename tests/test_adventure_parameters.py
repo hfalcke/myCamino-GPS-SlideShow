@@ -56,6 +56,7 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["gpx.maximum_vertical_accuracy_m"], 20.0)
         self.assertEqual(defaults["gpx.maximum_hdop"], 20.0)
         self.assertEqual(defaults["gpx.maximum_vdop"], 20.0)
+        self.assertEqual(defaults["gpx.running_speed_window_distance_m"], 500.0)
         self.assertEqual(defaults["trackmaps.media_point_color"], "#0066FF")
         self.assertEqual(defaults["trackmaps.track_title"], "endpoint_places")
         self.assertEqual(defaults["trackmaps.zoom"], 16)
@@ -100,6 +101,19 @@ class AdventureParameterTests(unittest.TestCase):
         )
         self.assertEqual(migrated["trackmaps.zoom"], 16)
         self.assertEqual(current_custom["trackmaps.zoom"], 15)
+
+    def test_previous_running_speed_default_migrates_to_five_hundred(self):
+        migrated = normalize_parameters(
+            {"version": 16, "values": {"gpx.running_speed_window_distance_m": 100.0}}
+        )
+        current_custom = normalize_parameters(
+            {
+                "version": PARAMETER_SCHEMA_VERSION,
+                "values": {"gpx.running_speed_window_distance_m": 100.0},
+            }
+        )
+        self.assertEqual(migrated["gpx.running_speed_window_distance_m"], 500.0)
+        self.assertEqual(current_custom["gpx.running_speed_window_distance_m"], 100.0)
 
     def test_schema_one_default_orange_migrates_but_custom_color_is_preserved(self):
         migrated = normalize_parameters(
@@ -200,6 +214,7 @@ class AdventureParameterTests(unittest.TestCase):
                 "timelapse.overview_as_media",
                 "timelapse.overview_on_stage_map_dual",
                 "timelapse.marker_style",
+                "slideshow.speedometer",
             },
         )
 
@@ -216,6 +231,8 @@ class AdventureParameterTests(unittest.TestCase):
                 "slideshow.clock",
                 "slideshow.font_color",
                 "slideshow.font_size",
+                "slideshow.font_family",
+                "slideshow.font_style",
                 "slideshow.header_stage_name",
                 "slideshow.header_track_details",
                 "slideshow.header_place_name",
@@ -247,6 +264,8 @@ class AdventureParameterTests(unittest.TestCase):
                 "gpx.maximum_vdop",
             }.issubset(keys)
         )
+        self.assertNotIn("gpx.running_speed_window_distance_m", keys)
+        self.assertNotIn("gpx.stationary_speed_threshold_kmh", keys)
 
 
 if __name__ == "__main__":

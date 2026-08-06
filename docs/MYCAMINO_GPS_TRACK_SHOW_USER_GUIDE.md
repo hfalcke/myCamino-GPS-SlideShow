@@ -1,5 +1,15 @@
 # myCamino GPS Track Show User Guide
 
+## Photo-Derived GPX Tracks
+
+Use **Create Tracks from Photos** in the GPX Files section to turn project photo
+and video GPS positions into editable, estimated GPX stage tracks. Existing
+valid media sidecars are reused. If a control file exists, its stages and media
+order define the generated tracks; otherwise media are grouped by local date.
+The generated tracks open in GPX Editor alongside the current GPX when one is
+already selected. A newly generated file becomes the Adventure's active GPX
+only after you save and confirm that choice.
+
 ## License and source code
 
 myCamino is free and open-source software licensed under GPL-3.0-or-later.
@@ -216,6 +226,9 @@ Controls:
 
 Behavior:
 
+- In a new project containing GPX files, **Choose** first offers all detected
+  files as the default selection. One file is used directly; several files are
+  opened together in the GPX Editor.
 - If one existing GPX file in the project directory is selected, the GUI uses
   it directly.
 - If a GPX file outside the project directory is selected, the GUI asks whether
@@ -667,6 +680,24 @@ Duration and transition settings remain active until another command changes
 them or the show restarts from its title page. Use the editor's CTL filter to
 find these rows quickly.
 
+## Hidden Media, Captions, and Fonts
+
+Choose **Hide Media** from an image or video row's context menu to retain that
+row while excluding it from playback. Hidden rows are gray and are saved with
+`# ` before the original line. Choose **Unhide Media** to restore them. The
+prefix can also disable any other control-file line when entered manually.
+
+`CAP – Photo/video caption` rows are saved as `#CAPTION:` and label only the
+immediately following enabled photo or video. Captions default to bottom
+center. Add `#TOP`, `#MIDDLE`, or `#BOTTOM` and `#LEFT`, `#CENTER`, or `#RIGHT`
+to position and align them. Use `\\n` for line breaks and double quotes around
+text containing commas. Video captions remain visible for the complete clip.
+
+`FNT – Label font` rows are saved as `#FONT:`. Use `#SIZE`, `#STYLE`, and
+`#FAMILY` independently; `#DEFAULT` restores the Adventure's Header settings.
+These settings also control following automatic stage headers. Captions use the
+configured text color and shadow without covering the image with a box.
+
 The Music section contains:
 
 - Audio folder icon: open the project's fixed `audio` folder in Finder. Copy
@@ -746,6 +777,10 @@ The Start Slide Show section contains:
   geocoded place can appear as one of the three centered title lines. When the
   clock option is enabled,
   the analog clock in the upper-left follows the moving GPX marker time
+  and the optional speedometer beside it follows the 500 m running mean. It is
+  shown only when recorded GPX timestamps support a meaningful speed. Changing
+  its window or stationary threshold updates small sidecar metadata files and
+  does not regenerate or download maps.
   throughout the stage rather than showing a fixed media time; the separate
   date subtitle is then omitted. The upper-right map header shows total
   travelled distance, distance within the current stage, and current height.
@@ -905,13 +940,15 @@ manual `a` toggle to Audio Off always has priority, so no control-file command
 can restart audio until `a` is pressed again. The crossfade duration is set in
 **Settings > Audio**. Missing labels or files warn and leave playback running.
 
-The time-lapse uses the recorded GPX point times where available. Missing times
-are estimated along the travelled distance; when a track has no usable duration,
-it uses a walking speed of 3.5 km/h. Creating or playing a time-lapse does not
-change the GPX file or its map information. Track maps include cumulative
-distance, elevation, and timing data. If that information is unavailable, the
-player uses its safe distance-based fallback instead of changing project files
-while it starts.
+The time-lapse uses recorded GPX point times where available. Gaps in a partly
+timed track are estimated along travelled distance. A completely untimed track
+uses a relative distance-based timeline and the configured fallback walking
+speed; no artificial calendar date is created. Its map, elevation profile,
+distance, PDF output, and moving marker remain available, but its clock and
+date are omitted. Photos cannot be assigned to that track by exposure time and
+missing photo GPS cannot be inferred until the user supplies and saves a track
+start time in the GPX Editor. Creating or playing a time-lapse does not change
+the GPX file.
 
 The position marker normally continues moving while a photo or video is shown.
 If it reaches the scheduled position of another medium before the current one

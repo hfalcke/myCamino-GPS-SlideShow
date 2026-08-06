@@ -13,6 +13,7 @@ hiddenimports = ['pyexpat', 'PIL._tkinter_finder']
 hiddenimports += collect_submodules('objc')
 hiddenimports += collect_submodules('AppKit')
 hiddenimports += collect_submodules('Foundation')
+hiddenimports += collect_submodules('CoreLocation')
 hiddenimports += collect_submodules('Quartz')
 hiddenimports += collect_submodules(
     'matplotlib',

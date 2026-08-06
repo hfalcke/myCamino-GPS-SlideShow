@@ -9,6 +9,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 
+from gpx_import import load_gpx_document
 
 GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
 ET.register_namespace("", GPX_NAMESPACE)
@@ -49,21 +50,15 @@ def ns_tag(local_name: str) -> str:
 # AI prompt: Parse a GPX file, validate that it looks like GPX 1.1, and return its XML tree root.
 def parse_gpx_file(filename: str) -> ET.Element:
     """Parse a GPX file and return the root XML element."""
-    try:
-        tree = ET.parse(filename)
-    except ET.ParseError as exc:
-        raise ValueError(f"{filename}: invalid XML/GPX content: {exc}") from exc
-    except OSError as exc:
-        raise ValueError(f"{filename}: unable to read file: {exc}") from exc
-
-    root = tree.getroot()
-    if root.tag != ns_tag("gpx"):
-        raise ValueError(f"{filename}: root element is not GPX 1.1")
-
-    version = root.attrib.get("version")
-    if version != "1.1":
-        raise ValueError(f"{filename}: expected GPX version 1.1, found {version!r}")
-
+    document = load_gpx_document(filename)
+    root = ET.Element(
+        ns_tag("gpx"),
+        {"version": "1.1", "creator": "myCamino gpxjoin"},
+    )
+    if document.metadata is not None:
+        root.append(copy.deepcopy(document.metadata))
+    for track in document.tracks:
+        root.append(copy.deepcopy(track))
     return root
 
 

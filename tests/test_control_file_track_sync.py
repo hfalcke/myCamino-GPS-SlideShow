@@ -151,18 +151,21 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             [
                 "All Rows", "No Media", "Media", "Maps",
                 "MUS – Music control", "CTL – Slide-show control",
+                "CAP – Photo/video caption", "FNT – Label font",
                 "IMG – Image", "VID – Video",
                 "MAP – Overview map", "TRK – Track map",
                 "BEF – Day before map", "AFT – Day after map",
                 "LOC – Media location map", "DAT – Date",
             ],
         )
-        rows = [{"type": value} for value in ("DAT", "MUS", "CTL", "IMG", "TRK", "VID", "LOC")]
-        self.assertEqual(visible_control_row_indexes(rows, "media"), [3, 5])
-        self.assertEqual(visible_control_row_indexes(rows, "maps"), [4, 6])
+        rows = [{"type": value} for value in ("DAT", "MUS", "CTL", "CAP", "FNT", "IMG", "TRK", "VID", "LOC")]
+        self.assertEqual(visible_control_row_indexes(rows, "media"), [5, 7])
+        self.assertEqual(visible_control_row_indexes(rows, "maps"), [6, 8])
         self.assertEqual(visible_control_row_indexes(rows, "mus"), [1])
         self.assertEqual(visible_control_row_indexes(rows, "ctl"), [2])
-        self.assertEqual(control_table_filter_anchor_index(rows, [5], "mus"), 1)
+        self.assertEqual(visible_control_row_indexes(rows, "cap"), [3])
+        self.assertEqual(visible_control_row_indexes(rows, "fnt"), [4])
+        self.assertEqual(control_table_filter_anchor_index(rows, [7], "mus"), 1)
 
     def test_jump_to_show_requires_a_running_player(self):
         self.assertFalse(slideshow_process_is_running(None))
@@ -361,6 +364,33 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             ["#CONTROL: #LABEL $START, #DURATION 5"]
         )[0]
         self.assertEqual(merge_entry["type"], "control")
+
+    def test_gui_round_trips_hidden_media_and_visual_directives(self):
+        hidden = parse_slideshow_control_line(
+            "# photo.jpeg | 12:00 | 50.0, 7.0 | Bonn"
+        )
+        self.assertEqual(hidden["type"], "IMG")
+        self.assertTrue(hidden["disabled"])
+        self.assertEqual(
+            serialize_slideshow_control_row(hidden),
+            "# photo.jpeg | 12:00 | 50.0, 7.0 | Bonn",
+        )
+        caption = parse_slideshow_control_line(
+            '#CAPTION: #TOP, #LEFT, "First, line\\nSecond line"'
+        )
+        self.assertEqual(caption["type"], "CAP")
+        self.assertEqual(
+            serialize_slideshow_control_row(caption),
+            '#CAPTION: #TOP, #LEFT, "First, line\\nSecond line"',
+        )
+        font = parse_slideshow_control_line(
+            "#FONT: #SIZE 36, #STYLE bold-italic, #FAMILY Helvetica Neue"
+        )
+        self.assertEqual(font["type"], "FNT")
+        self.assertEqual(
+            serialize_slideshow_control_row(font),
+            "#FONT: #SIZE 36, #STYLE BOLD-ITALIC, #FAMILY Helvetica Neue",
+        )
 
     def test_control_directive_serializes_time_lapse_canonically(self):
         row = parse_slideshow_control_line("#CONTROL: #TRANSITION time-lapse")

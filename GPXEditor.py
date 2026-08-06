@@ -57,8 +57,11 @@ from AppKit import (
     NSImageView,
     NSMakeRect,
     NSMakeSize,
+    NSMenu,
+    NSMenuItem,
     NSZeroRect,
     NSOpenPanel,
+    NSPasteboard,
     NSPopUpButton,
     NSProgressIndicator,
     NSProgressIndicatorStyleBar,
@@ -120,6 +123,20 @@ from gpx_processing import (
     process_track_element,
     semantic_track_fingerprint,
 )
+from gpx_import import (
+    load_gpx_document,
+    sanitize_track_element as sanitize_imported_track,
+    timing_status_for_track,
+)
+from gpx_point_editing import (
+    deserialize_points,
+    duplicate_point,
+    insert_point_for_rows,
+    insert_points_after_row,
+    move_rows as move_point_rows,
+    remove_rows,
+    serialized_points,
+)
 from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
 from map_provider_utils import contextily_provider, contextily_request_timeout, provider_display_name, provider_tile_url
 from map_overlay import MapOverlayScene, normalize_overlay_segments
@@ -174,6 +191,8 @@ BUTTON_HEIGHT = 28.0
 STATUS_HEIGHT = 24.0
 ROW_HEIGHT = 24.0
 DRAG_TYPE = "myCaminoGPXEditorRows"
+POINT_DRAG_TYPE = "myCaminoGPXEditorPointRows"
+POINT_PASTEBOARD_TYPE = "org.mycamino.gpx-track-points"
 APP_CACHE_DIR = Path.home() / "Library" / "Caches" / "myCamino-GPXEditor"
 TILE_CACHE_DIR = APP_CACHE_DIR / "tiles"
 MPL_CACHE_DIR = APP_CACHE_DIR / "matplotlib"
@@ -391,45 +410,13 @@ def iter_track_points(track_element: ET.Element) -> Iterable[ET.Element]:
 
 
 def sanitize_track_points(track_element: ET.Element) -> dict[str, int]:
-    removed_invalid_coordinates = 0
-    removed_invalid_timestamps = 0
-    removed_out_of_order = 0
-    valid_points: list[tuple[ET.Element, ET.Element, datetime]] = []
-    for segment in track_element.findall("gpx:trkseg", NS):
-        for point in list(segment.findall("gpx:trkpt", NS)):
-            try:
-                lat = float(point.attrib["lat"])
-                lon = float(point.attrib["lon"])
-            except (KeyError, TypeError, ValueError):
-                segment.remove(point)
-                removed_invalid_coordinates += 1
-                continue
-            if not (math.isfinite(lat) and math.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-                segment.remove(point)
-                removed_invalid_coordinates += 1
-                continue
-            time_text = point.findtext("gpx:time", default="", namespaces=NS)
-            if not time_text:
-                segment.remove(point)
-                removed_invalid_timestamps += 1
-                continue
-            parsed_time = parse_time(time_text)
-            if parsed_time is None:
-                segment.remove(point)
-                removed_invalid_timestamps += 1
-                continue
-            valid_points.append((segment, point, parsed_time))
-    last_time = None
-    for segment, point, parsed_time in valid_points:
-        if last_time is not None and parsed_time < last_time:
-            segment.remove(point)
-            removed_out_of_order += 1
-            continue
-        last_time = parsed_time
+    """Retain valid geometry when optional or unusable timestamps are present."""
+    removed = sanitize_imported_track(track_element)
     return {
-        "coordinates": removed_invalid_coordinates,
-        "timestamps": removed_invalid_timestamps,
-        "out_of_order": removed_out_of_order,
+        "coordinates": removed["coordinates"],
+        "timestamps": removed["timestamps"],
+        "out_of_order": removed["out_of_order"],
+        "missing_timestamps": removed["missing_timestamps"],
     }
 
 
@@ -859,6 +846,12 @@ class PlotView(NSView):
         self.inspector = None
         self.rendering_map = False
         self.last_viewport_signature = None
+        self.long_press_timer = None
+        self.long_press_origin = None
+        self.dragged_point_index = None
+        self.dragged_point_track = None
+        self.drag_original_xml = None
+        self.drag_inserted_point = False
         self.initial_plot_info = self.clone_plot_info(self.plot_info)
         self.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         return self
@@ -1427,6 +1420,7 @@ class PlotView(NSView):
             "e: open elevation profile",
             "d: toggle start/end dots",
             "click/drag: move cursor to nearest point",
+            "hold 1 second: insert or drag a waypoint; Escape cancels",
             "shift-click track point: set marker",
             "overview double-click: open that track and waypoint inspector",
             "double-click track point: open the waypoint inspector",
@@ -1434,6 +1428,7 @@ class PlotView(NSView):
             "track: arrows/space next track, m marker, delete range, x cut",
             "Cmd-Z / Shift-Cmd-Z: undo / redo the last track edit",
             "Cmd-X: cut the track at the current cursor point",
+            "point table: Cmd-I / Shift-Cmd-I inserts after / before",
         ]
         self.draw_overlay_panel(help_lines, bounds, title="myCamino GPX Editor Keys", width=560.0, centered=True)
 
@@ -1446,6 +1441,17 @@ class PlotView(NSView):
 
     def mouseDown_(self, event):
         self.move_cursor_to_event(event)
+        if self.mode == "track" and self.cursor is not None:
+            self.long_press_origin = self.convertPoint_fromView_(event.locationInWindow(), None)
+            if self.long_press_timer is not None:
+                self.long_press_timer.invalidate()
+            self.long_press_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                1.0,
+                self,
+                "beginPointEditingLongPress:",
+                None,
+                False,
+            )
         if self.mode == "track" and self.cursor is not None and event.modifierFlags() & NSEventModifierFlagShift:
             self.marker = self.cursor[0]
             self.sync_inspector_selection()
@@ -1463,7 +1469,186 @@ class PlotView(NSView):
                 inspector.window.orderFrontRegardless()
 
     def mouseDragged_(self, event):
+        location = self.convertPoint_fromView_(event.locationInWindow(), None)
+        if self.dragged_point_index is not None and self.dragged_point_track is not None:
+            coordinate = self.coordinate_for_view_point(location)
+            points = self.dragged_point_track.points()
+            if coordinate is not None and self.dragged_point_index < len(points):
+                longitude, latitude = coordinate
+                element = points[self.dragged_point_index].element
+                element.set("lat", f"{latitude:.8f}")
+                element.set("lon", f"{longitude:.8f}")
+                self.controller.invalidate_track_metrics(self.dragged_point_track)
+                updated = self.dragged_point_track.points()[self.dragged_point_index]
+                self.cursor = (
+                    self.dragged_point_index,
+                    updated,
+                    self.dragged_point_track,
+                )
+                if self.inspector is not None:
+                    self.inspector.reload_rows()
+                    self.inspector.select_point_index(self.dragged_point_index)
+                self.controller.refresh_elevation_profile_for_plot_view(self)
+                self.setNeedsDisplay_(True)
+            return
+        if self.long_press_origin is not None:
+            distance = math.hypot(
+                location.x - self.long_press_origin.x,
+                location.y - self.long_press_origin.y,
+            )
+            if distance > 5.0 and self.long_press_timer is not None:
+                self.long_press_timer.invalidate()
+                self.long_press_timer = None
         self.move_cursor_to_event(event)
+
+    def mouseUp_(self, _event):
+        if self.long_press_timer is not None:
+            self.long_press_timer.invalidate()
+            self.long_press_timer = None
+        self.long_press_origin = None
+        if self.dragged_point_index is None or self.dragged_point_track is None:
+            return
+        track = self.dragged_point_track
+        point_index = self.dragged_point_index
+        inserted = self.drag_inserted_point
+        self.dragged_point_index = None
+        self.dragged_point_track = None
+        self.drag_original_xml = None
+        self.drag_inserted_point = False
+        if self.inspector is not None:
+            self.inspector.reload_rows()
+            self.inspector.select_point_index(point_index)
+        self.controller.mark_dirty(
+            f"{'Inserted' if inserted else 'Moved'} point {point_index + 1} "
+            f"in track #{track.nr}."
+        )
+        self.controller.refresh_track_plot_for_track(track, self.inspector)
+        self.controller.refresh_open_plot_views()
+
+    def coordinate_for_view_point(self, location):
+        metadata = self.plot_info.get("metadata") or {}
+        extent = metadata.get("extent_mercator") or {}
+        axes = metadata.get("axes_box_fraction") or {}
+        required = ("min_x", "max_x", "min_y", "max_y")
+        if any(key not in extent for key in required):
+            return None
+        image_rect = self.image_rect(self.bounds())
+        left = image_rect.origin.x + float(axes.get("left", 0.0)) * image_rect.size.width
+        bottom = image_rect.origin.y + float(axes.get("bottom", 0.0)) * image_rect.size.height
+        width = max(float(axes.get("width", 1.0)) * image_rect.size.width, 1.0)
+        height = max(float(axes.get("height", 1.0)) * image_rect.size.height, 1.0)
+        fraction_x = (float(location.x) - left) / width
+        fraction_y = (float(location.y) - bottom) / height
+        merc_x = float(extent["min_x"]) + fraction_x * (
+            float(extent["max_x"]) - float(extent["min_x"])
+        )
+        merc_y = float(extent["min_y"]) + fraction_y * (
+            float(extent["max_y"]) - float(extent["min_y"])
+        )
+        from gpx_point_editing import web_mercator_to_lonlat
+
+        return web_mercator_to_lonlat(merc_x, merc_y)
+
+    def nearest_edit_target(self, location):
+        displayed = self.display_tracks()
+        if not displayed:
+            return None
+        track = displayed[0]
+        points = track.points()
+        if not points:
+            return None
+        transformer = self._metadata_transformer(points, self.bounds())
+        if transformer is None:
+            transformer = self._point_transformer(points, self.bounds())
+        projected = [transformer(point) for point in points]
+        segment_indexes = [point.segment_index for point in points]
+        point_distances = [
+            math.hypot(location.x - x_coord, location.y - y_coord)
+            for x_coord, y_coord in projected
+        ]
+        nearest_point = min(range(len(points)), key=point_distances.__getitem__)
+        if point_distances[nearest_point] <= 11.0:
+            return ("point", track, nearest_point, None)
+        best = None
+        for index, ((x1, y1), (x2, y2)) in enumerate(
+            zip(projected, projected[1:])
+        ):
+            if segment_indexes[index] != segment_indexes[index + 1]:
+                continue
+            dx = x2 - x1
+            dy = y2 - y1
+            denominator = dx * dx + dy * dy
+            if denominator <= 0:
+                continue
+            fraction = max(
+                0.0,
+                min(
+                    1.0,
+                    ((location.x - x1) * dx + (location.y - y1) * dy)
+                    / denominator,
+                ),
+            )
+            nearest_x = x1 + fraction * dx
+            nearest_y = y1 + fraction * dy
+            distance = math.hypot(location.x - nearest_x, location.y - nearest_y)
+            if best is None or distance < best[0]:
+                best = (distance, index, fraction)
+        if best is not None and best[0] <= 12.0:
+            return ("segment", track, best[1], best[2])
+        return None
+
+    @objc.IBAction
+    def beginPointEditingLongPress_(self, _timer):
+        self.long_press_timer = None
+        if self.long_press_origin is None:
+            return
+        target = self.nearest_edit_target(self.long_press_origin)
+        if target is None:
+            self.controller.set_status(
+                "Hold closer to a waypoint or track segment to edit it."
+            )
+            return
+        kind, track, index, fraction = target
+        inspector = self.controller.open_inspector_for_track(track)
+        if inspector is None:
+            return
+        self.inspector = inspector
+        inspector.plot_view = self
+        inspector.push_undo()
+        self.drag_original_xml = inspector.undo_stack[-1]
+        if kind == "segment":
+            from gpx_point_editing import insertion_for_row
+
+            try:
+                segment, insert_index, point = insertion_for_row(
+                    track.element,
+                    index,
+                    before=False,
+                )
+                coordinate = self.coordinate_for_view_point(self.long_press_origin)
+                if coordinate is not None:
+                    longitude, latitude = coordinate
+                    point.set("lat", f"{latitude:.8f}")
+                    point.set("lon", f"{longitude:.8f}")
+                segment.insert(insert_index, point)
+                self.controller.invalidate_track_metrics(track)
+                inspector.reload_rows()
+                index = next(
+                    row
+                    for row, candidate in enumerate(inspector.point_elements())
+                    if candidate is point
+                )
+            except ValueError as exc:
+                inspector.undo_stack.pop()
+                show_alert("Cannot insert a waypoint.", str(exc))
+                return
+        self.drag_inserted_point = kind == "segment"
+        self.dragged_point_index = index
+        self.dragged_point_track = track
+        inspector.select_point_index(index)
+        self.controller.set_status(
+            f"Drag point {index + 1}; release to keep it or press Escape to cancel."
+        )
 
     def scrollWheel_(self, event):
         self.pan_map(float(event.scrollingDeltaX()), float(event.scrollingDeltaY()))
@@ -1713,11 +1898,29 @@ class PlotView(NSView):
         command_down = bool(event.modifierFlags() & NSEventModifierFlagCommand)
         shift_down = bool(event.modifierFlags() & NSEventModifierFlagShift)
         self.transient_help_until = None
+        if key == "\x1b" and self.dragged_point_index is not None:
+            track = self.dragged_point_track
+            if track is not None and self.drag_original_xml is not None:
+                track.element = ET.fromstring(self.drag_original_xml)
+                self.controller.invalidate_track_metrics(track)
+                if self.inspector is not None:
+                    if self.inspector.undo_stack:
+                        self.inspector.undo_stack.pop()
+                    self.inspector.reload_rows()
+                self.controller.refresh_track_plot_for_track(track, self.inspector)
+            self.dragged_point_index = None
+            self.dragged_point_track = None
+            self.drag_original_xml = None
+            self.drag_inserted_point = False
+            self.controller.set_status("Cancelled waypoint drag.")
+            return
         if key not in {"h", "H"}:
             self.show_help = False
         if command_down and key.casefold() == "z":
             if shift_down:
                 self.controller.redo_(None)
+            elif self.inspector is not None and self.inspector.undo_stack:
+                self.inspector.undo()
             else:
                 self.controller.undo_(None)
             return
@@ -2789,6 +2992,24 @@ class ElevationProfileView(NSView):
 class InspectorPointTableView(NSTableView):
     def keyDown_(self, event):
         key = str(event.charactersIgnoringModifiers() or event.characters() or "")
+        modifiers = int(event.modifierFlags())
+        command_down = bool(modifiers & NSEventModifierFlagCommand)
+        shift_down = bool(modifiers & NSEventModifierFlagShift)
+        if command_down and key.casefold() == "i" and getattr(self, "controller", None) is not None:
+            self.controller.insert_point(before=shift_down)
+            return
+        if command_down and key.casefold() == "c" and getattr(self, "controller", None) is not None:
+            self.controller.copy_selected_points()
+            return
+        if command_down and key.casefold() == "x" and getattr(self, "controller", None) is not None:
+            self.controller.cut_selected_points()
+            return
+        if command_down and key.casefold() == "v" and getattr(self, "controller", None) is not None:
+            self.controller.paste_points()
+            return
+        if command_down and key.casefold() == "z" and getattr(self, "controller", None) is not None:
+            self.controller.undo()
+            return
         if key in {"\x7f", "\uf728"} and getattr(self, "controller", None) is not None:
             self.controller.delete_selected_points()
             return
@@ -2819,6 +3040,30 @@ class TrackPointDataSource(NSObject):
 
     def tableViewColumnDidResize_(self, _notification):
         self.controller.resize_table_document()
+
+    def tableView_writeRowsWithIndexes_toPasteboard_(self, _table_view, row_indexes, pasteboard):
+        rows = [
+            index
+            for index in range(row_indexes.firstIndex(), row_indexes.lastIndex() + 1)
+            if row_indexes.containsIndex_(index)
+        ]
+        if not rows:
+            return False
+        pasteboard.declareTypes_owner_([POINT_DRAG_TYPE], None)
+        pasteboard.setString_forType_(",".join(str(row) for row in rows), POINT_DRAG_TYPE)
+        return True
+
+    def tableView_validateDrop_proposedRow_proposedDropOperation_(
+        self, _table_view, info, row, _operation
+    ):
+        text = str(info.draggingPasteboard().stringForType_(POINT_DRAG_TYPE) or "")
+        rows = [int(part) for part in text.split(",") if part.isdigit()]
+        return 1 if rows and 0 <= row <= len(self.controller.rows) else 0
+
+    def tableView_acceptDrop_row_dropOperation_(self, _table_view, info, row, _operation):
+        text = str(info.draggingPasteboard().stringForType_(POINT_DRAG_TYPE) or "")
+        rows = [int(part) for part in text.split(",") if part.isdigit()]
+        return self.controller.move_selected_rows(rows, row)
 
 
 class TrackMetadataChoiceDataSource(NSObject):
@@ -2901,11 +3146,13 @@ class TrackInspectorController(NSObject):
         self.table.setRowHeight_(22)
         self.table.setTarget_(self)
         self.table.setDoubleAction_("pointDoubleClicked:")
+        self.table.registerForDraggedTypes_([POINT_DRAG_TYPE])
         self.data_source = TrackPointDataSource.alloc().initWithController_(self)
         self.table.setDataSource_(self.data_source)
         self.table.setDelegate_(self.data_source)
         self.table_scroll.setDocumentView_(self.table)
         root.addSubview_(self.table_scroll)
+        self.build_point_context_menu()
 
         self.buttons = {}
         for title, action in [
@@ -2928,6 +3175,34 @@ class TrackInspectorController(NSObject):
             root.addSubview_(button)
 
         self.layout_window()
+
+    def build_point_context_menu(self):
+        menu = NSMenu.alloc().initWithTitle_("Waypoint")
+        menu.setAutoenablesItems_(False)
+        for title, action, key in [
+            ("Insert Point After", "insertPointAfter:", ""),
+            ("Insert Point Before", "insertPointBefore:", ""),
+            ("Duplicate Points", "duplicatePoints:", ""),
+            (None, None, None),
+            ("Cut", "cutPoints:", "x"),
+            ("Copy", "copyPoints:", "c"),
+            ("Paste Below", "pastePoints:", "v"),
+            ("Delete", "deletePoints:", ""),
+            (None, None, None),
+            ("Split Track Here", "splitTrack:", ""),
+            ("Readjust Time", "readjustTime:", ""),
+            ("Fit Map to Selection", "fitMapToSelection:", ""),
+            ("Fit Map to Track", "fitMapToTrack:", ""),
+        ]:
+            if title is None:
+                menu.addItem_(NSMenuItem.separatorItem())
+                continue
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
+            item.setTarget_(self)
+            item.setEnabled_(True)
+            menu.addItem_(item)
+        self.point_context_menu = menu
+        self.table.setMenu_(menu)
 
     def layout_window(self):
         bounds = self.root.bounds()
@@ -3042,10 +3317,13 @@ class TrackInspectorController(NSObject):
             for point in processed.raw_points
             if point.source_index in original_raw and original_raw[point.source_index].element is not None
         }
+        running_speed_by_element = {}
         for point in processed.points:
             raw = original_raw.get(point.source_index)
             if raw is not None and raw.element is not None:
                 quality_by_element[raw.element] = (point.horizontal_status, point.elevation_status)
+                if point.running_speed_kmh is not None:
+                    running_speed_by_element[raw.element] = f"{point.running_speed_kmh:.1f}"
         extra = []
         row_fields = []
         row_refs = []
@@ -3076,6 +3354,7 @@ class TrackInspectorController(NSObject):
                 "ele": format_inspector_elevation(fields.get("ele", "")),
                 "time": format_inspector_timestamp(fields.get("time", "")),
                 "calc_velocity": velocity_by_element.get(point, "N/A"),
+                "running_speed": running_speed_by_element.get(point, "N/A"),
             }
             for col, key in {"lat": "@lat", "lon": "@lon", "ele": "ele", "time": "time"}.items():
                 if key in refs:
@@ -3250,11 +3529,13 @@ class TrackInspectorController(NSObject):
             "ele": 72,
             "time": 205,
             "calc_velocity": 105,
+            "running_speed": 105,
         }
         titles = {
             "xy_status": "XY use",
             "z_status": "Elevation use",
             "calc_velocity": "Velocity\nkm/h",
+            "running_speed": "Running mean\nkm/h",
         }
         tooltips = {
             "xy_status": (
@@ -3266,8 +3547,8 @@ class TrackInspectorController(NSObject):
                 "the suffix gives the reason."
             ),
         }
-        readonly = {"index", "xy_status", "z_status", "calc_velocity"}
-        identifiers = ["index", "lat", "lon", "ele", "time", "calc_velocity"]
+        readonly = {"index", "xy_status", "z_status", "calc_velocity", "running_speed"}
+        identifiers = ["index", "lat", "lon", "ele", "time", "calc_velocity", "running_speed"]
         identifiers += self.extra_columns
         identifiers += ["xy_status", "z_status"]
         for identifier in identifiers:
@@ -3324,7 +3605,7 @@ class TrackInspectorController(NSObject):
 
     def edit_point_value(self, row, column, value):
         points = self.point_elements()
-        if row < 0 or row >= len(points) or column in {"index", "calc_velocity"}:
+        if row < 0 or row >= len(points) or column in {"index", "calc_velocity", "running_speed"}:
             return
         point = points[row]
         self.push_undo()
@@ -3373,6 +3654,225 @@ class TrackInspectorController(NSObject):
             for index in range(indexes.firstIndex(), indexes.lastIndex() + 1)
             if indexes.containsIndex_(index)
         ]
+
+    def select_point_rows(self, rows):
+        mutable = objc.lookUpClass("NSMutableIndexSet").alloc().init()
+        valid = sorted({int(row) for row in rows if 0 <= int(row) < len(self.rows)})
+        for row in valid:
+            mutable.addIndex_(row)
+        self.suppress_selection_change = True
+        try:
+            self.table.selectRowIndexes_byExtendingSelection_(mutable, False)
+            if valid:
+                self.table.scrollRowToVisible_(valid[0])
+                self.table.scrollRowToVisible_(valid[-1])
+        finally:
+            self.suppress_selection_change = False
+        self.update_info_label()
+
+    def finish_point_structure_change(self, rows, message):
+        self.parent.invalidate_track_metrics(self.track)
+        self.reload_rows()
+        self.select_point_rows(rows)
+        self.parent.mark_dirty(message)
+        self.refresh_after_point_table_change(rows)
+
+    def insert_point(self, *, before=False):
+        rows = self.selected_row_indexes()
+        try:
+            self.push_undo()
+            _point, new_row = insert_point_for_rows(
+                self.track.element,
+                rows,
+                before=before,
+            )
+        except ValueError as exc:
+            if self.undo_stack:
+                self.undo_stack.pop()
+            show_alert("Cannot insert a waypoint.", str(exc))
+            return
+        position = "before" if before else "after"
+        self.finish_point_structure_change(
+            [new_row],
+            f"Inserted point {position} the selection in track #{self.track.nr}.",
+        )
+
+    @objc.IBAction
+    def insertPointAfter_(self, _sender):
+        self.insert_point(before=False)
+
+    @objc.IBAction
+    def insertPointBefore_(self, _sender):
+        self.insert_point(before=True)
+
+    def copy_selected_points(self):
+        rows = self.selected_row_indexes()
+        points = self.point_elements()
+        selected = [points[row] for row in rows if 0 <= row < len(points)]
+        if not selected:
+            self.parent.set_status("Select one or more waypoints to copy.")
+            return False
+        pasteboard = NSPasteboard.generalPasteboard()
+        pasteboard.declareTypes_owner_(
+            [POINT_PASTEBOARD_TYPE, "public.utf8-plain-text"],
+            None,
+        )
+        pasteboard.setString_forType_(
+            serialized_points(selected),
+            POINT_PASTEBOARD_TYPE,
+        )
+        text_rows = []
+        for point in selected:
+            elevation = next(
+                (
+                    child.text or ""
+                    for child in list(point)
+                    if self.local_name(child.tag) == "ele"
+                ),
+                "",
+            )
+            timestamp = next(
+                (
+                    child.text or ""
+                    for child in list(point)
+                    if self.local_name(child.tag) == "time"
+                ),
+                "",
+            )
+            text_rows.append(
+                "\t".join(
+                    [
+                        point.attrib.get("lat", ""),
+                        point.attrib.get("lon", ""),
+                        elevation,
+                        timestamp,
+                    ]
+                )
+            )
+        pasteboard.setString_forType_(
+            "\n".join(text_rows),
+            "public.utf8-plain-text",
+        )
+        self.parent.set_status(f"Copied {len(selected)} waypoint(s).")
+        return True
+
+    def cut_selected_points(self):
+        rows = self.selected_row_indexes()
+        if not rows or not self.copy_selected_points():
+            return
+        self.push_undo()
+        removed = remove_rows(self.track.element, rows)
+        next_row = min(rows[0], max(0, len(self.point_elements()) - 1))
+        self.finish_point_structure_change(
+            [next_row] if self.point_elements() else [],
+            f"Cut {removed} point(s) from track #{self.track.nr}.",
+        )
+
+    def paste_points(self):
+        pasteboard = NSPasteboard.generalPasteboard()
+        payload = pasteboard.stringForType_(POINT_PASTEBOARD_TYPE)
+        if payload is None:
+            show_alert(
+                "No GPX waypoints on the clipboard.",
+                "Copy or cut waypoint rows in a GPX point table first.",
+            )
+            return
+        try:
+            points = deserialize_points(str(payload))
+            rows = self.selected_row_indexes()
+            anchor = rows[-1] if rows else max(0, len(self.rows) - 1)
+            self.push_undo()
+            inserted_rows = insert_points_after_row(self.track.element, anchor, points)
+        except (ET.ParseError, ValueError) as exc:
+            if self.undo_stack:
+                self.undo_stack.pop()
+            show_alert("Cannot paste waypoints.", str(exc))
+            return
+        self.finish_point_structure_change(
+            inserted_rows,
+            f"Pasted {len(inserted_rows)} point(s) into track #{self.track.nr}.",
+        )
+
+    def duplicate_selected_points(self):
+        rows = self.selected_row_indexes()
+        points = self.point_elements()
+        selected = [points[row] for row in rows if 0 <= row < len(points)]
+        if not selected:
+            return
+        try:
+            self.push_undo()
+            inserted_rows = insert_points_after_row(
+                self.track.element,
+                rows[-1],
+                [duplicate_point(point) for point in selected],
+            )
+        except ValueError as exc:
+            if self.undo_stack:
+                self.undo_stack.pop()
+            show_alert("Cannot duplicate waypoints.", str(exc))
+            return
+        self.finish_point_structure_change(
+            inserted_rows,
+            f"Duplicated {len(inserted_rows)} point(s) in track #{self.track.nr}.",
+        )
+
+    def move_selected_rows(self, rows, destination_row):
+        if not rows:
+            return False
+        try:
+            self.push_undo()
+            moved_rows = move_point_rows(
+                self.track.element,
+                rows,
+                max(0, min(int(destination_row), len(self.rows))),
+            )
+        except ValueError as exc:
+            if self.undo_stack:
+                self.undo_stack.pop()
+            show_alert("Cannot move waypoints.", str(exc))
+            return False
+        self.finish_point_structure_change(
+            moved_rows,
+            f"Moved {len(moved_rows)} point(s) in track #{self.track.nr}.",
+        )
+        return True
+
+    @objc.IBAction
+    def duplicatePoints_(self, _sender):
+        self.duplicate_selected_points()
+
+    @objc.IBAction
+    def cutPoints_(self, _sender):
+        self.cut_selected_points()
+
+    @objc.IBAction
+    def copyPoints_(self, _sender):
+        self.copy_selected_points()
+
+    @objc.IBAction
+    def pastePoints_(self, _sender):
+        self.paste_points()
+
+    @objc.IBAction
+    def deletePoints_(self, _sender):
+        self.delete_selected_points()
+
+    def ensure_plot_view(self):
+        if self.plot_view is None:
+            self.plot_(None)
+        return self.plot_view
+
+    @objc.IBAction
+    def fitMapToSelection_(self, _sender):
+        view = self.ensure_plot_view()
+        if view is not None:
+            view.zoom_to_selected()
+
+    @objc.IBAction
+    def fitMapToTrack_(self, _sender):
+        view = self.ensure_plot_view()
+        if view is not None:
+            view.reset_view()
 
     def delete_selected_points(self):
         rows = self.selected_row_indexes()
@@ -3718,7 +4218,9 @@ class TrackInspectorController(NSObject):
             "This window shows every raw waypoint of the selected track. Scroll the table to inspect coordinates, height, time, accuracy fields, and any extra data stored with each point. The compact XY use and Elevation use columns are at the right end. Used means retained in processed geometry; Smooth means valid but used only for smoothing. Interp retains the reason for elevation interpolation, while the other short values state rejection reasons. The header reports retained/raw point counts.\n\n"
             "Click a row to select a waypoint. Shift-click or drag in the table to select a range. Double-click a row to open the track map if needed and move the white cursor dot and arrow to that waypoint.\n\n"
             "Edit a table cell and press Enter to change a waypoint value. Undo restores recent inspector edits. Backspace/Delete removes selected waypoints after confirmation.\n\n"
+            "Command-I inserts a waypoint after the selected rows; Shift-Command-I inserts before them. Interior points are placed halfway between their neighbors. At a track end, the last two points are extrapolated. Command-C, Command-X, and Command-V copy, cut, and paste complete GPX waypoint data. Drag selected table rows to reorder them inside the same GPX segment. The right-click menu provides the same commands plus Duplicate, Fit Map, Split Track, and Readjust Time.\n\n"
             "Plot Track opens the track map. When this inspector and the map are both open, selecting points in the table highlights them on the map; clicking the map selects the nearest waypoint here. If a map marker is active, the selected range is shown in red. A new manual table selection replaces the active map-marker range.\n\n"
+            "On the track map, hold for one second near a waypoint or connecting segment to begin editing. Holding a segment inserts a new point; drag to place it and release to keep it. Press Escape while dragging to cancel. Shift-Z fits the map to the complete current track after points have moved beyond the old map boundary.\n\n"
             "Split Track moves the selected waypoint and all following waypoints into a new track. Readjust Time recalculates selected waypoint timestamps from the first selected timestamp and the velocity field. Save keeps inspector edits in memory; Save & Exit keeps them and closes this window. The main editor Save writes everything to disk.",
         )
 
@@ -3870,6 +4372,7 @@ class GPXEditorController(NSObject):
             ("sum", "Sum\n[km]", 82, False),
             ("distance", "Distance\n[km]", 100, False),
             ("speed", "Avg Speed\n[km/h]", 105, False),
+            ("moving_speed", "Moving Avg\n[km/h]", 105, False),
             ("ascent", "Ascent\n[m]", 82, False),
             ("descent", "Descent\n[m]", 88, False),
             ("npoints", "NPoints\n", 82, False),
@@ -3893,6 +4396,8 @@ class GPXEditorController(NSObject):
         self.maximum_vertical_accuracy_m = float(values["gpx.maximum_vertical_accuracy_m"])
         self.maximum_hdop = float(values["gpx.maximum_hdop"])
         self.maximum_vdop = float(values["gpx.maximum_vdop"])
+        self.running_speed_window_distance_m = float(values["gpx.running_speed_window_distance_m"])
+        self.stationary_speed_threshold_kmh = float(values["gpx.stationary_speed_threshold_kmh"])
         self.elevation_headroom_fraction = float(values["gpx.elevation_headroom_fraction"])
         self.maximum_map_tiles = int(values["gpx.maximum_map_tiles"])
         self.pdf_document_dpi = int(values["pdf.document_dpi"])
@@ -3938,6 +4443,8 @@ class GPXEditorController(NSObject):
             maximum_vertical_accuracy_m=self.maximum_vertical_accuracy_m,
             maximum_hdop=self.maximum_hdop,
             maximum_vdop=self.maximum_vdop,
+            running_speed_window_distance_m=self.running_speed_window_distance_m,
+            stationary_speed_threshold_kmh=self.stationary_speed_threshold_kmh,
         ).normalized()
 
     def processing_parameter_signature(self) -> tuple:
@@ -4022,6 +4529,7 @@ class GPXEditorController(NSObject):
             f"elevation {options.elevation_smoothing_distance_m:g} m | "
             f"H/V error {options.maximum_horizontal_accuracy_m:g}/{options.maximum_vertical_accuracy_m:g} m | "
             f"HDOP/VDOP {options.maximum_hdop:g}/{options.maximum_vdop:g}"
+            f" | speed {options.running_speed_window_distance_m:g} m / {options.stationary_speed_threshold_kmh:g} km/h"
         )
 
     def refresh_processing_summary(self):
@@ -4265,6 +4773,11 @@ class GPXEditorController(NSObject):
 
         button_specs = [
             ("Add Tracks", "addTracks:", "Load one or more .gpx files and append their tracks."),
+            (
+                "Tracks from Photos",
+                "addTracksFromPhotos:",
+                "Create editable estimated tracks from photo/video GPS positions and add them to this editor.",
+            ),
             ("Save", "save:", "Save all tracks to the output GPX filename."),
             ("Save & Exit", "saveAndExit:", "Save the GPX file and exit the editor."),
             ("PNG", "savePng:", "Save the current selected-track plot as a PNG image."),
@@ -4376,7 +4889,10 @@ class GPXEditorController(NSObject):
         top -= 52
         project_y = top - FIELD_HEIGHT
         self.buttons["Add Tracks"].setFrame_(NSMakeRect(PADDING, project_y, 104, BUTTON_HEIGHT))
-        project_x = PADDING + 104 + gap
+        self.buttons["Tracks from Photos"].setFrame_(
+            NSMakeRect(PADDING + 104 + gap, project_y, 140, BUTTON_HEIGHT)
+        )
+        project_x = PADDING + 104 + gap + 140 + gap
         self.project_label.setFrame_(NSMakeRect(project_x, project_y + FIELD_HEIGHT + 2, 220, 18))
         self.project_field.setFrame_(NSMakeRect(project_x, project_y, 310, FIELD_HEIGHT))
         undo_size = BUTTON_HEIGHT
@@ -4446,6 +4962,7 @@ class GPXEditorController(NSObject):
             self.buttons["Help"],
             self.settings_button,
             self.buttons["Add Tracks"],
+            self.buttons["Tracks from Photos"],
             self.project_field,
             self.buttons["Undo"],
             self.buttons["Redo"],
@@ -5098,7 +5615,7 @@ class GPXEditorController(NSObject):
                     break
         rows: list[dict[str, str]] = []
         cumulative = 0.0
-        values = {"length": [], "duration": [], "speed": [], "ascent": [], "descent": []}
+        values = {"length": [], "duration": [], "speed": [], "moving_speed": [], "ascent": [], "descent": []}
         for index, track in enumerate(self.tracks, 1):
             metrics = self.compute_metrics(track)
             track.metrics = metrics
@@ -5112,6 +5629,8 @@ class GPXEditorController(NSObject):
                 values["duration"].append(metrics["duration"])
             if included and metrics["speed_kmh"] is not None:
                 values["speed"].append(metrics["speed_kmh"])
+            if included and metrics["moving_speed_kmh"] is not None:
+                values["moving_speed"].append(metrics["moving_speed_kmh"])
             if included:
                 values["ascent"].append(metrics["ascent_m"])
                 values["descent"].append(metrics["descent_m"])
@@ -5127,6 +5646,7 @@ class GPXEditorController(NSObject):
                     "sum": f"{cumulative:.1f}",
                     "distance": "N/A" if metrics["distance_km"] is None else f"{metrics['distance_km']:.1f}",
                     "speed": "N/A" if metrics["speed_kmh"] is None else f"{metrics['speed_kmh']:.1f}",
+                    "moving_speed": "N/A" if metrics["moving_speed_kmh"] is None else f"{metrics['moving_speed_kmh']:.1f}",
                     "ascent": f"{metrics['ascent_m']:.1f}",
                     "descent": f"{metrics['descent_m']:.1f}",
                     "npoints": str(metrics["npoints"]),
@@ -5146,6 +5666,7 @@ class GPXEditorController(NSObject):
                     "sum": f"{cumulative:.1f}",
                     "distance": "",
                     "speed": self.average_text(values["speed"]),
+                    "moving_speed": self.average_text(values["moving_speed"]),
                     "ascent": self.average_text(values["ascent"]),
                     "descent": self.average_text(values["descent"]),
                     "npoints": str(sum(track.metrics.get("npoints", 0) for track in self.tracks if not track.hidden)),
@@ -5175,7 +5696,7 @@ class GPXEditorController(NSObject):
                 width = max(width, 16 * data_char_width + 10.0)
             elif identifier == "show":
                 width = 50.0
-            elif identifier in {"length", "duration", "sum", "distance", "speed", "ascent", "descent", "npoints"}:
+            elif identifier in {"length", "duration", "sum", "distance", "speed", "moving_speed", "ascent", "descent", "npoints"}:
                 width = min(max(width, 42.0), float(default_width))
             column = self.track_table.tableColumnWithIdentifier_(nsstring(identifier))
             if column is not None:
@@ -5317,6 +5838,7 @@ class GPXEditorController(NSObject):
             "length_km": length,
             "distance_km": distance,
             "speed_kmh": speed,
+            "moving_speed_kmh": processed.moving_average_speed_kmh,
             "ascent_m": ascent,
             "descent_m": descent,
             "npoints": processed.retained_point_count,
@@ -5436,7 +5958,9 @@ class GPXEditorController(NSObject):
     def apply_track_start_time(self, track: TrackRecord, new_time: datetime):
         points = track.points()
         old_first_time = next((point.time for point in points if point.time is not None), None)
-        get_or_create_track_time(track.element).text = format_gpx_time(new_time)
+        for child in list(track.element):
+            if child.tag == qname("time"):
+                track.element.remove(child)
         if old_first_time is not None:
             offset = new_time - old_first_time
             for point in points:
@@ -5513,35 +6037,117 @@ class GPXEditorController(NSObject):
             paths = [Path(str(url.path())).resolve() for url in panel.URLs()]
             self.load_gpx_paths(paths)
 
+    @objc.IBAction
+    def addTracksFromPhotos_(self, _sender):
+        from GetGeoLocations import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+        from media_track_builder import build_media_tracks, write_media_gpx
+
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(True)
+        panel.setPrompt_("Create Tracks")
+        if not panel.runModal():
+            return
+        selected = [Path(str(url.path())).expanduser().resolve() for url in panel.URLs()]
+        media_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        excluded_names = {
+            "audio",
+            "trackimages",
+            "normalized-videos",
+            "__pycache__",
+        }
+        media_paths = []
+        for selected_path in selected:
+            candidates = (
+                selected_path.rglob("*")
+                if selected_path.is_dir()
+                else [selected_path]
+            )
+            for candidate in candidates:
+                if (
+                    candidate.is_file()
+                    and candidate.suffix.casefold() in media_extensions
+                    and not any(part.casefold() in excluded_names for part in candidate.parts)
+                ):
+                    media_paths.append(candidate.resolve())
+        media_paths = sorted(set(media_paths), key=lambda path: str(path).casefold())
+        if not media_paths:
+            show_alert("No supported photos or videos were selected.")
+            return
+        common_directory = (
+            selected[0] if len(selected) == 1 and selected[0].is_dir() else media_paths[0].parent
+        )
+        control_candidates = sorted(
+            common_directory.glob("*.lst"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        control_path = control_candidates[0] if control_candidates else None
+        spacing = float(self.parameters.get("gpx.minimum_point_spacing_m", 10.0))
+        self.set_status(f"Preparing {len(media_paths)} media file(s) for photo tracks...")
+        result = build_media_tracks(
+            media_paths,
+            control_path=control_path,
+            minimum_spacing_m=spacing,
+            refresh_metadata=True,
+        )
+        if not result.tracks:
+            details = "\n".join(result.skipped_media[:12])
+            show_alert(
+                "No photo track could be created.",
+                details or "The selected media contain no usable GPS coordinates.",
+            )
+            return
+        temporary = Path(tempfile.gettempdir()) / (
+            f"myCamino-photo-tracks-{os.getpid()}-{time.time_ns()}.gpx"
+        )
+        write_media_gpx(temporary, result, PROGRAM_TITLE)
+        if not self.project_name:
+            self.project_name = common_directory.name
+            self.project_field.setStringValue_(self.project_name)
+        if self.last_save_path is None and not str(self.output_field.stringValue()).strip():
+            suggested = common_directory / f"{common_directory.name}-photo-tracks.gpx"
+            self.set_output_path(suggested.resolve(strict=False))
+        self.load_gpx_paths([temporary], mark_dirty=True)
+        self.last_load_dir = common_directory
+        suffix = (
+            f" Reused {result.reused_sidecars}, refreshed {result.refreshed_sidecars}; "
+            f"merged {result.merged_points} near-duplicate point(s)."
+        )
+        if result.skipped_media:
+            suffix += f" Skipped {len(result.skipped_media)} media file(s)."
+        self.pending_track_load_status = suffix
+
     def _append_gpx_track_records(self, paths: list[Path]):
         """Parse GPX files and append unprocessed records, returning load details."""
         added_records = []
         removed_invalid_coordinates = 0
         removed_invalid_timestamps = 0
         removed_out_of_order = 0
+        missing_timestamps = 0
+        converted_routes = 0
+        converted_waypoint_tracks = 0
         self.last_load_dir = paths[0].parent
         for path in paths:
             try:
-                tree = ET.parse(path)
-                root = tree.getroot()
-            except (OSError, ET.ParseError) as exc:
+                document = load_gpx_document(path)
+            except (OSError, ValueError) as exc:
                 show_alert("Could not read GPX file.", f"{path}\n\n{exc}")
-                continue
-            if root.tag != qname("gpx"):
-                show_alert("Unsupported GPX file.", f"{path} is not a GPX 1.1 document.")
                 continue
             if not self.tracks and not self.project_name:
                 self.project_name = path.stem
                 self.project_field.setStringValue_(self.project_name)
                 if self.last_save_path is None and not str(self.output_field.stringValue()).strip():
                     self.set_output_path(path.with_suffix(".gpx").resolve())
-            for trk in root.findall("gpx:trk", NS):
+            converted_routes += document.report.converted_routes
+            converted_waypoint_tracks += document.report.converted_waypoint_tracks
+            removed_invalid_coordinates += document.report.invalid_coordinates
+            removed_invalid_timestamps += document.report.invalid_timestamps
+            removed_out_of_order += document.report.backward_timestamps
+            missing_timestamps += document.report.missing_timestamps
+            for trk in document.tracks:
                 record = TrackRecord(self.next_nr, copy.deepcopy(trk), str(path))
-                removed = sanitize_track_points(record.element)
-                removed_invalid_coordinates += removed["coordinates"]
-                removed_invalid_timestamps += removed["timestamps"]
-                removed_out_of_order += removed["out_of_order"]
-                self.populate_track_time_from_first_point(record)
                 self.tracks.append(record)
                 added_records.append(record)
                 self.next_nr += 1
@@ -5551,8 +6157,18 @@ class GPXEditorController(NSObject):
         if removed_invalid_timestamps:
             ignored_parts.append(f"{removed_invalid_timestamps} point(s) with invalid timestamps")
         if removed_out_of_order:
-            ignored_parts.append(f"{removed_out_of_order} out-of-order point(s)")
-        ignored_suffix = f" Ignored {', '.join(ignored_parts)}." if ignored_parts else ""
+            ignored_parts.append(f"{removed_out_of_order} out-of-order timestamp(s)")
+        if converted_routes:
+            ignored_parts.append(f"converted {converted_routes} route(s)")
+        if converted_waypoint_tracks:
+            ignored_parts.append(
+                f"connected {converted_waypoint_tracks} waypoint collection(s)"
+            )
+        if missing_timestamps:
+            ignored_parts.append(
+                f"kept {missing_timestamps} point(s) without timestamps"
+            )
+        ignored_suffix = f" Import details: {', '.join(ignored_parts)}." if ignored_parts else ""
         return added_records, ignored_suffix
 
     def load_gpx_paths(self, paths: list[Path], mark_dirty: bool = True):
@@ -5653,9 +6269,47 @@ class GPXEditorController(NSObject):
         action = "Added" if mark_dirty else "Loaded"
         self.set_status(f"{action} {added} track(s) from {path_count} GPX file(s).{ignored_suffix}")
         self.notify_initial_load_complete()
+        self.offer_track_time_entry()
         if self.pending_pdf_export_after_load:
             self.pending_pdf_export_after_load = False
             self.exportPdf_(None)
+
+    def offer_track_time_entry(self):
+        """Offer, but never require, an absolute anchor for fully untimed tracks."""
+        untimed_rows = [
+            index
+            for index, track in enumerate(self.tracks)
+            if timing_status_for_track(track.element) == "untimed"
+        ]
+        if not untimed_rows:
+            return
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(
+            f"{len(untimed_rows)} track(s) have no recorded timestamps."
+        )
+        alert.setInformativeText_(
+            "The tracks can still be edited, mapped, and animated by distance. "
+            "Without a confirmed start time, photos cannot be assigned to them "
+            "by exposure time. You may enter a start in the Date & Time column "
+            "or continue with undated tracks."
+        )
+        alert.addButtonWithTitle_("Set Track Time")
+        alert.addButtonWithTitle_("Continue Without Time")
+        if alert.runModal() != 1000:
+            return
+        row = untimed_rows[0]
+        self.track_table.selectRowIndexes_byExtendingSelection_(
+            objc.lookUpClass("NSIndexSet").indexSetWithIndex_(row),
+            False,
+        )
+        column = self.track_table.columnWithIdentifier_(nsstring("date"))
+        if column >= 0:
+            self.track_table.editColumn_row_withEvent_select_(
+                column,
+                row,
+                None,
+                True,
+            )
 
     def _load_gpx_paths_synchronously(self, paths: list[Path], mark_dirty: bool = True):
         """Retain synchronous loading only for the exceptional recovery-file path."""
@@ -6776,7 +7430,11 @@ class GPXEditorController(NSObject):
             anchor.set("lat", f"{self.anchor[0]:.8f}")
             anchor.set("lon", f"{self.anchor[1]:.8f}")
         for track in self.tracks:
-            root.append(copy.deepcopy(track.element))
+            output_track = copy.deepcopy(track.element)
+            for child in list(output_track):
+                if child.tag == qname("time"):
+                    output_track.remove(child)
+            root.append(output_track)
         return root
 
     def write_gpx_file(self, path: Path):
@@ -7017,20 +7675,31 @@ class GPXEditorController(NSObject):
     def date_sorted_tracks(self, tracks: list[TrackRecord], metric_cache: dict[int, dict]) -> list[TrackRecord]:
         for track in tracks:
             track.metrics = metric_cache[id(track)]
-        regular = [track for track in tracks if not self.is_exceptional(track)]
-        exceptional = [track for track in tracks if self.is_exceptional(track)]
-        regular.sort(key=lambda track: (track.metrics["time"] or datetime.max.replace(tzinfo=UTC), track.name.casefold()))
-        exceptional.sort(key=lambda track: (track.metrics["distance_km"] if track.metrics["distance_km"] is not None else float("inf"), track.name.casefold()))
-        merged = list(regular)
-        for track in exceptional:
-            distance = track.metrics["distance_km"] if track.metrics["distance_km"] is not None else float("inf")
-            insert_at = len(merged)
-            for index, candidate in enumerate(merged):
-                candidate_distance = candidate.metrics["distance_km"] if candidate.metrics["distance_km"] is not None else float("inf")
-                if distance <= candidate_distance:
-                    insert_at = index
-                    break
-            merged.insert(insert_at, track)
+        source_order = sorted(tracks, key=lambda track: track.nr)
+        dated = [
+            track
+            for track in source_order
+            if track.metrics.get("time") is not None
+        ]
+        if not dated:
+            return source_order
+        leading = []
+        attached: dict[int, list[TrackRecord]] = {}
+        preceding = None
+        for track in source_order:
+            if track.metrics.get("time") is not None:
+                preceding = track
+            elif preceding is None:
+                leading.append(track)
+            else:
+                attached.setdefault(id(preceding), []).append(track)
+        merged = list(leading)
+        for track in sorted(
+            dated,
+            key=lambda item: (item.metrics["time"], item.name.casefold()),
+        ):
+            merged.append(track)
+            merged.extend(attached.get(id(track), ()))
         return merged
 
     def is_exceptional(self, track: TrackRecord) -> bool:

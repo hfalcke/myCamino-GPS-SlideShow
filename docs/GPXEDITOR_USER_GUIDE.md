@@ -1,5 +1,43 @@
 # myCamino GPX Editor User Guide
 
+## Creating Tracks from Photos
+
+**Tracks from Photos** creates editable estimated tracks from the GPS positions
+stored with selected photos and videos. Select individual media files or
+folders. The editor reuses valid extension-aware media sidecars and extracts
+metadata only for missing, invalid, or changed selected media.
+
+When a slide-show control file is available in the selected folder, one track is
+created for each control-file stage and media order is preserved. Otherwise,
+one track is created per local calendar date. Nearby consecutive positions are
+reduced using the GPX **Minimum point spacing** setting (10 m by default), while
+the first and last position of every stage are retained. Generated GPX tracks
+are marked as estimated and media-derived.
+
+The main myCamino GUI provides **Create Tracks from Photos** too. It uses all
+project media and the active control file, opens the result in GPX Editor, and
+asks before a newly saved GPX becomes the Adventure's active journey source.
+
+## Planning and Editing Points
+
+- `Cmd-I` inserts a point after the selected waypoint rows.
+- `Shift-Cmd-I` inserts a point before the selected waypoint rows.
+- Interior points are inserted halfway between their neighbors. At a track end,
+  the first or last two points are extrapolated.
+- `Cmd-C`, `Cmd-X`, `Cmd-V`, and `Cmd-Z` copy, cut, paste, and undo complete
+  waypoint records, including elevation, time, and extensions.
+- Drag selected rows to reorder points inside the same GPX segment.
+- Right-click the waypoint table for insert, duplicate, clipboard, delete,
+  split, timing, and map-fit commands.
+- On a Track Map, hold near a point or segment for one second. Drag the armed or
+  inserted point and release to keep it; press Escape to cancel.
+- `Shift-Z` fits the map back to the complete track, including points moved
+  beyond the previous map boundary.
+
+Automatic road-following route planning is intentionally deferred. OpenStreetMap
+road data can support a future Valhalla, OSRM, or openrouteservice provider, but
+the current editor never silently changes a hand-planned path.
+
 ## License and source code
 
 The GPX Editor is part of the GPL-3.0-or-later licensed myCamino project. Open
@@ -59,7 +97,9 @@ The gear button opens **GPX Editor Settings** with three sections:
 
 - GPX Processing: separate horizontal and elevation smoothing, retained-point
   spacing, horizontal/vertical error and HDOP/VDOP limits, timestamp fallback,
-  recovery interval, and interactive map behavior.
+  running-speed window and stationary threshold, recovery interval, and
+  interactive map behavior. The table shows both overall and moving average
+  speed; the point inspector shows the local running mean.
 - PDF Export: document/map resolution, zoom, and tile limits.
 - Map Service: OpenStreetMap, Esri, or a custom tile service.
 
@@ -81,6 +121,14 @@ Behavior:
 
 - Multiple files can be selected.
 - Selection order is preserved.
+- GPX 1.0 and GPX 1.1 files are accepted, including files that use XML
+  namespace prefixes or omit the namespace while declaring a supported
+  version.
+- Standard tracks retain their segment boundaries. GPX routes are converted
+  into editable tracks. A file containing only waypoints becomes one track in
+  the waypoint order stored in the file.
+- Trackpoint timestamps are optional. Missing timestamps never remove otherwise
+  valid coordinates.
 - The first loaded GPX basename becomes the project name if the table was
   empty.
 - Original GPX structure and metadata are preserved as much as possible.
@@ -195,6 +243,12 @@ Editable table fields:
 Changing a track date/time updates track metadata and shifts track point times
 as needed. If timing information is incomplete, the editor estimates timestamps
 from distance and speed.
+
+After loading completely untimed tracks, the editor offers **Set Track Time**
+or **Continue Without Time**. Continuing keeps maps, distance, elevation, PDF
+output, and distance-based Time-Lapse available. Entering a start in the
+**Date & Time** column creates an explicit absolute timeline when the GPX file
+is saved.
 
 Undo and Redo support recent main-table actions.
 
@@ -375,6 +429,9 @@ Embedded use from GPS Track Show:
 - If map tiles are slow, the editor may be waiting for OpenStreetMap tile
   downloads.
 - If a track has no time information, date edits may estimate point timestamps.
+- Untimed tracks cannot automatically receive photos by exposure time, infer
+  missing photo GPS, or participate in Day before/Day after matching until a
+  start time has been confirmed and saved.
 - If the main GUI opened the editor, use Save or Save & Exit so the saved GPX
   path is returned to the main GUI.
 - If settings cannot be stored, check write access to the Adventure directory

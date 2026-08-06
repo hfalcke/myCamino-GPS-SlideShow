@@ -12,6 +12,8 @@ from math import asin, atan2, cos, degrees, floor, log, pi, radians, sin, sqrt, 
 from pathlib import Path
 
 from gpx_processing import (
+    DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+    DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
     ProcessingOptions,
     RawTrackPoint,
     extract_raw_track_points,
@@ -21,6 +23,7 @@ from gpx_processing import (
     process_track_element,
     semantic_track_fingerprint as shared_semantic_track_fingerprint,
 )
+from gpx_import import load_gpx_document, timing_status_for_track
 
 from plot_metadata_utils import (
     build_coordinate_point,
@@ -54,6 +57,25 @@ GPX_NS = {"gpx": "http://www.topografix.com/GPX/1/1"}
 EARLIEST_UNKNOWN = datetime.max.replace(tzinfo=timezone.utc)
 DEFAULT_IMAGE_SIZE = (1600, 1200)
 STAGE_HEADER_HEIGHT_SCALE = 1.25
+RUNNING_SPEED_METADATA_VERSION = 1
+
+
+def running_speed_metadata(track):
+    """Return sidecar-only speed metadata, independent of rendered map pixels."""
+    options = track.get("processing_options", {})
+    return {
+        "version": RUNNING_SPEED_METADATA_VERSION,
+        "window_distance_m": options.get(
+            "running_speed_window_distance_m",
+            DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+        ),
+        "stationary_threshold_kmh": options.get(
+            "stationary_speed_threshold_kmh",
+            DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
+        ),
+        "moving_average_speed_kmh": track.get("moving_average_speed_kmh"),
+        "maximum_running_speed_kmh": track.get("maximum_running_speed_kmh"),
+    }
 
 
 # AI prompt: "Write a function that parses GPX/ISO timestamps, handles trailing Z,
@@ -281,6 +303,8 @@ def summarize_track(
     maximum_vertical_accuracy_m=20.0,
     maximum_hdop=20.0,
     maximum_vdop=20.0,
+    running_speed_window_distance_m=DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+    stationary_speed_threshold_kmh=DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
 ):
     """Build a normalized track dictionary from a GPX <trk> element."""
     track_name = normalize_track_name(
@@ -295,6 +319,8 @@ def summarize_track(
         maximum_vertical_accuracy_m=maximum_vertical_accuracy_m,
         maximum_hdop=maximum_hdop,
         maximum_vdop=maximum_vdop,
+        running_speed_window_distance_m=running_speed_window_distance_m,
+        stationary_speed_threshold_kmh=stationary_speed_threshold_kmh,
     )
     processed = process_track_element(track_element, options)
     raw_points = processed.raw_points
@@ -336,6 +362,8 @@ def summarize_track(
         "length_km": processed.length_km,
         "ascent_m": processed.ascent_m,
         "descent_m": processed.descent_m,
+        "moving_average_speed_kmh": processed.moving_average_speed_kmh,
+        "maximum_running_speed_kmh": processed.maximum_running_speed_kmh,
         "first_point": first_point,
         "last_point": last_point,
         "points": [(point["lat"], point["lon"]) for point in points],
@@ -372,19 +400,14 @@ def parse_gpx_file(
     maximum_hdop=20.0,
     maximum_vdop=20.0,
     track_processing_callback=None,
+    running_speed_window_distance_m=DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+    stationary_speed_threshold_kmh=DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
 ):
     """Parse the GPX file and return summarized tracks."""
-    try:
-        tree = ET.parse(file_path)
-    except ET.ParseError as exc:
-        raise ValueError(f"Invalid GPX XML: {exc}") from exc
-
-    root = tree.getroot()
-    if root.tag != f"{{{GPX_NS['gpx']}}}gpx":
-        raise ValueError("The file is not a GPX 1.1 document.")
+    document = load_gpx_document(file_path)
 
     tracks = []
-    for original_sequence_number, track_element in enumerate(root.findall("gpx:trk", GPX_NS), start=1):
+    for original_sequence_number, track_element in enumerate(document.tracks, start=1):
         if track_processing_callback is not None:
             track_processing_callback()
         track = summarize_track(
@@ -398,8 +421,28 @@ def parse_gpx_file(
             maximum_vertical_accuracy_m,
             maximum_hdop,
             maximum_vdop,
+            running_speed_window_distance_m,
+            stationary_speed_threshold_kmh,
         )
         track["original_sequence_number"] = original_sequence_number
+        track["timing_status"] = timing_status_for_track(track_element)
+        track["has_absolute_time"] = track["start_time"] is not None
+        media_derived = any(
+            element.tag.rsplit("}", 1)[-1] == "trackOrigin"
+            and str(element.attrib.get("kind", "")).casefold() == "media-derived"
+            for element in track_element.iter()
+        )
+        track["source_structure"] = (
+            "media"
+            if media_derived
+            else "route"
+            if original_sequence_number > document.report.track_count
+            and original_sequence_number
+            <= document.report.track_count + document.report.converted_routes
+            else "waypoints"
+            if document.report.converted_waypoint_tracks
+            else "track"
+        )
         tracks.append(track)
     return tracks
 
@@ -478,7 +521,7 @@ def sort_tracks(tracks, sort_date, sort_distance, sort_original=False):
             )
         )
     elif sort_date:
-        tracks.sort(key=lambda track: (track_time_key(track), track["name"].casefold()))
+        tracks[:] = date_order_with_untimed_tracks(tracks)
     else:
         regular_tracks = sorted(
             (track for track in tracks if not has_missing_or_zero_duration(track)),
@@ -499,6 +542,41 @@ def sort_tracks(tracks, sort_date, sort_distance, sort_original=False):
             merged_tracks.insert(insert_index, exceptional_track)
         tracks[:] = merged_tracks
     return tracks, anchor_point, anchor_name
+
+
+def date_order_with_untimed_tracks(tracks):
+    """Sort dated tracks while retaining each untimed track's original context."""
+    original = sorted(
+        tracks,
+        key=lambda track: int(track.get("original_sequence_number", 0)),
+    )
+    dated = [track for track in original if track.get("time") is not None]
+    if not dated:
+        return original
+
+    leading = []
+    attached: dict[int, list[dict]] = {}
+    preceding_dated = None
+    for track in original:
+        if track.get("time") is not None:
+            preceding_dated = track
+        elif preceding_dated is None:
+            leading.append(track)
+        else:
+            attached.setdefault(id(preceding_dated), []).append(track)
+
+    ordered = list(leading)
+    for track in sorted(
+        dated,
+        key=lambda item: (
+            track_time_key(item),
+            int(item.get("original_sequence_number", 0)),
+            item["name"].casefold(),
+        ),
+    ):
+        ordered.append(track)
+        ordered.extend(attached.get(id(track), ()))
+    return ordered
 
 
 # AI prompt: "Write a parser for a WIDTHxHEIGHT image size option, validating
@@ -762,10 +840,23 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "laenge_km": round(track["length_km"], 1),
                 "ascent_m": round(track.get("ascent_m", 0.0), 1),
                 "descent_m": round(track.get("descent_m", 0.0), 1),
+                "moving_average_speed_kmh": (
+                    None
+                    if track.get("moving_average_speed_kmh") is None
+                    else round(track["moving_average_speed_kmh"], 2)
+                ),
+                "maximum_running_speed_kmh": (
+                    None
+                    if track.get("maximum_running_speed_kmh") is None
+                    else round(track["maximum_running_speed_kmh"], 2)
+                ),
                 "kumulativ_km": round(cumulative_km, 1),
                 "abstand_km": None if track["distance_km"] is None else round(track["distance_km"], 1),
                 "start_time": format_datetime_local_seconds(track["start_time"]),
                 "end_time": format_datetime_local_seconds(track["end_time"]),
+                "timing_status": track.get("timing_status", "recorded"),
+                "has_absolute_time": bool(track.get("has_absolute_time")),
+                "source_structure": track.get("source_structure", "track"),
                 "start_point": build_coordinate_point(
                     track["first_point"][0] if track["first_point"] is not None else None,
                     track["first_point"][1] if track["first_point"] is not None else None,
@@ -2110,6 +2201,24 @@ def build_argument_parser():
         help="Fallback speed for repairing missing point timestamps (default: 3.5 km/h).",
     )
     parser.add_argument(
+        "--gpx-running-speed-window-distance",
+        type=parse_non_negative_float,
+        default=DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+        help=(
+            "Centered route-distance window for running speed in meters "
+            f"(default: {DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M:g})."
+        ),
+    )
+    parser.add_argument(
+        "--gpx-stationary-speed-threshold",
+        type=parse_non_negative_float,
+        default=DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
+        help=(
+            "Speeds below this km/h value are stationary for moving averages "
+            f"(default: {DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH:g})."
+        ),
+    )
+    parser.add_argument(
         "--map-layout",
         choices=("standard", "time-lapse"),
         default="standard",
@@ -2149,6 +2258,8 @@ def normalize_runtime_args(args):
         "gpx_maximum_vertical_accuracy",
         "gpx_maximum_hdop",
         "gpx_maximum_vdop",
+        "gpx_running_speed_window_distance",
+        "gpx_stationary_speed_threshold",
     ):
         if float(getattr(args, name, 0.0)) < 0:
             raise ValueError(f"{name} must be non-negative.")
@@ -2231,6 +2342,8 @@ def prepare_run_context(args):
         args.gpx_maximum_hdop,
         args.gpx_maximum_vdop,
         getattr(args, "track_processing_callback", None),
+        args.gpx_running_speed_window_distance,
+        args.gpx_stationary_speed_threshold,
     )
 
     tracks, anchor_point, anchor_name = sort_tracks(
@@ -2559,6 +2672,8 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "track_start_time": format_datetime_local_seconds(track["start_time"]),
                     "track_length_km": round(track["length_km"], 1),
                     "track_duration": format_duration(track["duration"]),
+                    "timing_status": track.get("timing_status", "recorded"),
+                    "has_absolute_time": bool(track.get("has_absolute_time")),
                     "line_color": args.line_color,
                     "line_width": args.line_width,
                     "dot_color": args.dot_color,
@@ -2592,6 +2707,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                         track.get("point_records", []),
                         args.fallback_walking_speed_kmh,
                     ),
+                    "running_speed": running_speed_metadata(track),
                 }
             )
             if media_clear_options is not None:
@@ -2793,6 +2909,8 @@ def namespace_from_options(gpx_file, **overrides):
         gpx_maximum_vertical_accuracy=20.0,
         gpx_maximum_hdop=20.0,
         gpx_maximum_vdop=20.0,
+        gpx_running_speed_window_distance=DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
+        gpx_stationary_speed_threshold=DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
         fallback_walking_speed_kmh=3.5,
         map_layout="standard",
         track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
@@ -2852,7 +2970,7 @@ def _legacy_sidecar_matches_track(metadata, track):
 
 
 def upgrade_timed_track_sidecars(gpx_file, output_dir, **overrides):
-    """Add timing payloads to existing sidecars matched by track fingerprint."""
+    """Upgrade derived timing and speed data without regenerating map images."""
     fallback_walking_speed_kmh = float(overrides.get("fallback_walking_speed_kmh", 3.5))
     context = prepare_with_options(gpx_file, output_dir=str(output_dir), **overrides)
     tracks_by_fingerprint = {
@@ -2895,11 +3013,17 @@ def upgrade_timed_track_sidecars(gpx_file, output_dir, **overrides):
             track.get("point_records", []),
             fallback_walking_speed_kmh,
         )
-        if metadata.get("timed_track_points") == payload and metadata.get("track_fingerprint") == fingerprint:
+        speed_metadata = running_speed_metadata(track)
+        if (
+            metadata.get("timed_track_points") == payload
+            and metadata.get("running_speed") == speed_metadata
+            and metadata.get("track_fingerprint") == fingerprint
+        ):
             report["current"].append(track["table_number"])
             continue
         metadata["track_fingerprint"] = fingerprint
         metadata["timed_track_points"] = payload
+        metadata["running_speed"] = speed_metadata
         write_plot_metadata(metadata, metadata_path)
         report["updated"].append(track["table_number"])
     for fingerprint, track in tracks_by_fingerprint.items():

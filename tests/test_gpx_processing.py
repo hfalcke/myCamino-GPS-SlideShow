@@ -16,7 +16,13 @@ from gpx_processing import (
     processing_cache_info,
     semantic_track_fingerprint,
 )
-from gpx_tracks_table import build_table_summary_data, parse_gpx_file, summarize_track
+from gpx_import import GPX_10_NAMESPACE, load_gpx_document
+from gpx_tracks_table import (
+    build_table_summary_data,
+    date_order_with_untimed_tracks,
+    parse_gpx_file,
+    summarize_track,
+)
 from gpxlist import summarize_track as summarize_track_for_list
 
 
@@ -87,6 +93,133 @@ class SharedGpxProcessingTests(unittest.TestCase):
         with self.assertRaises(CancelStatusRefresh):
             parse_gpx_file(path, "", 0, 0, False, 0, 0, 0, 0, 0, cancel_on_second_track)
         self.assertEqual(calls, 2)
+
+    def test_untimed_points_remain_available(self):
+        temporary_directory, path = self._write_gpx_tracks(1)
+        self.addCleanup(temporary_directory.cleanup)
+        document = load_gpx_document(path)
+        processed = process_track_element(
+            document.tracks[0],
+            ProcessingOptions(0, 0, 0, 0, 0, 0, 0),
+        )
+        self.assertEqual(processed.raw_point_count, 2)
+        self.assertEqual(processed.retained_point_count, 2)
+        self.assertIsNone(processed.start_time)
+
+    def test_running_speed_uses_recorded_anchor_interval(self):
+        start = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+        raw = [
+            RawTrackPoint(index, 0, index, 50.0, 7.0 + index * 0.001, time=start + timedelta(minutes=index))
+            for index in range(4)
+        ]
+        processed = process_raw_points(
+            raw,
+            ProcessingOptions(
+                horizontal_smoothing_distance_m=0,
+                minimum_point_spacing_m=0,
+                elevation_smoothing_distance_m=0,
+                maximum_horizontal_accuracy_m=0,
+                maximum_vertical_accuracy_m=0,
+                maximum_hdop=0,
+                maximum_vdop=0,
+                running_speed_window_distance_m=100,
+                stationary_speed_threshold_kmh=1.5,
+            ),
+        )
+        speeds = [point.running_speed_kmh for point in processed.points]
+        self.assertTrue(all(speed is not None and 3.5 < speed < 5.5 for speed in speeds))
+        self.assertIsNotNone(processed.moving_average_speed_kmh)
+        self.assertAlmostEqual(processed.moving_average_speed_kmh, speeds[1], delta=0.1)
+
+    def test_running_speed_does_not_extrapolate_outside_timestamp_anchors(self):
+        start = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+        raw = [
+            RawTrackPoint(0, 0, 0, 50.0, 7.000),
+            RawTrackPoint(1, 0, 1, 50.0, 7.001, time=start),
+            RawTrackPoint(2, 0, 2, 50.0, 7.002, time=start + timedelta(minutes=1)),
+            RawTrackPoint(3, 0, 3, 50.0, 7.003),
+        ]
+        processed = process_raw_points(raw, ProcessingOptions(0, 0, 0, 0, 0, 0, 0, 100, 1.5))
+        self.assertIsNone(processed.points[0].running_speed_kmh)
+        self.assertIsNotNone(processed.points[1].running_speed_kmh)
+        self.assertIsNotNone(processed.points[2].running_speed_kmh)
+        self.assertIsNone(processed.points[3].running_speed_kmh)
+
+    def test_gpx_10_route_is_converted_to_canonical_track(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "route.gpx"
+            path.write_text(
+                f"""<?xml version="1.0"?>
+<gpx xmlns="{GPX_10_NAMESPACE}" version="1.0" creator="test">
+  <rte><name>Route One</name>
+    <rtept lat="50.0" lon="8.0"><ele>100</ele></rtept>
+    <rtept lat="50.1" lon="8.1"><ele>110</ele></rtept>
+  </rte>
+</gpx>""",
+                encoding="utf-8",
+            )
+            document = load_gpx_document(path)
+        self.assertEqual(document.report.converted_routes, 1)
+        self.assertTrue(document.tracks[0].tag.endswith("}trk"))
+        self.assertEqual(
+            len(document.tracks[0].findall(".//{http://www.topografix.com/GPX/1/1}trkpt")),
+            2,
+        )
+
+    def test_waypoint_only_document_becomes_one_ordered_track(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "points.gpx"
+            path.write_text(
+                """<gpx version="1.1" creator="test">
+  <metadata><name>Stops</name></metadata>
+  <wpt lat="50.0" lon="8.0"><name>A</name></wpt>
+  <wpt lat="50.1" lon="8.1"><name>B</name></wpt>
+</gpx>""",
+                encoding="utf-8",
+            )
+            document = load_gpx_document(path)
+        self.assertEqual(document.report.converted_waypoint_tracks, 1)
+        points = document.tracks[0].findall(
+            ".//{http://www.topografix.com/GPX/1/1}trkpt"
+        )
+        self.assertEqual(
+            [(point.get("lat"), point.get("lon")) for point in points],
+            [("50.0", "8.0"), ("50.1", "8.1")],
+        )
+
+    def test_date_sort_attaches_untimed_tracks_to_preceding_source_track(self):
+        first_untimed = {
+            "original_sequence_number": 1,
+            "time": None,
+            "name": "Leading",
+        }
+        later_dated = {
+            "original_sequence_number": 2,
+            "time": datetime(2024, 2, 1, tzinfo=UTC),
+            "name": "Later",
+        }
+        attached = {
+            "original_sequence_number": 3,
+            "time": None,
+            "name": "Attached",
+        }
+        earlier_dated = {
+            "original_sequence_number": 4,
+            "time": datetime(2024, 1, 1, tzinfo=UTC),
+            "name": "Earlier",
+        }
+        trailing = {
+            "original_sequence_number": 5,
+            "time": None,
+            "name": "Trailing",
+        }
+        ordered = date_order_with_untimed_tracks(
+            [first_untimed, later_dated, attached, earlier_dated, trailing]
+        )
+        self.assertEqual(
+            [item["name"] for item in ordered],
+            ["Leading", "Earlier", "Trailing", "Later", "Attached"],
+        )
 
     def test_segments_are_never_connected(self):
         track = track_xml(

@@ -38,9 +38,11 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
                 "lon": lon,
                 "time": point_time if isinstance(point_time, datetime) else None,
                 "estimated": False,
+                "has_absolute_time": point_time is not None,
                 "elevation_m": elevation_m,
                 "segment_index": int(point.get("segment_index", 0) or 0),
                 "cumulative_distance_km": cumulative_distance_km,
+                "running_speed_kmh": point.get("running_speed_kmh"),
             }
         )
     if not result:
@@ -106,11 +108,19 @@ def repair_timed_points(points: Iterable[dict], fallback_speed_kmh: float = DEFA
             km = distances[index] - distances[index - 1]
             result[index]["time"] = result[index - 1]["time"] + timedelta(hours=km / speed)
             result[index]["estimated"] = True
+        origin_time = result[0]["time"]
+        for point in result:
+            point["has_absolute_time"] = True
+            point["elapsed_seconds"] = max(
+                0.0,
+                (point["time"] - origin_time).total_seconds(),
+            )
     else:
-        base = datetime.now().astimezone()
         for index, point in enumerate(result):
-            point["time"] = base + timedelta(hours=distances[index] / speed)
+            point["time"] = None
             point["estimated"] = True
+            point["has_absolute_time"] = False
+            point["elapsed_seconds"] = distances[index] / speed * 3600.0
     return result
 
 
@@ -118,19 +128,24 @@ def timed_points_payload(points: Iterable[dict], fallback_speed_kmh: float = DEF
     """Serialize repaired points for plot sidecars without changing GPX data."""
     payload = []
     for point in repair_timed_points(points, fallback_speed_kmh):
-        if point.get("time") is None:
-            continue
-        payload.append(
-            {
-                "lat": point["lat"],
-                "lon": point["lon"],
-                "time_iso": point["time"].isoformat(),
-                "estimated": point["estimated"],
-                "elevation_m": point.get("elevation_m"),
-                "cumulative_distance_km": round(float(point.get("cumulative_distance_km", 0.0)), 6),
-                "segment_index": int(point.get("segment_index", 0) or 0),
-            }
-        )
+        item = {
+            "lat": point["lat"],
+            "lon": point["lon"],
+            "elapsed_seconds": round(float(point.get("elapsed_seconds", 0.0)), 3),
+            "estimated": point["estimated"],
+            "has_absolute_time": bool(point.get("has_absolute_time")),
+            "elevation_m": point.get("elevation_m"),
+            "cumulative_distance_km": round(float(point.get("cumulative_distance_km", 0.0)), 6),
+            "segment_index": int(point.get("segment_index", 0) or 0),
+            "running_speed_kmh": (
+                None
+                if point.get("running_speed_kmh") is None
+                else round(float(point["running_speed_kmh"]), 3)
+            ),
+        }
+        if point.get("time") is not None:
+            item["time_iso"] = point["time"].isoformat()
+        payload.append(item)
     return payload
 
 

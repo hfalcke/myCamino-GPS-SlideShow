@@ -18,7 +18,7 @@ import traceback
 import warnings
 import textwrap
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
@@ -62,16 +62,23 @@ from video_audio_normalization import (
     valid_normalized_video,
 )
 from slideshow_control_format import (
+    CaptionDirective,
+    CaptionSyntaxError,
     ControlDirective,
     ControlSyntaxError,
+    FontDirective,
+    FontSyntaxError,
     MusicAction,
     MusicDirective,
     MusicSyntaxError,
     control_label_key,
     is_control_directive,
     is_music_directive,
+    is_disabled_control_line,
     normalize_control_transition,
+    parse_caption_directive,
     parse_control_directive,
+    parse_font_directive,
     parse_music_directive,
 )
 
@@ -91,6 +98,9 @@ try:
         NSEventMaskKeyDown,
         NSEventMaskKeyUp,
         NSFont,
+        NSFontManager,
+        NSBoldFontMask,
+        NSItalicFontMask,
         NSFontAttributeName,
         NSForegroundColorAttributeName,
         NSGraphicsContext,
@@ -473,6 +483,8 @@ class Config:
     arrow_length: float
     font_color: tuple[float, float, float, float]
     font_size: int
+    font_family: str
+    font_style: str
     mapwindow: bool
     join_windows: bool
     end_behavior: str
@@ -481,6 +493,7 @@ class Config:
     fullscreen: bool
     window_swap: bool
     clock: bool
+    speedometer: bool
     header_stage_name: bool
     header_track_details: bool
     header_place_name: bool
@@ -552,6 +565,13 @@ class PhotoListEntry:
 
 
 @dataclass(frozen=True)
+class CaptionFontState:
+    size: float
+    style: str
+    family: str
+
+
+@dataclass(frozen=True)
 class WindowTarget:
     """One rendered image update for a presenter."""
 
@@ -568,6 +588,8 @@ class WindowTarget:
     header_lines: tuple[str, ...] = ()
     header_metrics: tuple[str, ...] = ()
     header_metadata: Optional[dict] = None
+    caption: Optional[CaptionDirective] = None
+    caption_font: Optional[CaptionFontState] = None
 
 
 @dataclass
@@ -835,6 +857,7 @@ def parse_args(argv: list[str]) -> Config:
         help="Play regular map stages as GPS time-lapses and adjacent-day stages as static maps.",
     )
     parser.add_argument("--time-lapse-duration", type=float, default=30.0, help="Seconds of active arrow motion per time-lapse stage (default: 30).")
+    parser.add_argument("--speedometer", choices=("on", "off"), default="on", help="Show recorded running speed in Time-Lapse (default: on).")
     parser.add_argument(
         "--time-lapse-media-min-fraction",
         "--time-lapse-media-max-fraction",
@@ -915,6 +938,8 @@ def parse_args(argv: list[str]) -> Config:
     )
     parser.add_argument("--font-color", default="white", help="Overview date text color.")
     parser.add_argument("--font-size", type=int, default=30, help="Overview date text font size.")
+    parser.add_argument("--font-family", default="System", help="Font family for headers and captions.")
+    parser.add_argument("--font-style", choices=("regular", "bold", "italic", "bold-italic"), default="bold", help="Font style for headers and captions.")
     parser.add_argument("--mapwindow", "-m", action="store_true", default=None, help="Open a separate map window.")
     parser.add_argument("--no-mapwindow", action="store_false", dest="mapwindow", default=None, help="Do not open a separate map window.")
     parser.add_argument("--join-windows", "-j", action="store_true", help="Show photo and map views side by side.")
@@ -1066,6 +1091,8 @@ def parse_args(argv: list[str]) -> Config:
         arrow_length=float(args.arrow_length),
         font_color=parse_color(args.font_color, parser, "--font-color"),
         font_size=args.font_size,
+        font_family=str(args.font_family),
+        font_style=str(args.font_style),
         mapwindow=mapwindow_enabled,
         join_windows=bool(args.join_windows),
         end_behavior=("loop_forever" if args.repeat else str(args.end_behavior)),
@@ -1074,6 +1101,7 @@ def parse_args(argv: list[str]) -> Config:
         fullscreen=fullscreen_enabled,
         window_swap=bool(args.window_swap),
         clock=args.clock == "on",
+        speedometer=args.speedometer == "on",
         header_stage_name=args.header_stage_name == "on",
         header_track_details=args.header_track_details == "on",
         header_place_name=args.header_place_name == "on",
@@ -1234,6 +1262,8 @@ def config_from_options(
     arrow_length: float = 1.0,
     font_color: str | tuple[float, ...] | list[float] = "white",
     font_size: int = 30,
+    font_family: str = "System",
+    font_style: str = "bold",
     mapwindow: Optional[bool] = None,
     join_windows: bool = False,
     end_behavior: str = "loop_forever",
@@ -1243,6 +1273,7 @@ def config_from_options(
     fullscreen: Optional[bool] = None,
     window_swap: bool = False,
     clock: bool = True,
+    speedometer: bool = True,
     header_stage_name: bool = True,
     header_track_details: bool = True,
     header_place_name: bool = True,
@@ -1354,6 +1385,8 @@ def config_from_options(
         raise ValueError("arrow_length must be 0 or greater")
     if font_size < 8:
         raise ValueError("font_size must be at least 8")
+    if font_style not in {"regular", "bold", "italic", "bold-italic"}:
+        raise ValueError("font_style must be regular, bold, italic, or bold-italic")
     if collage_max_images < 1:
         raise ValueError("collage_max_images must be at least 1")
 
@@ -1408,6 +1441,8 @@ def config_from_options(
         arrow_length=float(arrow_length),
         font_color=parse_color_option(font_color, "font_color"),
         font_size=int(font_size),
+        font_family=str(font_family or "System"),
+        font_style=str(font_style),
         mapwindow=mapwindow_enabled,
         join_windows=bool(join_windows),
         end_behavior=normalized_end_behavior,
@@ -1416,6 +1451,7 @@ def config_from_options(
         fullscreen=fullscreen_enabled,
         window_swap=bool(window_swap),
         clock=bool(clock),
+        speedometer=bool(speedometer),
         header_stage_name=bool(header_stage_name),
         header_track_details=bool(header_track_details),
         header_place_name=bool(header_place_name),
@@ -1550,6 +1586,54 @@ def parse_photo_entry(line: str) -> PhotoListEntry:
         latitude, longitude = parse_coordinate_pair(parts[2])
     place = parts[3] if len(parts) > 3 and parts[3] else None
     return PhotoListEntry(filename, time_text, latitude, longitude, place)
+
+
+def build_caption_plan(
+    lines: list[str] | tuple[str, ...],
+    default_font: CaptionFontState,
+) -> tuple[dict[int, tuple[CaptionDirective, CaptionFontState]], dict[int, CaptionFontState]]:
+    """Precompute immediate caption targets and persistent font state by row."""
+    active_font = default_font
+    captions = {}
+    fonts = {}
+    for index, line in enumerate(lines):
+        fonts[index] = active_font
+        if is_disabled_control_line(line):
+            continue
+        try:
+            font_directive = parse_font_directive(line)
+        except FontSyntaxError as exc:
+            warn_message(f"font line {index + 1}: {exc}")
+            continue
+        if font_directive is not None:
+            active_font = (
+                default_font
+                if font_directive.reset
+                else CaptionFontState(
+                    font_directive.size if font_directive.size is not None else active_font.size,
+                    font_directive.style if font_directive.style is not None else active_font.style,
+                    font_directive.family if font_directive.family is not None else active_font.family,
+                )
+            )
+            fonts[index] = active_font
+            continue
+        try:
+            caption = parse_caption_directive(line)
+        except CaptionSyntaxError as exc:
+            warn_message(f"caption line {index + 1}: {exc}")
+            continue
+        if caption is None or index + 1 >= len(lines):
+            continue
+        next_line = str(lines[index + 1]).strip()
+        if not next_line or next_line.startswith("#") or is_disabled_control_line(lines[index + 1]):
+            continue
+        try:
+            entry = parse_photo_entry(next_line)
+        except Exception:
+            continue
+        if entry.source_name:
+            captions[index + 1] = (caption, active_font)
+    return captions, fonts
 
 
 def parse_iso_datetime(value: object) -> Optional[datetime]:
@@ -1772,6 +1856,8 @@ def draw_runtime_header(
     background_style: str,
     background_color: tuple[float, float, float, float],
     shadow_color: tuple[float, float, float, float],
+    font_family: str = "System",
+    font_style: str = "bold",
 ) -> None:
     """Draw the shared clock/title/statistics header background and text."""
     header_x, header_y, header_width, header_height = runtime_header_band(image_rect, metadata)
@@ -1806,7 +1892,7 @@ def draw_runtime_header(
         title_top = header_y + header_height - padding
         for index, line in enumerate(title_lines):
             font_size = first_size if index == 0 else max(8.0, min(requested * 0.86, row_height * 0.78))
-            font = NSFont.boldSystemFontOfSize_(font_size)
+            font = caption_font(CaptionFontState(font_size, font_style, font_family))
             text_height = NSString.stringWithString_(line).sizeWithAttributes_({NSFontAttributeName: font}).height
             baseline = title_top - (index + 1) * row_height + max(0.0, (row_height - text_height) / 2.0)
             draw_shadowed_text(
@@ -1821,7 +1907,7 @@ def draw_runtime_header(
 
     if metrics_lines:
         font_size = max(8.0, min(float(base_font_size) * 0.62 * display_scale, usable_height / 3.35))
-        font = NSFont.boldSystemFontOfSize_(font_size)
+        font = caption_font(CaptionFontState(font_size, font_style, font_family))
         line_height = max(font_size + 1.0, usable_height / 3.0)
         right_x = header_x + header_width - max(5.0, header_width * 0.012)
         parsed = [tuple(part.strip() for part in str(line).partition(":")[::2]) for line in metrics_lines[:3]]
@@ -1851,6 +1937,8 @@ def create_runtime_header_overlay_image(
     background_color: tuple[float, float, float, float],
     shadow_color: tuple[float, float, float, float],
     reference_rect: Optional[tuple[float, float, float, float]] = None,
+    font_family: str = "System",
+    font_style: str = "bold",
 ):
     """Create the header layer used over full-window photos and videos."""
     image = NSImage.alloc().initWithSize_(NSMakeSize(width, height))
@@ -1866,6 +1954,8 @@ def create_runtime_header_overlay_image(
         background_style=background_style,
         background_color=background_color,
         shadow_color=shadow_color,
+        font_family=font_family,
+        font_style=font_style,
     )
     image.unlockFocus()
     return image
@@ -1893,11 +1983,18 @@ def timed_points_from_metadata(metadata: Optional[dict]) -> list[dict]:
     payload = metadata.get("timed_track_points") if isinstance(metadata, dict) else None
     points = []
     if isinstance(payload, list):
+        relative_origin = datetime(1970, 1, 1, tzinfo=UTC)
         for item in payload:
             if not isinstance(item, dict):
                 continue
             point_time = parse_iso_datetime(item.get("time_iso"))
+            elapsed_seconds = safe_float(item.get("elapsed_seconds"))
             lat, lon = safe_float(item.get("lat")), safe_float(item.get("lon"))
+            has_absolute_time = bool(
+                item.get("has_absolute_time", point_time is not None)
+            )
+            if point_time is None and elapsed_seconds is not None:
+                point_time = relative_origin + timedelta(seconds=max(0.0, elapsed_seconds))
             if point_time is not None and lat is not None and lon is not None:
                 points.append(
                     {
@@ -1905,18 +2002,35 @@ def timed_points_from_metadata(metadata: Optional[dict]) -> list[dict]:
                         "lon": lon,
                         "time": point_time,
                         "estimated": bool(item.get("estimated")),
+                        "has_absolute_time": has_absolute_time,
                         "elevation_m": safe_float(item.get("elevation_m")),
                         "cumulative_distance_km": safe_float(item.get("cumulative_distance_km")),
+                        "segment_index": int(item.get("segment_index", 0) or 0),
+                        "running_speed_kmh": safe_float(item.get("running_speed_kmh")),
                     }
                 )
     if len(points) >= 2:
         return timeline_points_with_distances(points)
     raw_points = metadata_track_points(metadata)
     repaired = timed_points_payload([{"lat": lat, "lon": lon} for lat, lon in raw_points])
-    return timeline_points_with_distances([
-        {"lat": item["lat"], "lon": item["lon"], "time": parse_iso_datetime(item["time_iso"]), "estimated": True}
-        for item in repaired
-    ])
+    relative_origin = datetime(1970, 1, 1, tzinfo=UTC)
+    return timeline_points_with_distances(
+        [
+            {
+                "lat": item["lat"],
+                "lon": item["lon"],
+                "time": relative_origin
+                + timedelta(seconds=float(item.get("elapsed_seconds", 0.0))),
+                "estimated": True,
+                "has_absolute_time": False,
+                "elevation_m": item.get("elevation_m"),
+                "cumulative_distance_km": item.get("cumulative_distance_km"),
+                "segment_index": int(item.get("segment_index", 0) or 0),
+                "running_speed_kmh": safe_float(item.get("running_speed_kmh")),
+            }
+            for item in repaired
+        ]
+    )
 
 
 def timeline_points_with_distances(points: list[dict]) -> list[dict]:
@@ -1986,6 +2100,7 @@ def interpolate_timeline_state(points: list[dict], fraction: float) -> Optional[
             "time": point.get("time"),
             "stage_distance_km": safe_float(point.get("cumulative_distance_km")) or 0.0,
             "elevation_m": safe_float(point.get("elevation_m")),
+            "running_speed_kmh": safe_float(point.get("running_speed_kmh")),
         }
     fraction = max(0.0, min(1.0, fraction))
     first_time, last_time = points[0].get("time"), points[-1].get("time")
@@ -2023,13 +2138,35 @@ def interpolate_timeline_state(points: list[dict], fraction: float) -> Optional[
         elevation_m = start_elevation
     else:
         elevation_m = start_elevation + (end_elevation - start_elevation) * local
+    start_speed = safe_float(start.get("running_speed_kmh"))
+    end_speed = safe_float(end.get("running_speed_kmh"))
+    if start_speed is None:
+        running_speed_kmh = end_speed
+    elif end_speed is None:
+        running_speed_kmh = start_speed
+    elif start.get("segment_index") != end.get("segment_index"):
+        running_speed_kmh = start_speed if local < 0.5 else end_speed
+    else:
+        running_speed_kmh = start_speed + (end_speed - start_speed) * local
     return {
         "lat": start["lat"] + (end["lat"] - start["lat"]) * local,
         "lon": start["lon"] + (end["lon"] - start["lon"]) * local,
         "time": target_time,
         "stage_distance_km": start_distance + (end_distance - start_distance) * local,
         "elevation_m": elevation_m,
+        "running_speed_kmh": running_speed_kmh,
     }
+
+
+def nice_speedometer_maximum(maximum_speed_kmh: Optional[float]) -> float:
+    """Round a track maximum upward to a readable gauge scale, at least 7 km/h."""
+    value = max(7.0, float(maximum_speed_kmh or 0.0))
+    magnitude = 10.0 ** math.floor(math.log10(value))
+    normalized = value / magnitude
+    for candidate in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if normalized <= candidate:
+            return candidate * magnitude
+    return 10.0 * magnitude
 
 
 def interpolate_timeline_point(points: list[dict], fraction: float) -> Optional[tuple[float, float]]:
@@ -2335,6 +2472,90 @@ if APPKIT_AVAILABLE:
         return _PILGRIM_FRAME_IMAGES
 
 
+    class SpeedometerView(NSView):
+        """Small retained analog gauge with a bounded one-second needle slew."""
+
+        def initWithFrame_(self, frame):
+            self = objc.super(SpeedometerView, self).initWithFrame_(frame)
+            if self is None:
+                return None
+            self.current_speed = 0.0
+            self.target_speed = 0.0
+            self.maximum_speed = 7.0
+            self.last_update = time.monotonic()
+            return self
+
+        def setSpeed_maximum_(self, speed, maximum):
+            now = time.monotonic()
+            maximum = max(7.0, float(maximum or 7.0))
+            elapsed = max(0.0, now - self.last_update)
+            max_change = maximum * min(1.0, elapsed / 1.0)
+            self.target_speed = max(0.0, min(float(speed or 0.0), maximum))
+            delta = self.target_speed - self.current_speed
+            self.current_speed += max(-max_change, min(max_change, delta))
+            self.maximum_speed = maximum
+            self.last_update = now
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, _dirty_rect):
+            bounds = self.bounds()
+            width, height = float(bounds.size.width), float(bounds.size.height)
+            size = min(width, height * 0.78)
+            if size <= 4.0:
+                return
+            center = (width / 2.0, height - size / 2.0)
+            radius = size * 0.48
+            ns_color((0.0, 0.0, 0.0, 0.52)).setFill()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(center[0] - radius, center[1] - radius, 2 * radius, 2 * radius)
+            ).fill()
+            ns_color(COLOR_NAMES["white"]).setStroke()
+            for tick in range(9):
+                angle = math.radians(210.0 - 240.0 * tick / 8.0)
+                outer = radius * 0.72
+                inner = radius * (0.61 if tick % 2 else 0.55)
+                path = NSBezierPath.bezierPath()
+                path.moveToPoint_((center[0] + inner * math.cos(angle), center[1] + inner * math.sin(angle)))
+                path.lineToPoint_((center[0] + outer * math.cos(angle), center[1] + outer * math.sin(angle)))
+                path.setLineWidth_(max(1.0, size * 0.018))
+                path.stroke()
+            scale_font = NSFont.systemFontOfSize_(max(7.0, size * 0.09))
+            label_ticks = (0, 2, 4, 6, 8) if size >= 92.0 else (0, 4, 8)
+            for tick in label_ticks:
+                value = self.maximum_speed * tick / 8.0
+                label = f"{value:.0f}" if abs(value - round(value)) < 0.05 else f"{value:.1f}"
+                angle = math.radians(210.0 - 240.0 * tick / 8.0)
+                label_radius = radius * 0.88
+                label_size = NSString.stringWithString_(label).sizeWithAttributes_({NSFontAttributeName: scale_font})
+                label_center = (
+                    center[0] + label_radius * math.cos(angle),
+                    center[1] + label_radius * math.sin(angle),
+                )
+                NSString.stringWithString_(label).drawAtPoint_withAttributes_(
+                    (label_center[0] - label_size.width / 2.0, label_center[1] - label_size.height / 2.0),
+                    {NSFontAttributeName: scale_font, NSForegroundColorAttributeName: ns_color(COLOR_NAMES["white"])},
+                )
+            fraction = max(0.0, min(1.0, self.current_speed / self.maximum_speed))
+            angle = math.radians(210.0 - 240.0 * fraction)
+            needle = NSBezierPath.bezierPath()
+            needle.moveToPoint_(center)
+            needle.lineToPoint_((center[0] + radius * 0.72 * math.cos(angle), center[1] + radius * 0.72 * math.sin(angle)))
+            ns_color(COLOR_NAMES["red"]).setStroke()
+            needle.setLineWidth_(max(2.0, size * 0.035))
+            needle.setLineCapStyle_(NSRoundLineCapStyle)
+            needle.stroke()
+            font = NSFont.boldSystemFontOfSize_(max(8.0, size * 0.105))
+            label = f"{self.current_speed:.1f} km/h"
+            label_size = NSString.stringWithString_(label).sizeWithAttributes_({NSFontAttributeName: font})
+            NSString.stringWithString_(label).drawAtPoint_withAttributes_(
+                (
+                    (width - label_size.width) / 2.0,
+                    max(0.0, (height - size - label_size.height) / 2.0),
+                ),
+                {NSFontAttributeName: font, NSForegroundColorAttributeName: ns_color(COLOR_NAMES["white"])},
+            )
+
+
     class TimeLapseMapView(NSView):
         """Draw retained maps plus a changing arrow/media layer without image churn."""
 
@@ -2349,6 +2570,8 @@ if APPKIT_AVAILABLE:
             self.media_marker_latlon = None
             self.media_marker_fixed_arrow = False
             self.media_image = None
+            self.caption_directive = None
+            self.caption_font_state = None
             self.media_draw_frame = True
             self.highlight_route = False
             self.route_visible = True
@@ -2376,6 +2599,8 @@ if APPKIT_AVAILABLE:
             self.header_background_style = "black"
             self.unified_header_enabled = True
             self.overlay_font_size = 30.0
+            self.overlay_font_family = "System"
+            self.overlay_font_style = "bold"
             self.overlay_font_color = COLOR_NAMES["white"]
             self.overlay_background_color = COLOR_NAMES["black"]
             self.overlay_shadow_color = COLOR_NAMES["black"]
@@ -2388,6 +2613,14 @@ if APPKIT_AVAILABLE:
             self.clock_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
             self.clock_view.setAlphaValue_(0.0)
             self.addSubview_(self.clock_view)
+            self.speedometer_view = SpeedometerView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
+            self.speedometer_view.setHidden_(True)
+            self.addSubview_(self.speedometer_view)
+            self.caption_view = NSImageView.alloc().initWithFrame_(self.bounds())
+            self.caption_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            self.caption_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            self.caption_view.setAlphaValue_(0.0)
+            self.addSubview_(self.caption_view)
             return self
 
         def configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(self, image, metadata, route_points, arrow_latlon, media_image, highlight_route):
@@ -2480,10 +2713,51 @@ if APPKIT_AVAILABLE:
             """Keep the clock above an optional AVPlayer child view."""
             self.clock_view.removeFromSuperview()
             self.addSubview_(self.clock_view)
+            self.speedometer_view.removeFromSuperview()
+            self.addSubview_(self.speedometer_view)
+            self.caption_view.removeFromSuperview()
+            self.addSubview_(self.caption_view)
+
+        def updateCaptionOverlay(self):
+            if self.caption_directive is None or self.caption_font_state is None or self.media_image is None:
+                self.caption_view.setImage_(None)
+                self.caption_view.setAlphaValue_(0.0)
+                return
+            bounds = self.bounds()
+            _outer_rect, media_rect = self.mediaRectsForImage_(self.media_image)
+            self.caption_view.setFrame_(bounds)
+            self.caption_view.setImage_(caption_overlay_image(
+                float(bounds.size.width),
+                float(bounds.size.height),
+                self.caption_directive,
+                self.caption_font_state,
+                media_rect,
+                self.overlay_font_color,
+                self.overlay_shadow_color,
+            ))
+            self.caption_view.setAlphaValue_(1.0)
+            self._raise_clock_overlay()
+
+        def _update_speedometer(self, speed, maximum, enabled):
+            if not enabled or speed is None:
+                self.speedometer_view.setHidden_(True)
+                return
+            image_rect = self.headerReferenceRect()
+            clock_frame, clock_size = time_lapse_clock_layout(
+                (float(image_rect.origin.x), float(image_rect.origin.y), float(image_rect.size.width), float(image_rect.size.height)),
+                self.map_metadata,
+                True,
+            )
+            gauge_size = max(36.0, clock_size * 0.82)
+            margin = max(2.0, gauge_size * 0.05)
+            self.speedometer_view.setFrame_(NSMakeRect(clock_frame[0] + clock_frame[2] + margin, clock_frame[1] + (clock_frame[3] - gauge_size) / 2.0, gauge_size, gauge_size))
+            self.speedometer_view.setSpeed_maximum_(speed, maximum)
+            self.speedometer_view.setHidden_(False)
 
         def _retire_content(self):
             """Drop heavyweight content while a closed Cocoa window stays retained."""
             self._update_clock_overlay(None, None, False)
+            self._update_speedometer(None, None, False)
             self.map_image = None
             self.map_metadata = None
             self.route_points = []
@@ -2729,6 +3003,8 @@ if APPKIT_AVAILABLE:
                     background_style=self.header_background_style,
                     background_color=self.overlay_background_color,
                     shadow_color=self.overlay_shadow_color,
+                    font_family=self.overlay_font_family,
+                    font_style=self.overlay_font_style,
                 )
 
             if self.relation_title and not self.unified_header_enabled:
@@ -2745,7 +3021,7 @@ if APPKIT_AVAILABLE:
                     6.0,
                     min(float(self.overlay_font_size) * 1.05, title_height * 0.62),
                 )
-                title_font = NSFont.boldSystemFontOfSize_(title_font_size)
+                title_font = caption_font(CaptionFontState(title_font_size, self.overlay_font_style, self.overlay_font_family))
                 title_size = NSString.stringWithString_(self.relation_title).sizeWithAttributes_(
                     {NSFontAttributeName: title_font}
                 )
@@ -2773,7 +3049,7 @@ if APPKIT_AVAILABLE:
                 header_height = max(1.0, header_top - header_bottom)
                 padding = max(2.0, header_height * 0.04)
                 font_size = max(8.0, min(float(self.overlay_font_size) * 0.62, (header_height - 2.0 * padding) / 3.35))
-                font = NSFont.boldSystemFontOfSize_(font_size)
+                font = caption_font(CaptionFontState(font_size, self.overlay_font_style, self.overlay_font_family))
                 line_height = max(font_size + 1.0, (header_height - 2.0 * padding) / 3.0)
                 right_x = float(image_rect.origin.x + image_rect.size.width) - max(5.0, image_width * 0.012)
                 parsed_lines = [
@@ -2864,7 +3140,7 @@ if APPKIT_AVAILABLE:
                     if text_size.width <= max_width and text_size.height <= row_height * 0.82:
                         break
                     font_size -= 1.0
-                    font = NSFont.boldSystemFontOfSize_(font_size)
+                    font = caption_font(CaptionFontState(font_size, self.overlay_font_style, self.overlay_font_family))
                 text_size = NSString.stringWithString_(text).sizeWithAttributes_({NSFontAttributeName: font})
                 baseline_y = text_band_y + max(1.0, (row_height - text_size.height) / 2.0)
                 draw_shadowed_text(
@@ -3792,6 +4068,80 @@ def draw_shadowed_text(
         NSMakeRect(origin_x, baseline_y, text_size.width, text_size.height),
         fill_attributes,
     )
+
+
+def caption_font(state: CaptionFontState):
+    """Resolve a configured caption/header font with a safe system fallback."""
+    size = max(8.0, float(state.size))
+    family = str(state.family or "System").strip()
+    font = None if family.casefold() == "system" else NSFont.fontWithName_size_(family, size)
+    if font is None and family.casefold() != "system":
+        warned = globals().setdefault("_MISSING_CAPTION_FONT_WARNINGS", set())
+        key = family.casefold()
+        if key not in warned:
+            warned.add(key)
+            warn_message(f"font '{family}' is unavailable; using the system font")
+    if font is None:
+        font = NSFont.systemFontOfSize_(size)
+    traits = 0
+    if "bold" in state.style:
+        traits |= NSBoldFontMask
+    if "italic" in state.style:
+        traits |= NSItalicFontMask
+    if traits:
+        converted = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(font, traits)
+        if converted is not None:
+            font = converted
+    return font
+
+
+def draw_caption_in_rect(
+    directive: CaptionDirective,
+    state: CaptionFontState,
+    rect,
+    font_color,
+    shadow_color,
+) -> None:
+    """Draw a multiline caption within one displayed media rectangle."""
+    font = caption_font(state)
+    lines = str(directive.text).splitlines() or [""]
+    attributes = {NSFontAttributeName: font}
+    sizes = [NSString.stringWithString_(line).sizeWithAttributes_(attributes) for line in lines]
+    line_height = max([float(size.height) for size in sizes] + [float(state.size) * 1.15])
+    total_height = line_height * len(lines)
+    margin = max(8.0, float(state.size) * 0.4)
+    if directive.vertical == "top":
+        first_y = float(rect.origin.y + rect.size.height) - margin - line_height
+    elif directive.vertical == "middle":
+        first_y = float(rect.origin.y) + (float(rect.size.height) + total_height) / 2.0 - line_height
+    else:
+        first_y = float(rect.origin.y) + margin + total_height - line_height
+    if directive.horizontal == "left":
+        anchor_x = float(rect.origin.x) + margin
+    elif directive.horizontal == "right":
+        anchor_x = float(rect.origin.x + rect.size.width) - margin
+    else:
+        anchor_x = float(rect.origin.x + rect.size.width / 2.0)
+    for index, line in enumerate(lines):
+        draw_shadowed_text(
+            line,
+            anchor_x,
+            first_y - index * line_height,
+            font,
+            font_color,
+            directive.horizontal,
+            shadow_color,
+        )
+
+
+def caption_overlay_image(width, height, directive, state, media_rect, font_color, shadow_color):
+    image = NSImage.alloc().initWithSize_(NSMakeSize(width, height))
+    image.lockFocus()
+    try:
+        draw_caption_in_rect(directive, state, media_rect, font_color, shadow_color)
+    finally:
+        image.unlockFocus()
+    return image
 
 
 def _draw_profile_label(text: str, x: float, y: float, font, *, centered=False) -> None:
@@ -5362,7 +5712,7 @@ def draw_relation_title_on_image(
             metadata,
         )
         font_size = max(6.0, min(float(config.font_size) * 1.05, title_height * 0.62))
-        font = NSFont.boldSystemFontOfSize_(font_size)
+        font = caption_font(CaptionFontState(font_size, config.font_style, config.font_family))
         title_size = NSString.stringWithString_(relation_title).sizeWithAttributes_(
             {NSFontAttributeName: font}
         )
@@ -5696,6 +6046,8 @@ class CocoaImagePresenter:
         self.header_font_size = 30.0
         self.header_font_color = COLOR_NAMES["white"]
         self.header_shadow_color = COLOR_NAMES["black"]
+        self.header_font_family = "System"
+        self.header_font_style = "bold"
         self.header_font_factor = 2.2
         self.header_background_style = "black"
         self.header_reference_image = None
@@ -5715,6 +6067,8 @@ class CocoaImagePresenter:
         self.layout_canvas = None
         self.layout_mode: Optional[Transition] = None
         self.last_media_rect = None
+        self.caption_directive = None
+        self.caption_font_state = None
         self.video_view = None
         self.video_player = None
         self.video_uses_full_frame = False
@@ -5727,6 +6081,7 @@ class CocoaImagePresenter:
         self.header_view = self._make_image_view(host_view.bounds())
         self.clock_view = self._make_image_view(host_view.bounds())
         self.place_view = self._make_image_view(host_view.bounds())
+        self.caption_view = self._make_image_view(host_view.bounds())
         self.info_view = self._make_image_view(host_view.bounds())
         self.status_view = self._make_image_view(host_view.bounds())
         self.memory_view = self._make_image_view(host_view.bounds())
@@ -5744,6 +6099,7 @@ class CocoaImagePresenter:
         host_view.addSubview_(self.header_view)
         host_view.addSubview_(self.clock_view)
         host_view.addSubview_(self.place_view)
+        host_view.addSubview_(self.caption_view)
         host_view.addSubview_(self.info_view)
         host_view.addSubview_(self.status_view)
         host_view.addSubview_(self.memory_view)
@@ -5753,6 +6109,7 @@ class CocoaImagePresenter:
         self.header_view.setAlphaValue_(0.0)
         self.clock_view.setAlphaValue_(0.0)
         self.place_view.setAlphaValue_(0.0)
+        self.caption_view.setAlphaValue_(0.0)
         self.info_view.setAlphaValue_(0.0)
         self.status_view.setAlphaValue_(0.0)
         self.memory_view.setAlphaValue_(0.0)
@@ -5797,6 +6154,7 @@ class CocoaImagePresenter:
             "header_view",
             "clock_view",
             "place_view",
+            "caption_view",
             "info_view",
             "status_view",
             "memory_view",
@@ -5844,6 +6202,7 @@ class CocoaImagePresenter:
             self.header_view,
             self.clock_view,
             self.place_view,
+            self.caption_view,
             self.info_view,
             self.status_view,
             self.memory_view,
@@ -5950,6 +6309,48 @@ class CocoaImagePresenter:
             self.header_visible,
         )
         return NSMakeRect(*rect)
+
+    def clear_caption(self) -> None:
+        self.caption_directive = None
+        self.caption_font_state = None
+        self.caption_view.setImage_(None)
+        self.caption_view.setAlphaValue_(0.0)
+
+    def set_caption(self, directive, state, media_image) -> None:
+        """Show one retained caption over the actual displayed media rectangle."""
+        self.clear_caption()
+        if directive is None or state is None or media_image is None:
+            return
+        bounds = self.host_view.bounds()
+        rect = self.last_media_rect
+        if rect is None:
+            frame = self._content_frame()
+            image_width, image_height = image_size_tuple(media_image)
+            draw_width, draw_height = aspect_fit_rect(
+                image_width,
+                image_height,
+                float(frame.size.width),
+                float(frame.size.height),
+            )
+            rect = NSMakeRect(
+                float(frame.origin.x) + (float(frame.size.width) - draw_width) / 2.0,
+                float(frame.origin.y) + (float(frame.size.height) - draw_height) / 2.0,
+                draw_width,
+                draw_height,
+            )
+        self.caption_directive = directive
+        self.caption_font_state = state
+        self.caption_view.setFrame_(bounds)
+        self.caption_view.setImage_(caption_overlay_image(
+            float(bounds.size.width),
+            float(bounds.size.height),
+            directive,
+            state,
+            rect,
+            self.header_font_color,
+            self.header_shadow_color,
+        ))
+        self.caption_view.setAlphaValue_(1.0)
 
     def _apply_header_layout(self) -> None:
         """Apply the selected full-frame or black-header media geometry."""
@@ -6122,6 +6523,8 @@ class CocoaImagePresenter:
                     float(reference.size.width),
                     float(reference.size.height),
                 ),
+                self.header_font_family,
+                self.header_font_style,
             )
         )
         self.header_view.setAlphaValue_(1.0)
@@ -6140,6 +6543,8 @@ class CocoaImagePresenter:
             self.header_shadow_color,
         )
         self.set_clock_time(self.clock_time, self.clock_date_text)
+        if self.caption_directive is not None and self.caption_font_state is not None:
+            self.set_caption(self.caption_directive, self.caption_font_state, self.current_image)
         if self.help_visible:
             self.set_help_visible(True)
 
@@ -6227,6 +6632,7 @@ class CocoaImagePresenter:
         """Animate from the current image to a new image."""
         self.cancel_pending()
         self.stop_video()
+        self.clear_caption()
         self.last_media_rect = None
         if transition == Transition.COLLAGE:
             self._transition_collage(image, on_complete, media_is_video)
@@ -7057,6 +7463,16 @@ class GPSTrackShowApp:
         self.config = config
         self.playlist_lines = self._load_playlist_lines()
         self.stages = parse_stage_descriptors(self.playlist_lines)
+        self.default_caption_font = CaptionFontState(
+            float(config.font_size),
+            str(config.font_style),
+            str(config.font_family),
+        )
+        self.caption_by_row, self.font_state_by_row = build_caption_plan(
+            self.playlist_lines,
+            self.default_caption_font,
+        )
+        self.active_caption_font = self.default_caption_font
         self.control_directives: dict[int, ControlDirective] = {}
         for row_index, line in enumerate(self.playlist_lines):
             if not is_control_directive(line):
@@ -7118,6 +7534,8 @@ class GPSTrackShowApp:
         self.time_lapse_last_tick = None
         self.time_lapse_current_media: Optional[tuple[int, PhotoListEntry]] = None
         self.time_lapse_media_image = None
+        self.time_lapse_caption = None
+        self.time_lapse_caption_font = None
         self.time_lapse_media_draw_frame = True
         self.time_lapse_media_marker_latlon: Optional[tuple[float, float]] = None
         self.time_lapse_stage_start_marker_latlon: Optional[tuple[float, float]] = None
@@ -8232,7 +8650,7 @@ class GPSTrackShowApp:
                 ),
                 photo_target.header_metadata,
                 bool(self.header_visible),
-                self.config.font_size,
+                self.active_caption_font.size,
                 self.config.font_color,
                 self.config.map_header_font_factor,
                 getattr(self.config, "header_background", "black"),
@@ -9879,7 +10297,9 @@ class GPSTrackShowApp:
     ) -> Optional[float]:
         # Synthetic track times establish motion only; they cannot safely align
         # a real camera timestamp, so keep those media entries at stage end.
-        if len(points) < 2 or all(point.get("estimated") for point in points):
+        if len(points) < 2 or not any(
+            point.get("has_absolute_time") for point in points
+        ):
             return None
         if photo_time is None:
             photo_time = self._time_lapse_media_datetime(entry, points, date_text)
@@ -9911,6 +10331,15 @@ class GPSTrackShowApp:
         if marker_state is not None and stage_distance_km <= 0.0 and self.time_lapse_progress > 0.0:
             stage_distance_km = track_length_from_metadata(self.current_track_metadata) * self.time_lapse_progress
         elevation_m = None if marker_state is None else safe_float(marker_state.get("elevation_m"))
+        running_speed_kmh = None if marker_state is None else safe_float(marker_state.get("running_speed_kmh"))
+        speed_metadata = self.current_track_metadata.get("running_speed", {}) if isinstance(self.current_track_metadata, dict) else {}
+        speedometer_maximum = nice_speedometer_maximum(
+            safe_float(speed_metadata.get("maximum_running_speed_kmh"))
+            or max(
+                (safe_float(point.get("running_speed_kmh")) or 0.0 for point in self.time_lapse_points),
+                default=0.0,
+            )
+        )
         metrics_lines = format_time_lapse_metrics(
             self.time_lapse_stage_start_distance_km + stage_distance_km,
             stage_distance_km,
@@ -9923,7 +10352,8 @@ class GPSTrackShowApp:
         display_time = time_lapse_clock_datetime(marker_time, self.time_lapse_progress, media_time)
         uses_late_media_time = isinstance(display_time, datetime) and display_time != marker_time
         if isinstance(display_time, datetime) and (
-            uses_late_media_time or not all(point.get("estimated") for point in self.time_lapse_points)
+            uses_late_media_time
+            or any(point.get("has_absolute_time") for point in self.time_lapse_points)
         ):
             local_marker_time = display_time.astimezone() if display_time.tzinfo is not None else display_time
             self.time_lapse_clock_time = (local_marker_time.hour, local_marker_time.minute)
@@ -9951,6 +10381,8 @@ class GPSTrackShowApp:
             stage_view.route_width = self.config.route_width
             stage_view.media_min_fraction = self.config.time_lapse_media_min_fraction
             stage_view.media_draw_frame = self.time_lapse_media_draw_frame
+            stage_view.caption_directive = self.time_lapse_caption
+            stage_view.caption_font_state = self.time_lapse_caption_font
             stage_view.media_marker_latlon = self.time_lapse_media_marker_latlon
             stage_view.media_marker_fixed_arrow = media_map_stage
             stage_view.place_text = None
@@ -9979,7 +10411,9 @@ class GPSTrackShowApp:
                 self.time_lapse_stage_start_distance_km + stage_distance_km,
             )
             stage_view.relation_title = None
-            stage_view.overlay_font_size = self.config.font_size
+            stage_view.overlay_font_size = self.active_caption_font.size
+            stage_view.overlay_font_family = self.active_caption_font.family
+            stage_view.overlay_font_style = self.active_caption_font.style
             stage_view.overlay_font_color = self.config.font_color
             stage_view.overlay_background_color = self.config.background_color
             stage_view.overlay_shadow_color = self.config.header_shadow_color
@@ -9990,6 +10424,11 @@ class GPSTrackShowApp:
                 self.time_lapse_clock_time,
                 self.time_lapse_clock_date_text,
                 bool(self.header_visible and self.config.clock),
+            )
+            stage_view._update_speedometer(
+                running_speed_kmh,
+                speedometer_maximum,
+                bool(self.header_visible and self.config.speedometer),
             )
             if self.time_lapse_video_view is not None and self.time_lapse_media_image is not None:
                 old_superview = self.time_lapse_video_view.superview()
@@ -10002,6 +10441,7 @@ class GPSTrackShowApp:
                     stage_view._raise_clock_overlay()
                 _outer_rect, content_rect = stage_view.mediaRectsForImage_(self.time_lapse_media_image)
                 self.time_lapse_video_view.setFrame_(content_rect)
+            stage_view.updateCaptionOverlay()
         if overview_view is not None:
             overview_view.setHidden_(False)
             overview_view.marker_color = self.config.dot_color
@@ -10064,6 +10504,11 @@ class GPSTrackShowApp:
                 self.time_lapse_clock_date_text,
                 bool(self.header_visible and self.config.clock),
             )
+            overview_view._update_speedometer(
+                running_speed_kmh,
+                speedometer_maximum,
+                bool(self.header_visible and self.config.speedometer),
+            )
         self._publish_live_state()
 
     def _clear_time_lapse_views(self):
@@ -10071,6 +10516,7 @@ class GPSTrackShowApp:
         for view in (self.time_photo_view, self.time_map_view):
             if view is not None:
                 view._update_clock_overlay(None, None, False)
+                view._update_speedometer(None, None, False)
                 view.setHidden_(True)
         for presenter in (self.photo_presenter, self.map_presenter):
             if presenter is not None:
@@ -10186,7 +10632,9 @@ class GPSTrackShowApp:
         self.time_lapse_stage_start_distance_km = self._time_lapse_distance_before_stage(map_index)
         if relation is None and (
             len(self.time_lapse_points) < 2
-            or all(point.get("estimated") for point in self.time_lapse_points)
+            or not any(
+                point.get("has_absolute_time") for point in self.time_lapse_points
+            )
         ):
             warn_message("Track map has no stored timing; using distance-based motion and showing untimed media at stage end.")
         self.time_lapse_progress = max(0.0, min(1.0, start_fraction))
@@ -10587,6 +11035,7 @@ class GPSTrackShowApp:
             self.time_lapse_control_deferred = deferred
             return False if deferred else bool(state["result"])
         self.control_flow_steps = 0
+        self.active_caption_font = self.font_state_by_row.get(row_index, self.default_caption_font)
         path = resolve_path(self.config.photodir, entry.source_name)
         try:
             image = load_media_preview(path)
@@ -10606,6 +11055,9 @@ class GPSTrackShowApp:
             except ValueError:
                 self.current_stage_media_position = None
         self.time_lapse_media_image = image
+        caption_data = self.caption_by_row.get(row_index)
+        self.time_lapse_caption = caption_data[0] if caption_data else None
+        self.time_lapse_caption_font = caption_data[1] if caption_data else None
         self.time_lapse_media_draw_frame = True
         metadata = try_read_photo_metadata(media_sidecar_path(path), path) or {}
         raw_place = metadata.get("place")
@@ -10642,6 +11094,8 @@ class GPSTrackShowApp:
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
         self.time_lapse_media_image = None
+        self.time_lapse_caption = None
+        self.time_lapse_caption_font = None
         self.time_lapse_media_draw_frame = True
         self.time_lapse_media_marker_latlon = None
         self.time_lapse_clock_time = None
@@ -11004,9 +11458,22 @@ class GPSTrackShowApp:
             row_index = self.playlist_index
             line = self.playlist_lines[row_index]
             content = line.strip()
+            default_caption_font = getattr(
+                self,
+                "default_caption_font",
+                CaptionFontState(float(getattr(self.config, "font_size", 30)), "bold", "System"),
+            )
+            self.active_caption_font = getattr(self, "font_state_by_row", {}).get(
+                row_index,
+                default_caption_font,
+            )
             self.music_controller.synchronize_row(row_index)
             self.playlist_index += 1
             debug_print(self.config, f"Processing line: {line}")
+            if is_disabled_control_line(line):
+                if not self._guard_control_flow():
+                    return
+                continue
             if is_music_directive(content):
                 if not self._guard_control_flow():
                     return
@@ -11018,6 +11485,10 @@ class GPSTrackShowApp:
                 if not self._guard_control_flow():
                     return
                 if self._execute_control_actions(directive, row_index):
+                    return
+                continue
+            if content.upper().startswith(("#FONT:", "#CAPTION:")):
+                if not self._guard_control_flow():
                     return
                 continue
             if content.startswith("#Overviewmap:"):
@@ -11066,6 +11537,10 @@ class GPSTrackShowApp:
                 self._handle_map(map_directive.filename, map_directive.relation)
                 self.resume_start_pending = False
                 return
+            if content.startswith("#"):
+                if not self._guard_control_flow():
+                    return
+                continue
             entry = parse_photo_entry(line)
             if self.time_lapse_active and self.time_lapse_stage is None:
                 stage_index = stage_index_for_playlist_row(self.stages, row_index)
@@ -11303,6 +11778,9 @@ class GPSTrackShowApp:
                 place_text = format_place_for_slideshow(cleaned_place)
         photo_transition = self._effective_photo_transition()
         photo_identity = str(photo_path.resolve())
+        caption_data = self.caption_by_row.get(row_index)
+        caption = caption_data[0] if caption_data else None
+        caption_font_state = caption_data[1] if caption_data else None
 
         header_lines = selected_stage_header_lines(
             self.current_track_metadata,
@@ -11339,6 +11817,8 @@ class GPSTrackShowApp:
                 header_lines=header_lines,
                 header_metrics=header_metrics,
                 header_metadata=self.current_track_metadata,
+                caption=caption,
+                caption_font=caption_font_state,
             )
 
         preview_duplicate = (
@@ -11474,6 +11954,15 @@ class GPSTrackShowApp:
             ):
                 on_complete()
 
+        active_font = getattr(
+            self,
+            "active_caption_font",
+            CaptionFontState(
+                float(getattr(self.config, "font_size", 30)),
+                str(getattr(self.config, "font_style", "bold")),
+                str(getattr(self.config, "font_family", "System")),
+            ),
+        )
         active_photo_presenter = None
         active_info_presenter = None
         for target in targets:
@@ -11498,6 +11987,8 @@ class GPSTrackShowApp:
                 target.image,
                 effective_transition in {Transition.COLLAGE, Transition.QUAD},
             )
+            presenter.header_font_family = active_font.family
+            presenter.header_font_style = active_font.style
             presenter.set_header(
                 target.header_lines,
                 (
@@ -11507,7 +11998,7 @@ class GPSTrackShowApp:
                 ),
                 target.header_metadata,
                 bool(full_window_header and self.header_visible),
-                self.config.font_size,
+                active_font.size,
                 self.config.font_color,
                 self.config.map_header_font_factor,
                 getattr(self.config, "header_background", "black"),
@@ -11517,7 +12008,7 @@ class GPSTrackShowApp:
                 target.clock_time if full_window_header and self.header_visible and self.config.clock else None,
                 target.clock_date_text if full_window_header and self.header_visible and self.config.clock else None,
             )
-            presenter.set_place_text(None, False, self.config.font_size, self.config.font_color)
+            presenter.set_place_text(None, False, int(active_font.size), self.config.font_color)
             presenter.set_info_text(target.info_text if target.presenter_name == "photo" else None)
             if target.presenter_name == "photo":
                 def photo_complete(current_presenter=presenter, current_target=target, transition=effective_transition) -> None:
@@ -11535,12 +12026,17 @@ class GPSTrackShowApp:
                             playback_path=self._video_playback_path(current_target.video_path),
                             volume=self._video_gain(),
                         )
+                    current_presenter.set_caption(
+                        current_target.caption,
+                        current_target.caption_font,
+                        current_target.image,
+                    )
                     done()
 
                 presenter.transition_to(
                     target.image,
                     effective_transition,
-                    photo_complete if (on_complete is not None or target.video_path is not None) else None,
+                    photo_complete if (on_complete is not None or target.video_path is not None or target.caption is not None) else None,
                     media_is_video=target.video_path is not None,
                 )
             else:
@@ -11855,12 +12351,15 @@ class GPSTrackShowApp:
         """Apply supported Adventure settings without restarting playback."""
         simple_values = {
             "slideshow.clock": ("clock", bool),
+            "slideshow.speedometer": ("speedometer", bool),
             "slideshow.header_stage_name": ("header_stage_name", bool),
             "slideshow.header_track_details": ("header_track_details", bool),
             "slideshow.header_place_name": ("header_place_name", bool),
             "slideshow.header_track_stats": ("header_track_stats", bool),
             "slideshow.header_background": ("header_background", str),
             "slideshow.font_size": ("font_size", int),
+            "slideshow.font_family": ("font_family", str),
+            "slideshow.font_style": ("font_style", str),
             "slideshow.marker_radius": ("dot_size", int),
             "slideshow.arrow_scale": ("arrow_length", float),
             "slideshow.transition_duration_ms": ("transition_duration_ms", int),
@@ -11882,6 +12381,17 @@ class GPSTrackShowApp:
                     if converted not in {"off", "transparent", "black"}:
                         continue
                 object.__setattr__(self.config, attribute, converted)
+
+        if any(key in values for key in ("slideshow.font_size", "slideshow.font_family", "slideshow.font_style")):
+            self.default_caption_font = CaptionFontState(
+                float(self.config.font_size),
+                str(self.config.font_style),
+                str(self.config.font_family),
+            )
+            self.caption_by_row, self.font_state_by_row = build_caption_plan(
+                self.playlist_lines,
+                self.default_caption_font,
+            )
 
         color_values = {
             "slideshow.background_color": "background_color",

@@ -22,6 +22,7 @@ from GPSTrackShow import (
     format_time_lapse_metrics,
     interpolate_timeline_point,
     interpolate_timeline_state,
+    nice_speedometer_maximum,
     parse_map_directive,
     parse_photo_entry,
     parse_control_datetime,
@@ -35,6 +36,11 @@ from track_timing_utils import haversine_km, repair_timed_points, timed_points_p
 
 
 class TrackTimingTests(unittest.TestCase):
+    def test_speedometer_scale_uses_nice_upper_bound(self):
+        self.assertEqual(nice_speedometer_maximum(None), 10.0)
+        self.assertEqual(nice_speedometer_maximum(6.2), 10.0)
+        self.assertEqual(nice_speedometer_maximum(12.1), 20.0)
+
     def test_stage_navigation_uses_media_maps_without_gpx_tracks(self):
         lines = [
             "#Datum: Monday, 15.07.2024",
@@ -101,8 +107,22 @@ class TrackTimingTests(unittest.TestCase):
             [{"lat": 50.0, "lon": 8.0}, {"lat": 50.0, "lon": 8.01}, {"lat": 50.0, "lon": 8.02}]
         )
         self.assertTrue(all(point["estimated"] for point in repaired))
-        self.assertLess(repaired[0]["time"], repaired[1]["time"])
-        self.assertLess(repaired[1]["time"], repaired[2]["time"])
+        self.assertTrue(all(point["time"] is None for point in repaired))
+        self.assertFalse(any(point["has_absolute_time"] for point in repaired))
+        self.assertLess(repaired[0]["elapsed_seconds"], repaired[1]["elapsed_seconds"])
+        self.assertLess(repaired[1]["elapsed_seconds"], repaired[2]["elapsed_seconds"])
+
+    def test_untimed_payload_contains_relative_time_without_fake_calendar_date(self):
+        payload = timed_points_payload(
+            [{"lat": 50.0, "lon": 8.0}, {"lat": 50.0, "lon": 8.01}]
+        )
+        self.assertEqual(payload[0]["elapsed_seconds"], 0.0)
+        self.assertGreater(payload[1]["elapsed_seconds"], 0.0)
+        self.assertNotIn("time_iso", payload[0])
+        self.assertFalse(payload[0]["has_absolute_time"])
+        restored = timed_points_from_metadata({"timed_track_points": payload})
+        self.assertEqual(len(restored), 2)
+        self.assertFalse(any(point["has_absolute_time"] for point in restored))
 
     def test_backwards_timestamp_is_repaired_to_monotonic_sequence(self):
         start = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
@@ -312,15 +332,22 @@ class TrackTimingTests(unittest.TestCase):
         }
         with TemporaryDirectory() as temp_dir:
             sidecar = Path(temp_dir) / "existing-track-map.json"
+            map_image = Path(temp_dir) / "existing-track-map.png"
+            map_image.write_bytes(b"unchanged map pixels")
+            image_mtime = map_image.stat().st_mtime_ns
             sidecar.write_text(json.dumps({"track_fingerprint": "track-one", "preserved": True}), encoding="utf-8")
             with patch("gpx_tracks_table.prepare_with_options", return_value=context):
                 report = upgrade_timed_track_sidecars("unused.gpx", temp_dir)
             updated = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(map_image.read_bytes(), b"unchanged map pixels")
+            self.assertEqual(map_image.stat().st_mtime_ns, image_mtime)
         self.assertEqual(report["updated"], [1])
         self.assertTrue(updated["preserved"])
         self.assertEqual(len(updated["timed_track_points"]), 2)
         self.assertIn("cumulative_distance_km", updated["timed_track_points"][1])
         self.assertEqual(updated["timed_track_points"][1]["elevation_m"], 180.0)
+        self.assertEqual(updated["running_speed"]["version"], 1)
+        self.assertEqual(updated["running_speed"]["window_distance_m"], 500.0)
 
     def test_sidecar_upgrade_safely_matches_legacy_identity_fields(self):
         start = datetime(2020, 10, 17, 11, 0, tzinfo=timezone.utc)

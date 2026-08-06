@@ -154,6 +154,7 @@ from gpx_tracks_table import (
     run_with_options as run_gpx_tracks_table_with_options,
     render_media_overview_map,
     selected_track_numbers,
+    upgrade_timed_track_sidecars,
 )
 from plot_metadata_utils import (
     media_sidecar_freshness,
@@ -212,12 +213,20 @@ from audio_playlist import (
 )
 from slideshow_control_format import (
     CONTROL_TRANSITIONS,
+    CaptionDirective,
+    CaptionSyntaxError,
     ControlSyntaxError,
+    FontSyntaxError,
     MusicSyntaxError,
     control_labels,
+    parse_caption_parameters,
     parse_control_parameters,
+    parse_font_parameters,
     parse_music_parameters,
+    serialize_caption_parameters,
     serialize_control_parameters,
+    serialize_font_parameters,
+    split_disabled_control_line,
 )
 from map_overlay import MAP_CONTENT_VERSION
 from workflow_assistant import (
@@ -329,6 +338,8 @@ CONTROL_ROW_TYPE_KEYWORDS = {
     "DAT": "Datum",
     "MUS": "MUSIC",
     "CTL": "CONTROL",
+    "CAP": "CAPTION",
+    "FNT": "FONT",
 }
 CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "IMG": "Image",
@@ -341,6 +352,8 @@ CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "DAT": "Date",
     "MUS": "Music control",
     "CTL": "Slide-show control",
+    "CAP": "Photo/video caption",
+    "FNT": "Label font",
 }
 CONTROL_ROW_TYPES = tuple(CONTROL_ROW_TYPE_DESCRIPTIONS)
 CONTROL_ROW_TYPE_CHOICES = tuple(
@@ -354,6 +367,8 @@ CONTROL_TABLE_FILTERS = (
     ("maps", "Maps"),
     ("mus", "MUS – Music control"),
     ("ctl", "CTL – Slide-show control"),
+    ("cap", "CAP – Photo/video caption"),
+    ("fnt", "FNT – Label font"),
     ("img", "IMG – Image"),
     ("vid", "VID – Video"),
     ("map", "MAP – Overview map"),
@@ -688,6 +703,7 @@ def slideshow_row_type_for_filename(filename: str) -> str:
 def parse_slideshow_control_line(line: str) -> dict:
     """Parse one sorted slideshow control-file line into a table row."""
     text = str(line).rstrip("\r\n")
+    disabled, text = split_disabled_control_line(text)
     if text.startswith("#"):
         body = text[1:]
         keyword, separator, value = body.partition(":")
@@ -710,6 +726,10 @@ def parse_slideshow_control_line(line: str) -> dict:
             row_type = "MUS"
         elif normalized == "control":
             row_type = "CTL"
+        elif normalized == "caption":
+            row_type = "CAP"
+        elif normalized == "font":
+            row_type = "FNT"
         else:
             row_type = keyword.upper() if keyword else "#"
         return {
@@ -720,6 +740,7 @@ def parse_slideshow_control_line(line: str) -> dict:
             "place": "",
             "keyword": keyword,
             "is_keyword": True,
+            "disabled": disabled,
         }
 
     parts = [part.strip() for part in text.split("|")]
@@ -735,6 +756,7 @@ def parse_slideshow_control_line(line: str) -> dict:
         "place": "" if is_missing_place_text(place_text) else place_text,
         "keyword": "",
         "is_keyword": False,
+        "disabled": disabled,
     }
 
 
@@ -747,16 +769,28 @@ def serialize_slideshow_control_row(row: dict) -> str:
             name = serialize_control_parameters(parse_control_parameters(name))
         except ControlSyntaxError:
             pass
-    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "CTL"}:
+    elif row_type == "CAP" and name:
+        try:
+            name = serialize_caption_parameters(parse_caption_parameters(name))
+        except CaptionSyntaxError:
+            pass
+    elif row_type == "FNT" and name:
+        try:
+            name = serialize_font_parameters(parse_font_parameters(name))
+        except FontSyntaxError:
+            pass
+    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "CTL", "CAP", "FNT"}:
         keyword = str(row.get("keyword", "")).strip()
         if not keyword:
             keyword = CONTROL_ROW_TYPE_KEYWORDS.get(row_type, row_type)
-        return f"#{keyword}: {name}"
+        line = f"#{keyword}: {name}"
+        return f"# {line}" if row.get("disabled") else line
 
     time_text = str(row.get("time", "")).strip()
     gps_text = str(row.get("gps", "")).strip() or GPS_NOT_AVAILABLE
     place_text = str(row.get("place", "")).strip() or PLACE_NOT_REQUESTED
-    return f"{name} | {time_text} | {gps_text} | {place_text}"
+    line = f"{name} | {time_text} | {gps_text} | {place_text}"
+    return f"# {line}" if row.get("disabled") else line
 
 
 def clone_slideshow_row(row: dict) -> dict:
@@ -794,7 +828,7 @@ def visible_control_row_indexes(rows, filter_key="all", hide_media=None):
     filter_key = str(filter_key or "all").casefold()
     if filter_key == "all":
         return list(range(len(rows)))
-    exact = {"mus", "ctl", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
+    exact = {"mus", "ctl", "cap", "fnt", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
     if filter_key in exact:
         return [
             index for index, row in enumerate(rows)
@@ -1106,6 +1140,9 @@ class SlideShowControlTableDataSource(NSObject):
             if row_type == "CTL":
                 self.controller.showControlDirectiveHelp_(table_view)
                 break
+            if row_type in {"CAP", "FNT"}:
+                self.controller.showCaptionDirectiveHelp_(table_view)
+                break
 
     def tableView_willDisplayCell_forTableColumn_row_(self, _table_view, cell, _table_column, row_index):
         model_index = self.controller.control_table_model_index_for_view_row(row_index)
@@ -1115,11 +1152,17 @@ class SlideShowControlTableDataSource(NSObject):
         base_font = NSFont.systemFontOfSize_(13.0)
         if row_type == "DAT":
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSBoldFontMask)
-        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS", "CTL"}:
+        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS", "CTL", "CAP", "FNT"}:
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSItalicFontMask)
         else:
             font = base_font
         cell.setFont_(font)
+        row = self.controller.control_table_rows[model_index]
+        cell.setTextColor_(
+            NSColor.disabledControlTextColor()
+            if row.get("disabled")
+            else NSColor.controlTextColor()
+        )
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table_view, row_indexes, pasteboard):
         indexes = []
@@ -1195,6 +1238,12 @@ class SlideShowControlTableView(NSTableView):
         add_item("Copy", "copyControlRowsToPasteboard:")
         add_item("Paste", "pasteControlRows:")
         add_item("Insert Row", "insertControlRow:")
+        if self.controller.selectedControlRowIsCaption():
+            add_item("Edit Caption…", "editSelectedCaption:")
+        media_rows = self.controller.selectedControlRowsAreImagesOrVideos()
+        if media_rows:
+            hidden = self.controller.selectedControlRowsAreHidden()
+            add_item("Unhide Media" if hidden else "Hide Media", "toggleHiddenControlRows:")
         menu.addItem_(NSMenuItem.separatorItem())
         has_viewable_file = self.controller.selectedControlRowsHaveViewableFiles()
         add_item("Preview", "openSelectedControlMedia:", has_viewable_file)
@@ -2069,6 +2118,8 @@ class GPXTrackerController(NSObject):
         self.music_directive_help_text = None
         self.control_directive_help_window = None
         self.control_directive_help_text = None
+        self.caption_directive_help_window = None
+        self.caption_directive_help_text = None
         self.saved_project_payload = None
         self.media_viewer_window = None
         self.media_viewer_view = None
@@ -2304,6 +2355,10 @@ class GPXTrackerController(NSObject):
         self.gpx_folder_button = self._make_file_icon_button("openGPXFolder:", "Open the project folder in Finder to manage GPX files.")
         self.root_view.addSubview_(self.gpx_folder_button)
         self.gpx_edit_button = self._make_button("Add & Edit Tracks", "addAndEditTracks:")
+        self.gpx_photo_tracks_button = self._make_button(
+            "Photo Tracks",
+            "createTracksFromPhotos:",
+        )
 
         self.track_maps_status_checkbox = self._make_section_status_checkbox()
         self.root_view.addSubview_(self.track_maps_status_checkbox)
@@ -2317,6 +2372,7 @@ class GPXTrackerController(NSObject):
         self.gpx_cancel_plots_button = self._make_button("Cancel", "cancelMakePlots:")
         self.gpx_cancel_plots_button.setHidden_(True)
         self.root_view.addSubview_(self.gpx_edit_button)
+        self.root_view.addSubview_(self.gpx_photo_tracks_button)
         self.root_view.addSubview_(self.gpx_track_images_label)
         self.root_view.addSubview_(self.gpx_make_plots_button)
         self.root_view.addSubview_(self.gpx_view_plots_button)
@@ -2691,6 +2747,9 @@ class GPXTrackerController(NSObject):
         )
         self.gpx_folder_button.setToolTip_("Open Finder with GPX files in the project directory so they can be renamed or deleted.")
         self.gpx_edit_button.setToolTip_("Open GPXEditor to add or edit tracks and save the active GPX file.")
+        self.gpx_photo_tracks_button.setToolTip_(
+            "Create editable estimated GPX stage tracks from project photo/video GPS positions."
+        )
         self.track_maps_box.setToolTip_("Maps are generated automatically after media preparation. Use this section to repair or deliberately regenerate the shared overview and both map variants.")
         self.gpx_track_images_label.setToolTip_("Map-generation actions.")
         self.gpx_make_plots_button.setToolTip_("Select logical stages and generate missing or stale Standard and Time-Lapse maps together.")
@@ -2786,7 +2845,8 @@ class GPXTrackerController(NSObject):
         self.gpx_field.setNextKeyView_(self.gpx_button)
         self.gpx_button.setNextKeyView_(self.gpx_folder_button)
         self.gpx_folder_button.setNextKeyView_(self.gpx_edit_button)
-        self.gpx_edit_button.setNextKeyView_(self.gpx_no_gpx_checkbox)
+        self.gpx_edit_button.setNextKeyView_(self.gpx_photo_tracks_button)
+        self.gpx_photo_tracks_button.setNextKeyView_(self.gpx_no_gpx_checkbox)
         self.gpx_no_gpx_checkbox.setNextKeyView_(self.media_import_button)
         self.media_import_button.setNextKeyView_(self.media_view_button)
         self.media_view_button.setNextKeyView_(self.media_edit_button)
@@ -2846,7 +2906,15 @@ class GPXTrackerController(NSObject):
         description_width = usable_width - LABEL_WIDTH - INNER_GAP
         project_field_width = description_width - FILE_BUTTON_WIDTH - INNER_GAP
         gpx_choose_width = 76.0
-        gpx_field_width = description_width - gpx_choose_width - FILE_BUTTON_WIDTH - EDIT_BUTTON_WIDTH - 3 * INNER_GAP
+        photo_tracks_width = 116.0
+        gpx_field_width = (
+            description_width
+            - gpx_choose_width
+            - FILE_BUTTON_WIDTH
+            - EDIT_BUTTON_WIDTH
+            - photo_tracks_width
+            - 4 * INNER_GAP
+        )
 
         current_top = height - PADDING
 
@@ -2978,7 +3046,10 @@ class GPXTrackerController(NSObject):
         current_top -= 22.0
         media_only = str(self.parameters.get("trackmaps.route_source", "automatic")) == "media"
         if media_only:
-            row_y = current_top
+            row_y = current_top - FIELD_HEIGHT
+            self.gpx_photo_tracks_button.setFrame_(
+                NSMakeRect(field_x, row_y, photo_tracks_width, FIELD_HEIGHT)
+            )
         else:
             row_y = current_top - FIELD_HEIGHT
             self.gpx_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
@@ -2999,6 +3070,19 @@ class GPXTrackerController(NSObject):
                     field_x + gpx_field_width + gpx_choose_width + FILE_BUTTON_WIDTH + 3 * INNER_GAP,
                     row_y - 1.0,
                     EDIT_BUTTON_WIDTH,
+                    FIELD_HEIGHT + 2.0,
+                )
+            )
+            self.gpx_photo_tracks_button.setFrame_(
+                NSMakeRect(
+                    field_x
+                    + gpx_field_width
+                    + gpx_choose_width
+                    + FILE_BUTTON_WIDTH
+                    + EDIT_BUTTON_WIDTH
+                    + 4 * INNER_GAP,
+                    row_y - 1.0,
+                    photo_tracks_width,
                     FIELD_HEIGHT + 2.0,
                 )
             )
@@ -4340,6 +4424,9 @@ class GPXTrackerController(NSObject):
             self.parameters["gpx.maximum_vertical_accuracy_m"],
             self.parameters["gpx.maximum_hdop"],
             self.parameters["gpx.maximum_vdop"],
+            None,
+            self.parameters["gpx.running_speed_window_distance_m"],
+            self.parameters["gpx.stationary_speed_threshold_kmh"],
         )
         return self._format_gpx_summary_from_tracks(gpx_path, tracks)
 
@@ -5741,7 +5828,7 @@ class GPXTrackerController(NSObject):
             "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
             "13. Update Metadata Extraction in the Photos and Video Clips section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
             "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
-            "15. In the control-file editor, use the row-type filter or Reset Filter, and press Start Slide Show Here at the bottom or in the context menu to launch once from that exact map, medium, date, music directive, or slide-show control row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
+            "15. In the control-file editor, use the row-type filter or Reset Filter. Right-click photos or videos to Hide/Unhide them. CAPTION rows label the immediately following medium; FONT rows change following caption and header fonts. Press Start Slide Show Here at the bottom or in the context menu to launch from an exact row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
             "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
             "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Its temporary help hint disappears after five seconds. Press Space or Right/Down to leave the title immediately; otherwise it advances automatically after 30 seconds. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Every playback style uses the same clock, three-line title area, and track statistics. Settings independently select stage name, track length and duration, place name, clock, and statistics. One Header layout applies to photos, Time-Lapse maps, and overview maps. No box and Semi-transparent overlay retain the full screen and align the header to the fitted image edge. Header area is the default; it uses the slideshow Background color and fits the display beneath it while maps retain the full width. Font color also controls the clock, time, and date, and Shadow color defaults to black. The Time-Lapse marker can be a pilgrim, bicycle, car, airplane, or arrow. Selected title fields are packed from the top without empty lines; the first line is larger. Press c to toggle the complete header, and a to pause or resume background audio.\n\n"
             "Workflow Assistant:\n"
@@ -7462,6 +7549,18 @@ class GPXTrackerController(NSObject):
                 except ControlSyntaxError as exc:
                     show_alert(f"Invalid slide-show control directive in row {index}.", str(exc))
                     return False
+            elif row_type == "CAP":
+                try:
+                    parse_caption_parameters(str(row.get("name", "")))
+                except CaptionSyntaxError as exc:
+                    show_alert(f"Invalid caption directive in row {index}.", str(exc))
+                    return False
+            elif row_type == "FNT":
+                try:
+                    parse_font_parameters(str(row.get("name", "")))
+                except FontSyntaxError as exc:
+                    show_alert(f"Invalid font directive in row {index}.", str(exc))
+                    return False
         try:
             _labels, duplicates = control_labels(serialized_lines)
         except ControlSyntaxError as exc:
@@ -8322,6 +8421,97 @@ class GPXTrackerController(NSObject):
             and self.control_table_path.is_file()
         )
 
+    def selectedControlRowsAreImagesOrVideos(self):
+        indexes = self._selected_control_table_indexes()
+        return bool(indexes) and all(
+            0 <= index < len(self.control_table_rows)
+            and str(self.control_table_rows[index].get("type", "")).upper() in {"IMG", "VID"}
+            for index in indexes
+        )
+
+    def selectedControlRowIsCaption(self):
+        indexes = self._selected_control_table_indexes()
+        return bool(
+            len(indexes) == 1
+            and 0 <= indexes[0] < len(self.control_table_rows)
+            and str(self.control_table_rows[indexes[0]].get("type", "")).upper() == "CAP"
+        )
+
+    @objc.IBAction
+    def editSelectedCaption_(self, _sender):
+        """Edit multiline caption text and placement without exposing escapes."""
+        indexes = self._selected_control_table_indexes()
+        if len(indexes) != 1:
+            return
+        index = indexes[0]
+        row = self.control_table_rows[index]
+        try:
+            directive = parse_caption_parameters(str(row.get("name", "")))
+        except CaptionSyntaxError:
+            directive = parse_caption_parameters("Caption")
+        accessory = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 460.0, 190.0))
+        vertical = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0.0, 160.0, 140.0, FIELD_HEIGHT), False)
+        vertical.addItemsWithTitles_(["Top", "Middle", "Bottom"])
+        vertical.selectItemWithTitle_(directive.vertical.title())
+        horizontal = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(150.0, 160.0, 140.0, FIELD_HEIGHT), False)
+        horizontal.addItemsWithTitles_(["Left", "Center", "Right"])
+        horizontal.selectItemWithTitle_(directive.horizontal.title())
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 460.0, 150.0))
+        scroll.setHasVerticalScroller_(True)
+        text_view = NSTextView.alloc().initWithFrame_(scroll.bounds())
+        text_view.setString_(directive.text)
+        text_view.setFont_(NSFont.systemFontOfSize_(14.0))
+        disable_field_editor_text_checking(text_view)
+        scroll.setDocumentView_(text_view)
+        accessory.addSubview_(vertical)
+        accessory.addSubview_(horizontal)
+        accessory.addSubview_(scroll)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Edit photo/video caption")
+        alert.setInformativeText_("The caption applies only to the immediately following enabled photo or video.")
+        alert.setAccessoryView_(accessory)
+        alert.addButtonWithTitle_("Apply")
+        alert.addButtonWithTitle_("Cancel")
+        if int(alert.runModal()) != 1000:
+            return
+        candidate = CaptionDirective(
+            str(text_view.string()),
+            str(vertical.titleOfSelectedItem()).casefold(),
+            str(horizontal.titleOfSelectedItem()).casefold(),
+        )
+        if not candidate.text.strip():
+            show_alert("Caption text cannot be empty.")
+            return
+        self._push_control_table_undo()
+        row["name"] = serialize_caption_parameters(candidate)
+        self._reload_control_table()
+        self._select_control_table_indexes([index])
+
+    def selectedControlRowsAreHidden(self):
+        indexes = self._selected_control_table_indexes()
+        return bool(indexes) and all(
+            0 <= index < len(self.control_table_rows)
+            and bool(self.control_table_rows[index].get("disabled"))
+            for index in indexes
+        )
+
+    @objc.IBAction
+    def toggleHiddenControlRows_(self, _sender):
+        """Hide or restore selected image/video rows without deleting them."""
+        media_indexes = [
+            index for index in self._selected_control_table_indexes()
+            if 0 <= index < len(self.control_table_rows)
+            and str(self.control_table_rows[index].get("type", "")).upper() in {"IMG", "VID"}
+        ]
+        if not media_indexes:
+            return
+        hide = not all(bool(self.control_table_rows[index].get("disabled")) for index in media_indexes)
+        self._push_control_table_undo()
+        for index in media_indexes:
+            self.control_table_rows[index]["disabled"] = hide
+        self._reload_control_table()
+        self._select_control_table_indexes(media_indexes)
+
     @objc.IBAction
     def startSlideShowFromSelectedControlRow_(self, _sender):
         """Launch the player once at the selected control-file model row."""
@@ -8673,6 +8863,20 @@ class GPXTrackerController(NSObject):
                 show_alert("Invalid #CONTROL directive.", str(exc))
                 return
             candidate["name"] = serialize_control_parameters(directive)
+        if str(candidate.get("type", "")).upper() == "CAP" and str(candidate.get("name", "")).strip():
+            try:
+                directive = parse_caption_parameters(str(candidate.get("name", "")))
+            except CaptionSyntaxError as exc:
+                show_alert("Invalid #CAPTION directive.", str(exc))
+                return
+            candidate["name"] = serialize_caption_parameters(directive)
+        if str(candidate.get("type", "")).upper() == "FNT" and str(candidate.get("name", "")).strip():
+            try:
+                directive = parse_font_parameters(str(candidate.get("name", "")))
+            except FontSyntaxError as exc:
+                show_alert("Invalid #FONT directive.", str(exc))
+                return
+            candidate["name"] = serialize_font_parameters(directive)
         self._push_control_table_undo()
         self.control_table_rows[row_index] = candidate
         if self.control_table_view is not None:
@@ -8681,6 +8885,8 @@ class GPXTrackerController(NSObject):
             self.performSelector_withObject_afterDelay_("showMusicDirectiveHelp:", None, 0.01)
         elif str(candidate.get("type", "")).upper() == "CTL":
             self.performSelector_withObject_afterDelay_("showControlDirectiveHelp:", None, 0.01)
+        elif str(candidate.get("type", "")).upper() in {"CAP", "FNT"}:
+            self.performSelector_withObject_afterDelay_("showCaptionDirectiveHelp:", None, 0.01)
         self.performSelector_withObject_afterDelay_(
             "reloadControlTableAfterEditing:",
             None,
@@ -8775,6 +8981,26 @@ class GPXTrackerController(NSObject):
             "#LABEL $CHAPTER2\n"
             "#DURATION 5, #TRANSITION FADE\n"
             "#GOTO $CHAPTER2"
+        )
+
+    def _caption_directive_help_content(self):
+        return (
+            "#CAPTION and #FONT commands\n\n"
+            "#CAPTION places text on the immediately following enabled photo or "
+            "video. The default position is bottom center. Video captions remain "
+            "visible for the complete video. Use \\n for a line break and double "
+            "quotes around text containing commas.\n\n"
+            "#TOP / #MIDDLE / #BOTTOM   vertical position\n"
+            "#LEFT / #CENTER / #RIGHT  horizontal alignment\n"
+            "#TEXT                     introduces text that resembles a command\n\n"
+            "Examples:\n"
+            "#CAPTION: A simple caption\n"
+            '#CAPTION: #TOP, #LEFT, "First line\\nSecond line"\n\n'
+            "#FONT changes subsequent captions and automatic headers. Values may "
+            "be changed independently.\n\n"
+            "#SIZE 36\n#STYLE REGULAR/BOLD/ITALIC/BOLD-ITALIC\n"
+            "#FAMILY Helvetica Neue\n#DEFAULT\n\n"
+            "Example:\n#FONT: #SIZE 36, #STYLE BOLD, #FAMILY Helvetica Neue"
         )
 
     def _position_music_directive_help_window(self, anchor_view=None):
@@ -8898,6 +9124,39 @@ class GPXTrackerController(NSObject):
         self.control_directive_help_text.setString_(self._control_directive_help_content())
         self._position_control_directive_help_window(_sender)
         self.control_directive_help_window.orderFront_(None)
+
+    @objc.IBAction
+    def showCaptionDirectiveHelp_(self, _sender):
+        """Raise the retained caption/font syntax reference."""
+        if self.caption_directive_help_window is None:
+            window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(260.0, 180.0, 410.0, 300.0),
+                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+                NSBackingStoreBuffered,
+                False,
+            )
+            window.setTitle_("Caption and Font Help")
+            window.setReleasedWhenClosed_(False)
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8.0, 8.0, 394.0, 284.0))
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            scroll.setHasVerticalScroller_(True)
+            text_view = NSTextView.alloc().initWithFrame_(scroll.bounds())
+            text_view.setEditable_(False)
+            text_view.setSelectable_(True)
+            text_view.setFont_(NSFont.systemFontOfSize_(13.0))
+            disable_field_editor_text_checking(text_view)
+            scroll.setDocumentView_(text_view)
+            window.contentView().addSubview_(scroll)
+            self.caption_directive_help_window = window
+            self.caption_directive_help_text = text_view
+        self.caption_directive_help_text.setString_(self._caption_directive_help_content())
+        saved = self.music_directive_help_window
+        self.music_directive_help_window = self.caption_directive_help_window
+        try:
+            self._position_music_directive_help_window(_sender)
+        finally:
+            self.music_directive_help_window = saved
+        self.caption_directive_help_window.orderFront_(None)
 
     @objc.IBAction
     def moveControlRowsUp_(self, _sender):
@@ -9126,6 +9385,8 @@ class GPXTrackerController(NSObject):
             self.music_directive_help_window.orderOut_(None)
         if self.control_directive_help_window is not None:
             self.control_directive_help_window.orderOut_(None)
+        if self.caption_directive_help_window is not None:
+            self.caption_directive_help_window.orderOut_(None)
 
     def _collect_media_candidates(self, paths, images_only=False):
         allowed = IMAGE_EXTENSIONS if images_only else MEDIA_EXTENSIONS
@@ -9933,6 +10194,29 @@ class GPXTrackerController(NSObject):
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
             return
+        detected_paths = sorted(
+            project_dir.glob("*.gpx"),
+            key=lambda path: path.name.casefold(),
+        )
+        if detected_paths:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Use GPX files found in this project?")
+            names = "\n".join(f"• {path.name}" for path in detected_paths)
+            alert.setInformativeText_(
+                f"The following GPX file(s) are selected by default:\n\n{names}\n\n"
+                "Use all of them, or open the file chooser to select a different set."
+            )
+            alert.addButtonWithTitle_(
+                "Use This File" if len(detected_paths) == 1 else "Use All Detected Files"
+            )
+            alert.addButtonWithTitle_("Choose Other Files")
+            alert.addButtonWithTitle_("Cancel")
+            detected_result = alert.runModal()
+            if detected_result == 1000:
+                self._use_selected_gpx_paths(detected_paths, project_dir)
+                return
+            if detected_result != 1001:
+                return
         panel = NSOpenPanel.openPanel()
         panel.setCanChooseFiles_(True)
         panel.setCanChooseDirectories_(False)
@@ -9945,21 +10229,39 @@ class GPXTrackerController(NSObject):
             if urls is None:
                 return
             selected_paths = [Path(str(url.path())).expanduser().resolve(strict=False) for url in urls]
-            if len(selected_paths) == 1:
-                adopted_path = self._adopt_single_gpx_path(selected_paths[0], show_errors=True)
-                if adopted_path is None:
-                    return
+            self._use_selected_gpx_paths(selected_paths, project_dir)
+
+    def _use_selected_gpx_paths(self, selected_paths, project_dir):
+        """Adopt one selected GPX or open all selected files for joining."""
+        selected_paths = list(
+            dict.fromkeys(
+                Path(path).expanduser().resolve(strict=False)
+                for path in selected_paths
+            )
+        )
+        if not selected_paths:
+            return
+        if len(selected_paths) == 1:
+            adopted_path = self._adopt_single_gpx_path(
+                selected_paths[0],
+                show_errors=True,
+            )
+            if adopted_path is not None:
                 self._accept_existing_project_gpx(adopted_path)
-            else:
-                target_name = self._gpx_field_basename()
-                if not target_name:
-                    default_path = self._default_gpx_path()
-                    target_name = default_path.name if default_path is not None else "project.gpx"
-                target_path = project_dir / Path(target_name).name
-                self._set_gpx_field_value(target_path.name, manual=True)
-                self._open_gpx_editor(input_paths=selected_paths, output_path=target_path.resolve(strict=False))
-                self.mark_dirty()
-                return
+            return
+        target_name = self._gpx_field_basename()
+        if not target_name:
+            default_path = self._default_gpx_path()
+            target_name = (
+                default_path.name if default_path is not None else "project.gpx"
+            )
+        target_path = project_dir / Path(target_name).name
+        self._set_gpx_field_value(target_path.name, manual=True)
+        self._open_gpx_editor(
+            input_paths=selected_paths,
+            output_path=target_path.resolve(strict=False),
+        )
+        self.mark_dirty()
 
     @objc.IBAction
     def openGPXFolder_(self, _sender):
@@ -11949,6 +12251,9 @@ class GPXTrackerController(NSObject):
                 self.set_status("Slide show is already running.")
             return
 
+        if not self._ensure_running_speed_sidecars_current(trackimages_dir):
+            return
+
         resume_position = (
             dict(transient_resume_position)
             if isinstance(transient_resume_position, dict)
@@ -11971,6 +12276,7 @@ class GPXTrackerController(NSObject):
                 else None
             )
         )
+
         if continue_previous and resume_position is None:
             show_alert(
                 "No saved slide-show position is available.",
@@ -12025,6 +12331,58 @@ class GPXTrackerController(NSObject):
             f"Started slide show with {style} as the initial style, "
             f"{control_file_path.name}, and trackdir {trackimages_dir}."
         )
+
+    def _ensure_running_speed_sidecars_current(self, trackimages_dir):
+        """Upgrade cheap derived speed JSON without changing any map image."""
+        gpx_path = self._current_single_gpx_path()
+        if gpx_path is None or not gpx_path.is_file():
+            return True
+        expected_window = float(self.parameters["gpx.running_speed_window_distance_m"])
+        expected_threshold = float(self.parameters["gpx.stationary_speed_threshold_kmh"])
+        track_sidecars = 0
+        needs_upgrade = False
+        for metadata_path in Path(trackimages_dir).glob("*.json"):
+            try:
+                metadata = read_plot_metadata(metadata_path)
+            except Exception:
+                continue
+            if not metadata.get("track_fingerprint") or "timed_track_points" not in metadata:
+                continue
+            track_sidecars += 1
+            speed = metadata.get("running_speed")
+            if not isinstance(speed, dict) or speed.get("version") != 1:
+                needs_upgrade = True
+                break
+            try:
+                if (
+                    not math.isclose(float(speed.get("window_distance_m")), expected_window)
+                    or not math.isclose(float(speed.get("stationary_threshold_kmh")), expected_threshold)
+                ):
+                    needs_upgrade = True
+                    break
+            except (TypeError, ValueError):
+                needs_upgrade = True
+                break
+        if track_sidecars == 0 or not needs_upgrade:
+            return True
+        self.set_status("Updating running-speed metadata in Track Map sidecars...")
+        try:
+            project_name = self._current_project_name() or gpx_path.stem
+            options = self._plot_common_options(project_name, Path(trackimages_dir))
+            # The upgrade API receives its destination positionally; plotting
+            # options carry the same value for rendering calls.
+            options.pop("output_dir", None)
+            report = upgrade_timed_track_sidecars(gpx_path, trackimages_dir, **options)
+        except Exception as exc:
+            show_alert(
+                "Could not update running-speed metadata.",
+                f"No map images were changed. {exc}",
+            )
+            return False
+        self.set_status(
+            f"Updated speed metadata for {len(report['updated'])} Track Map sidecar(s); no maps were regenerated."
+        )
+        return True
 
     @objc.IBAction
     def exportPdfSummary_(self, _sender):
@@ -12191,6 +12549,10 @@ class GPXTrackerController(NSObject):
             str(settings["slideshow.header_shadow_color"]),
             "--font-size",
             str(settings["slideshow.font_size"]),
+            "--font-family",
+            str(settings["slideshow.font_family"]),
+            "--font-style",
+            str(settings["slideshow.font_style"]),
             "--dot-color",
             str(settings["slideshow.marker_color"]),
             "--dot-size",
@@ -12223,6 +12585,8 @@ class GPXTrackerController(NSObject):
             str(settings["trackmaps.track_title"]),
             "--clock",
             "on" if settings["slideshow.clock"] else "off",
+            "--speedometer",
+            "on" if settings["slideshow.speedometer"] else "off",
             "--header-stage-name",
             "on" if settings["slideshow.header_stage_name"] else "off",
             "--header-track-details",
@@ -13150,6 +13514,8 @@ class GPXTrackerController(NSObject):
             "gpx_maximum_vertical_accuracy": values["gpx.maximum_vertical_accuracy_m"],
             "gpx_maximum_hdop": values["gpx.maximum_hdop"],
             "gpx_maximum_vdop": values["gpx.maximum_vdop"],
+            "gpx_running_speed_window_distance": values["gpx.running_speed_window_distance_m"],
+            "gpx_stationary_speed_threshold": values["gpx.stationary_speed_threshold_kmh"],
             "fallback_walking_speed_kmh": values["gpx.fallback_walking_speed_kmh"],
             "map_layout": "standard",
             "track_edge_margin_fraction": values["trackmaps.edge_margin_fraction"],
@@ -13550,7 +13916,14 @@ class GPXTrackerController(NSObject):
             return
         self.open_media_browser_window()
 
-    def _open_gpx_editor(self, input_paths=None, output_path=None, open_pdf_summary=False, project_name=None):
+    def _open_gpx_editor(
+        self,
+        input_paths=None,
+        output_path=None,
+        open_pdf_summary=False,
+        project_name=None,
+        confirm_generated_activation=False,
+    ):
         from GPXEditor import show_gpx_editor_from_cli_args
 
         if not open_pdf_summary and self.current_project_file is not None:
@@ -13588,19 +13961,21 @@ class GPXTrackerController(NSObject):
             return (str(candidate), int(stat.st_size), int(stat.st_mtime_ns))
 
         handled_gpx_identities = set()
+        generated_activation_confirmed = not bool(confirm_generated_activation)
         opening_path = self._current_single_gpx_path() or expected_output_path
         opening_identity = gpx_file_identity(opening_path)
         if opening_identity is not None:
             handled_gpx_identities.add(opening_identity)
 
         def handle_editor_output(returned_output_path, source="editor"):
+            nonlocal generated_activation_confirmed
             if returned_output_path is None:
-                return
+                return False
             returned_path = Path(returned_output_path).expanduser().resolve(strict=False)
             current_path = self._current_single_gpx_path()
             if source == "save" and current_path is not None and returned_path != current_path.resolve(strict=False):
                 self.set_status(f"GPXEditor saved {returned_path.name}; will confirm active GPX file when the editor closes.")
-                return
+                return False
             if source == "close" and current_path is not None and returned_path != current_path.resolve(strict=False):
                 if not confirm_alert(
                     "Use the GPX file saved by the editor?",
@@ -13609,17 +13984,33 @@ class GPXTrackerController(NSObject):
                     "Keep Current",
                 ):
                     self.set_status(f"Continuing with {current_path.name}.")
-                    return
+                    return False
             if returned_path.exists() and self.current_project_dir is not None and returned_path.parent != self.current_project_dir.resolve(strict=False):
                 adopted_path = self._adopt_single_gpx_path(returned_path, show_errors=True, target_basename=returned_path.name)
                 if adopted_path is None:
-                    return
+                    return False
                 returned_path = adopted_path
             returned_identity = gpx_file_identity(returned_path)
             if returned_identity is not None and returned_identity in handled_gpx_identities:
                 if source == "close":
                     self.set_status(f"GPXEditor closed without new changes to {returned_path.name}.")
-                return
+                return False
+            if (
+                source == "save"
+                and not generated_activation_confirmed
+                and not confirm_alert(
+                    "Use the generated photo tracks for this Adventure?",
+                    "The generated GPX has been saved. Make it the active journey source "
+                    "for maps, control-file updates, and slide shows?",
+                    "Use Generated GPX",
+                    "Keep Current Source",
+                )
+            ):
+                self.set_status(
+                    f"Saved {returned_path.name}, but kept the current Adventure journey source."
+                )
+                return False
+            generated_activation_confirmed = True
             self._set_gpx_field_value(returned_path.name, manual=not self._is_default_gpx_path(returned_path))
             self.mark_dirty()
             self._refresh_project_file_menus()
@@ -13632,7 +14023,7 @@ class GPXTrackerController(NSObject):
                 except (OSError, RuntimeError, ValueError) as exc:
                     show_alert("Could not reload the GPX file after editing.", str(exc))
                     self.set_status("GPX file handling failed.")
-                    return
+                    return False
                 refreshed_identity = gpx_file_identity(returned_path)
                 if refreshed_identity is not None:
                     handled_gpx_identities.add(refreshed_identity)
@@ -13644,14 +14035,19 @@ class GPXTrackerController(NSObject):
             else:
                 suffix = f"; updated {summary_path.name}" if summary_path is not None else ""
                 self.set_status(f"Continuing with {returned_path}{suffix}")
+            return True
 
         def handle_editor_close(returned_output_path):
             self.gpx_editor_controller = None
             handle_editor_output(returned_output_path, source="close")
 
         def handle_editor_save(returned_output_path):
-            handle_editor_output(returned_output_path, source="save")
-            if returned_output_path is not None and Path(returned_output_path).is_file():
+            activated = handle_editor_output(returned_output_path, source="save")
+            if (
+                activated
+                and returned_output_path is not None
+                and Path(returned_output_path).is_file()
+            ):
                 self._select_gpx_journey_source()
                 self.gpx_ready_cache = True
                 self.mark_dirty(immediate=True)
@@ -13813,6 +14209,75 @@ class GPXTrackerController(NSObject):
         self.mark_dirty()
         self._open_gpx_editor(input_paths=existing_inputs, output_path=output_path)
 
+    @objc.IBAction
+    def createTracksFromPhotos_(self, _sender):
+        from media_track_builder import build_media_tracks, write_media_gpx
+
+        project_dir = self._resolve_project_directory(
+            allow_create=False,
+            update_gpx_field=False,
+        )
+        if project_dir is None:
+            show_alert("Please choose a project directory first.")
+            return
+        media_paths = [Path(item["path"]) for item in self.project_media_items()]
+        if not media_paths:
+            show_alert(
+                "No project photos or videos are available.",
+                "Import or accept media before creating a photo-derived GPX track.",
+            )
+            return
+        current_gpx = self._current_single_gpx_path()
+        if current_gpx is not None and current_gpx.is_file():
+            if not confirm_alert(
+                "Add photo-derived tracks to the existing GPX?",
+                f"The generated stage tracks will be appended in GPX Editor to:\n"
+                f"{current_gpx.name}\n\nNothing is changed until you save.",
+                "Open Together",
+                "Cancel",
+            ):
+                return
+        spacing = float(self.parameters.get("gpx.minimum_point_spacing_m", 10.0))
+        self.set_status(f"Creating estimated tracks from {len(media_paths)} media file(s)...")
+        try:
+            result = build_media_tracks(
+                media_paths,
+                control_path=self._control_file_path(),
+                minimum_spacing_m=spacing,
+                refresh_metadata=True,
+            )
+        except Exception as exc:
+            show_alert("Could not create photo tracks.", str(exc))
+            self.set_status("Photo-track creation failed.")
+            return
+        if not result.tracks:
+            details = "\n".join(result.skipped_media[:12])
+            show_alert(
+                "No photo track could be created.",
+                details or "The project media contain no usable GPS coordinates.",
+            )
+            return
+        temporary = Path(tempfile.gettempdir()) / (
+            f"myCamino-photo-tracks-{os.getpid()}-{time.time_ns()}.gpx"
+        )
+        write_media_gpx(temporary, result, PROGRAM_TITLE)
+        default_output = self._default_gpx_path()
+        if default_output is None:
+            default_output = project_dir / f"{self._current_project_name() or project_dir.name}.gpx"
+        inputs = ([current_gpx] if current_gpx is not None and current_gpx.is_file() else [])
+        inputs.append(temporary)
+        controller = self._open_gpx_editor(
+            input_paths=inputs,
+            output_path=current_gpx if current_gpx is not None else default_output,
+            project_name=self._current_project_name(),
+            confirm_generated_activation=current_gpx is None,
+        )
+        if controller is not None:
+            self.set_status(
+                f"Opened {len(result.tracks)} estimated photo track(s) in GPX Editor; "
+                f"reused {result.reused_sidecars}, refreshed {result.refreshed_sidecars} sidecar(s)."
+            )
+
     def controlTextDidEndEditing_(self, notification):
         field = notification.object()
         if field is self.project_dir_field:
@@ -13958,6 +14423,14 @@ class GPXTrackerController(NSObject):
                 pass
             self.control_directive_help_window = None
             self.control_directive_help_text = None
+        if self.caption_directive_help_window is not None:
+            try:
+                self.caption_directive_help_window.orderOut_(None)
+                self.caption_directive_help_window.close()
+            except Exception:
+                pass
+            self.caption_directive_help_window = None
+            self.caption_directive_help_text = None
         if self.main_help_window is not None:
             try:
                 self.main_help_window.orderOut_(None)

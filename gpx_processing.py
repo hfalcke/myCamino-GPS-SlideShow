@@ -17,6 +17,8 @@ from typing import Iterable
 GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
 GPX_NS = {"gpx": GPX_NAMESPACE}
 EARTH_RADIUS_KM = 6371.0088
+DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M = 500.0
+DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH = 1.5
 
 HORIZONTAL_ACCURACY_NAMES = {
     "accuracy",
@@ -49,6 +51,8 @@ class ProcessingOptions:
     maximum_vertical_accuracy_m: float = 20.0
     maximum_hdop: float = 20.0
     maximum_vdop: float = 20.0
+    running_speed_window_distance_m: float = DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M
+    stationary_speed_threshold_kmh: float = DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH
 
     def normalized(self) -> "ProcessingOptions":
         return ProcessingOptions(
@@ -59,6 +63,8 @@ class ProcessingOptions:
             maximum_vertical_accuracy_m=max(0.0, float(self.maximum_vertical_accuracy_m)),
             maximum_hdop=max(0.0, float(self.maximum_hdop)),
             maximum_vdop=max(0.0, float(self.maximum_vdop)),
+            running_speed_window_distance_m=max(0.0, float(self.running_speed_window_distance_m)),
+            stationary_speed_threshold_kmh=max(0.0, float(self.stationary_speed_threshold_kmh)),
         )
 
     def as_dict(self) -> dict[str, float]:
@@ -70,6 +76,8 @@ class ProcessingOptions:
             "maximum_vertical_accuracy_m": self.maximum_vertical_accuracy_m,
             "maximum_hdop": self.maximum_hdop,
             "maximum_vdop": self.maximum_vdop,
+            "running_speed_window_distance_m": self.running_speed_window_distance_m,
+            "stationary_speed_threshold_kmh": self.stationary_speed_threshold_kmh,
         }
 
 
@@ -115,6 +123,7 @@ class ProcessedPoint:
     pdop: float | None = None
     satellites: int | None = None
     fix: str | None = None
+    running_speed_kmh: float | None = None
 
     def as_record(self) -> dict:
         return {
@@ -136,6 +145,7 @@ class ProcessedPoint:
             "pdop": self.pdop,
             "satellites": self.satellites,
             "fix": self.fix,
+            "running_speed_kmh": self.running_speed_kmh,
         }
 
 
@@ -162,6 +172,8 @@ class ProcessedTrack:
     duration: timedelta | None
     rejection_counts: dict[str, dict[str, int]]
     options: ProcessingOptions
+    moving_average_speed_kmh: float | None = None
+    maximum_running_speed_kmh: float | None = None
 
     @property
     def first_point(self) -> ProcessedPoint | None:
@@ -391,6 +403,20 @@ def process_raw_points(
         total_ascent += segment.ascent_m
         total_descent += segment.descent_m
 
+    moving_distance_km = 0.0
+    moving_seconds = 0.0
+    maximum_running_speed_kmh = None
+    for segment in segments:
+        segment_distance, segment_seconds = _assign_running_speeds(segment.points, normalized)
+        moving_distance_km += segment_distance
+        moving_seconds += segment_seconds
+        for point in segment.points:
+            if point.running_speed_kmh is not None:
+                maximum_running_speed_kmh = max(
+                    maximum_running_speed_kmh or 0.0,
+                    point.running_speed_kmh,
+                )
+
     times = [point.time for point in copied if point.time is not None]
     start_time = min(times) if times else None
     end_time = max(times) if times else None
@@ -413,7 +439,104 @@ def process_raw_points(
         duration=duration,
         rejection_counts=rejection_counts,
         options=normalized,
+        moving_average_speed_kmh=(
+            moving_distance_km / (moving_seconds / 3600.0)
+            if moving_seconds > 0.0
+            else None
+        ),
+        maximum_running_speed_kmh=maximum_running_speed_kmh,
     )
+
+
+def _assign_running_speeds(
+    points: list[ProcessedPoint],
+    options: ProcessingOptions,
+) -> tuple[float, float]:
+    """Assign distance-window speeds using only recorded timestamp anchors."""
+    if len(points) < 2:
+        return 0.0, 0.0
+    times: list[datetime | None] = [None] * len(points)
+    anchors = [index for index, point in enumerate(points) if point.time is not None]
+    for left, right in zip(anchors, anchors[1:]):
+        left_time, right_time = points[left].time, points[right].time
+        if left_time is None or right_time is None or right_time <= left_time:
+            continue
+        distance = points[right].segment_distance_km - points[left].segment_distance_km
+        if distance <= 0.0:
+            continue
+        for index in range(left, right + 1):
+            fraction = (
+                points[index].segment_distance_km - points[left].segment_distance_km
+            ) / distance
+            times[index] = left_time + (right_time - left_time) * fraction
+
+    intervals = []
+    moving_distance_km = 0.0
+    moving_seconds = 0.0
+    threshold = options.stationary_speed_threshold_kmh
+    for index in range(len(points) - 1):
+        start_time, end_time = times[index], times[index + 1]
+        distance = points[index + 1].segment_distance_km - points[index].segment_distance_km
+        if start_time is None or end_time is None or distance <= 0.0:
+            intervals.append(None)
+            continue
+        seconds = (end_time - start_time).total_seconds()
+        if seconds <= 0.0:
+            intervals.append(None)
+            continue
+        speed = distance / (seconds / 3600.0)
+        intervals.append((distance, seconds, speed))
+        if speed >= threshold:
+            moving_distance_km += distance
+            moving_seconds += seconds
+
+    half_window_km = options.running_speed_window_distance_m / 2000.0
+    for point_index, point in enumerate(points):
+        if times[point_index] is None:
+            continue
+        if half_window_km <= 0.0:
+            candidates = [
+                interval
+                for interval in (
+                    intervals[point_index - 1] if point_index > 0 else None,
+                    intervals[point_index] if point_index < len(intervals) else None,
+                )
+                if interval is not None and interval[2] >= threshold
+            ]
+            if candidates:
+                distance = sum(item[0] for item in candidates)
+                seconds = sum(item[1] for item in candidates)
+                point.running_speed_kmh = distance / (seconds / 3600.0)
+            continue
+
+        center = point.segment_distance_km
+        window_start = max(points[0].segment_distance_km, center - half_window_km)
+        window_end = min(points[-1].segment_distance_km, center + half_window_km)
+        selected_distance = 0.0
+        selected_seconds = 0.0
+        all_distance = 0.0
+        all_seconds = 0.0
+        for index, interval in enumerate(intervals):
+            if interval is None:
+                continue
+            interval_start = points[index].segment_distance_km
+            interval_end = points[index + 1].segment_distance_km
+            overlap = min(window_end, interval_end) - max(window_start, interval_start)
+            if overlap <= 0.0:
+                continue
+            fraction = overlap / interval[0]
+            seconds = interval[1] * fraction
+            all_distance += overlap
+            all_seconds += seconds
+            if interval[2] >= threshold:
+                selected_distance += overlap
+                selected_seconds += seconds
+        if selected_seconds > 0.0:
+            point.running_speed_kmh = selected_distance / (selected_seconds / 3600.0)
+        elif all_seconds > 0.0:
+            # A completely stationary local window still receives its endpoint speed.
+            point.running_speed_kmh = all_distance / (all_seconds / 3600.0)
+    return moving_distance_km, moving_seconds
 
 
 def elevation_gain_loss(

@@ -1,5 +1,25 @@
 # myCamino GPS Track Show Programmer Guide
 
+## Media-Derived Tracks and Planning
+
+`media_track_builder.py` is the shared non-GUI pipeline for creating estimated
+GPX tracks from media. It validates extension-aware sidecars, selectively calls
+the existing metadata extractor, groups media by control-file stage or local
+date, applies endpoint-preserving point spacing, and writes canonical GPX 1.1.
+Generated tracks carry a `mycamino:trackOrigin` extension with
+`kind="media-derived"` and `estimated="true"`. `gpx_tracks_table.py` reports
+their `source_structure` as `media`.
+
+`gpx_point_editing.py` contains segment-aware XML operations used by the point
+table and Track Map: Web Mercator interpolation/extrapolation, insertion,
+clipboard serialization, deletion, and same-segment movement. UI code should
+use these helpers rather than duplicating GPX child-order or boundary logic.
+
+`gpx_routing.py` defines the deliberately small future routing-provider
+boundary. A future Valhalla, OSRM, or openrouteservice implementation returns
+candidate points; it must not mutate editor XML directly. No external routing
+server or API dependency is introduced in the current release.
+
 ## Licensing and release artifacts
 
 Original project content is GPL-3.0-or-later, copyright 2026 Heino Falcke.
@@ -46,8 +66,8 @@ The active source files are:
   tile-request handling.
 - `audio_playlist.py`: recursive audio discovery, `$`-label playlist
   parsing/generation/update, album membership, and pure transport progression.
-- `slideshow_control_format.py`: strict CSV-style `#MUSIC:` and `#CONTROL:`
-  parsing and command normalization.
+- `slideshow_control_format.py`: strict CSV-style `#MUSIC:`, `#CONTROL:`,
+  `#CAPTION:`, and `#FONT:` parsing, disabled-line handling, and normalization.
 - `video_audio_normalization.py`: generated-directory exclusion, FFmpeg
   discovery, two-pass loudness normalization, atomic manifests, freshness
   checks, and runtime normalized-video resolution.
@@ -296,6 +316,13 @@ still equal their old defaults.
 
 ## Shared GPX Processing
 
+`gpx_import.py` is the common document-level importer. It accepts GPX 1.0 and
+1.1 core namespaces plus namespace-free documents that declare one of those
+versions. It normalizes core elements to GPX 1.1, converts routes into tracks,
+and converts waypoint-only documents into one ordered track. Extension
+namespaces remain unchanged. Invalid coordinates are removed, but absent,
+malformed, or backward timestamps never remove valid geometry.
+
 `gpx_processing.py` is the single source for GPX geometry and quality metrics.
 It defines `ProcessingOptions`, `RawTrackPoint`, `ProcessedPoint`,
 `ProcessedSegment`, and `ProcessedTrack`. The processor keeps `<trkseg>`
@@ -303,6 +330,10 @@ boundaries, filters horizontal and vertical quality independently, smooths XY
 and elevation over separate route-distance kernels, applies retained-point
 spacing, interpolates missing/rejected elevations only between valid anchors,
 and computes length/ascent/descent from the resulting geometry.
+It also derives a distance-centered running speed from intervals bounded by
+recorded timestamps. Speeds below the stationary threshold are excluded from
+the whole-track moving average; no speed is extrapolated beyond recorded time
+anchors.
 
 Consumers must not recalculate point-to-point geometry independently.
 `GPXEditor.py`, `gpx_tracks_table.py`, `gpxlist.py`, `track_timing_utils.py`,
@@ -317,8 +348,10 @@ Summary and map sidecars record processing options, raw/retained counts,
 rejection counts, segment-preserving geometry, processed elevation, and timed
 points. Retained point records also preserve explicit horizontal/vertical
 uncertainty, HDOP, VDOP, PDOP, satellite count, and fix type when present; PDOP,
-satellites, and fix are metadata only in this version. Every processing option is also part of GUI freshness signatures, so
-changing a threshold or kernel marks summaries and generated maps as stale.
+satellites, and fix are metadata only in this version. Geometry parameters are
+part of map freshness signatures. Running-speed window and stationary-threshold
+changes are intentionally sidecar-only: `upgrade_timed_track_sidecars(...)`
+updates `timed_track_points` and `running_speed` JSON without touching PNG maps.
 
 When a project directory is selected, the GUI creates it if needed, discovers
 all valid `.adv` files, and loads the newest one. Adventure, GPX, and control
@@ -592,14 +625,21 @@ Supported line types:
 - `#MUSIC: command, target, ...`: ordered non-display music transport commands.
 - `#CONTROL: command, ...`: ordered non-display slide-show timing, style,
   label, jump, pause, and end commands.
+- `#CAPTION: command, ..., text`: a retained visual caption for the immediately
+  following enabled image or video.
+- `#FONT: command, ...`: persistent partial caption/header font changes or
+  `#DEFAULT`.
+- `# original line`: a disabled line retained for later restoration.
 
 Media lines have exactly the normal filename/time/GPS/place fields; directives
 are never attached to another row. The shared parsers use strict CSV quoting,
 normalize case-insensitive `$LABEL` references, and reject malformed command
 syntax. `#CONTROL` labels are indexed once; duplicate labels warn and the first
 definition wins in direct-player launches. GetGeoLocations merge/sync and
-Adventure rename/copy keep `#MUSIC:` and `#CONTROL:` entries as ordinary
-ordered directives and never interpret their payload as a map path.
+Adventure rename/copy and control-file maintenance preserve disabled rows and
+all four directive families without interpreting their payload as a map path.
+The player precomputes caption targets and font state by model row so Start
+Here, resume, jumps, backward navigation, and Time-Lapse use identical state.
 
 The control-table window intercepts Command- and Control-C/X/V before row
 commands and sends them to the shared field editor whenever a cell is actively
@@ -776,6 +816,10 @@ one map directive and its following media rows until the next map directive. The
 map is rendered by a retained `TimeLapseMapView`; the overview is drawn in the
 map role with the complete active route and current position. This avoids
 allocating a new full-screen image for every 20 ms animation tick.
+When recorded timing provides running speeds, a retained analog speedometer
+interpolates `running_speed_kmh` beside the clock. Its scale is selected from
+the current track maximum, rounded upward to a readable value of at least
+7 km/h; the needle takes one second to traverse the complete scale.
 
 GPX-backed stages optionally begin with an elevation-profile inset. The player
 reads `processed_track_segments` from the selected Track Map sidecar, so it
@@ -961,15 +1005,19 @@ rows to their owning map, but starts non-display directives such as `#Datum:`,
 `track_timing_utils.py` is the single timestamp-repair policy shared by the
 GPX editor, `gpx_tracks_table.py`, and the player. It preserves usable GPX
 times, interpolates missing intervals by cumulative distance, and falls back to
-3.5 km/h when a duration cannot be derived. It returns repaired in-memory
+3.5 km/h when a duration cannot be derived. Completely untimed tracks retain
+`time=None` and receive monotonic `elapsed_seconds`; the routine must never use
+the current time as a fabricated absolute anchor. It returns repaired in-memory
 values only. GPX files are changed only by an explicit GPX Editor save.
 
 Track-map sidecars include `timed_track_points`, an ordered list of latitude,
-longitude, ISO timestamp, estimated-time flag, elevation in metres, and
-cumulative stage distance in kilometres. Automatic and manual Map Generation
-write this complete payload as part of normal map generation. The player stays
-read-only and can calculate distance-based timing in memory when imported map
-metadata does not contain timed points.
+longitude, elapsed seconds, optional ISO timestamp, absolute-time flag,
+estimated-time flag, elevation in metres, segment identity, and cumulative
+stage distance. Summaries carry `timing_status` and `has_absolute_time`.
+Calendar-based media assignment, track-time GPS inference, and adjacent-day
+classification must skip untimed tracks. Control-file creation still emits
+their map stages and orders each beside the preceding dated track from its
+original GPX sequence.
 
 The Adventure settings window now persists the global slide-show parameters in
 `.adv` files: media and stage durations, time-lapse media minimum size,
