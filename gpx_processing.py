@@ -371,6 +371,20 @@ def processed_track_geometry_fingerprint(processed: ProcessedTrack) -> str:
     )
 
 
+def raw_track_geometry_fingerprint(track_element: ET.Element) -> str:
+    """Hash raw segment-preserving coordinates without track metadata or timing."""
+    segments = []
+    for segment in track_element.findall(f"{{{GPX_NAMESPACE}}}trkseg"):
+        points = []
+        for point in segment.findall(f"{{{GPX_NAMESPACE}}}trkpt"):
+            try:
+                points.append((float(point.attrib["lat"]), float(point.attrib["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        segments.append(points)
+    return geometry_fingerprint_from_segments(segments)
+
+
 def processed_track_data_fingerprint(processed: ProcessedTrack) -> str:
     """Hash processed geometry, elevation, timing, and segment boundaries."""
     return data_fingerprint_from_segments(segment.points for segment in processed.segments)

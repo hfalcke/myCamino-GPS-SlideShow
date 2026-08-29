@@ -64,6 +64,25 @@ def web_mercator_to_lonlat(x_coord: float, y_coord: float) -> tuple[float, float
     return longitude, latitude
 
 
+def translate_points_web_mercator(
+    points: list[ET.Element],
+    original_coordinates: list[tuple[float, float]],
+    delta_x_m: float,
+    delta_y_m: float,
+) -> None:
+    """Translate points together in Web Mercator while preserving their metadata."""
+    if len(points) != len(original_coordinates):
+        raise ValueError("Point and coordinate counts do not match.")
+    for point, (longitude, latitude) in zip(points, original_coordinates):
+        x_coord, y_coord = lonlat_to_web_mercator(longitude, latitude)
+        moved_lon, moved_lat = web_mercator_to_lonlat(
+            x_coord + float(delta_x_m),
+            y_coord + float(delta_y_m),
+        )
+        point.set("lat", f"{moved_lat:.8f}")
+        point.set("lon", f"{moved_lon:.8f}")
+
+
 def _direct_child(point: ET.Element, name: str) -> ET.Element | None:
     return next(
         (child for child in list(point) if local_name(child.tag) == name),
@@ -185,6 +204,70 @@ def insert_point_for_rows(
         if candidate is point
     )
     return point, new_row
+
+
+def cut_segment_after_row(track: ET.Element, row: int) -> tuple[int, int]:
+    """Break the route after a point without creating a second track.
+
+    Returns the zero-based indexes of the old and newly created GPX segments.
+    """
+    locations = point_locations(track)
+    if row < 0 or row >= len(locations) - 1:
+        raise ValueError("The cut must leave a waypoint on both sides.")
+    _point, segment, local_index = locations[row]
+    next_point, next_segment, _next_local_index = locations[row + 1]
+    if next_segment is not segment:
+        raise ValueError("The track is already cut at this location.")
+    points = segment_points(segment)
+    if local_index >= len(points) - 1:
+        raise ValueError("The track is already cut at this location.")
+
+    segments = track_segments(track)
+    segment_index = segments.index(segment)
+    new_segment = ET.Element(qualified_like(segment, "trkseg"))
+    move_points = points[local_index + 1 :]
+    for point in move_points:
+        segment.remove(point)
+        new_segment.append(point)
+
+    children = list(track)
+    insertion_index = children.index(segment) + 1
+    track.insert(insertion_index, new_segment)
+    if next_point not in segment_points(new_segment):
+        raise ValueError("Could not preserve the first point after the cut.")
+    return segment_index, segment_index + 1
+
+
+def joinable_segment_boundary(track: ET.Element, row: int) -> tuple[int, int] | None:
+    """Return adjacent segment indexes when row touches an internal boundary."""
+    locations = point_locations(track)
+    if row < 0 or row >= len(locations):
+        return None
+    _point, segment, local_index = locations[row]
+    segments = track_segments(track)
+    segment_index = segments.index(segment)
+    points = segment_points(segment)
+    if local_index == len(points) - 1 and segment_index + 1 < len(segments):
+        return segment_index, segment_index + 1
+    if local_index == 0 and segment_index > 0:
+        return segment_index - 1, segment_index
+    return None
+
+
+def join_segments_at_row(track: ET.Element, row: int) -> tuple[int, int]:
+    """Remove the segment break adjacent to a selected endpoint."""
+    boundary = joinable_segment_boundary(track, row)
+    if boundary is None:
+        raise ValueError("Select an endpoint next to a cut track connection.")
+    first_index, second_index = boundary
+    segments = track_segments(track)
+    first = segments[first_index]
+    second = segments[second_index]
+    for child in list(second):
+        second.remove(child)
+        first.append(child)
+    track.remove(second)
+    return boundary
 
 
 def serialized_points(points: list[ET.Element]) -> str:

@@ -599,6 +599,8 @@ class WindowTarget:
     transition: Transition
     clock_time: Optional[tuple[int, int]] = None
     clock_date_text: Optional[str] = None
+    running_speed_kmh: Optional[float] = None
+    speedometer_maximum_kmh: Optional[float] = None
     place_text: Optional[str] = None
     info_text: Optional[str] = None
     photo_identity: Optional[str] = None
@@ -1821,6 +1823,25 @@ def time_lapse_clock_layout(
     ), clock_size
 
 
+def speedometer_layout(
+    image_rect: tuple[float, float, float, float],
+    metadata: Optional[dict],
+    has_date: bool,
+) -> tuple[tuple[float, float, float, float], float]:
+    """Place a clock-sized gauge beside the clock with room for its value."""
+    clock_frame, clock_size = time_lapse_clock_layout(image_rect, metadata, has_date)
+    dial_size = max(20.0, float(clock_size))
+    frame_width = dial_size * 1.18
+    frame_height = dial_size * 1.24
+    margin = max(2.0, dial_size * 0.05)
+    frame_x = clock_frame[0] + clock_frame[2] + margin
+    # Align the dial center, rather than the taller value-bearing view, to the clock.
+    frame_y = clock_frame[1] + clock_size / 2.0 - (frame_height - dial_size / 2.0)
+    image_x, _image_y, image_width, _image_height = image_rect
+    frame_x = min(frame_x, image_x + image_width - margin - frame_width)
+    return (frame_x, frame_y, frame_width, frame_height), dial_size
+
+
 def runtime_header_band(
     image_rect: tuple[float, float, float, float],
     metadata: Optional[dict],
@@ -2281,16 +2302,15 @@ def format_time_lapse_metrics(total_km: float, stage_km: float, elevation_m: Opt
     )
 
 
-def photo_track_metrics(
+def photo_track_state(
     metadata: Optional[dict],
     latitude: Optional[float],
     longitude: Optional[float],
-    distance_before_stage_km: float,
     media_datetime: Optional[datetime] = None,
-) -> tuple[str, ...]:
-    """Return Time-Lapse-equivalent statistics at a photograph position."""
+) -> Optional[dict]:
+    """Return the timed-track state best matching one Standard-mode medium."""
     if not isinstance(metadata, dict):
-        return ()
+        return None
     points = metadata.get("timed_track_points")
     candidates: list[dict] = []
     for point in points if isinstance(points, list) else ():
@@ -2306,6 +2326,7 @@ def photo_track_metrics(
             "lon": point_lon,
             "stage_km": max(0.0, stage_km),
             "elevation_m": safe_float(point.get("elevation_m", point.get("elevation"))),
+            "running_speed_kmh": safe_float(point.get("running_speed_kmh")),
             "time": parse_iso_datetime(point.get("time_iso", point.get("time"))),
         })
     selected = None
@@ -2333,6 +2354,20 @@ def photo_track_metrics(
         )
     if selected is None and candidates:
         selected = candidates[-1]
+    return selected
+
+
+def photo_track_metrics(
+    metadata: Optional[dict],
+    latitude: Optional[float],
+    longitude: Optional[float],
+    distance_before_stage_km: float,
+    media_datetime: Optional[datetime] = None,
+) -> tuple[str, ...]:
+    """Return Time-Lapse-equivalent statistics at a photograph position."""
+    if not isinstance(metadata, dict):
+        return ()
+    selected = photo_track_state(metadata, latitude, longitude, media_datetime)
     if selected is None:
         stage_km = track_length_from_metadata(metadata)
         if stage_km <= 0.0:
@@ -2346,6 +2381,32 @@ def photo_track_metrics(
         stage_km,
         elevation_m,
     )
+
+
+def photo_track_speedometer(
+    metadata: Optional[dict],
+    latitude: Optional[float],
+    longitude: Optional[float],
+    media_datetime: Optional[datetime] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    """Return the Standard-mode running speed and the stage's dial maximum."""
+    selected = photo_track_state(metadata, latitude, longitude, media_datetime)
+    speed = safe_float(selected.get("running_speed_kmh")) if selected is not None else None
+    if speed is None:
+        return None, None
+    running = metadata.get("running_speed", {}) if isinstance(metadata, dict) else {}
+    maximum = safe_float(running.get("maximum_running_speed_kmh")) if isinstance(running, dict) else None
+    if maximum is None and isinstance(metadata, dict):
+        points = metadata.get("timed_track_points")
+        maximum = max(
+            (
+                safe_float(point.get("running_speed_kmh")) or 0.0
+                for point in (points if isinstance(points, list) else ())
+                if isinstance(point, dict)
+            ),
+            default=0.0,
+        )
+    return speed, nice_speedometer_maximum(maximum)
 
 
 def track_length_from_metadata(metadata: Optional[dict]) -> float:
@@ -2595,7 +2656,7 @@ if APPKIT_AVAILABLE:
         def drawRect_(self, _dirty_rect):
             bounds = self.bounds()
             width, height = float(bounds.size.width), float(bounds.size.height)
-            size = min(width, height * 0.78)
+            size = min(width / 1.18, height / 1.24)
             if size <= 4.0:
                 return
             center = (width / 2.0, height - size / 2.0)
@@ -2838,14 +2899,12 @@ if APPKIT_AVAILABLE:
                 self.speedometer_view.setHidden_(True)
                 return
             image_rect = self.headerReferenceRect()
-            clock_frame, clock_size = time_lapse_clock_layout(
+            frame, _dial_size = speedometer_layout(
                 (float(image_rect.origin.x), float(image_rect.origin.y), float(image_rect.size.width), float(image_rect.size.height)),
                 self.map_metadata,
                 True,
             )
-            gauge_size = max(36.0, clock_size * 0.82)
-            margin = max(2.0, gauge_size * 0.05)
-            self.speedometer_view.setFrame_(NSMakeRect(clock_frame[0] + clock_frame[2] + margin, clock_frame[1] + (clock_frame[3] - gauge_size) / 2.0, gauge_size, gauge_size))
+            self.speedometer_view.setFrame_(NSMakeRect(*frame))
             self.speedometer_view.setSpeed_maximum_(speed, maximum)
             self.speedometer_view.setHidden_(False)
 
@@ -6149,6 +6208,9 @@ class CocoaImagePresenter:
         self.help_visible = False
         self.clock_time: Optional[tuple[int, int]] = None
         self.clock_date_text: Optional[str] = None
+        self.running_speed_kmh: Optional[float] = None
+        self.speedometer_maximum_kmh: Optional[float] = None
+        self.speedometer_visible = False
         self.header_metadata: Optional[dict] = None
         self.header_lines: tuple[str, ...] = ()
         self.header_metrics: tuple[str, ...] = ()
@@ -6190,6 +6252,8 @@ class CocoaImagePresenter:
         self.overlay_view = self._make_image_view(host_view.bounds())
         self.header_view = self._make_image_view(host_view.bounds())
         self.clock_view = self._make_image_view(host_view.bounds())
+        self.speedometer_view = SpeedometerView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
+        self.speedometer_view.setHidden_(True)
         self.place_view = self._make_image_view(host_view.bounds())
         self.caption_view = self._make_image_view(host_view.bounds())
         self.info_view = self._make_image_view(host_view.bounds())
@@ -6208,6 +6272,7 @@ class CocoaImagePresenter:
         host_view.addSubview_(self.overlay_view)
         host_view.addSubview_(self.header_view)
         host_view.addSubview_(self.clock_view)
+        host_view.addSubview_(self.speedometer_view)
         host_view.addSubview_(self.place_view)
         host_view.addSubview_(self.caption_view)
         host_view.addSubview_(self.info_view)
@@ -6252,6 +6317,9 @@ class CocoaImagePresenter:
             self.fade_view,
         ):
             view.setHidden_(hidden)
+        self.speedometer_view.setHidden_(
+            hidden or not self.speedometer_visible or self.running_speed_kmh is None
+        )
         if self.video_view is not None:
             self.video_view.setHidden_(hidden)
 
@@ -6263,6 +6331,7 @@ class CocoaImagePresenter:
             "overlay_view",
             "header_view",
             "clock_view",
+            "speedometer_view",
             "place_view",
             "caption_view",
             "info_view",
@@ -6311,6 +6380,7 @@ class CocoaImagePresenter:
             self.overlay_view,
             self.header_view,
             self.clock_view,
+            self.speedometer_view,
             self.place_view,
             self.caption_view,
             self.info_view,
@@ -6558,6 +6628,34 @@ class CocoaImagePresenter:
         )
         self.clock_view.setAlphaValue_(1.0)
 
+    def set_speedometer(
+        self,
+        speed: Optional[float],
+        maximum: Optional[float],
+        visible: bool,
+    ) -> None:
+        """Show a clock-sized retained running-speed gauge in Standard mode."""
+        self.running_speed_kmh = speed
+        self.speedometer_maximum_kmh = maximum
+        self.speedometer_visible = bool(visible)
+        if not visible or speed is None:
+            self.speedometer_view.setHidden_(True)
+            return
+        reference = self._header_reference_rect()
+        frame, _dial_size = speedometer_layout(
+            (
+                float(reference.origin.x),
+                float(reference.origin.y),
+                float(reference.size.width),
+                float(reference.size.height),
+            ),
+            self.header_metadata,
+            bool(self.clock_date_text),
+        )
+        self.speedometer_view.setFrame_(NSMakeRect(*frame))
+        self.speedometer_view.setSpeed_maximum_(speed, maximum)
+        self.speedometer_view.setHidden_(False)
+
     def set_header_reference_image(self, image, fills_frame: bool = False) -> None:
         """Select the image whose fitted top edge anchors overlay headers."""
         self.header_reference_image = image
@@ -6653,6 +6751,11 @@ class CocoaImagePresenter:
             self.header_shadow_color,
         )
         self.set_clock_time(self.clock_time, self.clock_date_text)
+        self.set_speedometer(
+            self.running_speed_kmh,
+            self.speedometer_maximum_kmh,
+            self.speedometer_visible,
+        )
         if self.caption_directive is not None and self.caption_font_state is not None:
             self.set_caption(self.caption_directive, self.caption_font_state, self.current_image)
         if self.help_visible:
@@ -9259,11 +9362,22 @@ class GPSTrackShowApp:
                 photo_target.clock_time if self.header_visible and self.config.clock else None,
                 photo_target.clock_date_text if self.header_visible and self.config.clock else None,
             )
+            active_presenter.set_speedometer(
+                photo_target.running_speed_kmh,
+                photo_target.speedometer_maximum_kmh,
+                bool(
+                    self.header_visible
+                    and self.config.speedometer
+                    and photo_target.running_speed_kmh is not None
+                ),
+            )
         if self.photo_presenter is not None and self.photo_presenter is not active_presenter:
             self.photo_presenter.set_clock_time(None)
+            self.photo_presenter.set_speedometer(None, None, False)
             self.photo_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.map_presenter is not None and self.map_presenter is not active_presenter:
             self.map_presenter.set_clock_time(None)
+            self.map_presenter.set_speedometer(None, None, False)
             self.map_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
 
     def _continue_time_lapse_after_navigation(self) -> None:
@@ -12507,12 +12621,19 @@ class GPSTrackShowApp:
             )
         # Retain available statistics even when currently hidden so a live
         # Settings Apply can reveal them without advancing to another medium.
+        media_datetime = parse_iso_datetime(photo_metadata.get("datetime_iso"))
         header_metrics = photo_track_metrics(
             self.current_track_metadata,
             latitude,
             longitude,
             distance_before_stage,
-            parse_iso_datetime(photo_metadata.get("datetime_iso")),
+            media_datetime,
+        )
+        running_speed_kmh, speedometer_maximum_kmh = photo_track_speedometer(
+            self.current_track_metadata,
+            latitude,
+            longitude,
+            media_datetime,
         )
 
         def make_photo_target(transition: Transition) -> WindowTarget:
@@ -12522,6 +12643,8 @@ class GPSTrackShowApp:
                 transition=transition,
                 clock_time=clock_time,
                 clock_date_text=clock_date_text,
+                running_speed_kmh=running_speed_kmh,
+                speedometer_maximum_kmh=speedometer_maximum_kmh,
                 place_text=place_text,
                 info_text=info_text,
                 photo_identity=photo_identity,
@@ -12721,6 +12844,16 @@ class GPSTrackShowApp:
                 target.clock_time if full_window_header and self.header_visible and self.config.clock else None,
                 target.clock_date_text if full_window_header and self.header_visible and self.config.clock else None,
             )
+            presenter.set_speedometer(
+                target.running_speed_kmh,
+                target.speedometer_maximum_kmh,
+                bool(
+                    full_window_header
+                    and self.header_visible
+                    and self.config.speedometer
+                    and target.running_speed_kmh is not None
+                ),
+            )
             presenter.set_place_text(None, False, int(active_font.size), self.config.font_color)
             presenter.set_info_text(target.info_text if target.presenter_name == "photo" else None)
             if target.presenter_name == "photo":
@@ -12759,9 +12892,11 @@ class GPSTrackShowApp:
             self._set_transition_overlay_visible(True)
         if self.photo_presenter is not None and self.photo_presenter is not active_photo_presenter:
             self.photo_presenter.set_clock_time(None)
+            self.photo_presenter.set_speedometer(None, None, False)
             self.photo_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.map_presenter is not None and self.map_presenter is not active_photo_presenter:
             self.map_presenter.set_clock_time(None)
+            self.map_presenter.set_speedometer(None, None, False)
             self.map_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.photo_presenter is not None and self.photo_presenter is not active_info_presenter:
             self.photo_presenter.set_info_text(None)

@@ -3,12 +3,16 @@ from datetime import datetime
 import unittest
 
 from gpx_point_editing import (
+    cut_segment_after_row,
     deserialize_points,
     insert_point_for_rows,
     insert_points_after_row,
+    join_segments_at_row,
+    joinable_segment_boundary,
     move_rows,
     point_locations,
     serialized_points,
+    translate_points_web_mercator,
 )
 
 
@@ -45,6 +49,57 @@ def coordinates(track):
 
 
 class PointEditingTests(unittest.TestCase):
+    def test_cut_segment_breaks_connection_without_splitting_track(self):
+        track = track_with_points(
+            [
+                (50.0, 7.00, None, None),
+                (50.0, 7.01, None, None),
+                (50.0, 7.02, None, None),
+                (50.0, 7.03, None, None),
+            ]
+        )
+        self.assertEqual(cut_segment_after_row(track, 1), (0, 1))
+        segments = list(track)
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(
+            [[float(point.attrib["lon"]) for point in list(segment)] for segment in segments],
+            [[7.00, 7.01], [7.02, 7.03]],
+        )
+        self.assertEqual(coordinates(track), [(50.0, 7.00), (50.0, 7.01), (50.0, 7.02), (50.0, 7.03)])
+
+    def test_cut_segment_rejects_existing_boundary_and_track_end(self):
+        track = track_with_points(
+            [(50.0, 7.00, None, None), (50.0, 7.01, None, None)],
+            [(50.0, 7.02, None, None), (50.0, 7.03, None, None)],
+        )
+        with self.assertRaisesRegex(ValueError, "already cut"):
+            cut_segment_after_row(track, 1)
+        with self.assertRaisesRegex(ValueError, "both sides"):
+            cut_segment_after_row(track, 3)
+
+    def test_join_segments_accepts_either_endpoint_and_removes_break(self):
+        for selected_row in (1, 2):
+            track = track_with_points(
+                [(50.0, 7.00, None, None), (50.0, 7.01, None, None)],
+                [(50.0, 7.02, None, None), (50.0, 7.03, None, None)],
+            )
+            self.assertEqual(joinable_segment_boundary(track, selected_row), (0, 1))
+            self.assertEqual(join_segments_at_row(track, selected_row), (0, 1))
+            self.assertEqual(len(list(track)), 1)
+            self.assertEqual(
+                [value[1] for value in coordinates(track)],
+                [7.00, 7.01, 7.02, 7.03],
+            )
+
+    def test_join_segments_rejects_non_endpoint(self):
+        track = track_with_points(
+            [(50.0, 7.00, None, None), (50.0, 7.01, None, None), (50.0, 7.02, None, None)],
+            [(50.0, 7.03, None, None), (50.0, 7.04, None, None)],
+        )
+        self.assertIsNone(joinable_segment_boundary(track, 1))
+        with self.assertRaisesRegex(ValueError, "endpoint"):
+            join_segments_at_row(track, 1)
+
     def test_insert_after_interior_interpolates_geometry_elevation_and_time(self):
         track = track_with_points(
             [
@@ -118,3 +173,26 @@ class PointEditingTests(unittest.TestCase):
             [value[1] for value in coordinates(track)],
             [7.00, 7.01, 7.02],
         )
+
+    def test_translate_points_moves_selected_geometry_as_one_block(self):
+        track = track_with_points(
+            [
+                (50.0, 7.0, 100.0, "2026-01-01T10:00:00Z"),
+                (50.0, 7.01, 110.0, "2026-01-01T10:05:00Z"),
+            ]
+        )
+        points = [entry[0] for entry in point_locations(track)]
+        originals = [(7.0, 50.0), (7.01, 50.0)]
+        translate_points_web_mercator(points, originals, 100.0, 50.0)
+        moved = coordinates(track)
+        self.assertGreater(moved[0][0], 50.0)
+        self.assertGreater(moved[0][1], 7.0)
+        self.assertAlmostEqual(moved[1][1] - moved[0][1], 0.01, places=6)
+        self.assertEqual(points[0].findtext(qname("ele")), "100.0")
+        self.assertEqual(points[0].findtext(qname("time")), "2026-01-01T10:00:00Z")
+
+    def test_translate_points_rejects_mismatched_originals(self):
+        track = track_with_points([(50.0, 7.0, None, None)])
+        points = [entry[0] for entry in point_locations(track)]
+        with self.assertRaisesRegex(ValueError, "counts"):
+            translate_points_web_mercator(points, [], 10.0, 10.0)

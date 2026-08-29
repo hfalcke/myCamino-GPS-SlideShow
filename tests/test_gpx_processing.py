@@ -17,6 +17,7 @@ from gpx_processing import (
     process_raw_points,
     process_track_element,
     processing_cache_info,
+    raw_track_geometry_fingerprint,
     semantic_track_fingerprint,
 )
 from gpx_import import GPX_10_NAMESPACE, load_gpx_document
@@ -233,6 +234,28 @@ class SharedGpxProcessingTests(unittest.TestCase):
         self.assertEqual(semantic_track_fingerprint(track), original)
         editor.set("order_number", "42")
         self.assertEqual(semantic_track_fingerprint(track), original)
+
+    def test_raw_geometry_fingerprint_ignores_metadata_but_preserves_segments(self):
+        track = track_xml(
+            [[
+                {"lat": 50.0, "lon": 7.0},
+                {"lat": 50.1, "lon": 7.1},
+            ]]
+        )
+        original = raw_track_geometry_fingerprint(track)
+        ET.SubElement(track, f"{{{GPX_NAMESPACE}}}name").text = "Renamed"
+        ET.SubElement(
+            track.find(f"{{{GPX_NAMESPACE}}}trkseg/{{{GPX_NAMESPACE}}}trkpt"),
+            f"{{{GPX_NAMESPACE}}}time",
+        ).text = "2026-01-01T10:00:00Z"
+        self.assertEqual(raw_track_geometry_fingerprint(track), original)
+
+        points = list(track.iter(f"{{{GPX_NAMESPACE}}}trkpt"))
+        first_segment = track.find(f"{{{GPX_NAMESPACE}}}trkseg")
+        first_segment.remove(points[1])
+        second_segment = ET.SubElement(track, f"{{{GPX_NAMESPACE}}}trkseg")
+        second_segment.append(points[1])
+        self.assertNotEqual(raw_track_geometry_fingerprint(track), original)
 
     def test_versioned_geometry_and_data_fingerprints_have_separate_scope(self):
         first = [[

@@ -4,12 +4,15 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from interactive_tile_viewport import visible_tiles, zoomed_extent
+
 from GPXEditor import (
     GPXEditorController,
     PlotView,
     TRACK_SORT_CRITERIA,
     TrackRecord,
     TrackInspectorController,
+    apply_untimed_prompt_response,
     compact_elevation_status,
     compact_xy_status,
     context_track_row_selection,
@@ -21,16 +24,83 @@ from GPXEditor import (
     inspector_table_document_size,
     lonlat_to_web_mercator,
     normalize_inspector_timestamp_edit,
+    point_table_segment_break_rows,
     qname,
+    remember_untimed_track_identities,
     renumber_track_records,
     reordered_selected_items,
+    suppressed_untimed_track_identities,
+    untimed_tracks_requiring_prompt,
     unique_track_copy_name,
     visible_track_count,
     visible_simplified_polyline_runs,
 )
 
 
+class FakeDefaults:
+    def __init__(self):
+        self.values = {}
+        self.synchronized = False
+
+    def arrayForKey_(self, key):
+        return self.values.get(key)
+
+    def setObject_forKey_(self, value, key):
+        self.values[key] = list(value)
+
+    def synchronize(self):
+        self.synchronized = True
+
+
 class InspectorPointSelectionTests(unittest.TestCase):
+    def test_segment_break_rows_follow_segment_indexes(self):
+        rows = [
+            {"segment_index": 0},
+            {"segment_index": 0},
+            {"segment_index": 1},
+            {"segment_index": 1},
+            {"segment_index": 2},
+        ]
+        self.assertEqual(point_table_segment_break_rows(rows), {2, 4})
+
+    def test_closing_inspector_only_closes_map_it_created(self):
+        for owns_map in (False, True):
+            parent = SimpleNamespace(
+                unregister_auxiliary_window=Mock(),
+                close_plot_windows_for_inspector=Mock(),
+            )
+            plot = SimpleNamespace(inspector=None)
+            inspector = TrackInspectorController.alloc().init()
+            inspector.parent = parent
+            inspector.owns_plot_window = owns_map
+            inspector.plot_view = plot
+            notification = SimpleNamespace(object=Mock(return_value=object()))
+
+            inspector.windowWillClose_(notification)
+
+            if owns_map:
+                parent.close_plot_windows_for_inspector.assert_called_once_with(inspector)
+            else:
+                parent.close_plot_windows_for_inspector.assert_not_called()
+
+    def test_track_table_double_click_plots_without_opening_inspector(self):
+        track = SimpleNamespace(nr=7)
+        controller = GPXEditorController.alloc().init()
+        controller.track_table = SimpleNamespace(clickedRow=Mock(return_value=0), selectedRow=Mock(return_value=0))
+        controller.tracks = [track]
+        controller.selected_nrs = []
+        controller.update_selection_field = Mock()
+        controller.highlight_selected_rows = Mock()
+        controller.plotSelected_ = Mock()
+        controller.open_inspector_for_track = Mock()
+        controller.set_status = Mock()
+
+        controller.trackDoubleClicked_(None)
+
+        self.assertEqual(controller.selected_nrs, [7])
+        controller.plotSelected_.assert_called_once_with(None)
+        controller.open_inspector_for_track.assert_not_called()
+
     def make_controller(self, rows, *, suppressed=False, marker=4):
         track = object()
         plot = SimpleNamespace(
@@ -104,6 +174,230 @@ class InspectorPointSelectionTests(unittest.TestCase):
             PlotView.selected_ranges_for_track(plot, track),
             [(2, 3), (7, 7), (9, 10)],
         )
+
+    def test_marked_range_hit_accepts_points_and_internal_connections(self):
+        track = object()
+        plot = SimpleNamespace(
+            selected_ranges_for_track=lambda candidate: [(3, 7)] if candidate is track else [],
+        )
+        self.assertEqual(
+            PlotView.selected_range_at_target(plot, ("point", track, 5, None)),
+            (track, 3, 7),
+        )
+        self.assertEqual(
+            PlotView.selected_range_at_target(plot, ("segment", track, 6, 0.5)),
+            (track, 3, 7),
+        )
+        self.assertIsNone(
+            PlotView.selected_range_at_target(plot, ("segment", track, 7, 0.5))
+        )
+
+    def test_inspector_undo_and_redo_restore_track_local_edits(self):
+        original = ET.Element(qname("trk"))
+        segment = ET.SubElement(original, qname("trkseg"))
+        ET.SubElement(segment, qname("trkpt"), {"lat": "50", "lon": "7"})
+        track = TrackRecord(1, ET.fromstring(ET.tostring(original)), "track.gpx")
+        track.points()[0].element.set("lat", "51")
+        parent = SimpleNamespace(
+            tracks=[track],
+            invalidate_track_metrics=Mock(),
+            mark_dirty=Mock(),
+        )
+        inspector = TrackInspectorController.alloc().init()
+        inspector.undo_stack = [ET.tostring(original, encoding="unicode")]
+        inspector.redo_stack = []
+        inspector.track = track
+        inspector.parent = parent
+        inspector.reload_rows = Mock()
+        inspector.refresh_after_point_table_change = Mock()
+
+        TrackInspectorController.undo(inspector)
+        self.assertEqual(track.points()[0].lat, 50.0)
+        self.assertEqual(len(inspector.redo_stack), 1)
+
+        TrackInspectorController.redo(inspector)
+        self.assertEqual(track.points()[0].lat, 51.0)
+        self.assertEqual(len(inspector.undo_stack), 1)
+
+    def test_point_table_edit_refreshes_existing_map_without_rebuilding_viewport(self):
+        track_element = ET.Element(qname("trk"))
+        segment = ET.SubElement(track_element, qname("trkseg"))
+        ET.SubElement(segment, qname("trkpt"), {"lat": "50", "lon": "7"})
+        ET.SubElement(segment, qname("trkpt"), {"lat": "50.1", "lon": "7.1"})
+        track = TrackRecord(1, track_element, "track.gpx")
+        plot = SimpleNamespace(refresh_after_map_edit=Mock(), setNeedsDisplay_=Mock(), cursor=None)
+        parent = SimpleNamespace(
+            selected_nrs=[],
+            update_selection_field=Mock(),
+            highlight_selected_rows=Mock(),
+            refresh_track_plot_for_track=Mock(),
+            refresh_elevation_profile_for_plot_view=Mock(),
+            redraw_open_plot_views=Mock(),
+        )
+        inspector = SimpleNamespace(
+            parent=parent,
+            track=track,
+            plot_view=plot,
+            selected_row_indexes=Mock(return_value=[1]),
+        )
+
+        TrackInspectorController.refresh_after_point_table_change(inspector, [1])
+
+        plot.refresh_after_map_edit.assert_called_once_with(track, 1)
+        parent.refresh_track_plot_for_track.assert_not_called()
+
+    def test_cursor_title_uses_coordinates_and_optional_height(self):
+        point = SimpleNamespace(lat=50.1234567, lon=7.7654321, ele=123.45)
+        self.assertEqual(
+            PlotView.cursor_title_text(point),
+            "50.123457, 7.765432   123.5 m",
+        )
+        point.ele = None
+        self.assertEqual(PlotView.cursor_title_text(point), "50.123457, 7.765432")
+
+    def test_map_header_uses_pointer_position_and_interpolated_height(self):
+        plot = SimpleNamespace(
+            pointer_coordinate=(7.7654321, 50.1234567),
+            pointer_elevation=123.45,
+        )
+        self.assertEqual(
+            PlotView.map_pointer_title_text(plot),
+            "50.123457, 7.765432   123.5 m",
+        )
+        plot.pointer_elevation = None
+        self.assertEqual(
+            PlotView.map_pointer_title_text(plot),
+            "50.123457, 7.765432",
+        )
+
+    def test_dismissing_point_information_latches_overlay_closed(self):
+        plot = SimpleNamespace(
+            show_info=True,
+            info_overlay_dismissed=False,
+            context_overlay_coordinate=(7.0, 50.0),
+            info_overlay_close_rect=object(),
+            setNeedsDisplay_=Mock(),
+        )
+
+        PlotView.dismiss_info_overlay(plot)
+
+        self.assertFalse(plot.show_info)
+        self.assertTrue(plot.info_overlay_dismissed)
+        self.assertIsNone(plot.context_overlay_coordinate)
+        self.assertIsNone(plot.info_overlay_close_rect)
+
+
+class UntimedTrackPromptTests(unittest.TestCase):
+    @staticmethod
+    def make_track(name="Untimed", *, timed=False, latitude="50"):
+        element = ET.Element(qname("trk"))
+        ET.SubElement(element, qname("name")).text = name
+        segment = ET.SubElement(element, qname("trkseg"))
+        first = ET.SubElement(segment, qname("trkpt"), {"lat": latitude, "lon": "7"})
+        second = ET.SubElement(segment, qname("trkpt"), {"lat": "50.1", "lon": "7.1"})
+        if timed:
+            ET.SubElement(first, qname("time")).text = "2026-01-01T10:00:00Z"
+            ET.SubElement(second, qname("time")).text = "2026-01-01T10:10:00Z"
+        return TrackRecord(1, element, "track.gpx")
+
+    def test_no_decision_is_remembered_without_changing_gpx(self):
+        defaults = FakeDefaults()
+        track = self.make_track()
+        before = ET.tostring(track.element)
+        pending = untimed_tracks_requiring_prompt([track], set())
+
+        remember_untimed_track_identities(defaults, [pending[0][2]])
+
+        self.assertEqual(ET.tostring(track.element), before)
+        suppressed = suppressed_untimed_track_identities(defaults)
+        self.assertEqual(untimed_tracks_requiring_prompt([track], suppressed), [])
+        self.assertTrue(defaults.synchronized)
+
+    def test_name_changes_do_not_reactivate_suppressed_prompt(self):
+        track = self.make_track("Original")
+        identity = untimed_tracks_requiring_prompt([track], set())[0][2]
+        track.element.find("gpx:name", {"gpx": "http://www.topografix.com/GPX/1/1"}).text = "Renamed"
+
+        self.assertEqual(untimed_tracks_requiring_prompt([track], {identity}), [])
+
+    def test_geometry_changes_reactivate_prompt(self):
+        track = self.make_track()
+        identity = untimed_tracks_requiring_prompt([track], set())[0][2]
+        track.points()[0].element.set("lat", "51")
+
+        self.assertEqual(len(untimed_tracks_requiring_prompt([track], {identity})), 1)
+
+    def test_timed_tracks_are_never_prompted(self):
+        self.assertEqual(
+            untimed_tracks_requiring_prompt([self.make_track(timed=True)], set()),
+            [],
+        )
+
+    def test_yes_edits_first_track_without_storing_suppression(self):
+        defaults = FakeDefaults()
+        pending = untimed_tracks_requiring_prompt(
+            [self.make_track("First"), self.make_track("Second", latitude="49")],
+            set(),
+        )
+
+        self.assertEqual(apply_untimed_prompt_response(1000, pending, defaults), ("edit", 0))
+        self.assertEqual(suppressed_untimed_track_identities(defaults), set())
+
+    def test_no_suppresses_every_listed_track(self):
+        defaults = FakeDefaults()
+        pending = untimed_tracks_requiring_prompt(
+            [self.make_track("First"), self.make_track("Second", latitude="49")],
+            set(),
+        )
+
+        self.assertEqual(apply_untimed_prompt_response(1001, pending, defaults), ("suppress", None))
+        self.assertEqual(
+            suppressed_untimed_track_identities(defaults),
+            {pending[0][2], pending[1][2]},
+        )
+
+    def test_later_records_nothing(self):
+        defaults = FakeDefaults()
+        pending = untimed_tracks_requiring_prompt([self.make_track()], set())
+
+        self.assertEqual(apply_untimed_prompt_response(1002, pending, defaults), ("later", None))
+        self.assertEqual(suppressed_untimed_track_identities(defaults), set())
+
+
+class InteractiveTileLimitTests(unittest.TestCase):
+    @staticmethod
+    def controller():
+        controller = SimpleNamespace(maximum_map_zoom=19)
+        controller.tile_diagnostics = lambda extent, zoom: GPXEditorController.tile_diagnostics(
+            controller, extent, zoom
+        )
+        return controller
+
+    def test_hanisch_sized_viewport_is_reduced_below_tile_limit(self):
+        extent = {"min_x": 0.0, "max_x": 48600.0, "min_y": 0.0, "max_y": 35000.0}
+        controller = self.controller()
+
+        zoom, diagnostics = GPXEditorController.effective_tile_zoom_for_limit(
+            controller, extent, 14, 48
+        )
+
+        self.assertEqual(zoom, 12)
+        self.assertLessEqual(diagnostics["count"], 48)
+        self.assertLessEqual(len(visible_tiles(extent, zoom)), 48)
+
+    def test_repeated_factor_two_zoom_keeps_each_request_bounded(self):
+        extent = {"min_x": 0.0, "max_x": 48600.0, "min_y": 0.0, "max_y": 35000.0}
+        controller = self.controller()
+        zoom, _diagnostics = GPXEditorController.effective_tile_zoom_for_limit(
+            controller, extent, 14, 48
+        )
+
+        for _step in range(5):
+            extent = zoomed_extent(extent, 2.0)
+            zoom, diagnostics = GPXEditorController.effective_tile_zoom_for_limit(
+                controller, extent, zoom + 1, 48
+            )
+            self.assertLessEqual(diagnostics["count"], 48)
 
 
 class TrackContextSelectionTests(unittest.TestCase):
