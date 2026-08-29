@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from GPSTrackShowGUI import (
     GPXTrackerController,
+    SLIDESHOW_CHECKPOINT_VERSION,
     append_slideshow_checkpoint,
     build_argument_parser,
     ensure_default_project_playlist,
@@ -90,13 +91,13 @@ class GUIStartupPathTests(unittest.TestCase):
         self.assertTrue(payload["restore_display"])
 
     def test_resume_history_accepts_only_current_checkpoint_format(self):
-        current = {"version": 4, "completed": False, "playlist_index": 4}
+        current = {"version": SLIDESHOW_CHECKPOINT_VERSION, "completed": False, "playlist_index": 4}
         self.assertEqual(
             normalize_slideshow_resume_history(
                 [
                     current,
                     {"version": 2, "playlist_index": 3},
-                    {"version": 4, "completed": True},
+                    {"version": SLIDESHOW_CHECKPOINT_VERSION, "completed": True},
                 ]
             ),
             [current],
@@ -114,7 +115,7 @@ class GUIStartupPathTests(unittest.TestCase):
             history = append_slideshow_checkpoint(
                 history,
                 {
-                    "version": 4,
+                    "version": SLIDESHOW_CHECKPOINT_VERSION,
                     "completed": False,
                     "playlist_index": index,
                 },
@@ -125,7 +126,7 @@ class GUIStartupPathTests(unittest.TestCase):
         self.assertEqual(
             append_slideshow_checkpoint(
                 history,
-                {"version": 4, "completed": True},
+                {"version": SLIDESHOW_CHECKPOINT_VERSION, "completed": True},
             ),
             history,
         )
@@ -136,7 +137,7 @@ class GUIStartupPathTests(unittest.TestCase):
             control_file.write_text("photo.jpeg | 12:00 | - | -\n", encoding="utf-8")
             stat = control_file.stat()
             checkpoint = {
-                "version": 4,
+                "version": SLIDESHOW_CHECKPOINT_VERSION,
                 "completed": False,
                 "control_file": str(control_file),
                 "control_file_identity": {

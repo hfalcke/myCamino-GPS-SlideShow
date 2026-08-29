@@ -1,13 +1,19 @@
 import unittest
+import xml.etree.ElementTree as ET
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from GPXEditor import (
     GPXEditorController,
     PlotView,
+    TRACK_SORT_CRITERIA,
+    TrackRecord,
     TrackInspectorController,
     compact_elevation_status,
     compact_xy_status,
+    context_track_row_selection,
+    duplicate_track_records,
     elevation_distance_range_for_map_extent,
     elevation_profile_visible_range,
     format_inspector_elevation,
@@ -15,6 +21,9 @@ from GPXEditor import (
     inspector_table_document_size,
     lonlat_to_web_mercator,
     normalize_inspector_timestamp_edit,
+    qname,
+    reordered_selected_items,
+    unique_track_copy_name,
     visible_simplified_polyline_runs,
 )
 
@@ -93,6 +102,161 @@ class InspectorPointSelectionTests(unittest.TestCase):
             PlotView.selected_ranges_for_track(plot, track),
             [(2, 3), (7, 7), (9, 10)],
         )
+
+
+class TrackContextSelectionTests(unittest.TestCase):
+    def test_right_click_preserves_existing_multi_selection(self):
+        self.assertEqual(context_track_row_selection(3, [1, 3, 5], 7), [1, 3, 5])
+
+    def test_right_click_on_other_track_replaces_selection(self):
+        self.assertEqual(context_track_row_selection(2, [1, 3, 5], 7), [2])
+
+    def test_empty_area_and_summary_row_have_no_track_context(self):
+        self.assertEqual(context_track_row_selection(-1, [1], 4), [])
+        self.assertEqual(context_track_row_selection(4, [1], 4), [])
+
+
+class TrackBatchOrderTests(unittest.TestCase):
+    def test_move_disjoint_groups_up_and_down_one_position(self):
+        items = list("ABCDE")
+        self.assertEqual(
+            reordered_selected_items(items, [1, 3], "up"),
+            list("BADCE"),
+        )
+        self.assertEqual(
+            reordered_selected_items(items, [1, 3], "down"),
+            list("ACBED"),
+        )
+
+    def test_move_selection_to_top_and_bottom_preserves_relative_order(self):
+        items = list("ABCDE")
+        self.assertEqual(
+            reordered_selected_items(items, [1, 3], "top"),
+            list("BDACE"),
+        )
+        self.assertEqual(
+            reordered_selected_items(items, [1, 3], "bottom"),
+            list("ACEBD"),
+        )
+
+    def test_copy_names_are_unique_case_insensitively(self):
+        self.assertEqual(unique_track_copy_name("Stage", []), "Stage (copy)")
+        self.assertEqual(
+            unique_track_copy_name("Stage", ["stage (COPY)", "Stage (copy 2)"]),
+            "Stage (copy 3)",
+        )
+
+    @staticmethod
+    def make_track(number, name, source):
+        element = ET.Element(qname("trk"))
+        ET.SubElement(element, qname("name")).text = name
+        segment = ET.SubElement(element, qname("trkseg"))
+        ET.SubElement(segment, qname("trkpt"), {"lat": "50", "lon": "7"})
+        return TrackRecord(number, element, source)
+
+    def test_duplicate_tracks_form_one_block_after_last_selected_track(self):
+        tracks = [
+            self.make_track(1, "A", "one.gpx"),
+            self.make_track(2, "B", "two.gpx"),
+            self.make_track(3, "C", "three.gpx"),
+            self.make_track(4, "D", "four.gpx"),
+        ]
+        updated, duplicates, next_nr = duplicate_track_records(tracks, [0, 2], 5)
+
+        self.assertEqual(
+            [track.name for track in updated],
+            ["A", "B", "C", "A (copy)", "C (copy)", "D"],
+        )
+        self.assertEqual([track.nr for track in duplicates], [5, 6])
+        self.assertEqual(next_nr, 7)
+        self.assertEqual(updated[3].source_file, "one.gpx")
+        self.assertIsNot(updated[3].element, updated[0].element)
+        updated[3].element.find("gpx:name", {"gpx": "http://www.topografix.com/GPX/1/1"}).text = "Changed"
+        self.assertEqual(updated[0].name, "A")
+
+    def test_batch_visibility_changes_only_tracks_that_need_it(self):
+        visible = self.make_track(1, "Visible", "one.gpx")
+        hidden = self.make_track(2, "Hidden", "two.gpx")
+        hidden.set_hidden(True)
+        controller = SimpleNamespace(
+            selected_tracks=lambda: [visible, hidden],
+            push_undo=Mock(),
+            mark_dirty=Mock(),
+            refresh_open_plot_views=Mock(),
+        )
+
+        GPXEditorController._set_selected_tracks_hidden(controller, True)
+
+        self.assertTrue(visible.hidden)
+        self.assertTrue(hidden.hidden)
+        controller.push_undo.assert_called_once_with()
+        controller.mark_dirty.assert_called_once_with("Hidden 1 selected track(s).")
+
+    def test_selected_moving_speed_sort_preserves_unselected_positions(self):
+        tracks = [
+            self.make_track(1, "A", "one.gpx"),
+            self.make_track(2, "B", "two.gpx"),
+            self.make_track(3, "C", "three.gpx"),
+            self.make_track(4, "D", "four.gpx"),
+        ]
+        speeds = {1: 5.0, 2: 9.0, 3: 3.0, 4: 7.0}
+
+        def metrics(track):
+            return {
+                "time": None,
+                "length_km": float(track.nr),
+                "duration": timedelta(hours=1),
+                "distance_km": float(track.nr),
+                "speed_kmh": speeds[track.nr],
+                "moving_speed_kmh": speeds[track.nr],
+                "ascent_m": float(track.nr),
+                "descent_m": float(track.nr),
+                "npoints": track.nr,
+            }
+
+        controller = SimpleNamespace(
+            tracks=tracks,
+            columns=[(identifier, title, 80, False) for identifier, title in TRACK_SORT_CRITERIA],
+            sort_column=None,
+            sort_ascending=True,
+            selected_nrs=[1, 3],
+            push_undo=Mock(),
+            set_status=Mock(),
+            compute_metrics=metrics,
+            selected_track_row_indexes=lambda: [0, 2],
+            recalculate=Mock(),
+            highlight_selected_rows=Mock(),
+            update_sort_descriptor=Mock(),
+            refresh_open_plot_views=Mock(),
+            update_selection_field=Mock(),
+        )
+
+        GPXEditorController.sort_by_column(
+            controller,
+            "moving_speed",
+            ascending=True,
+            source="test",
+        )
+
+        self.assertEqual([track.nr for track in controller.tracks], [3, 2, 1, 4])
+        self.assertEqual(controller.selected_nrs, [3, 1])
+        controller.refresh_open_plot_views.assert_called_once_with()
+
+    def test_sort_dialog_criteria_exclude_order_dependent_columns(self):
+        identifiers = [identifier for identifier, _title in TRACK_SORT_CRITERIA]
+        self.assertIn("moving_speed", identifiers)
+        self.assertNotIn("row", identifiers)
+        self.assertNotIn("sum", identifiers)
+
+    def test_snapshot_restores_duplicate_source_file(self):
+        track = self.make_track(8, "Copy", "source.gpx")
+        controller = SimpleNamespace(tracks=[track], next_nr=9, dirty=False, recalculate=Mock())
+        snapshot = GPXEditorController.snapshot(controller)
+        controller.tracks = []
+
+        GPXEditorController.restore_snapshot(controller, snapshot)
+
+        self.assertEqual(controller.tracks[0].source_file, "source.gpx")
 
 
 class InspectorTableDocumentSizeTests(unittest.TestCase):

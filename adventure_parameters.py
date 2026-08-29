@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 18
+PARAMETER_SCHEMA_VERSION = 20
 
 
 @dataclass(frozen=True)
@@ -66,10 +66,15 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.collage_size_range", "Slide Show", "Collage size range", "33-66", "range", "Minimum and maximum collage image size in percent, for example 33-66.", unit="%"),
     ParameterSpec("slideshow.collage_max_images", "Slide Show", "Maximum collage images", 9, "int", "Clear the collage after this many images.", 1, 100),
 
-    ParameterSpec("audio.enabled", "Audio", "Background music", False, "bool", "Enable the optional background-music source for this Adventure."),
+    ParameterSpec("audio.enabled", "Audio", "Audio playback", False, "bool", "Enable background music and narration for this Adventure."),
     ParameterSpec("audio.crossfade_seconds", "Audio", "Crossfade duration", 2.0, "float", "Fade duration for normal music changes, marker jumps, pause, and resume.", 0.0, 30.0, unit="s"),
     ParameterSpec("audio.music_volume_percent", "Audio", "Music volume", 65.0, "float", "Maximum internal background-music level. Device volume remains authoritative.", 0.0, 100.0, unit="%"),
     ParameterSpec("audio.video_volume_percent", "Audio", "Video volume", 100.0, "float", "Playback level for the sound contained in videos.", 0.0, 100.0, unit="%"),
+    ParameterSpec("audio.narration_volume_percent", "Audio", "Narration volume", 100.0, "float", "Maximum internal narrator level.", 0.0, 100.0, unit="%"),
+    ParameterSpec("audio.narration_music_behavior", "Audio", "Music during narration", "reduce", "choice", "Keep music unchanged, reduce it, or fade it out and pause while narration speaks.", choices=_choice(("parallel", "Parallel"), ("reduce", "Reduce music"), ("pause", "Fade out and pause"))),
+    ParameterSpec("audio.narration_music_reduction_percent", "Audio", "Reduced music level", 25.0, "float", "Percentage of the current music level retained during narration.", 0.0, 100.0, unit="%"),
+    ParameterSpec("audio.narration_video_reduction_percent", "Audio", "Reduced video level", 25.0, "float", "Percentage of video sound retained while narration speaks.", 0.0, 100.0, unit="%"),
+    ParameterSpec("audio.narration_transition_seconds", "Audio", "Narration transition", 0.25, "float", "Fade duration when narrator recordings start or replace one another.", 0.0, 5.0, unit="s"),
     ParameterSpec("audio.use_normalized_videos", "Audio", "Use normalized video audio", True, "bool", "Prefer current prepared video copies with normalized audio during playback."),
     ParameterSpec("audio.video_normalization_target_lufs", "Audio", "Video normalization target", -16.0, "float", "Target integrated loudness for prepared video audio.", -40.0, -5.0, unit="LUFS"),
     ParameterSpec("audio.video_normalization_max_boost_db", "Audio", "Maximum video boost", 12.0, "float", "Maximum gain applied to a quiet video during normalization.", 0.0, 30.0, unit="dB"),
@@ -131,12 +136,14 @@ PARAMETER_SPECS = (
     ParameterSpec("locations.pacing_min_seconds", "Locations", "Minimum request spacing", 1.0, "float", "Minimum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_max_seconds", "Locations", "Maximum request spacing", 5.0, "float", "Maximum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
 
-    ParameterSpec("maps.provider", "Map Service", "Map provider", "osm", "choice", "Basemap provider shared by Track Maps and GPX Editor.", choices=_choice(("osm", "OpenStreetMap"), ("esri", "Esri World Street Map"), ("custom", "Custom"))),
-    ParameterSpec("maps.custom_url", "Map Service", "Custom URL template", "", "text", "HTTP(S) tile URL containing {z}, {x}, and {y}.", advanced=True),
+    ParameterSpec("maps.interactive_provider", "Map Service", "Interactive provider", "osm", "choice", "Provider used for interactive GPX Editor maps. Public OpenStreetMap is suitable for this use.", choices=_choice(("osm", "OpenStreetMap (public)"), ("geoapify", "Geoapify"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
+    ParameterSpec("maps.output_provider", "Map Service", "Map-generation provider", "osm", "choice", "Provider used for generated PNG and PDF maps. Public OpenStreetMap is restricted to manually selected individual maps.", choices=_choice(("osm", "OpenStreetMap (manual only)"), ("geoapify", "Geoapify (recommended)"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
+    ParameterSpec("maps.credential_id", "Map Service", "Credential name", "default", "text", "Name of the API credential stored in the macOS Keychain. The API key itself is never stored in the Adventure file."),
+    ParameterSpec("maps.custom_url", "Map Service", "Custom URL template", "", "text", "HTTPS tile URL containing {z}, {x}, and {y}.", advanced=True),
     ParameterSpec("maps.custom_attribution", "Map Service", "Custom attribution", "", "text", "Required map attribution for a custom provider.", advanced=True),
     ParameterSpec("maps.maximum_zoom", "Map Service", "Maximum provider zoom", 19, "int", "Maximum supported tile zoom.", 0, 30),
     ParameterSpec("maps.request_timeout_seconds", "Map Service", "Tile request timeout", 12.0, "float", "Maximum wait for a map tile request.", 1.0, 300.0, advanced=True, unit="s"),
-    ParameterSpec("maps.cache_retention_hours", "Map Service", "Tile cache retention", 24.0, "float", "Delete cached tiles older than this age.", 0.0, 8760.0, advanced=True, unit="h"),
+    ParameterSpec("maps.cache_retention_hours", "Map Service", "Tile cache retention", 720.0, "float", "Delete cached tiles older than this age. Public OSM tiles are retained for at least seven days.", 0.0, 8760.0, advanced=True, unit="h"),
 )
 
 
@@ -168,7 +175,12 @@ def visible_specs_for_section(
 ) -> tuple[ParameterSpec, ...]:
     """Return settings visible for a section and its current dependent choices."""
     values = values or {}
-    custom_provider = values.get("maps.provider") == "custom"
+    providers = {
+        values.get("maps.interactive_provider", "osm"),
+        values.get("maps.output_provider", "osm"),
+    }
+    custom_provider = "custom" in providers
+    keyed_provider = bool(providers & {"geoapify", "thunderforest", "stadia"})
     custom_keys = {"maps.custom_url", "maps.custom_attribution"}
     return tuple(
         spec
@@ -176,7 +188,8 @@ def visible_specs_for_section(
         if spec.section == section
         and (
             (spec.key in custom_keys and custom_provider)
-            or (spec.key not in custom_keys and (include_advanced or not spec.advanced))
+            or (spec.key == "maps.credential_id" and keyed_provider)
+            or (spec.key not in custom_keys | {"maps.credential_id"} and (include_advanced or not spec.advanced))
         )
     )
 
@@ -262,10 +275,13 @@ def validate_parameters(values: dict[str, Any]) -> dict[str, str]:
             message = "minimum spacing must not exceed maximum spacing"
             errors["locations.pacing_min_seconds"] = message
             errors["locations.pacing_max_seconds"] = message
-        if normalized["maps.provider"] == "custom":
+        if "custom" in {
+            normalized["maps.interactive_provider"],
+            normalized["maps.output_provider"],
+        }:
             template = normalized["maps.custom_url"]
-            if not template.startswith(("http://", "https://")) or not all(token in template for token in ("{z}", "{x}", "{y}")):
-                errors["maps.custom_url"] = "custom URL must use HTTP(S) and contain {z}, {x}, and {y}"
+            if not template.startswith("https://") or not all(token in template for token in ("{z}", "{x}", "{y}")):
+                errors["maps.custom_url"] = "custom URL must use HTTPS and contain {z}, {x}, and {y}"
             if not normalized["maps.custom_attribution"].strip():
                 errors["maps.custom_attribution"] = "attribution is required for a custom provider"
     return errors
@@ -276,6 +292,10 @@ def normalize_parameters(raw: Any) -> dict[str, Any]:
     values = raw.get("values", {}) if isinstance(raw, dict) and isinstance(raw.get("values"), dict) else raw
     values = values if isinstance(values, dict) else {}
     values = dict(values)
+    legacy_map_provider = str(values.pop("maps.provider", "") or "").strip().casefold()
+    if legacy_map_provider:
+        values.setdefault("maps.interactive_provider", legacy_map_provider)
+        values.setdefault("maps.output_provider", legacy_map_provider)
     if "slideshow.header_background" not in values and "timelapse.header_background" in values:
         values["slideshow.header_background"] = values["timelapse.header_background"]
     values.pop("timelapse.header_background", None)
@@ -377,7 +397,7 @@ def map_affecting_parameter_keys() -> frozenset[str]:
             "gpx.maximum_hdop",
             "gpx.maximum_vdop",
             "gpx.elevation_smoothing_distance_m",
-            "maps.provider",
+            "maps.output_provider",
             "maps.custom_url",
             "maps.custom_attribution",
             "maps.maximum_zoom",

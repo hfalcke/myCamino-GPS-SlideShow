@@ -11,6 +11,8 @@ from tempfile import TemporaryDirectory
 from adventure_files import (
     ADVENTURE_FORMAT_VERSION,
     AdventureFormatError,
+    create_adventure_from_template,
+    discover_adventure_candidates,
     discover_adventures,
     load_adventure,
     rename_or_copy_adventure,
@@ -36,6 +38,102 @@ def adventure_payload(directory: Path, name: str) -> dict:
 
 
 class AdventureFileTests(unittest.TestCase):
+    def test_discovery_separates_copied_templates_from_invalid_files(self):
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as original:
+            directory = Path(temporary)
+            old_directory = Path(original)
+            for name in ("Older", "Newer"):
+                (directory / f"{name}.gpx").write_text("<gpx/>")
+                (directory / f"{name}-sorted.lst").write_text("")
+                payload = adventure_payload(old_directory, name)
+                atomic_write_json(directory / f"{name}.adv", payload)
+            os.utime(directory / "Older.adv", (100.0, 100.0))
+            os.utime(directory / "Newer.adv", (200.0, 200.0))
+            atomic_write_json(directory / "Broken.adv", {"project_name": "Broken"})
+
+            records, templates, errors = discover_adventure_candidates(directory)
+
+            self.assertEqual(records, [])
+            self.assertEqual(
+                [record.project_name for record in templates], ["Newer", "Older"]
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertIn("format 2", errors[0])
+
+    def test_discovery_keeps_valid_and_copied_adventures_available_together(self):
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as original:
+            directory = Path(temporary)
+            for name, payload_directory in (
+                ("Local", directory),
+                ("Copied", Path(original)),
+            ):
+                (directory / f"{name}.gpx").write_text("<gpx/>")
+                (directory / f"{name}-sorted.lst").write_text("")
+                atomic_write_json(
+                    directory / f"{name}.adv",
+                    adventure_payload(payload_directory, name),
+                )
+
+            records, templates, errors = discover_adventure_candidates(directory)
+
+            self.assertEqual([record.project_name for record in records], ["Local"])
+            self.assertEqual(
+                [record.project_name for record in templates], ["Copied"]
+            )
+            self.assertEqual(errors, [])
+
+    def test_create_from_copied_template_rebases_internal_paths_only(self):
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as original:
+            directory = Path(temporary)
+            old_directory = Path(original).resolve()
+            name = "Old Trip"
+            source = directory / f"{name}.adv"
+            (directory / f"{name}.gpx").write_text("<gpx/>")
+            (directory / f"{name}-sorted.lst").write_text("")
+            payload = adventure_payload(old_directory, name)
+            payload["title_image"] = str(old_directory / "photo.jpeg")
+            payload["external_reference"] = "/Volumes/Archive/music.mp3"
+            payload["slideshow_resume_position"] = {"playlist_index": 2}
+            original_payload = dict(payload)
+            atomic_write_json(source, payload)
+            source_text = source.read_text(encoding="utf-8")
+
+            target, created = create_adventure_from_template(
+                source, directory, "New Copy"
+            )
+
+            self.assertEqual(target.name, "New Copy.adv")
+            self.assertEqual(created["project_name"], "New Copy")
+            self.assertEqual(created["project_directory"], str(directory.resolve()))
+            self.assertEqual(created["gpx_file"], f"{name}.gpx")
+            self.assertEqual(created["control_file"], f"{name}-sorted.lst")
+            self.assertEqual(created["track_map_base"], name)
+            self.assertEqual(
+                created["title_image"], str(directory.resolve() / "photo.jpeg")
+            )
+            self.assertEqual(created["external_reference"], "/Volumes/Archive/music.mp3")
+            self.assertEqual(created["slideshow_resume_history"], [])
+            self.assertNotIn("slideshow_resume_position", created)
+            self.assertEqual(source.read_text(encoding="utf-8"), source_text)
+            self.assertEqual(json.loads(source_text), original_payload)
+            self.assertEqual(load_adventure(target).payload, created)
+
+    def test_create_from_copied_template_never_overwrites_target(self):
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as original:
+            directory = Path(temporary)
+            name = "Old"
+            source = directory / f"{name}.adv"
+            (directory / f"{name}.gpx").write_text("<gpx/>")
+            (directory / f"{name}-sorted.lst").write_text("")
+            atomic_write_json(source, adventure_payload(Path(original), name))
+            target = directory / "New.adv"
+            target.write_text("keep", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                create_adventure_from_template(source, directory, "New")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep")
+
     def test_discovery_accepts_only_format_two_and_sorts_by_mtime(self):
         with TemporaryDirectory() as temporary:
             directory = Path(temporary)

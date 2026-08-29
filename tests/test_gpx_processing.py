@@ -1,4 +1,5 @@
 import unittest
+import copy
 import json
 import tempfile
 import xml.etree.ElementTree as ET
@@ -47,6 +48,79 @@ def track_xml(segments):
                         extensions = ET.SubElement(node, f"{{{GPX_NAMESPACE}}}extensions")
                     ET.SubElement(extensions, key).text = str(point[key])
     return root
+
+
+def legacy_running_speeds(points, options):
+    """Reference implementation retained to prove window-result equivalence."""
+    times = [None] * len(points)
+    anchors = [index for index, point in enumerate(points) if point.time is not None]
+    for left, right in zip(anchors, anchors[1:]):
+        left_time, right_time = points[left].time, points[right].time
+        if right_time <= left_time:
+            continue
+        distance = points[right].segment_distance_km - points[left].segment_distance_km
+        if distance <= 0.0:
+            continue
+        for index in range(left, right + 1):
+            fraction = (
+                points[index].segment_distance_km - points[left].segment_distance_km
+            ) / distance
+            times[index] = left_time + (right_time - left_time) * fraction
+    intervals = []
+    threshold = options.stationary_speed_threshold_kmh
+    for index in range(len(points) - 1):
+        distance = points[index + 1].segment_distance_km - points[index].segment_distance_km
+        if times[index] is None or times[index + 1] is None or distance <= 0.0:
+            intervals.append(None)
+            continue
+        seconds = (times[index + 1] - times[index]).total_seconds()
+        intervals.append(None if seconds <= 0.0 else (distance, seconds, distance / (seconds / 3600.0)))
+    half_window_km = options.running_speed_window_distance_m / 2000.0
+    speeds = []
+    for point_index, point in enumerate(points):
+        if times[point_index] is None:
+            speeds.append(None)
+            continue
+        if half_window_km <= 0.0:
+            candidates = [
+                interval
+                for interval in (
+                    intervals[point_index - 1] if point_index > 0 else None,
+                    intervals[point_index] if point_index < len(intervals) else None,
+                )
+                if interval is not None and interval[2] >= threshold
+            ]
+            if not candidates:
+                speeds.append(None)
+                continue
+            distance = sum(item[0] for item in candidates)
+            seconds = sum(item[1] for item in candidates)
+            speeds.append(distance / (seconds / 3600.0))
+            continue
+        start = max(points[0].segment_distance_km, point.segment_distance_km - half_window_km)
+        end = min(points[-1].segment_distance_km, point.segment_distance_km + half_window_km)
+        selected_distance = selected_seconds = all_distance = all_seconds = 0.0
+        for index, interval in enumerate(intervals):
+            if interval is None:
+                continue
+            overlap = min(end, points[index + 1].segment_distance_km) - max(
+                start, points[index].segment_distance_km
+            )
+            if overlap <= 0.0:
+                continue
+            seconds = interval[1] * overlap / interval[0]
+            all_distance += overlap
+            all_seconds += seconds
+            if interval[2] >= threshold:
+                selected_distance += overlap
+                selected_seconds += seconds
+        if selected_seconds > 0.0:
+            speeds.append(selected_distance / (selected_seconds / 3600.0))
+        elif all_seconds > 0.0:
+            speeds.append(all_distance / (all_seconds / 3600.0))
+        else:
+            speeds.append(None)
+    return speeds
 
 
 class SharedGpxProcessingTests(unittest.TestCase):
@@ -145,6 +219,38 @@ class SharedGpxProcessingTests(unittest.TestCase):
         self.assertIsNotNone(processed.points[2].running_speed_kmh)
         self.assertIsNone(processed.points[3].running_speed_kmh)
 
+    def test_running_speed_prefix_integrals_match_legacy_window_scan(self):
+        start = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+        raw = []
+        elapsed = 0
+        for index in range(80):
+            if index:
+                elapsed += 900 if index in {25, 52} else 18 + index % 7
+            longitude_index = index - 1 if index == 40 else index
+            point_time = start + timedelta(seconds=elapsed) if 3 <= index <= 74 else None
+            raw.append(
+                RawTrackPoint(
+                    index,
+                    0,
+                    index,
+                    50.0,
+                    7.0 + longitude_index * 0.0001,
+                    time=point_time,
+                )
+            )
+        for window in (0.0, 100.0, 500.0, 1200.0):
+            options = ProcessingOptions(0, 0, 0, 0, 0, 0, 0, window, 1.5)
+            processed = process_raw_points(raw, options)
+            reference_points = copy.deepcopy(processed.points)
+            for point in reference_points:
+                point.running_speed_kmh = None
+            expected = legacy_running_speeds(reference_points, options)
+            actual = [point.running_speed_kmh for point in processed.points]
+            self.assertEqual([value is None for value in actual], [value is None for value in expected])
+            for actual_value, expected_value in zip(actual, expected):
+                if actual_value is not None:
+                    self.assertAlmostEqual(actual_value, expected_value, places=9)
+
     def test_gpx_10_route_is_converted_to_canonical_track(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "route.gpx"
@@ -165,6 +271,13 @@ class SharedGpxProcessingTests(unittest.TestCase):
             len(document.tracks[0].findall(".//{http://www.topografix.com/GPX/1/1}trkpt")),
             2,
         )
+
+    def test_canonical_gpx_11_does_not_clone_the_complete_tree(self):
+        temporary_directory, path = self._write_gpx_tracks(2)
+        self.addCleanup(temporary_directory.cleanup)
+        with patch("gpx_import._normalize_element", side_effect=AssertionError("clone")):
+            document = load_gpx_document(path)
+        self.assertEqual(len(document.tracks), 2)
 
     def test_waypoint_only_document_becomes_one_ordered_track(self):
         with tempfile.TemporaryDirectory() as directory:

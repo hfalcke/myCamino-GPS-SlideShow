@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from GPSTrackShow import (
     GPSTrackShowApp,
+    SLIDESHOW_CHECKPOINT_VERSION,
     PhotoListEntry,
     TimeLapseStage,
     adjacent_stage_map_index,
@@ -31,11 +32,42 @@ from GPSTrackShow import (
     time_lapse_clock_datetime,
     timeline_sample_count,
 )
-from gpx_tracks_table import extract_track_points, upgrade_timed_track_sidecars
+from gpx_tracks_table import (
+    extract_track_points,
+    run_with_options,
+    upgrade_timed_track_sidecars,
+)
 from track_timing_utils import haversine_km, repair_timed_points, timed_points_payload
 
 
 class TrackTimingTests(unittest.TestCase):
+    def test_summary_references_map_independent_derived_track_data(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            gpx_path = root / "trip.gpx"
+            gpx_path.write_text(
+                """<?xml version="1.0"?><gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>Stage</name><trkseg><trkpt lat="50.0" lon="8.0"><ele>100</ele><time>2024-01-01T10:00:00Z</time></trkpt><trkpt lat="50.001" lon="8.001"><ele>110</ele><time>2024-01-01T10:01:00Z</time></trkpt></trkseg></trk></gpx>""",
+                encoding="utf-8",
+            )
+            result = run_with_options(
+                gpx_path,
+                output_dir=root,
+                output_base="trip",
+                plot_overview=False,
+                plot_tracks=None,
+                print_table_output=False,
+            )
+            summary = json.loads(Path(result["table_json_path"]).read_text(encoding="utf-8"))
+            row = summary["tracks"][0]
+            self.assertNotIn("timed_track_points", row)
+            derived_path = root / row["track_data_sidecar"]
+            derived = json.loads(derived_path.read_text(encoding="utf-8"))
+            self.assertEqual(derived["track_fingerprint"], row["track_fingerprint"])
+            self.assertEqual(len(derived["timed_track_points"]), 2)
+            self.assertEqual(derived["processed_geometry_source"], "timed_track_points")
+            self.assertNotIn("processed_track_segments", derived)
+            self.assertNotIn("track_points", derived)
+
     def test_speedometer_scale_uses_nice_upper_bound(self):
         self.assertEqual(nice_speedometer_maximum(None), 10.0)
         self.assertEqual(nice_speedometer_maximum(6.2), 10.0)
@@ -205,7 +237,7 @@ class TrackTimingTests(unittest.TestCase):
         app.playlist_index = 6
         app.playlist_lines = ["#Overviewmap: map.png", "#Datum: 01.01.2024", "#Comment: test", "#Map: stage.png", "#Datum: 01.01.2024", "photo.jpeg"]
         state = app._resume_state_payload()
-        self.assertEqual(state["version"], 4)
+        self.assertEqual(state["version"], SLIDESHOW_CHECKPOINT_VERSION)
         self.assertEqual(state["control"]["version"], 1)
         self.assertEqual(state["playlist_index"], 3)
         self.assertEqual(state["media_index"], 5)

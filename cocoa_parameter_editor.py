@@ -77,6 +77,8 @@ class CocoaParameterEditor(NSObject):
         self.values = default_parameters()
         self.draft = dict(self.values)
         self.apply_callback = None
+        self.manage_map_provider_callback = None
+        self.cancel_callback = None
         self.current_section = ""
         self.show_advanced = False
         self.section_buttons = []
@@ -98,6 +100,8 @@ class CocoaParameterEditor(NSObject):
         sections: Iterable[str],
         values: dict,
         apply_callback: Callable[[dict, set[str]], bool | None],
+        manage_map_provider_callback: Callable[[dict], dict | None] | None = None,
+        cancel_callback: Callable[[], None] | None = None,
     ):
         self.title = str(title)
         self.sections = tuple(sections)
@@ -106,6 +110,8 @@ class CocoaParameterEditor(NSObject):
         self.values = normalize_parameters(values)
         self.draft = dict(self.values)
         self.apply_callback = apply_callback
+        self.manage_map_provider_callback = manage_map_provider_callback
+        self.cancel_callback = cancel_callback
         self.current_section = self.sections[0]
         self._build_window()
         return self
@@ -273,9 +279,15 @@ class CocoaParameterEditor(NSObject):
             and (index == 0 or specs[index - 1].subsection != spec.subsection)
         )
         subsection_height = 38.0
+        provider_header_height = (
+            50.0
+            if self.current_section == "Map Service"
+            and self.manage_map_provider_callback is not None
+            else 0.0
+        )
         document_height = max(
             visible_height,
-            24.0 + row_height * len(specs) + subsection_height * subsection_count,
+            24.0 + provider_header_height + row_height * len(specs) + subsection_height * subsection_count,
         )
         document_width = max(520.0, float(self.form_scroll.contentSize().width))
         form_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, document_width, document_height))
@@ -283,6 +295,12 @@ class CocoaParameterEditor(NSObject):
         self.steppers = {}
         self.tag_to_key = {}
         cursor_y = document_height - 18.0
+        if provider_header_height:
+            manage = self._make_button("Manage Map Provider...", "manageMapProvider:")
+            manage.setFrame_(NSMakeRect(16.0, cursor_y - 34.0, 190.0, 28.0))
+            manage.setToolTip_("Choose a provider, open its account page, or register an API key in macOS Keychain.")
+            form_view.addSubview_(manage)
+            cursor_y -= provider_header_height
         previous_subsection = ""
         for row, spec in enumerate(specs):
             if spec.subsection and spec.subsection != previous_subsection:
@@ -460,7 +478,7 @@ class CocoaParameterEditor(NSObject):
     def valueChanged_(self, sender):
         key = self.tag_to_key.get(int(sender.tag()))
         self._capture_controls()
-        if key == "maps.provider":
+        if key in {"maps.interactive_provider", "maps.output_provider"}:
             self.performSelector_withObject_afterDelay_("refreshSection:", None, 0.0)
 
     def controlTextDidChange_(self, _notification):
@@ -525,6 +543,18 @@ class CocoaParameterEditor(NSObject):
     def cancel_(self, _sender):
         self.draft = dict(self.values)
         self.window.orderOut_(None)
+        if self.cancel_callback is not None:
+            self.cancel_callback()
+
+    @objc.IBAction
+    def manageMapProvider_(self, _sender):
+        self._capture_controls()
+        if self.manage_map_provider_callback is None:
+            return
+        updated = self.manage_map_provider_callback(dict(self.draft))
+        if isinstance(updated, dict):
+            self.draft.update(updated)
+            self._render_section()
 
     @objc.IBAction
     def apply_(self, _sender):

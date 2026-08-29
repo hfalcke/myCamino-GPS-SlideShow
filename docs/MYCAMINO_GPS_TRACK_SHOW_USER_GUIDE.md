@@ -74,12 +74,11 @@ The normal order is:
 8. Export a PDF track summary if desired.
 9. Start the slide show.
 
-Music is an optional section of its own. New Adventures start with
-**No Music** selected, which hides the playlist controls. Every project has a
-fixed `audio` folder. It is created when the project is opened and recreated
-automatically if it was removed. Clear **No Music**, open that folder with the
-folder icon, and copy supported audio files or complete album directories into
-it. The selected playlist is saved with the Adventure.
+Audio is optional. New Adventures start with **No Audio** selected, which
+disables both music and narration and hides both playlist rows. Every project
+has fixed `audio` and `narration` folders, recreated automatically if removed.
+Clear **No Audio**, open either folder, and add supported recordings or folder
+groups. Both selected playlists are saved with the Adventure.
 
 In the **GPX Files** section, select **No GPX file - use only photos** when the Adventure has
 no recorded GPX track. The GPX filename controls are then hidden and the
@@ -121,7 +120,9 @@ Controls:
   is editable until it is first committed. Existing names are protected; click
   **Edit** before deliberately renaming or copying an Adventure.
   Selecting one loads it immediately. The most recently modified Adventure is
-  loaded automatically when a folder is chosen.
+  loaded automatically when a folder is chosen. Adventures copied from another
+  project directory are marked **Needs adaptation** until a valid copy is
+  created for the new folder.
 - Description: optional two-line description.
 
 Files created:
@@ -133,6 +134,17 @@ The `.adv` file explicitly stores its project directory, GPX filename, active
 `.lst` file, generated map family, settings, description, import directory, and
 last stopped slide-show position. After creation or loading, every relevant
 change is saved automatically.
+
+If you duplicate a complete project folder in Finder, its `.adv` files still
+record the previous absolute project directory. The GUI recognizes these as
+copied Adventure templates instead of reporting them as damaged. If the new
+folder contains no valid Adventure, select one of the templates and use
+**Create from Selected**. The proposed new name is the folder name. This creates
+a new `.adv` for the copied folder, clears old Continue positions, and shares
+the GPX, control file, generated maps, media, music, and narration files already
+present there. The selected template remains unchanged. Use **Create Blank
+Adventure** only when none of the copied settings and project-file references
+should be retained.
 
 In an empty folder, confirm the suggested Adventure name to create the first
 `.adv`. Committing a changed name for an existing Adventure offers **Rename**,
@@ -163,10 +175,23 @@ setting together with a short explanation.
 
 Settings cover Standard and Time-Lapse playback, Track Map appearance and
 ordering, GPX processing, PDF output resolution, place-name lookup, and map
-providers. OpenStreetMap and Esri are presets. A custom provider requires an
-HTTP(S) tile address containing `{z}`, `{x}`, and `{y}`, plus attribution.
-Selecting Custom reveals both required fields immediately. Numerical settings
-can be typed or adjusted with the adjacent up/down stepper.
+providers. Interactive GPX Editor maps and generated PNG/PDF maps have separate
+provider choices. Public OpenStreetMap remains the interactive default and may
+also generate one manually selected map plan, but it is never used for an
+automatic whole-project download. Geoapify is the recommended production
+provider; Thunderforest, Stadia, Esri, and Custom XYZ are also available. Before
+the first automatic Map Generation, myCamino offers these services in a guided
+setup. For Geoapify, Thunderforest, and Stadia it opens the provider's official
+account page, validates the pasted API key with one small map request, and stores
+the key in macOS Keychain. Esri and Custom XYZ transfer to Map Service Settings
+for manual configuration. **Manage Map Provider...** reopens this setup later.
+The chosen provider becomes this Mac's default for new Adventures, while each
+Adventure can override it. API keys are never stored in an Adventure and must be
+entered again on another Mac when they are not available in that Mac's Keychain.
+A custom provider requires an HTTPS tile address containing
+`{z}`, `{x}`, and `{y}`, plus attribution. Numerical settings can be typed or
+adjusted with the adjacent up/down stepper. All providers share a persistent
+tile cache; public OSM tiles are retained for at least seven days.
 
 GPX Processing separates horizontal smoothing (default 10 m), retained-point
 spacing (10 m), and elevation smoothing (50 m). Horizontal/vertical uncertainty
@@ -238,19 +263,32 @@ Behavior:
 - If the selected GPX file does not exist, the GPX Editor opens with the default
   output file.
 - If the GPX file directory does not exist, the GUI shows an error.
-- When the GPX Editor saves or closes, the GUI updates the GPX field to the
-  most recently saved GPX file, refreshes the statistics, and regenerates the
-  track summary file without recreating map images.
+- When the GPX Editor saves, the GUI immediately returns control and updates
+  compact summary plus per-track derived geometry/timing data once in the
+  background. It never downloads maps as part of Save.
 
 The summary line shows the number of tracks, track/date range information, how
 many track plot images exist, and whether an overview plot exists.
 
-## Map Generation Section
+## Maps Section
 
 Map Generation normally runs automatically after media have been accepted or
 imported and their metadata has been prepared. It maintains one shared overview
 plus Standard and Time-Lapse variants for every required GPX or media stage.
 Only missing or outdated maps are rendered.
+
+Automatic project generation requires a configured production provider. With
+Public OpenStreetMap selected, missing maps remain pending and the GUI directs
+you to choose a production provider or manually generate one selected overview
+or stage (both Standard and Time-Lapse variants are produced together). Provider
+setup may be deferred; this retains policy-limited OSM access but does
+not enable automatic whole-project downloads. Every installation uses the
+user's own hosted-provider account and quota; myCamino does not distribute a
+shared API key. Before a manual OSM request, a confirmation reports estimated required, cached, and
+downloadable tiles. HTTP
+403 blocks stop the provider job without retry; HTTP 429 responses report the
+provider's delay. Existing map images remain usable while changed tracks are
+clearly marked outdated.
 
 Newly created maps separate the downloaded basemap from the route and header.
 The PNG stores the basemap pixels; Standard maps include their normal title
@@ -364,7 +402,7 @@ Plot viewer window:
 - `q` hides/closes the viewer.
 - The window keeps the image aspect ratio while resizing.
 
-## Photos and Video Clips Section
+## Media Section
 
 Use this section to import and inspect the media files for the adventure.
 
@@ -435,7 +473,7 @@ Media viewer window:
 
 The status line below the buttons shows how many photos and videos are present.
 
-## Slide Show Control File Section
+## Control File Section
 
 This section creates and edits the file that tells the slide show what to show
 and in what order.
@@ -520,7 +558,7 @@ Music control uses separate `MUS` rows rather than an extra column. Slide-show
 flow and timing use `CTL` rows. Press **Insert Row** or Command-I, choose the
 desired Type, and enter the comma-separated commands in **File / Date / Map**.
 A nonmodal command reference opens for a `MUS` or `CTL` row. The music reference
-is also available from the small **Help** link beside **No Music** in the main
+is also available from the small **Help** link beside **No Audio** in the main
 window. The filter popup offers All Rows, No Media, Media, Maps,
 `MUS - Music control`, `CTL - Slide-show control`, each individual
 image/video/map type, and Date. **Reset Filter** returns to All Rows. The selected row remains visible
@@ -648,7 +686,7 @@ Update Control File:
 - Avoids duplicate media entries.
 - Cancel or failure leaves the active project unchanged.
 
-## Music
+## Audio, Music, and Narration
 
 The Slide Show control file can contain directives of the form
 `#MUSIC: Parameters`. They can jump to a playlist location, play a particular
@@ -656,9 +694,18 @@ piece, select loop behavior, change the internal volume, or switch music off
 and on at that point in the show. Playlists are editable text files and contain
 `$LABEL` entries for songs and albums. You can add your own labels for useful
 jump locations. Music is stored in the project's `audio` subdirectory as
-individual files or album folders. Click **Help** beside **No Music** for the
+individual files or album folders. **No Audio** disables both music and
+narration. Click **Help** beside it for the
 complete command reference and the labels currently available in the selected
 playlist.
+
+`#PLAY:` accepts a comma-separated mixture of labels, pathnames, and inclusive
+label ranges such as `$A - $D`. It plays that finite music selection and then
+resumes the interrupted title at its saved position. `#NARRATOR:` uses the same
+syntax with the separate playlist in the project's `narration` folder. It plays
+the selected recordings once while the visuals continue, then waits for the
+next narrator row. Quote or backslash-escape pathnames containing separators or
+blanks.
 
 `#JUMP $LABEL` and `#GOTO $LABEL` are equivalent music commands.
 
@@ -698,7 +745,12 @@ text containing commas. Video captions remain visible for the complete clip.
 These settings also control following automatic stage headers. Captions use the
 configured text color and shadow without covering the image with a box.
 
-The Music section contains:
+The Audio section contains separate Music and Narration playlist rows:
+
+Use the `+`/`−` button beside **Audio** to expand or collapse those rows. The
+choice is remembered for each Adventure. **No Audio** disables both music and
+narration independently; **Normalize Video Audio** remains available in the
+compact header row.
 
 - Audio folder icon: open the project's fixed `audio` folder in Finder. Copy
   MP3, M4A, AAC, WAV, AIFF, CAF, or FLAC files into it. Subdirectories that
@@ -723,6 +775,11 @@ The Music section contains:
   boost, true-peak ceiling, and music crossfade duration.
 - The Adventure stores `audio` as its fixed music source and the explicit
   selected playlist path.
+- Narration uses the fixed `narration` folder and the same recursive Create,
+  Update, Edit, album-label, and file-label implementation as music.
+- Settings > Audio chooses whether music remains parallel, is reduced to 25%
+  by default, or is faded out and paused while narration speaks. Video sound is
+  reduced to 25% by default during narration.
   Renaming or copying an Adventure with related files enabled also renames or
   copies its playlist; the audio recordings themselves remain unchanged.
 
@@ -921,8 +978,8 @@ Add a standalone line such as `#MUSIC: #JUMP $MORNING` to the control file.
 Entries are CSV-style comma-separated; quote a pathname containing commas.
 Available commands are:
 
-- `$LABEL` or pathname: temporarily queue titles in the listed order, then
-  resume the previously interrupted playlist title at its saved position.
+- `#PLAY: $A, $B - $D, "Song.mp3"`: temporarily play a finite mixed selection,
+  then resume the interrupted playlist title at its saved position.
 - `#JUMP $LABEL`: discard a queue or loop and continue from the label.
 - `#ON` / `#OFF`: open or close the control-file audio gate.
 - `#CONTINUE`: cancel the active queue or loop without a hard cut.
@@ -977,6 +1034,14 @@ work that is not part of a slide-show project. Its gear button edits GPX
 processing, PDF export, and map-service settings. Standalone settings are kept
 for future sessions; when opened from an Adventure, they are auto-saved in that
 Adventure instead.
+
+In the main track table, right-click one selected track or a multiple selection
+to inspect, plot, sort, duplicate, move, show/hide, join, or delete it. A
+right-click on an unselected row first selects only that track. **Sort Selected
+Tracks…** lets you choose a metric and direction while leaving every unselected
+row in place. Duplicated tracks are inserted together after the last selected
+row and receive unique copy names. Every ordering, visibility, duplication,
+join, and deletion operation can be undone with the editor's Undo command.
 
 ## What Files Are in a Finished Project Directory
 

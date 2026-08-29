@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from slideshow_control_format import (
+    AudioSelectionDirective,
     MusicSyntaxError,
     normalize_playlist_label,
     playlist_label_key,
@@ -86,6 +87,39 @@ class AudioPlaylist:
             if indexes and indexes[0] > int(current_index):
                 return indexes
         return albums[0]
+
+
+def resolve_audio_selection(
+    playlist: AudioPlaylist,
+    directive: AudioSelectionDirective,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    """Resolve a finite selection while retaining item order and duplicates."""
+    indexes: list[int] = []
+    warnings: list[str] = []
+    for item in directive.items:
+        if item.kind == "label":
+            index = playlist.index_for_label(item.value)
+            if index is None:
+                warnings.append(f"Audio label ${item.value} is not present in the playlist")
+            else:
+                indexes.append(index)
+        elif item.kind == "path":
+            index = playlist.index_for_path(item.value)
+            if index is None:
+                warnings.append(f"Audio file is not present in the playlist: {item.value}")
+            else:
+                indexes.append(index)
+        elif item.kind == "range":
+            first_label, last_label = item.value
+            first = playlist.index_for_label(first_label)
+            last = playlist.index_for_label(last_label)
+            if first is None or last is None:
+                warnings.append(f"Audio range labels not found: ${first_label} - ${last_label}")
+            elif first > last:
+                warnings.append(f"Audio range starts after its end: ${first_label} - ${last_label}")
+            else:
+                indexes.extend(range(first, last + 1))
+    return tuple(indexes), tuple(warnings)
 
 
 def _empty_playlist(source: Path, warning: str | None = None) -> AudioPlaylist:

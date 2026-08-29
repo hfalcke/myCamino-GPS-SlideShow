@@ -55,7 +55,12 @@ from elevation_profile_cache import (
     elevation_profile_segments,
 )
 from map_overlay import map_uses_dynamic_overlays, placement_obstacle_points, scene_from_metadata
-from audio_playlist import AUDIO_EXTENSIONS, MusicTransportState, load_audio_playlist
+from audio_playlist import (
+    AUDIO_EXTENSIONS,
+    MusicTransportState,
+    load_audio_playlist,
+    resolve_audio_selection,
+)
 from video_audio_normalization import (
     NormalizationSettings,
     load_manifest as load_video_normalization_manifest,
@@ -71,15 +76,20 @@ from slideshow_control_format import (
     MusicAction,
     MusicDirective,
     MusicSyntaxError,
+    AudioSelectionSyntaxError,
     control_label_key,
     is_control_directive,
     is_music_directive,
+    is_narrator_directive,
+    is_play_directive,
     is_disabled_control_line,
     normalize_control_transition,
     parse_caption_directive,
     parse_control_directive,
     parse_font_directive,
     parse_music_directive,
+    parse_narrator_directive,
+    parse_play_directive,
 )
 
 try:
@@ -291,7 +301,7 @@ WIPE_TRANSITION_MS = 1000
 WIPE_TRANSITION_STEPS = 100
 FIRST_STAGE_OVERVIEW_STARTUP_GRACE_SECONDS = 1.0
 INTRO_AUTO_ADVANCE_SECONDS = 30.0
-SLIDESHOW_CHECKPOINT_VERSION = 4
+SLIDESHOW_CHECKPOINT_VERSION = 5
 MUSIC_RESUME_STATE_VERSION = 1
 DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
@@ -519,14 +529,22 @@ class Config:
     resume_media_index: Optional[int] = None
     resume_phase: Optional[str] = None
     resume_audio_state: Optional[dict] = None
+    resume_narration_state: Optional[dict] = None
     resume_control_state: Optional[dict] = None
     state_file: Optional[Path] = None
     command_file: Optional[Path] = None
     music_source: Optional[Path] = None
     music_playlist: Optional[Path] = None
+    narration_source: Optional[Path] = None
+    narration_playlist: Optional[Path] = None
     audio_crossfade_seconds: float = 2.0
     music_volume_percent: float = 65.0
     video_volume_percent: float = 100.0
+    narration_volume_percent: float = 100.0
+    narration_music_behavior: str = "reduce"
+    narration_music_reduction_percent: float = 25.0
+    narration_video_reduction_percent: float = 25.0
+    narration_transition_seconds: float = 0.25
     use_normalized_videos: bool = True
     video_normalization_target_lufs: float = -16.0
     video_normalization_max_boost_db: float = 12.0
@@ -828,6 +846,7 @@ def parse_args(argv: list[str]) -> Config:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--resume-audio-state", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--resume-narration-state", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--resume-control-state", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--state-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--command-file", type=Path, default=None, help=argparse.SUPPRESS)
@@ -841,9 +860,16 @@ def parse_args(argv: list[str]) -> Config:
     )
     parser.add_argument("--music", type=Path, default=None, help="One audio file or a directory of background music.")
     parser.add_argument("--music-playlist", type=Path, default=None, help="Optional $label playlist for a music directory.")
+    parser.add_argument("--narration", type=Path, default=None, help="Directory containing narrator audio.")
+    parser.add_argument("--narration-playlist", type=Path, default=None, help="Optional $label playlist for narrator audio.")
     parser.add_argument("--audio-crossfade-seconds", type=float, default=2.0, help="Seconds used to crossfade music titles and #MUSIC transport changes (default: 2).")
     parser.add_argument("--music-volume-percent", type=float, default=65.0, help="Maximum background-music level in percent (default: 65).")
     parser.add_argument("--video-volume-percent", type=float, default=100.0, help="Video playback level in percent (default: 100).")
+    parser.add_argument("--narration-volume-percent", type=float, default=100.0, help="Narrator playback level in percent (default: 100).")
+    parser.add_argument("--narration-music-behavior", choices=("parallel", "reduce", "pause"), default="reduce", help="Music behavior while narration is active (default: reduce).")
+    parser.add_argument("--narration-music-reduction-percent", type=float, default=25.0, help="Music level while narration speaks (default: 25).")
+    parser.add_argument("--narration-video-reduction-percent", type=float, default=25.0, help="Video-audio level while narration speaks (default: 25).")
+    parser.add_argument("--narration-transition-seconds", type=float, default=0.25, help="Narrator fade/crossfade duration (default: 0.25).")
     parser.add_argument("--use-normalized-videos", action="store_true", default=True, help="Prefer current generated videos with normalized audio (default).")
     parser.add_argument("--no-normalized-videos", action="store_false", dest="use_normalized_videos", help="Use original videos at startup.")
     parser.add_argument("--video-normalization-target-lufs", type=float, default=-16.0, help=argparse.SUPPRESS)
@@ -1011,6 +1037,15 @@ def parse_args(argv: list[str]) -> Config:
         parser.error("--music-volume-percent must be between 0 and 100")
     if not 0.0 <= args.video_volume_percent <= 100.0:
         parser.error("--video-volume-percent must be between 0 and 100")
+    for option, value in (
+        ("--narration-volume-percent", args.narration_volume_percent),
+        ("--narration-music-reduction-percent", args.narration_music_reduction_percent),
+        ("--narration-video-reduction-percent", args.narration_video_reduction_percent),
+    ):
+        if not 0.0 <= value <= 100.0:
+            parser.error(f"{option} must be between 0 and 100")
+    if not 0.0 <= args.narration_transition_seconds <= 5.0:
+        parser.error("--narration-transition-seconds must be between 0 and 5")
     if args.video_normalization_max_boost_db < 0.0:
         parser.error("--video-normalization-max-boost-db must be non-negative")
     if args.time_lapse_duration <= 0:
@@ -1045,6 +1080,12 @@ def parse_args(argv: list[str]) -> Config:
     music_playlist = args.music_playlist.expanduser().resolve() if args.music_playlist else None
     if music_playlist is not None and not music_playlist.is_file():
         parser.error(f"music playlist not found: {music_playlist}")
+    narration_source = args.narration.expanduser().resolve() if args.narration else None
+    if narration_source is not None and not narration_source.is_dir():
+        parser.error(f"narration source is not a directory: {narration_source}")
+    narration_playlist = args.narration_playlist.expanduser().resolve() if args.narration_playlist else None
+    if narration_playlist is not None and not narration_playlist.is_file():
+        parser.error(f"narration playlist not found: {narration_playlist}")
 
     initial_style = "TIME_LAPSE" if args.time_lapse_stages else args.transition
     standard_transition = (
@@ -1060,6 +1101,14 @@ def parse_args(argv: list[str]) -> Config:
             parser.error(f"invalid --resume-audio-state: {exc}")
         if not isinstance(resume_audio_state, dict):
             parser.error("--resume-audio-state must contain a JSON object")
+    resume_narration_state = None
+    if args.resume_narration_state:
+        try:
+            resume_narration_state = json.loads(args.resume_narration_state)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(f"--resume-narration-state is invalid JSON: {exc}")
+        if not isinstance(resume_narration_state, dict):
+            parser.error("--resume-narration-state must contain a JSON object")
     resume_control_state = None
     resume_initial_style = None
     if args.resume_control_state:
@@ -1129,14 +1178,22 @@ def parse_args(argv: list[str]) -> Config:
         resume_media_index=args.resume_media_index,
         resume_phase=args.resume_phase,
         resume_audio_state=resume_audio_state,
+        resume_narration_state=resume_narration_state,
         resume_control_state=resume_control_state,
         state_file=args.state_file.expanduser().resolve() if args.state_file else None,
         command_file=args.command_file.expanduser().resolve() if args.command_file else None,
         music_source=music_source,
         music_playlist=music_playlist,
+        narration_source=narration_source,
+        narration_playlist=narration_playlist,
         audio_crossfade_seconds=float(args.audio_crossfade_seconds),
         music_volume_percent=float(args.music_volume_percent),
         video_volume_percent=float(args.video_volume_percent),
+        narration_volume_percent=float(args.narration_volume_percent),
+        narration_music_behavior=str(args.narration_music_behavior),
+        narration_music_reduction_percent=float(args.narration_music_reduction_percent),
+        narration_video_reduction_percent=float(args.narration_video_reduction_percent),
+        narration_transition_seconds=float(args.narration_transition_seconds),
         use_normalized_videos=bool(args.use_normalized_videos),
         video_normalization_target_lufs=float(args.video_normalization_target_lufs),
         video_normalization_max_boost_db=float(args.video_normalization_max_boost_db),
@@ -1298,14 +1355,22 @@ def config_from_options(
     resume_media_index: Optional[int] = None,
     resume_phase: Optional[str] = None,
     resume_audio_state: Optional[dict] = None,
+    resume_narration_state: Optional[dict] = None,
     resume_control_state: Optional[dict] = None,
     state_file: str | Path | None = None,
     command_file: str | Path | None = None,
     music_source: str | Path | None = None,
     music_playlist: str | Path | None = None,
+    narration_source: str | Path | None = None,
+    narration_playlist: str | Path | None = None,
     audio_crossfade_seconds: float = 2.0,
     music_volume_percent: float = 65.0,
     video_volume_percent: float = 100.0,
+    narration_volume_percent: float = 100.0,
+    narration_music_behavior: str = "reduce",
+    narration_music_reduction_percent: float = 25.0,
+    narration_video_reduction_percent: float = 25.0,
+    narration_transition_seconds: float = 0.25,
     use_normalized_videos: bool = True,
     video_normalization_target_lufs: float = -16.0,
     video_normalization_max_boost_db: float = 12.0,
@@ -1357,6 +1422,17 @@ def config_from_options(
         raise ValueError("music_volume_percent must be between 0 and 100")
     if not 0.0 <= video_volume_percent <= 100.0:
         raise ValueError("video_volume_percent must be between 0 and 100")
+    for name, value in (
+        ("narration_volume_percent", narration_volume_percent),
+        ("narration_music_reduction_percent", narration_music_reduction_percent),
+        ("narration_video_reduction_percent", narration_video_reduction_percent),
+    ):
+        if not 0.0 <= value <= 100.0:
+            raise ValueError(f"{name} must be between 0 and 100")
+    if narration_music_behavior not in {"parallel", "reduce", "pause"}:
+        raise ValueError("narration_music_behavior must be parallel, reduce, or pause")
+    if not 0.0 <= narration_transition_seconds <= 5.0:
+        raise ValueError("narration_transition_seconds must be between 0 and 5")
     if video_normalization_max_boost_db < 0.0:
         raise ValueError("video_normalization_max_boost_db must be non-negative")
     if time_lapse_duration <= 0:
@@ -1420,6 +1496,12 @@ def config_from_options(
     music_playlist_path = Path(music_playlist).expanduser().resolve() if music_playlist is not None else None
     if music_playlist_path is not None and not music_playlist_path.is_file():
         raise ValueError(f"music playlist not found: {music_playlist_path}")
+    narration_source_path = Path(narration_source).expanduser().resolve() if narration_source is not None else None
+    if narration_source_path is not None and not narration_source_path.is_dir():
+        raise ValueError(f"narration source is not a directory: {narration_source_path}")
+    narration_playlist_path = Path(narration_playlist).expanduser().resolve() if narration_playlist is not None else None
+    if narration_playlist_path is not None and not narration_playlist_path.is_file():
+        raise ValueError(f"narration playlist not found: {narration_playlist_path}")
 
     normalized_end_behavior = str(end_behavior).strip().casefold()
     if repeat is not None:
@@ -1483,6 +1565,11 @@ def config_from_options(
             if isinstance(resume_audio_state, dict)
             else None
         ),
+        resume_narration_state=(
+            dict(resume_narration_state)
+            if isinstance(resume_narration_state, dict)
+            else None
+        ),
         resume_control_state=(
             dict(resume_control_state)
             if isinstance(resume_control_state, dict)
@@ -1492,9 +1579,16 @@ def config_from_options(
         command_file=Path(command_file).expanduser().resolve() if command_file is not None else None,
         music_source=music_source_path,
         music_playlist=music_playlist_path,
+        narration_source=narration_source_path,
+        narration_playlist=narration_playlist_path,
         audio_crossfade_seconds=float(audio_crossfade_seconds),
         music_volume_percent=float(music_volume_percent),
         video_volume_percent=float(video_volume_percent),
+        narration_volume_percent=float(narration_volume_percent),
+        narration_music_behavior=str(narration_music_behavior),
+        narration_music_reduction_percent=float(narration_music_reduction_percent),
+        narration_video_reduction_percent=float(narration_video_reduction_percent),
+        narration_transition_seconds=float(narration_transition_seconds),
         use_normalized_videos=bool(use_normalized_videos),
         video_normalization_target_lufs=float(video_normalization_target_lufs),
         video_normalization_max_boost_db=float(video_normalization_max_boost_db),
@@ -3236,6 +3330,21 @@ if APPKIT_AVAILABLE:
                 if self.media_video_view is not None:
                     self.media_video_view.setFrame_(media_rect)
             self.drawTextOverlays()
+            attribution = (
+                self.map_metadata.get("map_attribution")
+                if isinstance(self.map_metadata, dict)
+                else None
+            )
+            if attribution:
+                draw_shadowed_text(
+                    str(attribution),
+                    float(image_rect.origin.x + 6.0),
+                    float(image_rect.origin.y + 4.0),
+                    NSFont.systemFontOfSize_(max(9.0, min(14.0, bounds.size.height * 0.014))),
+                    COLOR_NAMES["white"],
+                    "left",
+                    (0.0, 0.0, 0.0, 0.75),
+                )
 
 
 def format_place_for_slideshow(raw_place: str) -> str:
@@ -6825,16 +6934,18 @@ class BackgroundMusicController:
             playlist_path = candidate if candidate.is_file() else None
         self.playlist = load_audio_playlist(config.music_source, playlist_path) if config.music_source else None
         self.directives: dict[int, MusicDirective] = {}
+        self.play_directives = {}
         for index, line in enumerate(control_lines):
-            if not is_music_directive(line):
-                continue
             try:
-                directive = parse_music_directive(line)
-            except MusicSyntaxError as exc:
+                directive = parse_music_directive(line) if is_music_directive(line) else None
+                play_directive = parse_play_directive(line) if is_play_directive(line) else None
+            except (MusicSyntaxError, AudioSelectionSyntaxError) as exc:
                 warn_message(f"control line {index + 1}: {exc}")
                 continue
             if directive is not None:
                 self.directives[index] = directive
+            if play_directive is not None:
+                self.play_directives[index] = play_directive
         self.transport = MusicTransportState(self.playlist) if self.playlist is not None else None
         self.warned_music_errors: set[str] = set()
         self.players = [None, None]
@@ -6848,6 +6959,9 @@ class BackgroundMusicController:
         self.queue_resume_seconds: Optional[float] = None
         self.slideshow_paused = False
         self.video_paused = False
+        self.narration_active = False
+        self.narration_gain_envelope = 1.0
+        self.narration_gain_handles = []
         self.poll_handle = None
         self.fade_handles = []
         self.last_control_row = -1
@@ -6863,7 +6977,11 @@ class BackgroundMusicController:
 
     @property
     def effective_playing(self) -> bool:
-        return self.user_enabled and self.control_enabled and not self.slideshow_paused and not self.video_paused
+        narration_pauses = (
+            getattr(self, "narration_active", False)
+            and str(getattr(self.config, "narration_music_behavior", "reduce")) == "pause"
+        )
+        return self.user_enabled and self.control_enabled and not self.slideshow_paused and not self.video_paused and not narration_pauses
 
     def _player(self):
         return self.players[self.active_slot]
@@ -7017,6 +7135,9 @@ class BackgroundMusicController:
             directive = self.directives.get(index)
             if directive is not None:
                 self._execute_directive(directive, switch_player=True, show_status=True)
+            play_directive = getattr(self, "play_directives", {}).get(index)
+            if play_directive is not None:
+                self._execute_play_directive(play_directive, switch_player=True)
         self.last_control_row = row_index
 
     def _warn_once(self, message: str) -> None:
@@ -7058,7 +7179,60 @@ class BackgroundMusicController:
 
     def _target_gain(self) -> float:
         configured = max(0.0, min(100.0, float(getattr(self.config, "music_volume_percent", 65.0)))) / 100.0
-        return configured * max(0.0, min(1.0, float(self.volume_level) / 9.0))
+        gain = configured * max(0.0, min(1.0, float(self.volume_level) / 9.0))
+        return gain * float(getattr(self, "narration_gain_envelope", 1.0))
+
+    def _execute_play_directive(self, directive, switch_player: bool) -> None:
+        if self.transport is None or self.playlist is None:
+            return
+        indexes, warnings = resolve_audio_selection(self.playlist, directive)
+        for warning in warnings:
+            self._warn_once(warning)
+        if not indexes:
+            return
+        return_index = self.queue_resume_index if self.transport.mode == "queue" else self.current_index
+        if self.transport.mode != "queue":
+            self._remember_queue_resume_position(return_index)
+        target = self.transport.set_queue(indexes, return_index=return_index)
+        self._activate_transport(target, switch_player)
+
+    def set_narration_active(self, active: bool) -> None:
+        was_playing = self.effective_playing
+        self.narration_active = bool(active)
+        now_playing = self.effective_playing
+        player = self._player()
+        for handle in getattr(self, "narration_gain_handles", []):
+            handle.cancel()
+        self.narration_gain_handles = []
+        behavior = str(getattr(self.config, "narration_music_behavior", "reduce"))
+        target_gain = (
+            max(0.0, min(100.0, float(getattr(self.config, "narration_music_reduction_percent", 25.0)))) / 100.0
+            if self.narration_active and behavior == "reduce"
+            else 1.0
+        )
+        start_gain = float(getattr(self, "narration_gain_envelope", 1.0))
+        duration = max(0.0, float(getattr(self.config, "audio_crossfade_seconds", 2.0)))
+        if behavior == "reduce" or (not active and start_gain != 1.0):
+            steps = max(1, min(40, int(math.ceil(duration / 0.05)))) if duration else 1
+            for step in range(1, steps + 1):
+                fraction = step / steps
+
+                def apply_gain(value=fraction):
+                    self.narration_gain_envelope = start_gain + (target_gain - start_gain) * value
+                    self._apply_all_player_gains()
+
+                self.narration_gain_handles.append(self.schedule_callback(duration * fraction, apply_gain))
+        else:
+            self.narration_gain_envelope = target_gain
+        if player is None:
+            return
+        if was_playing != now_playing:
+            if now_playing:
+                self._fade(None, player, self.config.audio_crossfade_seconds)
+            else:
+                self._fade(player, None, self.config.audio_crossfade_seconds)
+        else:
+            self._apply_all_player_gains()
 
     def _slot_for_player(self, player) -> Optional[int]:
         for index, candidate in enumerate(self.players):
@@ -7446,6 +7620,9 @@ class BackgroundMusicController:
             self.poll_handle.cancel()
             self.poll_handle = None
         self._cancel_fades()
+        for handle in getattr(self, "narration_gain_handles", []):
+            handle.cancel()
+        self.narration_gain_handles = []
         for player in self.players:
             if player is not None:
                 try:
@@ -7454,6 +7631,291 @@ class BackgroundMusicController:
                 except Exception:
                     pass
         self.players = [None, None]
+
+
+class NarrationController:
+    """Finite narrator sequences driven by explicit ``#NARRATOR:`` rows."""
+
+    def __init__(self, config, control_lines, schedule_callback, overlay_callback, active_callback):
+        self.config = config
+        self.schedule_callback = schedule_callback
+        self.overlay_callback = overlay_callback
+        self.active_callback = active_callback
+        narration_playlist = config.narration_playlist
+        if narration_playlist is None and config.narration_source is not None:
+            adventure_name = config.inputlist.stem
+            if adventure_name.casefold().endswith("-sorted"):
+                adventure_name = adventure_name[:-7]
+            candidate = config.narration_source / f"{adventure_name}.playlist"
+            narration_playlist = candidate if candidate.is_file() else None
+        self.playlist_path = narration_playlist
+        self.playlist = (
+            load_audio_playlist(config.narration_source, narration_playlist)
+            if config.narration_source
+            else None
+        )
+        self.directives = {}
+        for index, line in enumerate(control_lines):
+            if not is_narrator_directive(line):
+                continue
+            try:
+                directive = parse_narrator_directive(line)
+            except AudioSelectionSyntaxError as exc:
+                warn_message(f"control line {index + 1}: {exc}")
+                continue
+            if directive is not None:
+                self.directives[index] = directive
+        self.players = [None, None]
+        self.active_slot = 0
+        self.sequence = ()
+        self.sequence_position = 0
+        self.current_index = None
+        self.paused = False
+        self.user_enabled = True
+        self.active = False
+        self.last_control_row = -1
+        self.poll_handle = None
+        self.fade_handles = []
+        self.disposed = False
+        self.warned = set()
+        if self.playlist is not None:
+            for warning in self.playlist.warnings:
+                self._warn_once(f"Narration: {warning}")
+
+    @property
+    def available(self):
+        return bool(AVKIT_VIDEO_AVAILABLE and AVPlayer is not None and self.playlist and self.playlist.files)
+
+    def _warn_once(self, message):
+        key = str(message).casefold()
+        if key not in self.warned:
+            self.warned.add(key)
+            warn_message(message)
+
+    def _player(self):
+        return self.players[self.active_slot]
+
+    def _duration_seconds(self, player):
+        try:
+            item = player.currentItem()
+            seconds = float(CMTimeGetSeconds(item.duration())) if item is not None and CMTimeGetSeconds else math.nan
+            return seconds if math.isfinite(seconds) and seconds > 0 else None
+        except Exception:
+            return None
+
+    def _current_seconds(self, player):
+        try:
+            seconds = float(CMTimeGetSeconds(player.currentTime())) if CMTimeGetSeconds else math.nan
+            return seconds if math.isfinite(seconds) and seconds >= 0 else None
+        except Exception:
+            return None
+
+    def _gain(self):
+        return max(0.0, min(100.0, float(self.config.narration_volume_percent))) / 100.0
+
+    def _cancel_fades(self):
+        for handle in self.fade_handles:
+            handle.cancel()
+        self.fade_handles.clear()
+
+    def _set_active(self, active):
+        active = bool(active)
+        if active == self.active:
+            return
+        self.active = active
+        self.active_callback(active)
+
+    def _fade_players(self, outgoing, incoming, duration):
+        self._cancel_fades()
+        duration = max(0.0, min(5.0, float(duration)))
+        if incoming is not None and not self.paused and self.user_enabled:
+            incoming.play()
+        if duration <= 0:
+            if outgoing is not None:
+                outgoing.setVolume_(0.0)
+                outgoing.pause()
+            if incoming is not None:
+                incoming.setVolume_(self._gain() if not self.paused else 0.0)
+            return
+        steps = max(2, min(20, int(math.ceil(duration / 0.05))))
+        for step in range(1, steps + 1):
+            fraction = step / steps
+
+            def apply(value=fraction, final=step == steps):
+                if self.disposed:
+                    return
+                if outgoing is not None:
+                    outgoing.setVolume_(self._gain() * (1.0 - value))
+                    if final:
+                        outgoing.pause()
+                if incoming is not None:
+                    incoming.setVolume_(self._gain() * value if not self.paused and self.user_enabled else 0.0)
+
+            self.fade_handles.append(self.schedule_callback(duration * fraction, apply))
+
+    def _switch_to(self, index, resume_seconds=None):
+        if not self.available or not 0 <= int(index) < len(self.playlist.files):
+            return
+        outgoing = self._player()
+        new_slot = 1 - self.active_slot
+        incoming = AVPlayer.playerWithURL_(NSURL.fileURLWithPath_(str(self.playlist.files[int(index)])))
+        incoming.setVolume_(0.0)
+        if resume_seconds is not None and CMTimeMake is not None:
+            try:
+                incoming.seekToTime_(CMTimeMake(max(0, int(float(resume_seconds) * 1000)), 1000))
+            except Exception as exc:
+                self._warn_once(f"Could not restore narration position: {exc}")
+        self.players[new_slot] = incoming
+        self.active_slot = new_slot
+        self.current_index = int(index)
+        self._set_active(True)
+        fade = float(self.config.narration_transition_seconds) if outgoing is not None else 0.0
+        self._fade_players(outgoing, incoming, fade)
+        old_slot = 1 - self.active_slot
+
+        def release_old():
+            if self.players[old_slot] is outgoing:
+                self.players[old_slot] = None
+
+        self.fade_handles.append(self.schedule_callback(fade + 0.05, release_old))
+
+    def _finish(self):
+        player = self._player()
+        fade = float(self.config.narration_transition_seconds)
+        self._fade_players(player, None, fade)
+
+        def complete():
+            if self.disposed:
+                return
+            self.players = [None, None]
+            self.current_index = None
+            self.sequence = ()
+            self.sequence_position = 0
+            self._set_active(False)
+
+        self.fade_handles.append(self.schedule_callback(fade + 0.05, complete))
+
+    def execute(self, directive):
+        if not self.available:
+            return
+        indexes, warnings = resolve_audio_selection(self.playlist, directive)
+        for warning in warnings:
+            self._warn_once(f"Narration: {warning}")
+        if not indexes:
+            return
+        self.sequence = indexes
+        self.sequence_position = 0
+        self._switch_to(indexes[0])
+        self._schedule_poll()
+
+    def synchronize_row(self, row_index):
+        row_index = int(row_index)
+        if row_index < self.last_control_row:
+            self.last_control_row = row_index
+            return
+        for index in range(self.last_control_row + 1, row_index + 1):
+            directive = self.directives.get(index)
+            if directive is not None:
+                self.execute(directive)
+        self.last_control_row = row_index
+
+    def _schedule_poll(self):
+        if self.poll_handle is None and not self.disposed:
+            self.poll_handle = self.schedule_callback(0.25, self._poll)
+
+    def _poll(self):
+        self.poll_handle = None
+        if self.disposed:
+            return
+        player = self._player()
+        if self.active and not self.paused and player is not None:
+            duration = self._duration_seconds(player)
+            current = self._current_seconds(player)
+            if duration is not None and current is not None and current >= duration - 0.1:
+                if self.sequence_position + 1 < len(self.sequence):
+                    self.sequence_position += 1
+                    self._switch_to(self.sequence[self.sequence_position])
+                else:
+                    self._finish()
+                    return
+        if self.active:
+            self._schedule_poll()
+
+    def set_slideshow_paused(self, paused):
+        self.paused = bool(paused)
+        player = self._player()
+        if player is None:
+            return
+        if self.paused:
+            player.pause()
+            player.setVolume_(0.0)
+        elif self.user_enabled:
+            player.setVolume_(self._gain())
+            player.play()
+
+    def set_user_enabled(self, enabled):
+        self.user_enabled = bool(enabled)
+        player = self._player()
+        if player is None:
+            return
+        if self.user_enabled and not self.paused:
+            player.setVolume_(self._gain())
+            player.play()
+        else:
+            player.setVolume_(0.0)
+            player.pause()
+
+    def resume_state_snapshot(self):
+        if not self.active or self.current_index is None or self.playlist is None:
+            return None
+        return {
+            "version": 1,
+            "playlist": str(self.playlist_path or ""),
+            "current_file": str(self.playlist.files[self.current_index]),
+            "elapsed_seconds": self._current_seconds(self._player()),
+            "sequence": [str(self.playlist.files[index]) for index in self.sequence],
+            "sequence_position": self.sequence_position,
+            "user_enabled": self.user_enabled,
+        }
+
+    def restore_state(self, payload):
+        if not self.available or not isinstance(payload, dict) or payload.get("version") != 1:
+            return False
+        saved_playlist = str(payload.get("playlist") or "").strip()
+        if saved_playlist and self.playlist_path is not None:
+            if Path(saved_playlist).expanduser().resolve(strict=False) != Path(self.playlist_path).resolve(strict=False):
+                return False
+        sequence = []
+        for path in payload.get("sequence", []):
+            index = self.playlist.index_for_path(path)
+            if index is None:
+                return False
+            sequence.append(index)
+        current = self.playlist.index_for_path(payload.get("current_file"))
+        if current is None or not sequence:
+            return False
+        self.sequence = tuple(sequence)
+        self.sequence_position = max(0, min(int(payload.get("sequence_position", 0)), len(sequence) - 1))
+        self.user_enabled = bool(payload.get("user_enabled", True))
+        self._switch_to(current, payload.get("elapsed_seconds"))
+        self._schedule_poll()
+        return True
+
+    def dispose(self):
+        self.disposed = True
+        if self.poll_handle is not None:
+            self.poll_handle.cancel()
+            self.poll_handle = None
+        self._cancel_fades()
+        for player in self.players:
+            if player is not None:
+                try:
+                    player.pause()
+                    player.setVolume_(0.0)
+                except Exception:
+                    pass
+        self.players = [None, None]
+        self._set_active(False)
 
 
 class GPSTrackShowApp:
@@ -7509,6 +7971,7 @@ class GPSTrackShowApp:
         self.current_overview_path: Optional[Path] = None
         self.compact_track_summary_loaded = False
         self.compact_track_summary: Optional[dict] = None
+        self.compact_track_summary_path: Optional[Path] = None
         self.summary_tracks_by_map_cache: Optional[dict[str, dict]] = None
         self.stage_start_distance_cache: dict[int, float] = {}
         self.stage_length_cache: dict[str, float] = {}
@@ -7546,6 +8009,8 @@ class GPSTrackShowApp:
         self.time_lapse_media_deadline: Optional[float] = None
         self.time_lapse_media_remaining: Optional[float] = None
         self.time_lapse_video_player = None
+        self.narration_video_envelope = 1.0
+        self.narration_video_gain_handles = []
         self.time_lapse_video_view = None
         self.time_lapse_video_original_path: Optional[Path] = None
         self.time_lapse_video_playback_path: Optional[Path] = None
@@ -7654,6 +8119,19 @@ class GPSTrackShowApp:
             self.schedule_callback,
             self._show_temporary_status_overlay,
         )
+        self.narration_controller = NarrationController(
+            self.config,
+            self.playlist_lines,
+            self.schedule_callback,
+            self._show_temporary_status_overlay,
+            self._set_narration_active,
+        )
+        if isinstance(self.config.resume_narration_state, dict):
+            if not self.narration_controller.restore_state(self.config.resume_narration_state):
+                self._show_temporary_status_overlay(
+                    "Saved narration position unavailable; waiting for the next narrator command",
+                    3.0,
+                )
         self._install_key_monitor()
         signal.signal(signal.SIGINT, self._handle_sigint)
         signal.signal(signal.SIGTERM, self._handle_sigint)
@@ -7773,7 +8251,45 @@ class GPSTrackShowApp:
         return original_path
 
     def _video_gain(self) -> float:
-        return max(0.0, min(100.0, float(self.config.video_volume_percent))) / 100.0
+        gain = max(0.0, min(100.0, float(self.config.video_volume_percent))) / 100.0
+        return gain * float(getattr(self, "narration_video_envelope", 1.0))
+
+    def _set_narration_active(self, active: bool) -> None:
+        music = getattr(self, "music_controller", None)
+        if music is not None:
+            music.set_narration_active(active)
+        for handle in getattr(self, "narration_video_gain_handles", []):
+            handle.cancel()
+        self.narration_video_gain_handles = []
+        start = float(getattr(self, "narration_video_envelope", 1.0))
+        target = (
+            max(0.0, min(100.0, float(self.config.narration_video_reduction_percent))) / 100.0
+            if active
+            else 1.0
+        )
+        duration = max(0.0, float(self.config.narration_transition_seconds))
+        steps = max(1, min(20, int(math.ceil(duration / 0.05)))) if duration else 1
+        for step in range(1, steps + 1):
+            fraction = step / steps
+
+            def apply_video_gain(value=fraction):
+                self.narration_video_envelope = start + (target - start) * value
+                gain = self._video_gain()
+                presenter = getattr(self, "active_photo_presenter", None)
+                if presenter is not None and getattr(presenter, "video_player", None) is not None:
+                    presenter.video_player.setVolume_(gain)
+                if getattr(self, "time_lapse_video_player", None) is not None:
+                    self.time_lapse_video_player.setVolume_(gain)
+
+            self.narration_video_gain_handles.append(self.schedule_callback(duration * fraction, apply_video_gain))
+
+    def _sync_audio_row(self, row_index: int) -> None:
+        music = getattr(self, "music_controller", None)
+        if music is not None:
+            music.synchronize_row(row_index)
+        narration = getattr(self, "narration_controller", None)
+        if narration is not None:
+            narration.synchronize_row(row_index)
 
     def _toggle_normalized_videos(self) -> None:
         desired = not self.use_normalized_videos
@@ -7806,6 +8322,7 @@ class GPSTrackShowApp:
             return getattr(self, "compact_track_summary", None)
         self.compact_track_summary_loaded = True
         self.compact_track_summary = None
+        self.compact_track_summary_path = None
         candidates = []
         current_overview_path = getattr(self, "current_overview_path", None)
         if current_overview_path is not None:
@@ -7824,6 +8341,7 @@ class GPSTrackShowApp:
                 continue
             if isinstance(payload, dict) and isinstance(payload.get("tracks"), list):
                 self.compact_track_summary = payload
+                self.compact_track_summary_path = candidate
                 return payload
         if (
             isinstance(getattr(self, "current_overview_metadata", None), dict)
@@ -7833,6 +8351,70 @@ class GPSTrackShowApp:
                 "tracks": self.current_overview_metadata["tracks"]
             }
         return self.compact_track_summary
+
+    def _load_stage_metadata(self, track_path: Path) -> Optional[dict]:
+        """Combine map geometry with current map-independent track data."""
+        metadata = try_read_plot_metadata(track_path.with_suffix(".json"))
+        row = self._summary_tracks_by_map_filename().get(
+            canonical_track_map_name(track_path.name)
+        )
+        relative = row.get("track_data_sidecar") if isinstance(row, dict) else None
+        summary_path = self.compact_track_summary_path
+        if not isinstance(relative, str) or summary_path is None:
+            return metadata
+        derived_path = Path(relative).expanduser()
+        if not derived_path.is_absolute():
+            derived_path = summary_path.parent / derived_path
+        derived = try_read_plot_metadata(derived_path)
+        if not isinstance(derived, dict):
+            return metadata
+        expected = str(row.get("track_fingerprint") or "")
+        if expected and str(derived.get("track_fingerprint") or "") != expected:
+            return metadata
+        combined = dict(metadata or {})
+        for key in (
+            "timed_track_points",
+            "running_speed",
+            "processed_track_segments",
+            "track_points",
+            "track_segments",
+            "timing_status",
+            "has_absolute_time",
+            "gpx_processing",
+            "track_endpoint_places",
+        ):
+            if key in derived:
+                combined[key] = derived[key]
+        combined["track_fingerprint"] = derived.get("track_fingerprint")
+        timed_points = combined.get("timed_track_points")
+        if isinstance(timed_points, list):
+            segments: dict[int, list] = {}
+            profiles: dict[int, list] = {}
+            for point in timed_points:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    segment_index = int(point.get("segment_index", 0) or 0)
+                    latitude = float(point["lat"])
+                    longitude = float(point["lon"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                segments.setdefault(segment_index, []).append([latitude, longitude])
+                if point.get("elevation_m") is not None:
+                    profiles.setdefault(segment_index, []).append(
+                        {
+                            "cumulative_distance_km": point.get(
+                                "cumulative_distance_km", 0.0
+                            ),
+                            "elevation_m": point.get("elevation_m"),
+                        }
+                    )
+            combined["track_segments"] = list(segments.values())
+            combined["track_points"] = [
+                point for segment in segments.values() for point in segment
+            ]
+            combined["processed_track_segments"] = list(profiles.values())
+        return combined
 
     def _summary_tracks_by_map_filename(self) -> dict[str, dict]:
         """Index compact track rows by their canonical Standard map filename."""
@@ -7976,7 +8558,17 @@ class GPSTrackShowApp:
                 self._toggle_elevation_profiles()
                 return None
             if chars in {"a", "A"} or raw_chars in {"a", "A"}:
-                self.music_controller.toggle()
+                if self.music_controller.available:
+                    self.music_controller.toggle()
+                    enabled = self.music_controller.user_enabled
+                elif self.narration_controller.available:
+                    enabled = not self.narration_controller.user_enabled
+                    self.music_controller.user_enabled = enabled
+                    self._show_temporary_status_overlay("Audio On" if enabled else "Audio Off", 2.0)
+                else:
+                    self._show_temporary_status_overlay("No audio available", 2.0)
+                    return None
+                self.narration_controller.set_user_enabled(enabled)
                 return None
             if chars in {"n", "N"} or raw_chars in {"n", "N"}:
                 self._toggle_normalized_videos()
@@ -8265,6 +8857,8 @@ class GPSTrackShowApp:
         self.manual_mode = not self.manual_mode
         self.paused = False
         self.music_controller.set_slideshow_paused(False)
+        if getattr(self, "narration_controller", None) is not None:
+            self.narration_controller.set_slideshow_paused(False)
         if self.manual_mode:
             self._freeze_time_lapse_media()
         else:
@@ -8316,6 +8910,8 @@ class GPSTrackShowApp:
             return
         self.paused = not self.paused
         self.music_controller.set_slideshow_paused(self.paused)
+        if getattr(self, "narration_controller", None) is not None:
+            self.narration_controller.set_slideshow_paused(self.paused)
         if self.paused:
             self._freeze_time_lapse_media()
         else:
@@ -8693,7 +9289,7 @@ class GPSTrackShowApp:
         except Exception as exc:
             warn_message(f"could not load stage map {selected}: {exc}")
             return False
-        metadata = try_read_plot_metadata(selected.with_suffix(".json"))
+        metadata = self._load_stage_metadata(selected)
         self.current_track_path = selected
         self.current_elevation_profile_image = None
         self.current_track_metadata = metadata
@@ -8823,7 +9419,7 @@ class GPSTrackShowApp:
         stage = self.stages[stage_index] if stage_index is not None else None
         if stage is not None and row_index in stage.media_indexes:
             media_position = stage.media_indexes.index(row_index)
-            self.music_controller.synchronize_row(row_index)
+            GPSTrackShowApp._sync_audio_row(self, row_index)
             if self.time_lapse_active:
                 entry = parse_photo_entry(self.playlist_lines[row_index])
                 self._start_time_lapse_at_media_row(
@@ -8835,7 +9431,7 @@ class GPSTrackShowApp:
                 self._show_standard_stage_media(stage_index, media_position)
             return True
 
-        self.music_controller.synchronize_row(row_index - 1)
+        GPSTrackShowApp._sync_audio_row(self, row_index - 1)
         self._prime_context_before_index(row_index)
         self.playlist_index = row_index
         self.pending_display_index = None
@@ -8891,6 +9487,8 @@ class GPSTrackShowApp:
         if not self.manual_mode:
             self.paused = False
             self.music_controller.set_slideshow_paused(False)
+            if getattr(self, "narration_controller", None) is not None:
+                self.narration_controller.set_slideshow_paused(False)
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
@@ -9067,6 +9665,8 @@ class GPSTrackShowApp:
         if not self.manual_mode:
             self.paused = False
             self.music_controller.set_slideshow_paused(False)
+            if getattr(self, "narration_controller", None) is not None:
+                self.narration_controller.set_slideshow_paused(False)
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
@@ -9800,6 +10400,8 @@ class GPSTrackShowApp:
         self._hide_startup_hint()
         self.music_controller.start(self.playlist_index)
         self.music_controller.set_slideshow_paused(False)
+        if getattr(self, "narration_controller", None) is not None:
+            self.narration_controller.set_slideshow_paused(False)
         self._show_intro_phase(PlaybackPhase.INTRO_OVERVIEW)
 
     def _show_intro_phase(self, phase: PlaybackPhase) -> None:
@@ -9871,7 +10473,9 @@ class GPSTrackShowApp:
         object.__setattr__(self.config, "duration", self.initial_duration)
         self._assign_playback_style(self.initial_playback_style)
         self.music_controller.set_slideshow_paused(True)
-        self.music_controller.synchronize_row(-1)
+        if getattr(self, "narration_controller", None) is not None:
+            self.narration_controller.set_slideshow_paused(True)
+        GPSTrackShowApp._sync_audio_row(self, -1)
         self.current_state = None
         self.current_display_index = None
         self.pending_display_index = None
@@ -9899,6 +10503,8 @@ class GPSTrackShowApp:
         self.awaiting_intro_start = False
         self._hide_startup_hint()
         self.music_controller.set_slideshow_paused(True)
+        if getattr(self, "narration_controller", None) is not None:
+            self.narration_controller.set_slideshow_paused(True)
         self.completed_naturally = True
         self.current_phase = None
         self.current_stage_index = None
@@ -9948,7 +10554,7 @@ class GPSTrackShowApp:
             self.current_track_image = load_nsimage(track_path)
             self.current_track_path = track_path
             self.current_elevation_profile_image = None
-            self.current_track_metadata = try_read_plot_metadata(track_path.with_suffix(".json"))
+            self.current_track_metadata = self._load_stage_metadata(track_path)
         except Exception as exc:
             warn_message(f"could not restore track map for resume: {exc}")
             return
@@ -10594,7 +11200,7 @@ class GPSTrackShowApp:
         self.current_track_image = load_nsimage(track_path)
         self.current_track_path = track_path
         self.current_elevation_profile_image = None
-        self.current_track_metadata = try_read_plot_metadata(track_path.with_suffix(".json"))
+        self.current_track_metadata = self._load_stage_metadata(track_path)
         self.current_track_image = draw_dynamic_map_overlay(
             self.current_track_image,
             self.current_track_metadata,
@@ -11144,15 +11750,20 @@ class GPSTrackShowApp:
         self._advance()
 
     def _sync_time_lapse_audio_through(self, row_index: int) -> None:
-        """Execute every music directive consumed internally by a Time-Lapse stage."""
+        """Execute every audio directive consumed internally by a Time-Lapse stage."""
         target = max(0, min(int(row_index), len(self.playlist_lines) - 1))
         if target < self.time_lapse_audio_row_cursor:
-            self.music_controller.synchronize_row(target)
+            GPSTrackShowApp._sync_audio_row(self, target)
             self.time_lapse_audio_row_cursor = target
             return
         for index in range(self.time_lapse_audio_row_cursor + 1, target + 1):
-            if is_music_directive(self.playlist_lines[index]) or index == target:
-                self.music_controller.synchronize_row(index)
+            if (
+                is_music_directive(self.playlist_lines[index])
+                or is_play_directive(self.playlist_lines[index])
+                or is_narrator_directive(self.playlist_lines[index])
+                or index == target
+            ):
+                GPSTrackShowApp._sync_audio_row(self, index)
         self.time_lapse_audio_row_cursor = target
 
     def _sync_time_lapse_controls_through(
@@ -11467,14 +12078,14 @@ class GPSTrackShowApp:
                 row_index,
                 default_caption_font,
             )
-            self.music_controller.synchronize_row(row_index)
+            GPSTrackShowApp._sync_audio_row(self, row_index)
             self.playlist_index += 1
             debug_print(self.config, f"Processing line: {line}")
             if is_disabled_control_line(line):
                 if not self._guard_control_flow():
                     return
                 continue
-            if is_music_directive(content):
+            if is_music_directive(content) or is_play_directive(content) or is_narrator_directive(content):
                 if not self._guard_control_flow():
                     return
                 continue
@@ -11567,6 +12178,7 @@ class GPSTrackShowApp:
             return
         self.compact_track_summary_loaded = False
         self.compact_track_summary = None
+        self.compact_track_summary_path = None
         self.summary_tracks_by_map_cache = None
         self.stage_start_distance_cache.clear()
         self.stage_length_cache.clear()
@@ -11603,7 +12215,7 @@ class GPSTrackShowApp:
         self.current_track_path = track_path
         self.current_elevation_profile_image = None
         metadata_path = track_path.with_suffix(".json")
-        self.current_track_metadata = try_read_plot_metadata(metadata_path)
+        self.current_track_metadata = self._load_stage_metadata(track_path)
         if self.current_track_metadata is not None:
             debug_print(self.config, f"Track map metadata loaded from {metadata_path}")
             self.current_track_image = draw_dynamic_map_overlay(
@@ -12224,6 +12836,14 @@ class GPSTrackShowApp:
                 )
                 else None
             ),
+            "narration": (
+                self.narration_controller.resume_state_snapshot()
+                if hasattr(
+                    getattr(self, "narration_controller", None),
+                    "resume_state_snapshot",
+                )
+                else None
+            ),
             "control": self._control_state_snapshot(),
         }
 
@@ -12523,6 +13143,10 @@ class GPSTrackShowApp:
         self.running = False
         self._write_resume_state()
         self.music_controller.dispose()
+        self.narration_controller.dispose()
+        for handle in self.narration_video_gain_handles:
+            handle.cancel()
+        self.narration_video_gain_handles = []
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None

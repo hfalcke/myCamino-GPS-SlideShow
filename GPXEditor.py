@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+from collections import defaultdict
 import io
 import json
 import math
@@ -113,6 +114,7 @@ from adventure_parameters import (
     parameter_subset,
 )
 from cocoa_parameter_editor import CocoaParameterEditor
+from cocoa_map_provider_setup import configure_hosted_provider, run_map_provider_setup
 from gpx_processing import (
     ProcessedTrack,
     ProcessingOptions,
@@ -128,6 +130,7 @@ from gpx_import import (
     sanitize_track_element as sanitize_imported_track,
     timing_status_for_track,
 )
+from gpx_editor_metrics_cache import load_metrics_cache, match_cached_tracks, write_metrics_cache
 from gpx_point_editing import (
     deserialize_points,
     duplicate_point,
@@ -138,7 +141,18 @@ from gpx_point_editing import (
     serialized_points,
 )
 from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
-from map_provider_utils import contextily_provider, contextily_request_timeout, provider_display_name, provider_tile_url
+from map_provider_utils import (
+    DEFAULT_TILE_CACHE_DIR,
+    configure_contextily_cache,
+    contextily_provider,
+    contextily_request_timeout,
+    provider_display_name,
+    provider_requires_credential,
+    provider_tile_url,
+    prune_contextily_cache,
+    read_provider_credential,
+)
+from map_provider_setup import load_map_provider_preference, save_map_provider_preference
 from map_overlay import MapOverlayScene, normalize_overlay_segments
 from track_timing_utils import timestamps_from_start
 from license_resources import read_license_document
@@ -147,6 +161,24 @@ from license_resources import read_license_document
 def process_track_snapshots(xml_snapshots: list[str], options: ProcessingOptions) -> list[ProcessedTrack]:
     """Process immutable XML snapshots without touching AppKit objects."""
     return [process_track_element(ET.fromstring(xml_text), options) for xml_text in xml_snapshots]
+
+
+def write_saved_metrics_cache(
+    path: Path,
+    options: ProcessingOptions,
+    track_elements: list[ET.Element],
+    metrics: list[dict],
+) -> None:
+    """Cache the exact elements written by Save without blocking AppKit."""
+    entries = [
+        {
+            "source_index": index,
+            "fingerprint": semantic_track_fingerprint(element),
+            "metrics": track_metrics,
+        }
+        for index, (element, track_metrics) in enumerate(zip(track_elements, metrics))
+    ]
+    write_metrics_cache(path, options, entries)
 
 try:
     from gpx_tracks_table import (
@@ -194,7 +226,7 @@ DRAG_TYPE = "myCaminoGPXEditorRows"
 POINT_DRAG_TYPE = "myCaminoGPXEditorPointRows"
 POINT_PASTEBOARD_TYPE = "org.mycamino.gpx-track-points"
 APP_CACHE_DIR = Path.home() / "Library" / "Caches" / "myCamino-GPXEditor"
-TILE_CACHE_DIR = APP_CACHE_DIR / "tiles"
+TILE_CACHE_DIR = DEFAULT_TILE_CACHE_DIR
 MPL_CACHE_DIR = APP_CACHE_DIR / "matplotlib"
 RECOVERY_PATH = Path(tempfile.gettempdir()) / "myCamino-GPXEditor-recovery.gpx"
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
@@ -390,6 +422,23 @@ def confirm(message: str, informative: str = "") -> bool:
     alert.addButtonWithTitle_("OK")
     alert.addButtonWithTitle_("Cancel")
     return alert.runModal() == 1000
+
+
+def request_provider_api_key(provider: str, credential_id: str) -> bool:
+    preference = load_map_provider_preference()
+    if (
+        read_provider_credential(provider, credential_id)
+        and preference.get("preferred_output_provider") == provider
+        and preference.get("credential_id", "default") == credential_id
+        and preference.get("credential_verified", False)
+    ):
+        return True
+    result = configure_hosted_provider(
+        provider,
+        credential_id,
+        initial_key=read_provider_credential(provider, credential_id),
+    )
+    return bool(result and result.get("action") == "configured")
 
 
 def file_panel_ok(result) -> bool:
@@ -668,6 +717,7 @@ class TrackRecord:
     nr: int
     element: ET.Element
     source_file: str = ""
+    source_track_index: int = 0
     metrics: dict = field(default_factory=dict)
     metrics_dirty: bool = True
     processed: ProcessedTrack | None = field(default=None, repr=False)
@@ -810,7 +860,123 @@ class EditorTableDataSource(NSObject):
         return True
 
 
+def context_track_row_selection(
+    clicked_row: int,
+    selected_rows: Iterable[int],
+    track_count: int,
+) -> list[int]:
+    """Return the standard macOS selection for a track-table context click."""
+    if clicked_row < 0 or clicked_row >= track_count:
+        return []
+    selected = sorted(
+        {int(row) for row in selected_rows if 0 <= int(row) < track_count}
+    )
+    return selected if clicked_row in selected else [clicked_row]
+
+
+def reordered_selected_items(items: list, selected_indexes: Iterable[int], action: str) -> list:
+    """Reorder selected groups while preserving their internal relative order."""
+    result = list(items)
+    selected = [False] * len(result)
+    for index in selected_indexes:
+        if 0 <= int(index) < len(result):
+            selected[int(index)] = True
+    if action == "up":
+        for index in range(1, len(result)):
+            if selected[index] and not selected[index - 1]:
+                result[index - 1], result[index] = result[index], result[index - 1]
+                selected[index - 1], selected[index] = True, False
+    elif action == "down":
+        for index in range(len(result) - 2, -1, -1):
+            if selected[index] and not selected[index + 1]:
+                result[index], result[index + 1] = result[index + 1], result[index]
+                selected[index], selected[index + 1] = False, True
+    elif action == "top":
+        moving = [item for index, item in enumerate(result) if selected[index]]
+        result = moving + [item for index, item in enumerate(result) if not selected[index]]
+    elif action == "bottom":
+        moving = [item for index, item in enumerate(result) if selected[index]]
+        result = [item for index, item in enumerate(result) if not selected[index]] + moving
+    else:
+        raise ValueError(f"Unknown selected-track move action: {action}")
+    return result
+
+
+def unique_track_copy_name(name: str, existing_names: Iterable[str]) -> str:
+    """Return a stable case-insensitive copy name for one duplicated track."""
+    existing = {str(item).casefold() for item in existing_names}
+    candidate = f"{name} (copy)"
+    if candidate.casefold() not in existing:
+        return candidate
+    suffix = 2
+    while True:
+        candidate = f"{name} (copy {suffix})"
+        if candidate.casefold() not in existing:
+            return candidate
+        suffix += 1
+
+
+def duplicate_track_records(
+    tracks: list[TrackRecord], selected_indexes: Iterable[int], next_nr: int
+) -> tuple[list[TrackRecord], list[TrackRecord], int]:
+    """Return tracks with one deep-copy block inserted after the last selection."""
+    indexes = sorted(
+        {int(index) for index in selected_indexes if 0 <= int(index) < len(tracks)}
+    )
+    if not indexes:
+        return list(tracks), [], next_nr
+    existing_names = [track.name for track in tracks]
+    duplicates = []
+    for index in indexes:
+        source = tracks[index]
+        element = copy.deepcopy(source.element)
+        duplicate_name = unique_track_copy_name(source.name, existing_names)
+        get_or_create_track_name(element).text = duplicate_name
+        existing_names.append(duplicate_name)
+        duplicates.append(TrackRecord(next_nr, element, source.source_file))
+        next_nr += 1
+    insert_at = max(indexes) + 1
+    result = list(tracks)
+    result[insert_at:insert_at] = duplicates
+    return result, duplicates, next_nr
+
+
+TRACK_SORT_CRITERIA = (
+    ("date", "Date & Time"),
+    ("nr", "Track Number"),
+    ("name", "Name"),
+    ("length", "Length"),
+    ("duration", "Duration"),
+    ("distance", "Distance from Anchor"),
+    ("speed", "Average Speed"),
+    ("moving_speed", "Moving Average Speed"),
+    ("ascent", "Ascent"),
+    ("descent", "Descent"),
+    ("npoints", "Number of Points"),
+)
+
+
 class EditorTableView(NSTableView):
+    def menuForEvent_(self, event):
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return None
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        clicked_row = int(self.rowAtPoint_(point))
+        selected_rows = controller.selected_track_row_indexes()
+        context_rows = context_track_row_selection(
+            clicked_row, selected_rows, len(controller.tracks)
+        )
+        if not context_rows:
+            return None
+        if context_rows != selected_rows:
+            indexes = objc.lookUpClass("NSMutableIndexSet").alloc().init()
+            for row in context_rows:
+                indexes.addIndex_(row)
+            self.selectRowIndexes_byExtendingSelection_(indexes, False)
+            controller.table_selection_changed()
+        return controller.build_track_context_menu()
+
     def keyDown_(self, event):
         key = str(event.charactersIgnoringModifiers() or event.characters() or "")
         if key in {"\x7f", "\uf728"} and getattr(self, "controller", None) is not None:
@@ -1425,9 +1591,9 @@ class PlotView(NSView):
             "overview double-click: open that track and waypoint inspector",
             "double-click track point: open the waypoint inspector",
             "overview: n toggles track numbers",
-            "track: arrows/space next track, m marker, delete range, x cut",
+            "track: arrows/space next track, m marker, delete range, x cut after cursor",
             "Cmd-Z / Shift-Cmd-Z: undo / redo the last track edit",
-            "Cmd-X: cut the track at the current cursor point",
+            "Cmd-X: cut the track after the current cursor point",
             "point table: Cmd-I / Shift-Cmd-I inserts after / before",
         ]
         self.draw_overlay_panel(help_lines, bounds, title="myCamino GPX Editor Keys", width=560.0, centered=True)
@@ -2109,7 +2275,7 @@ class PlotView(NSView):
             return
         track = self.cursor[2]
         index = self.cursor[0]
-        if confirm("Cut track in two?", f"Cut track #{track.nr} after point {index + 1}?"):
+        if confirm("Cut track after cursor?", f"Cut track #{track.nr} after point {index + 1}?"):
             self.controller.cut_track(track, index)
             self.cursor = None
             self.marker = None
@@ -3159,7 +3325,7 @@ class TrackInspectorController(NSObject):
             ("Undo", "undo:"),
             ("Plot", "plot:"),
             ("PNG", "savePng:"),
-            ("Split Track", "splitTrack:"),
+            ("Split Track Above", "splitTrack:"),
             ("Readjust Time", "readjustTime:"),
             ("Save", "save:"),
             ("Save & Exit", "saveAndExit:"),
@@ -3189,7 +3355,7 @@ class TrackInspectorController(NSObject):
             ("Paste Below", "pastePoints:", "v"),
             ("Delete", "deletePoints:", ""),
             (None, None, None),
-            ("Split Track Here", "splitTrack:", ""),
+            ("Split Track Above", "splitTrack:", ""),
             ("Readjust Time", "readjustTime:", ""),
             ("Fit Map to Selection", "fitMapToSelection:", ""),
             ("Fit Map to Track", "fitMapToTrack:", ""),
@@ -3216,9 +3382,9 @@ class TrackInspectorController(NSObject):
         )
         self.resize_table_document()
         x = PADDING
-        for title in ["Undo", "Plot", "PNG", "Split Track", "Readjust Time", "Save", "Save & Exit", "Help", "Quit"]:
+        for title in ["Undo", "Plot", "PNG", "Split Track Above", "Readjust Time", "Save", "Save & Exit", "Help", "Quit"]:
             w = 120 if title == "Save & Exit" else 100
-            if title in {"Split Track", "Readjust Time"}:
+            if title in {"Split Track Above", "Readjust Time"}:
                 w = 120
             self.buttons[title].setFrame_(NSMakeRect(x, PADDING, w, BUTTON_HEIGHT))
             x += w + 8
@@ -4001,10 +4167,10 @@ class TrackInspectorController(NSObject):
     def splitTrack_(self, _sender):
         rows = self.selected_row_indexes()
         if not rows:
-            show_alert("Select a waypoint row to split the track.")
+            show_alert("Select the waypoint row above which the track should be cut.")
             return
         split_at = min(rows)
-        if confirm("Split track?", f"Move waypoint {split_at + 1} and all following waypoints to a new track?"):
+        if confirm("Split track above selected point?", f"Move waypoint {split_at + 1} and all following waypoints to a new track?"):
             new_record = self.parent.split_track_from_index(self.track, split_at)
             if new_record is not None:
                 self.reload_rows()
@@ -4218,10 +4384,10 @@ class TrackInspectorController(NSObject):
             "This window shows every raw waypoint of the selected track. Scroll the table to inspect coordinates, height, time, accuracy fields, and any extra data stored with each point. The compact XY use and Elevation use columns are at the right end. Used means retained in processed geometry; Smooth means valid but used only for smoothing. Interp retains the reason for elevation interpolation, while the other short values state rejection reasons. The header reports retained/raw point counts.\n\n"
             "Click a row to select a waypoint. Shift-click or drag in the table to select a range. Double-click a row to open the track map if needed and move the white cursor dot and arrow to that waypoint.\n\n"
             "Edit a table cell and press Enter to change a waypoint value. Undo restores recent inspector edits. Backspace/Delete removes selected waypoints after confirmation.\n\n"
-            "Command-I inserts a waypoint after the selected rows; Shift-Command-I inserts before them. Interior points are placed halfway between their neighbors. At a track end, the last two points are extrapolated. Command-C, Command-X, and Command-V copy, cut, and paste complete GPX waypoint data. Drag selected table rows to reorder them inside the same GPX segment. The right-click menu provides the same commands plus Duplicate, Fit Map, Split Track, and Readjust Time.\n\n"
+            "Command-I inserts a waypoint after the selected rows; Shift-Command-I inserts before them. Interior points are placed halfway between their neighbors. At a track end, the last two points are extrapolated. Command-C, Command-X, and Command-V copy, cut, and paste complete GPX waypoint data. Drag selected table rows to reorder them inside the same GPX segment. The right-click menu provides the same commands plus Duplicate, Fit Map, Split Track Above, and Readjust Time.\n\n"
             "Plot Track opens the track map. When this inspector and the map are both open, selecting points in the table highlights them on the map; clicking the map selects the nearest waypoint here. If a map marker is active, the selected range is shown in red. A new manual table selection replaces the active map-marker range.\n\n"
             "On the track map, hold for one second near a waypoint or connecting segment to begin editing. Holding a segment inserts a new point; drag to place it and release to keep it. Press Escape while dragging to cancel. Shift-Z fits the map to the complete current track after points have moved beyond the old map boundary.\n\n"
-            "Split Track moves the selected waypoint and all following waypoints into a new track. Readjust Time recalculates selected waypoint timestamps from the first selected timestamp and the velocity field. Save keeps inspector edits in memory; Save & Exit keeps them and closes this window. The main editor Save writes everything to disk.",
+            "Split Track Above moves the selected waypoint and all following waypoints into a new track. Readjust Time recalculates selected waypoint timestamps from the first selected timestamp and the velocity field. Save keeps inspector edits in memory; Save & Exit keeps them and closes this window. The main editor Save writes everything to disk.",
         )
 
     @objc.IBAction
@@ -4322,8 +4488,9 @@ class GPXEditorController(NSObject):
         self.sort_ascending = True
         self.suppress_sort_descriptor_change = False
         self.pending_header_column = None
-        self.undo_stack: list[list[tuple[int, str]]] = []
-        self.redo_stack: list[list[tuple[int, str]]] = []
+        self.undo_stack: list[list[tuple[int, str, str]]] = []
+        self.redo_stack: list[list[tuple[int, str, str]]] = []
+        self.track_context_menu = None
         self.plot_windows = []
         self.plot_window_refs = []
         self.auxiliary_windows = []
@@ -4331,6 +4498,10 @@ class GPXEditorController(NSObject):
         self.processing_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="mycamino-gpx-processing",
+        )
+        self.metrics_cache_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mycamino-gpx-metrics-cache",
         )
         self.processing_future = None
         self.processing_poll_timer = None
@@ -4353,6 +4524,19 @@ class GPXEditorController(NSObject):
                 STANDALONE_SETTINGS_PATH,
                 EDITOR_PARAMETER_KEYS,
             )
+            if not STANDALONE_SETTINGS_PATH.is_file():
+                provider_preference = load_map_provider_preference()
+                preferred_provider = str(
+                    provider_preference.get("preferred_output_provider", "")
+                )
+                credential_id = str(provider_preference.get("credential_id", "default"))
+                if preferred_provider in {"osm", "esri"} or (
+                    provider_requires_credential(preferred_provider)
+                    and provider_preference.get("credential_verified", False)
+                    and read_provider_credential(preferred_provider, credential_id)
+                ):
+                    self.project_parameters["maps.output_provider"] = preferred_provider
+                    self.project_parameters["maps.credential_id"] = credential_id
         else:
             self.project_parameters = default_parameters()
         self._apply_parameter_attributes()
@@ -4405,7 +4589,9 @@ class GPXEditorController(NSObject):
         self.pdf_overview_zoom = int(values["pdf.overview_zoom"])
         self.pdf_track_zoom = int(values["pdf.track_zoom"])
         self.pdf_maximum_map_tiles = int(values["pdf.maximum_map_tiles"])
-        self.map_provider = str(values["maps.provider"])
+        self.map_provider = str(values["maps.interactive_provider"])
+        self.output_map_provider = str(values["maps.output_provider"])
+        self.map_credential_id = str(values["maps.credential_id"])
         self.custom_map_url = str(values["maps.custom_url"])
         self.custom_map_attribution = str(values["maps.custom_attribution"])
         self.maximum_map_zoom = int(values["maps.maximum_zoom"])
@@ -4453,7 +4639,9 @@ class GPXEditorController(NSObject):
 
     def processed_track(self, track: TrackRecord, force: bool = False) -> ProcessedTrack:
         signature = self.processing_parameter_signature()
-        fingerprint = semantic_track_fingerprint(track.element)
+        fingerprint = track.processed_fingerprint
+        if fingerprint is None:
+            fingerprint = semantic_track_fingerprint(track.element)
         if (
             not force
             and track.processed is not None
@@ -4594,6 +4782,8 @@ class GPXEditorController(NSObject):
             track.processed_fingerprint = snapshot_fingerprint
             track.metrics_dirty = True
         self.recalculate()
+        if not self.dirty:
+            self.write_metrics_caches_for_records(self.tracks)
         for window in list(self.auxiliary_windows):
             delegate = window.delegate() if window is not None else None
             if isinstance(delegate, TrackInspectorController):
@@ -4611,6 +4801,30 @@ class GPXEditorController(NSObject):
         for key in EDITOR_PARAMETER_KEYS:
             if key in values:
                 updated[key] = values[key]
+        credential_id = str(updated.get("maps.credential_id", "default"))
+        for key in ("maps.interactive_provider", "maps.output_provider"):
+            provider = str(updated.get(key, "osm"))
+            if provider_requires_credential(provider) and not request_provider_api_key(
+                provider, credential_id
+            ):
+                return False
+        output_provider = str(updated.get("maps.output_provider", "osm"))
+        provider_preference = load_map_provider_preference()
+        try:
+            save_map_provider_preference(
+                output_provider,
+                credential_id,
+                credential_verified=(
+                    output_provider == "osm"
+                    or (
+                        provider_preference.get("preferred_output_provider") == output_provider
+                        and provider_preference.get("credential_id", "default") == credential_id
+                        and provider_preference.get("credential_verified", False)
+                    )
+                ),
+            )
+        except OSError as exc:
+            show_alert("Could not remember the map-provider preference.", str(exc))
         self.apply_project_parameters(updated)
         if self.standalone:
             try:
@@ -4647,10 +4861,25 @@ class GPXEditorController(NSObject):
                 sections=EDITOR_PARAMETER_SECTIONS,
                 values=self.project_parameters,
                 apply_callback=self._apply_editor_settings,
+                manage_map_provider_callback=self._manage_map_provider_from_settings,
             )
         else:
             self.settings_controller.update_values(self.project_parameters)
         self.settings_controller.show()
+
+    def _manage_map_provider_from_settings(self, draft):
+        credential_id = str(draft.get("maps.credential_id", "default"))
+        result = run_map_provider_setup(
+            preferred_provider=str(draft.get("maps.output_provider", "geoapify")),
+            credential_id=credential_id,
+            timeout_seconds=float(draft.get("maps.request_timeout_seconds", 12.0)),
+        )
+        if str(result.get("action", "cancel")) == "cancel":
+            return None
+        provider = str(result.get("provider", draft.get("maps.output_provider", "osm")))
+        if result.get("action") == "settings" and provider == "custom":
+            self.settings_controller.show_advanced = True
+        return {"maps.output_provider": provider}
 
     def _build_window(self):
         style = (
@@ -4737,6 +4966,10 @@ class GPXEditorController(NSObject):
         self.track_table.setAllowsMultipleSelection_(True)
         self.track_table.setAllowsEmptySelection_(True)
         self.track_table.setRowHeight_(ROW_HEIGHT)
+        self.track_table.setToolTip_(
+            "Right-click selected tracks for plotting, sorting, duplicating, moving, "
+            "visibility, joining, and deletion actions."
+        )
         self.track_table.registerForDraggedTypes_([DRAG_TYPE])
         table_font = self.table_font(12)
         header_font = self.table_font(11)
@@ -4836,6 +5069,96 @@ class GPXEditorController(NSObject):
             return
         header.setFrameSize_(NSMakeSize(max(self.track_table.bounds().size.width, 1.0), 42.0))
         header.setNeedsDisplay_(True)
+
+    def _track_context_item(self, menu, title, action, enabled=True):
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            title, action, ""
+        )
+        item.setTarget_(self)
+        item.setEnabled_(bool(enabled))
+        menu.addItem_(item)
+        return item
+
+    def build_track_context_menu(self):
+        """Build a menu whose validation reflects the current track selection."""
+        selected = self.selected_tracks()
+        selected_indexes = self.selected_track_row_indexes()
+        count = len(selected)
+        selected_set = set(selected_indexes)
+        can_move_up = any(
+            index > 0 and index - 1 not in selected_set for index in selected_indexes
+        )
+        can_move_down = any(
+            index + 1 < len(self.tracks) and index + 1 not in selected_set
+            for index in selected_indexes
+        )
+
+        menu = NSMenu.alloc().initWithTitle_("Track")
+        menu.setAutoenablesItems_(False)
+        self._track_context_item(menu, "Inspect Track", "contextInspectTrack:", count == 1)
+        self._track_context_item(menu, "Plot Track(s)", "contextPlotTracks:", count > 0)
+        self._track_context_item(
+            menu,
+            "Plot Selected in Overview",
+            "contextPlotOverview:",
+            count > 0,
+        )
+        self._track_context_item(
+            menu, "View Source File", "contextViewSource:", count == 1
+        )
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._track_context_item(
+            menu,
+            "Sort Selected Tracks…",
+            "sortSelectedTracks:",
+            count >= 2,
+        )
+        self._track_context_item(
+            menu, "Duplicate Selected Tracks", "duplicateSelectedTracks:", count > 0
+        )
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._track_context_item(menu, "Move Up", "moveSelectedTracksUp:", can_move_up)
+        self._track_context_item(
+            menu, "Move Down", "moveSelectedTracksDown:", can_move_down
+        )
+        self._track_context_item(
+            menu, "Move to Top", "moveSelectedTracksToTop:", can_move_up
+        )
+        self._track_context_item(
+            menu, "Move to Bottom", "moveSelectedTracksToBottom:", can_move_down
+        )
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._track_context_item(
+            menu,
+            "Show Selected",
+            "showSelectedTracks:",
+            any(track.hidden for track in selected),
+        )
+        self._track_context_item(
+            menu,
+            "Hide Selected",
+            "hideSelectedTracks:",
+            any(not track.hidden for track in selected),
+        )
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._track_context_item(
+            menu, "Set Anchorpoint", "contextSetAnchorpoint:", count > 0
+        )
+        self._track_context_item(
+            menu,
+            "Join Selected Tracks",
+            "contextJoinTracks:",
+            count >= 2,
+        )
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._track_context_item(
+            menu,
+            "Delete Selected Tracks",
+            "contextDeleteTracks:",
+            count > 0,
+        )
+        self.track_context_menu = menu
+        return menu
 
     def table_font(self, size: float):
         preferred = NSFont.fontWithName_size_("DejaVu Sans Mono", size)
@@ -5103,6 +5426,7 @@ class GPXEditorController(NSObject):
         if self.processing_future is not None and not self.processing_future.done():
             self.processing_future.cancel()
         self.processing_executor.shutdown(wait=False, cancel_futures=True)
+        self.metrics_cache_executor.shutdown(wait=False, cancel_futures=False)
         if self.settings_controller is not None:
             self.settings_controller.close()
             self.settings_controller = None
@@ -5173,11 +5497,12 @@ class GPXEditorController(NSObject):
         self.save_with_panel()
 
     def prune_tile_cache(self, max_age_seconds: float):
-        cutoff = time.time() - max_age_seconds
         try:
-            for path in self.tile_cache_dir.rglob("*"):
-                if path.is_file() and path.stat().st_mtime < cutoff:
-                    path.unlink()
+            prune_contextily_cache(
+                self.tile_cache_dir,
+                self.map_provider,
+                max(0.0, float(max_age_seconds)) / 3600.0,
+            )
         except OSError as exc:
             print(f"GPXEditor cache cleanup warning: {exc}", flush=True)
 
@@ -5213,6 +5538,7 @@ class GPXEditorController(NSObject):
             self.custom_map_url,
             self.custom_map_attribution,
             self.maximum_map_zoom,
+            self.map_credential_id,
         )
         return [
             provider_tile_url(provider, x, y, zoom)
@@ -5272,14 +5598,20 @@ class GPXEditorController(NSObject):
         track_ids = tuple(track.nr for track in tracks)
         return mode, track_ids, effective_zoom, rounded_extent
 
-    def snapshot(self) -> list[tuple[int, str]]:
-        return [(track.nr, ET.tostring(track.element, encoding="unicode")) for track in self.tracks]
+    @objc.python_method
+    def snapshot(self) -> list[tuple[int, str, str]]:
+        return [
+            (
+                track.nr,
+                ET.tostring(track.element, encoding="unicode"),
+                str(track.source_file or ""),
+            )
+            for track in self.tracks
+        ]
 
-    def restore_snapshot(self, snapshot: list[tuple[int, str]]):
-        current_by_nr = {track.nr: track for track in self.tracks}
+    def restore_snapshot(self, snapshot: list[tuple[int, str, str]]):
         restored = []
-        for nr, xml_text in snapshot:
-            source = current_by_nr.get(nr).source_file if nr in current_by_nr else ""
+        for nr, xml_text, source in snapshot:
             restored.append(TrackRecord(nr, ET.fromstring(xml_text), source))
         self.tracks = restored
         self.next_nr = max([track.nr for track in self.tracks], default=0) + 1
@@ -5609,6 +5941,11 @@ class GPXEditorController(NSObject):
     def recalculate(self):
         if self.anchor is None:
             for track in self.tracks:
+                first_lat = track.metrics.get("first_lat") if track.metrics else None
+                first_lon = track.metrics.get("first_lon") if track.metrics else None
+                if first_lat is not None and first_lon is not None:
+                    self.anchor = (float(first_lat), float(first_lon))
+                    break
                 point = self.processed_track(track).first_point
                 if point is not None:
                     self.anchor = (point.lat, point.lon)
@@ -5846,6 +6183,8 @@ class GPXEditorController(NSObject):
             "retained_npoints": processed.retained_point_count,
             "rejection_counts": processed.rejection_counts,
             "processing_options": processed.options.as_dict(),
+            "first_lat": processed.first_point.lat if processed.first_point is not None else None,
+            "first_lon": processed.first_point.lon if processed.first_point is not None else None,
             "last_lat": processed.last_point.lat if processed.last_point is not None else None,
             "last_lon": processed.last_point.lon if processed.last_point is not None else None,
             "_anchor_key": current_anchor_key,
@@ -6122,6 +6461,7 @@ class GPXEditorController(NSObject):
     def _append_gpx_track_records(self, paths: list[Path]):
         """Parse GPX files and append unprocessed records, returning load details."""
         added_records = []
+        metrics_cache_hits = 0
         removed_invalid_coordinates = 0
         removed_invalid_timestamps = 0
         removed_out_of_order = 0
@@ -6146,8 +6486,27 @@ class GPXEditorController(NSObject):
             removed_invalid_timestamps += document.report.invalid_timestamps
             removed_out_of_order += document.report.backward_timestamps
             missing_timestamps += document.report.missing_timestamps
-            for trk in document.tracks:
-                record = TrackRecord(self.next_nr, copy.deepcopy(trk), str(path))
+            cache_lookup = load_metrics_cache(path, self.processing_options())
+            cached_tracks = match_cached_tracks(
+                document.tracks,
+                cache_lookup,
+                semantic_track_fingerprint,
+            )
+            for source_index, trk in enumerate(document.tracks):
+                # load_gpx_document returns detached normalized elements for
+                # converted inputs and owned editable elements for GPX 1.1.
+                record = TrackRecord(
+                    self.next_nr,
+                    trk,
+                    str(path),
+                    source_track_index=source_index,
+                )
+                fingerprint, cached_metrics = cached_tracks[source_index]
+                record.processed_fingerprint = fingerprint
+                if cached_metrics is not None:
+                    record.metrics = cached_metrics
+                    record.metrics_dirty = False
+                    metrics_cache_hits += 1
                 self.tracks.append(record)
                 added_records.append(record)
                 self.next_nr += 1
@@ -6168,8 +6527,43 @@ class GPXEditorController(NSObject):
             ignored_parts.append(
                 f"kept {missing_timestamps} point(s) without timestamps"
             )
+        if metrics_cache_hits:
+            ignored_parts.append(f"reused cached metrics for {metrics_cache_hits} track(s)")
         ignored_suffix = f" Import details: {', '.join(ignored_parts)}." if ignored_parts else ""
         return added_records, ignored_suffix
+
+    def write_metrics_caches_for_records(self, records: Iterable[TrackRecord]):
+        """Persist complete source-file groups without retaining processed geometry."""
+        by_source: dict[str, list[TrackRecord]] = defaultdict(list)
+        for track in records:
+            if track.source_file:
+                by_source[track.source_file].append(track)
+        for source_file, source_tracks in by_source.items():
+            source = Path(source_file)
+            if not source.is_file():
+                continue
+            source_tracks.sort(key=lambda item: item.source_track_index)
+            entries = []
+            for track in source_tracks:
+                if not track.metrics or track.metrics_dirty:
+                    break
+                fingerprint = track.processed_fingerprint
+                if fingerprint is None:
+                    fingerprint = semantic_track_fingerprint(track.element)
+                    track.processed_fingerprint = fingerprint
+                entries.append(
+                    {
+                        "source_index": track.source_track_index,
+                        "fingerprint": fingerprint,
+                        "metrics": track.metrics,
+                    }
+                )
+            else:
+                try:
+                    write_metrics_cache(source, self.processing_options(), entries)
+                except (OSError, TypeError, ValueError) as exc:
+                    if self.debug:
+                        print(f"GPXEditor metrics cache write failed for {source}: {exc}", flush=True)
 
     def load_gpx_paths(self, paths: list[Path], mark_dirty: bool = True):
         """Load files now, then process one new track per AppKit run-loop turn."""
@@ -6251,6 +6645,7 @@ class GPXEditorController(NSObject):
         path_count = self.pending_track_load_path_count
         ignored_suffix = self.pending_track_load_status
         mark_dirty = self.pending_track_load_mark_dirty
+        loaded_records = list(self.pending_track_loads)
         self.pending_track_loads = []
         self.pending_track_load_index = 0
         self.pending_track_load_total = 0
@@ -6264,6 +6659,7 @@ class GPXEditorController(NSObject):
             self.notify_initial_load_complete()
             return
         self.dirty = bool(mark_dirty)
+        self.write_metrics_caches_for_records(loaded_records)
         self.set_track_loading_controls_enabled(True)
         self.hide_track_load_progress()
         action = "Added" if mark_dirty else "Loaded"
@@ -6319,6 +6715,7 @@ class GPXEditorController(NSObject):
             self.push_undo()
         records, ignored_suffix = self._append_gpx_track_records(paths)
         self.recalculate()
+        self.write_metrics_caches_for_records(records)
         self.dirty = bool(mark_dirty)
         action = "Added" if mark_dirty else "Loaded"
         self.set_status(f"{action} {len(records)} track(s) from {len(paths)} GPX file(s).{ignored_suffix}")
@@ -6756,13 +7153,31 @@ class GPXEditorController(NSObject):
             path = path.with_suffix(".pdf")
         path = path.resolve()
         orientation = "landscape" if self.pdf_summary_orientation_menu.indexOfSelectedItem() == 1 else "portrait"
+        pdf_options = self.pdf_options_from_controls(self.pdf_summary_options)
+        if self.output_map_provider == "osm":
+            track_mode = pdf_options.get("track_mode", "none")
+            if track_mode == "all":
+                selected_map_count = len(self.tracks)
+            elif track_mode == "visible":
+                selected_map_count = len(self.visible_tracks())
+            elif track_mode == "selected":
+                selected_map_count = len(self.selected_tracks())
+            else:
+                selected_map_count = 0
+            selected_map_count += int(bool(pdf_options.get("include_overview")))
+            if selected_map_count > 1:
+                show_alert(
+                    "Public OpenStreetMap cannot be used for this multi-map PDF.",
+                    "Choose a production provider in Map Service settings, or export only one map page.",
+                )
+                return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self.set_status(f"PDF export: writing {path}.")
             if self.pdf_summary_status_label is not None:
                 self.pdf_summary_status_label.setStringValue_("Exporting PDF...")
                 self.pdf_summary_status_label.displayIfNeeded()
-            self.write_track_table_pdf(path, selected_columns, orientation, self.pdf_options_from_controls(self.pdf_summary_options))
+            self.write_track_table_pdf(path, selected_columns, orientation, pdf_options)
         except Exception as exc:
             show_alert("PDF export failed.", str(exc))
             if self.pdf_summary_status_label is not None:
@@ -7016,8 +7431,7 @@ class GPXEditorController(NSObject):
             return None
         timing_start = time.perf_counter()
         import contextily as cx
-        if hasattr(cx, "tile") and hasattr(cx.tile, "set_cache_dir"):
-            cx.tile.set_cache_dir(str(self.tile_cache_dir))
+        configure_contextily_cache(cx, self.tile_cache_dir)
         import_done = time.perf_counter()
         fig = plt.figure(figsize=page_size, dpi=self.pdf_document_dpi)
         fig.patch.set_facecolor("white")
@@ -7080,7 +7494,9 @@ class GPXEditorController(NSObject):
                 )
             else:
                 self.set_status(f"PDF export: using cached {provider_name} tiles for {map_label} at zoom {tile_zoom}.")
-            missing_basemap_tiles = self.add_basemap_with_timeout(cx, ax, tile_zoom)
+            missing_basemap_tiles = self.add_basemap_with_timeout(
+                cx, ax, tile_zoom, provider=self.output_map_provider
+            )
         except Exception as exc:
             self.set_status(f"PDF export: map unavailable for {map_label}: {exc}")
             ax.text(0.5, 0.5, f"Map unavailable\n{exc}", transform=ax.transAxes, ha="center", va="center", color="white", fontsize=10)
@@ -7437,9 +7853,11 @@ class GPXEditorController(NSObject):
             root.append(output_track)
         return root
 
-    def write_gpx_file(self, path: Path):
+    def write_gpx_file(self, path: Path) -> ET.Element:
         path.parent.mkdir(parents=True, exist_ok=True)
-        ET.ElementTree(self.build_root()).write(path, encoding="utf-8", xml_declaration=True)
+        root = self.build_root()
+        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+        return root
 
     def backup_existing_file(self, path: Path):
         if not path.exists():
@@ -7470,12 +7888,30 @@ class GPXEditorController(NSObject):
     def save_to_path(self, path: Path, autosave: bool = False):
         if not autosave:
             self.backup_existing_file(path)
-        self.write_gpx_file(path)
+        saved_root = self.write_gpx_file(path)
         if autosave:
             self.set_status(f"Recovery autosave written to {path}.")
             return
         self.set_output_path(path)
         self.dirty = False
+        saved_tracks = list(saved_root.findall("gpx:trk", NS))
+        saved_metrics = []
+        for track in self.tracks:
+            metrics = dict(track.metrics)
+            # build_root intentionally omits track-level <time>; on reload the
+            # displayed track time therefore falls back to the first point.
+            metrics["time"] = metrics.get("start_time")
+            saved_metrics.append(metrics)
+        self.metrics_cache_executor.submit(
+            write_saved_metrics_cache,
+            path,
+            self.processing_options(),
+            saved_tracks,
+            saved_metrics,
+        )
+        for source_index, track in enumerate(self.tracks):
+            track.source_file = str(path)
+            track.source_track_index = source_index
         self.delete_recovery_file()
         self.set_status(("Autosaved" if autosave else "Saved") + f" {len(self.tracks)} track(s) to {path}.")
         self.notify_save_callback(path)
@@ -7566,6 +8002,155 @@ class GPXEditorController(NSObject):
             self.raise_elevation_profile_for_plot_view(inspector.plot_view)
         self.set_status(f"Opened inspector, track map, and elevation profile for track #{track.nr}.")
 
+    @objc.IBAction
+    def contextInspectTrack_(self, sender):
+        self.inspectTrack_(sender)
+
+    @objc.IBAction
+    def contextPlotTracks_(self, sender):
+        self.plotSelected_(sender)
+
+    @objc.IBAction
+    def contextPlotOverview_(self, sender):
+        self.plotAll_(sender)
+
+    @objc.IBAction
+    def contextViewSource_(self, sender):
+        self.viewFile_(sender)
+
+    @objc.IBAction
+    def contextSetAnchorpoint_(self, sender):
+        self.setAnchorpoint_(sender)
+
+    @objc.IBAction
+    def contextJoinTracks_(self, sender):
+        self.joinTracks_(sender)
+
+    @objc.IBAction
+    def contextDeleteTracks_(self, _sender):
+        self.delete_selected_tracks()
+
+    @objc.IBAction
+    def sortSelectedTracks_(self, _sender):
+        if len(self.selected_track_row_indexes()) < 2:
+            return
+        criteria = [
+            (identifier, title)
+            for identifier, title in TRACK_SORT_CRITERIA
+            if identifier != "distance" or self.anchor is not None
+        ]
+        accessory = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 440, 72))
+        criterion_label = self.make_label("Sort by", 12, False, 0)
+        criterion_label.setFrame_(NSMakeRect(0, 46, 90, 20))
+        criterion_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(96, 42, 344, FIELD_HEIGHT), False
+        )
+        criterion_popup.addItemsWithTitles_([title for _identifier, title in criteria])
+        selected_identifier = self.sort_column
+        selected_criterion = next(
+            (
+                index
+                for index, (identifier, _title) in enumerate(criteria)
+                if identifier == selected_identifier
+            ),
+            0,
+        )
+        criterion_popup.selectItemAtIndex_(selected_criterion)
+        direction_label = self.make_label("Direction", 12, False, 0)
+        direction_label.setFrame_(NSMakeRect(0, 8, 90, 20))
+        direction_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(96, 4, 180, FIELD_HEIGHT), False
+        )
+        direction_popup.addItemsWithTitles_(["Ascending", "Descending"])
+        direction_popup.selectItemAtIndex_(0 if self.sort_ascending else 1)
+        accessory.addSubview_(criterion_label)
+        accessory.addSubview_(criterion_popup)
+        accessory.addSubview_(direction_label)
+        accessory.addSubview_(direction_popup)
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Sort Selected Tracks")
+        alert.setInformativeText_(
+            "Only the selected table positions are reordered. All unselected tracks remain in place."
+        )
+        alert.setAccessoryView_(accessory)
+        alert.addButtonWithTitle_("Sort")
+        alert.addButtonWithTitle_("Cancel")
+        if int(alert.runModal()) != 1000:
+            return
+        criterion_index = int(criterion_popup.indexOfSelectedItem())
+        if criterion_index < 0 or criterion_index >= len(criteria):
+            return
+        self.sort_by_column(
+            criteria[criterion_index][0],
+            ascending=int(direction_popup.indexOfSelectedItem()) != 1,
+            source="context menu",
+        )
+
+    def _move_selected_tracks(self, action: str):
+        selected_indexes = self.selected_track_row_indexes()
+        if not selected_indexes:
+            return
+        reordered = reordered_selected_items(self.tracks, selected_indexes, action)
+        if reordered == self.tracks:
+            return
+        self.push_undo()
+        self.tracks = reordered
+        self.mark_dirty(
+            f"Moved {len(selected_indexes)} selected track(s) {action}."
+        )
+        self.refresh_open_plot_views()
+
+    @objc.IBAction
+    def moveSelectedTracksUp_(self, _sender):
+        self._move_selected_tracks("up")
+
+    @objc.IBAction
+    def moveSelectedTracksDown_(self, _sender):
+        self._move_selected_tracks("down")
+
+    @objc.IBAction
+    def moveSelectedTracksToTop_(self, _sender):
+        self._move_selected_tracks("top")
+
+    @objc.IBAction
+    def moveSelectedTracksToBottom_(self, _sender):
+        self._move_selected_tracks("bottom")
+
+    def _set_selected_tracks_hidden(self, hidden: bool):
+        selected = self.selected_tracks()
+        changed = [track for track in selected if track.hidden != hidden]
+        if not changed:
+            return
+        self.push_undo()
+        for track in changed:
+            track.set_hidden(hidden)
+        action = "Hidden" if hidden else "Shown"
+        self.mark_dirty(f"{action} {len(changed)} selected track(s).")
+        self.refresh_open_plot_views()
+
+    @objc.IBAction
+    def showSelectedTracks_(self, _sender):
+        self._set_selected_tracks_hidden(False)
+
+    @objc.IBAction
+    def hideSelectedTracks_(self, _sender):
+        self._set_selected_tracks_hidden(True)
+
+    @objc.IBAction
+    def duplicateSelectedTracks_(self, _sender):
+        selected_indexes = self.selected_track_row_indexes()
+        if not selected_indexes:
+            return
+        self.push_undo()
+        self.tracks, duplicates, self.next_nr = duplicate_track_records(
+            self.tracks, selected_indexes, self.next_nr
+        )
+        self.selected_nrs = [track.nr for track in duplicates]
+        self.update_selection_field()
+        self.mark_dirty(f"Duplicated {len(duplicates)} selected track(s).")
+        self.refresh_open_plot_views()
+
     def sort_by_column(self, column: str, ascending: bool | None = None, update_header: bool = True, source: str = "direct"):
         if not self.tracks:
             return
@@ -7606,6 +8191,7 @@ class GPXEditorController(NSObject):
                 self.highlight_selected_rows()
             if update_header:
                 self.update_sort_descriptor()
+            self.refresh_open_plot_views()
             direction = "ascending" if self.sort_ascending else "descending"
             after_order = [track.nr for track in self.tracks[:6]]
             scope_text = f"selected {len(selected_indexes)} row(s)" if scoped_sort else "all rows"
@@ -7624,6 +8210,7 @@ class GPXEditorController(NSObject):
                 "sum": current_index,
                 "distance": metrics["distance_km"] if metrics["distance_km"] is not None else float("inf"),
                 "speed": metrics["speed_kmh"] if metrics["speed_kmh"] is not None else float("inf"),
+                "moving_speed": metrics["moving_speed_kmh"] if metrics["moving_speed_kmh"] is not None else float("inf"),
                 "ascent": metrics["ascent_m"],
                 "descent": metrics["descent_m"],
                 "npoints": metrics["npoints"],
@@ -7643,6 +8230,7 @@ class GPXEditorController(NSObject):
             self.highlight_selected_rows()
         if update_header:
             self.update_sort_descriptor()
+        self.refresh_open_plot_views()
         direction = "ascending" if self.sort_ascending else "descending"
         after_order = [track.nr for track in self.tracks[:6]]
         scope_text = f"selected {len(selected_indexes)} row(s)" if scoped_sort else "all rows"
@@ -7955,8 +8543,7 @@ class GPXEditorController(NSObject):
             import matplotlib
             matplotlib.use("Agg", force=True)
             import contextily as cx
-            if hasattr(cx, "tile") and hasattr(cx.tile, "set_cache_dir"):
-                cx.tile.set_cache_dir(str(self.tile_cache_dir))
+            configure_contextily_cache(cx, self.tile_cache_dir)
         except ImportError:
             pass
         output_dir = Path(tempfile.mkdtemp(prefix="mycamino-gpx-editor-"))
@@ -8084,23 +8671,27 @@ class GPXEditorController(NSObject):
             "max_y": center_y + span_y / 2.0,
         }
 
-    def add_basemap_with_timeout(self, cx, ax, tile_zoom: int):
+    def add_basemap_with_timeout(self, cx, ax, tile_zoom: int, provider: str | None = None):
         """Call Contextily with the configured provider and bounded timeout."""
+        selected_provider = str(provider or self.map_provider)
         try:
             import requests
         except ImportError:
             requests = None
         try:
-            with contextily_request_timeout(cx, self.map_request_timeout_seconds):
+            with contextily_request_timeout(
+                cx, self.map_request_timeout_seconds, selected_provider
+            ):
                 with tolerate_missing_tiles(cx) as missing_tile_report:
                     cx.add_basemap(
                         ax,
                         source=contextily_provider(
                             cx,
-                            self.map_provider,
+                            selected_provider,
                             self.custom_map_url,
                             self.custom_map_attribution,
                             self.maximum_map_zoom,
+                            self.map_credential_id,
                         ),
                         zoom=min(tile_zoom, self.maximum_map_zoom),
                     )
@@ -8118,8 +8709,7 @@ class GPXEditorController(NSObject):
             matplotlib.use("Agg", force=True)
             import contextily as cx
             import matplotlib.pyplot as plt
-            if hasattr(cx, "tile") and hasattr(cx.tile, "set_cache_dir"):
-                cx.tile.set_cache_dir(str(self.tile_cache_dir))
+            configure_contextily_cache(cx, self.tile_cache_dir)
             import_done = time.perf_counter()
         except ImportError as exc:
             show_alert("Could not render the map viewport.", f"Missing plotting dependency: {exc}")
@@ -8411,7 +9001,7 @@ class GPXEditorController(NSObject):
     def split_track_from_index(self, track: TrackRecord, start_index: int) -> TrackRecord | None:
         points = track.points()
         if start_index <= 0 or start_index >= len(points):
-            show_alert("Split point must leave points in both tracks.")
+            show_alert("Split Track Above must leave points in both tracks.")
             return None
         self.push_undo()
         new_track = copy.deepcopy(track.element)
@@ -8436,7 +9026,10 @@ class GPXEditorController(NSObject):
         self.tracks.insert(insert_at, new_record)
         self.invalidate_track_metrics(track)
         self.invalidate_track_metrics(new_record)
-        self.mark_dirty(f"Split track #{track.nr}; new track #{new_record.nr} created.")
+        self.mark_dirty(
+            f"Split track #{track.nr} above point {start_index + 1}; "
+            f"new track #{new_record.nr} created."
+        )
         return new_record
 
     @objc.IBAction
@@ -8494,12 +9087,13 @@ class GPXEditorController(NSObject):
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "Add Tracks loads GPX files into the table. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
-            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint inspector. Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, sorting applies to the full table. Drag selected rows to reorder tracks. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
+            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint inspector. Right-click a selected row to inspect, plot, sort, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row.\n\n"
+            "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
             "Plot Overview opens an overview using the configured map service. If tracks are selected, the overview zooms to those tracks and highlights them in red; selecting different tracks in the table updates the red highlight. Click a track in the overview to select it in the table. Double-click a point in the overview to open that track in the inspector and track map at the same point.\n\n"
             "Plot Track(s) opens a detailed map for the selected track. View File opens the original GPX source file of the selected track in TextEdit and asks whether unsaved edits should be saved first. Click or drag on a map to move the white cursor dot and arrow to the nearest waypoint. Double-click a track point to open its waypoint inspector. Press i to show or hide point information; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z zooms out to the full map extent; q closes the plot window. In the track map, m or Shift-click sets a marker, Delete removes the marker-to-cursor point range after confirmation, and x cuts the track at the cursor after confirmation.\n\n"
             "Inspect Track opens all raw waypoints of one track. The read-only XY and Elevation status columns explain quality filtering and interpolation; the header shows retained/raw counts. The processing summary above the main table shows the active XY smoothing, spacing, elevation smoothing, error, and HDOP/VDOP limits. Statistics, maps, PDFs, profiles, and timing use this common segment-aware processed geometry while saved GPX points remain unchanged.\n\n"
-            "The gear button edits GPX processing, PDF, and map-service settings. Set a smoothing, spacing, or quality limit to zero to disable it. A standalone editor keeps these settings for future sessions; an editor opened from an Adventure stores them with that Adventure. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
+            "The gear button edits GPX processing, PDF, and map-service settings. Manage Map Provider opens the shared provider setup, account links, and secure Keychain registration; Esri and Custom XYZ are completed manually in Map Service. Set a smoothing, spacing, or quality limit to zero to disable it. A standalone editor keeps these settings for future sessions; an editor opened from an Adventure stores them with that Adventure. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
         )
         self.show_scrollable_help("myCamino GPX Editor Help", text)
 

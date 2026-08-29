@@ -275,7 +275,11 @@ def load_gpx_document(path: str | Path) -> NormalizedGpxDocument:
         waypoint_count=len(waypoints),
     )
     fallback_name = _document_name(root, source_path)
-    normalized_tracks = [_normalize_element(track) for track in tracks]
+    canonical_document = root_uri == GPX_NAMESPACE and version == "1.1"
+    # Canonical GPX 1.1 elements can be edited directly. Cloning every node is
+    # expensive for large files and is only required when namespaces or point
+    # types need conversion.
+    normalized_tracks = list(tracks) if canonical_document else [_normalize_element(track) for track in tracks]
     for index, route in enumerate(routes, start=1):
         route_name = _core_child(route, "name")
         name = (
@@ -304,7 +308,11 @@ def load_gpx_document(path: str | Path) -> NormalizedGpxDocument:
         tracks=usable_tracks,
         report=report,
         source_path=source_path,
-        metadata=_normalize_element(metadata) if metadata is not None else None,
+        metadata=(
+            metadata
+            if canonical_document
+            else _normalize_element(metadata) if metadata is not None else None
+        ),
     )
 
 

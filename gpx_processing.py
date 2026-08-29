@@ -491,6 +491,50 @@ def _assign_running_speeds(
             moving_seconds += seconds
 
     half_window_km = options.running_speed_window_distance_m / 2000.0
+    point_distances = [point.segment_distance_km for point in points]
+    all_distance_prefix = [0.0]
+    all_seconds_prefix = [0.0]
+    moving_distance_prefix = [0.0]
+    moving_seconds_prefix = [0.0]
+    for interval in intervals:
+        valid = interval is not None
+        moving = valid and interval[2] >= threshold
+        all_distance_prefix.append(all_distance_prefix[-1] + (interval[0] if valid else 0.0))
+        all_seconds_prefix.append(all_seconds_prefix[-1] + (interval[1] if valid else 0.0))
+        moving_distance_prefix.append(
+            moving_distance_prefix[-1] + (interval[0] if moving else 0.0)
+        )
+        moving_seconds_prefix.append(
+            moving_seconds_prefix[-1] + (interval[1] if moving else 0.0)
+        )
+
+    def cumulative_interval_values(position: float, moving_only: bool) -> tuple[float, float]:
+        """Integrate valid interval distance and time through a route position."""
+        if position <= point_distances[0]:
+            return 0.0, 0.0
+        if position >= point_distances[-1]:
+            if moving_only:
+                return moving_distance_prefix[-1], moving_seconds_prefix[-1]
+            return all_distance_prefix[-1], all_seconds_prefix[-1]
+        index = max(0, min(len(intervals) - 1, bisect_right(point_distances, position) - 1))
+        distance_prefix = moving_distance_prefix if moving_only else all_distance_prefix
+        seconds_prefix = moving_seconds_prefix if moving_only else all_seconds_prefix
+        distance = distance_prefix[index]
+        seconds = seconds_prefix[index]
+        interval = intervals[index]
+        if interval is None or (moving_only and interval[2] < threshold):
+            return distance, seconds
+        overlap = min(position, point_distances[index + 1]) - point_distances[index]
+        if overlap <= 0.0 or interval[0] <= 0.0:
+            return distance, seconds
+        fraction = overlap / interval[0]
+        return distance + overlap, seconds + interval[1] * fraction
+
+    def window_values(start: float, end: float, moving_only: bool) -> tuple[float, float]:
+        end_distance, end_seconds = cumulative_interval_values(end, moving_only)
+        start_distance, start_seconds = cumulative_interval_values(start, moving_only)
+        return end_distance - start_distance, end_seconds - start_seconds
+
     for point_index, point in enumerate(points):
         if times[point_index] is None:
             continue
@@ -512,28 +556,13 @@ def _assign_running_speeds(
         center = point.segment_distance_km
         window_start = max(points[0].segment_distance_km, center - half_window_km)
         window_end = min(points[-1].segment_distance_km, center + half_window_km)
-        selected_distance = 0.0
-        selected_seconds = 0.0
-        all_distance = 0.0
-        all_seconds = 0.0
-        for index, interval in enumerate(intervals):
-            if interval is None:
-                continue
-            interval_start = points[index].segment_distance_km
-            interval_end = points[index + 1].segment_distance_km
-            overlap = min(window_end, interval_end) - max(window_start, interval_start)
-            if overlap <= 0.0:
-                continue
-            fraction = overlap / interval[0]
-            seconds = interval[1] * fraction
-            all_distance += overlap
-            all_seconds += seconds
-            if interval[2] >= threshold:
-                selected_distance += overlap
-                selected_seconds += seconds
+        selected_distance, selected_seconds = window_values(window_start, window_end, True)
         if selected_seconds > 0.0:
             point.running_speed_kmh = selected_distance / (selected_seconds / 3600.0)
-        elif all_seconds > 0.0:
+        else:
+            all_distance, all_seconds = window_values(window_start, window_end, False)
+            if all_seconds <= 0.0:
+                continue
             # A completely stationary local window still receives its endpoint speed.
             point.running_speed_kmh = all_distance / (all_seconds / 3600.0)
     return moving_distance_km, moving_seconds

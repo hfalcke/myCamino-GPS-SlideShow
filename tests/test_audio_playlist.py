@@ -14,15 +14,19 @@ from audio_playlist import (
     audio_files_in_directory,
     generated_playlist_text,
     load_audio_playlist,
+    resolve_audio_selection,
     updated_playlist_text,
 )
 from slideshow_control_format import (
     CONTROL_TRANSITIONS,
     ControlSyntaxError,
     MusicSyntaxError,
+    AudioSelectionSyntaxError,
     control_labels,
     parse_control_directive,
     parse_music_directive,
+    parse_narrator_directive,
+    parse_play_directive,
     serialize_control_parameters,
 )
 from GPSTrackShow import BackgroundMusicController
@@ -84,6 +88,52 @@ class AudioPlaylistTests(unittest.TestCase):
             directive.actions[0].value,
             "Album Name/Song Number One.mp3",
         )
+
+    def test_play_and_narrator_share_mixed_selection_grammar(self):
+        play = parse_play_directive('#PLAY: $INTRO, $A - $C, "A song, live.mp3"')
+        narration = parse_narrator_directive("#NARRATOR: $CHAPTER, $ONE - $THREE")
+        self.assertEqual([item.kind for item in play.items], ["label", "range", "path"])
+        self.assertEqual(play.items[1].value, ("A", "C"))
+        self.assertEqual(play.items[2].value, "A song, live.mp3")
+        self.assertEqual([item.kind for item in narration.items], ["label", "range"])
+        with self.assertRaises(AudioSelectionSyntaxError):
+            parse_play_directive("#PLAY: $A - song.mp3")
+        with self.assertRaises(AudioSelectionSyntaxError):
+            parse_play_directive("#PLAY: Chapter one.mp3")
+        escaped = parse_play_directive(r"#PLAY: Chapter\ one.mp3")
+        self.assertEqual(escaped.items[0].value, "Chapter one.mp3")
+
+    def test_audio_selection_resolves_ranges_and_preserves_order(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("a.mp3", "b.mp3", "c.mp3"):
+                (root / name).touch()
+            playlist_path = root / "test.playlist"
+            playlist_path.write_text("$A\na.mp3\n$B\nb.mp3\n$C\nc.mp3\n", encoding="utf-8")
+            playlist = load_audio_playlist(root, playlist_path)
+            indexes, warnings = resolve_audio_selection(
+                playlist,
+                parse_play_directive("#PLAY: $C, $A - $B, $C"),
+            )
+            self.assertEqual(indexes, (2, 0, 1, 2))
+            self.assertEqual(warnings, ())
+
+    def test_play_directive_uses_temporary_queue(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("a.mp3", "b.mp3", "c.mp3"):
+                (root / name).touch()
+            playlist = load_audio_playlist(root)
+            controller = self._controller_without_players(playlist)
+            controller.current_index = 1
+            controller.transport.set_playlist(1)
+            controller._execute_play_directive(
+                parse_play_directive("#PLAY: a.mp3, c.mp3"),
+                False,
+            )
+            self.assertEqual(controller.transport.mode, "queue")
+            self.assertEqual(controller.transport.sequence, (0, 2))
+            self.assertEqual(controller.transport.continuation_index, 1)
 
     def test_generic_loop_and_bad_volume_are_rejected(self):
         with self.assertRaises(MusicSyntaxError):

@@ -60,6 +60,7 @@ from AppKit import (
     NSShadow,
     NSSavePanel,
     NSSearchField,
+    NSScreen,
     NSSortDescriptor,
     NSStepper,
     NSTableColumn,
@@ -191,11 +192,13 @@ from adventure_parameters import (
     visible_specs_for_section,
 )
 from cocoa_parameter_editor import CocoaParameterEditor
+from cocoa_map_provider_setup import configure_hosted_provider, run_map_provider_setup
 from json_storage import atomic_write_json
 from adventure_files import (
     ADVENTURE_FORMAT_VERSION,
     AdventureFormatError,
-    discover_adventures,
+    create_adventure_from_template,
+    discover_adventure_candidates,
     filename_base as adventure_filename_base,
     load_adventure,
     project_file_names,
@@ -218,17 +221,34 @@ from slideshow_control_format import (
     ControlSyntaxError,
     FontSyntaxError,
     MusicSyntaxError,
+    AudioSelectionSyntaxError,
     control_labels,
     parse_caption_parameters,
     parse_control_parameters,
     parse_font_parameters,
     parse_music_parameters,
+    parse_audio_selection_parameters,
     serialize_caption_parameters,
     serialize_control_parameters,
     serialize_font_parameters,
     split_disabled_control_line,
 )
 from map_overlay import MAP_CONTENT_VERSION
+from map_provider_utils import (
+    DEFAULT_TILE_CACHE_DIR,
+    cached_contextily_tile_urls,
+    contextily_provider,
+    provider_requires_credential,
+    read_provider_credential,
+    provider_tile_url,
+)
+from map_provider_setup import (
+    load_map_provider_preference,
+    save_map_provider_preference,
+    validate_custom_xyz_access,
+    validate_custom_xyz_configuration,
+    validate_provider_credential,
+)
 from workflow_assistant import (
     assistant_bubble_size,
     assistant_stage_uses_text_input,
@@ -287,8 +307,11 @@ except Exception:
 
 PROGRAM_TITLE = "myCamino GPS Track Show"
 MIN_WINDOW_WIDTH = 920
-MIN_WINDOW_HEIGHT = 780
-MUSIC_WINDOW_HEIGHT = 840
+MIN_WINDOW_HEIGHT = 560
+PREFERRED_WINDOW_HEIGHT = 642
+MAIN_HEADER_HEIGHT = 76.0
+MAIN_FOOTER_HEIGHT = 78.0
+MAIN_FOOTER_PROGRESS_HEIGHT = 100.0
 LABEL_WIDTH = 140.0
 BUTTON_WIDTH = 110.0
 FILE_BUTTON_WIDTH = 28.0
@@ -316,9 +339,34 @@ IMAGE_EXTENSIONS = {
 VIDEO_EXTENSIONS = MEDIA_EXTENSIONS - IMAGE_EXTENSIONS
 
 
-def required_main_window_height(music_enabled: bool) -> float:
-    """Return the content height needed to keep the bottom status visible."""
-    return MUSIC_WINDOW_HEIGHT if music_enabled else MIN_WINDOW_HEIGHT
+def required_main_window_height(_music_enabled: bool = False) -> float:
+    """Return the resizable main window's minimum content height."""
+    return float(MIN_WINDOW_HEIGHT)
+
+
+def main_workflow_document_height(
+    audio_details_visible: bool,
+    media_only: bool = False,
+) -> float:
+    """Return the natural height of the compact, scrollable workflow form."""
+    height = 488.0 + (104.0 if audio_details_visible else 0.0)
+    return height - (18.0 if media_only else 0.0)
+
+
+def audio_disclosure_window_height(
+    current_height: float,
+    was_visible: bool,
+    is_visible: bool,
+    maximum_height: float | None = None,
+) -> float:
+    """Return a window height adjusted by exactly the Audio-detail allocation."""
+    delta = main_workflow_document_height(bool(is_visible)) - main_workflow_document_height(
+        bool(was_visible)
+    )
+    height = max(float(MIN_WINDOW_HEIGHT), float(current_height) + delta)
+    if maximum_height is not None:
+        height = min(height, max(float(MIN_WINDOW_HEIGHT), float(maximum_height)))
+    return height
 CONTROL_TABLE_COLUMNS = ["preview", "file_datetime", "type", "name", "time", "gps", "place"]
 CONTROL_TABLE_TITLES = {
     "preview": "",
@@ -337,6 +385,8 @@ CONTROL_ROW_TYPE_KEYWORDS = {
     "LOC": "MediaMap",
     "DAT": "Datum",
     "MUS": "MUSIC",
+    "PLY": "PLAY",
+    "NAR": "NARRATOR",
     "CTL": "CONTROL",
     "CAP": "CAPTION",
     "FNT": "FONT",
@@ -351,6 +401,8 @@ CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "LOC": "Media location map",
     "DAT": "Date",
     "MUS": "Music control",
+    "PLY": "Temporary music",
+    "NAR": "Narrator",
     "CTL": "Slide-show control",
     "CAP": "Photo/video caption",
     "FNT": "Label font",
@@ -366,6 +418,8 @@ CONTROL_TABLE_FILTERS = (
     ("media", "Media"),
     ("maps", "Maps"),
     ("mus", "MUS – Music control"),
+    ("ply", "PLY – Temporary music"),
+    ("nar", "NAR – Narrator"),
     ("ctl", "CTL – Slide-show control"),
     ("cap", "CAP – Photo/video caption"),
     ("fnt", "FNT – Label font"),
@@ -389,7 +443,8 @@ PH_COLLECTION_TYPE_SMART_ALBUM = 2
 PH_COLLECTION_SUBTYPE_ANY = 9223372036854775807
 PH_ASSET_MEDIA_TYPE_IMAGE = 1
 PROJECT_AUDIO_DIRECTORY_NAME = "audio"
-SLIDESHOW_CHECKPOINT_VERSION = 4
+PROJECT_NARRATION_DIRECTORY_NAME = "narration"
+SLIDESHOW_CHECKPOINT_VERSION = 5
 SLIDESHOW_CHECKPOINT_HISTORY_LIMIT = 20
 
 
@@ -529,6 +584,13 @@ def ensure_project_audio_directory(project_dir) -> Path:
     return audio_dir.resolve(strict=False)
 
 
+def ensure_project_narration_directory(project_dir) -> Path:
+    """Return the fixed project narration directory, creating it when necessary."""
+    narration_dir = Path(project_dir).expanduser().resolve(strict=False) / PROJECT_NARRATION_DIRECTORY_NAME
+    narration_dir.mkdir(parents=True, exist_ok=True)
+    return narration_dir.resolve(strict=False)
+
+
 def playlist_belongs_to_audio_directory(playlist_path, audio_dir) -> bool:
     """Return whether a playlist is a direct child of the project audio folder."""
     if playlist_path is None or audio_dir is None:
@@ -608,6 +670,24 @@ def confirm_alert(message: str, informative: str = "", confirm_title: str = "Pro
     return int(alert.runModal()) == 1000
 
 
+def request_provider_api_key(provider: str, credential_id: str) -> bool:
+    """Prompt once and store a hosted-provider API key in macOS Keychain."""
+    preference = load_map_provider_preference()
+    if (
+        read_provider_credential(provider, credential_id)
+        and preference.get("preferred_output_provider") == provider
+        and preference.get("credential_id", "default") == credential_id
+        and preference.get("credential_verified", False)
+    ):
+        return True
+    result = configure_hosted_provider(
+        provider,
+        credential_id,
+        initial_key=read_provider_credential(provider, credential_id),
+    )
+    return bool(result and result.get("action") == "configured")
+
+
 def control_table_backup_directory(control_path: Path) -> Path:
     """Return the private recovery directory beside a control file."""
     return control_path.parent / ".mycamino-control-backups"
@@ -663,6 +743,14 @@ def ensure_default_project_playlist(project_dir, project_name) -> Path:
     """Create the empty default playlist for one Adventure when necessary."""
     audio_dir = ensure_project_audio_directory(project_dir)
     playlist_path = audio_dir / f"{project_filename_base(project_name)}.playlist"
+    if not playlist_path.exists():
+        write_text_atomic(playlist_path, "")
+    return playlist_path.resolve(strict=False)
+
+
+def ensure_default_narration_playlist(project_dir, project_name) -> Path:
+    narration_dir = ensure_project_narration_directory(project_dir)
+    playlist_path = narration_dir / f"{project_filename_base(project_name)}.playlist"
     if not playlist_path.exists():
         write_text_atomic(playlist_path, "")
     return playlist_path.resolve(strict=False)
@@ -724,6 +812,10 @@ def parse_slideshow_control_line(line: str) -> dict:
             row_type = "DAT"
         elif normalized == "music":
             row_type = "MUS"
+        elif normalized == "play":
+            row_type = "PLY"
+        elif normalized == "narrator":
+            row_type = "NAR"
         elif normalized == "control":
             row_type = "CTL"
         elif normalized == "caption":
@@ -779,7 +871,7 @@ def serialize_slideshow_control_row(row: dict) -> str:
             name = serialize_font_parameters(parse_font_parameters(name))
         except FontSyntaxError:
             pass
-    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "CTL", "CAP", "FNT"}:
+    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "PLY", "NAR", "CTL", "CAP", "FNT"}:
         keyword = str(row.get("keyword", "")).strip()
         if not keyword:
             keyword = CONTROL_ROW_TYPE_KEYWORDS.get(row_type, row_type)
@@ -828,7 +920,7 @@ def visible_control_row_indexes(rows, filter_key="all", hide_media=None):
     filter_key = str(filter_key or "all").casefold()
     if filter_key == "all":
         return list(range(len(rows)))
-    exact = {"mus", "ctl", "cap", "fnt", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
+    exact = {"mus", "ply", "nar", "ctl", "cap", "fnt", "img", "vid", "map", "trk", "bef", "aft", "loc", "dat"}
     if filter_key in exact:
         return [
             index for index, row in enumerate(rows)
@@ -1137,6 +1229,9 @@ class SlideShowControlTableDataSource(NSObject):
             if row_type == "MUS":
                 self.controller.showMusicDirectiveHelp_(table_view)
                 break
+            if row_type in {"PLY", "NAR"}:
+                self.controller.showAudioSelectionHelp_(table_view)
+                break
             if row_type == "CTL":
                 self.controller.showControlDirectiveHelp_(table_view)
                 break
@@ -1152,7 +1247,7 @@ class SlideShowControlTableDataSource(NSObject):
         base_font = NSFont.systemFontOfSize_(13.0)
         if row_type == "DAT":
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSBoldFontMask)
-        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS", "CTL", "CAP", "FNT"}:
+        elif row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "MUS", "PLY", "NAR", "CTL", "CAP", "FNT"}:
             font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(base_font, NSItalicFontMask)
         else:
             font = base_font
@@ -1995,7 +2090,8 @@ class GPXTrackerController(NSObject):
         self.current_control_file = None
         self.track_map_base = ""
         self.adventure_records = []
-        self.adventure_combo_paths = []
+        self.adventure_templates = []
+        self.adventure_combo_entries = []
         self.project_file_menu_refreshing = False
         self.committed_adventure_name = ""
         self.adventure_name_commit_in_progress = False
@@ -2009,7 +2105,11 @@ class GPXTrackerController(NSObject):
         self.media_import_prepare_existing_on_cancel = False
         self.music_source = None
         self.music_playlist = None
+        self.narration_source = None
+        self.narration_playlist = None
+        self.audio_section_expanded = False
         self.parameters = default_parameters()
+        self.pending_map_provider_action = None
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
         self.slideshow_resume_history = []
@@ -2190,9 +2290,13 @@ class GPXTrackerController(NSObject):
         return self.initWithProjectDirectory_projectFile_(None, None)
 
     def _build_window(self):
-        initial_height = required_main_window_height(
-            bool(self.parameters.get("audio.enabled", False))
-        )
+        initial_height = float(PREFERRED_WINDOW_HEIGHT)
+        screen = NSScreen.mainScreen()
+        if screen is not None:
+            initial_height = min(
+                initial_height,
+                max(float(MIN_WINDOW_HEIGHT), float(screen.visibleFrame().size.height) - 24.0),
+            )
         rect = NSMakeRect(120.0, 28.0, 980.0, initial_height)
         style = (
             NSWindowStyleMaskTitled
@@ -2207,7 +2311,7 @@ class GPXTrackerController(NSObject):
             False,
         )
         self.window.setTitle_(PROGRAM_TITLE)
-        self.window.setMinSize_((MIN_WINDOW_WIDTH, initial_height))
+        self.window.setMinSize_((MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT))
 
         content = self.window.contentView()
         self.root_view = NSView.alloc().initWithFrame_(content.bounds())
@@ -2362,7 +2466,7 @@ class GPXTrackerController(NSObject):
 
         self.track_maps_status_checkbox = self._make_section_status_checkbox()
         self.root_view.addSubview_(self.track_maps_status_checkbox)
-        self.track_maps_box = self._make_box_label("Map Generation")
+        self.track_maps_box = self._make_box_label("Maps")
         self.root_view.addSubview_(self.track_maps_box)
         self.track_maps_divider = self._make_section_divider()
         self.gpx_track_images_label = self._make_label("Maps")
@@ -2386,7 +2490,7 @@ class GPXTrackerController(NSObject):
 
         self.media_status_checkbox = self._make_section_status_checkbox()
         self.root_view.addSubview_(self.media_status_checkbox)
-        self.media_box = self._make_box_label("Photos and Video Clips")
+        self.media_box = self._make_box_label("Media")
         self.root_view.addSubview_(self.media_box)
         self.media_divider = self._make_section_divider()
         self.media_label = self._make_label("Photos & Video Clips:")
@@ -2412,7 +2516,7 @@ class GPXTrackerController(NSObject):
 
         self.control_file_status_checkbox = self._make_section_status_checkbox()
         self.root_view.addSubview_(self.control_file_status_checkbox)
-        self.control_box = self._make_box_label("Slide Show Control File")
+        self.control_box = self._make_box_label("Control File")
         self.root_view.addSubview_(self.control_box)
         self.control_divider = self._make_section_divider()
         self.control_file_label = self._make_label("Control file")
@@ -2436,10 +2540,18 @@ class GPXTrackerController(NSObject):
         self.control_file_summary_label = self._make_label("No slide show control file available.", size=12.0)
         self.root_view.addSubview_(self.control_file_summary_label)
 
-        self.music_box = self._make_box_label("Music")
+        self.music_box = self._make_box_label("Audio")
         self.root_view.addSubview_(self.music_box)
         self.music_divider = self._make_section_divider()
-        self.no_music_checkbox = self._make_checkbox("No Music", "noMusicChanged:")
+        self.audio_disclosure_button = self._make_button(
+            "+",
+            "toggleAudioSection:",
+        )
+        self.audio_disclosure_button.setToolTip_(
+            "Expand or collapse the Music and Narration controls."
+        )
+        self.root_view.addSubview_(self.audio_disclosure_button)
+        self.no_music_checkbox = self._make_checkbox("No Audio", "noMusicChanged:")
         self.root_view.addSubview_(self.no_music_checkbox)
         self.music_help_button = self._make_link_button("Help", "showMusicDirectiveHelp:")
         self.root_view.addSubview_(self.music_help_button)
@@ -2472,6 +2584,19 @@ class GPXTrackerController(NSObject):
             "No playlist selected; alphabetical order.",
             size=12.0,
         )
+        self.narration_label = self._make_label("Narration")
+        self.narration_field = self._make_text_field("No narration playlist selected")
+        self.narration_field.setTarget_(self)
+        self.narration_field.setAction_("narrationPlaylistCommitted:")
+        self.narration_playlist_select_button = self._make_button("Choose", "chooseNarrationPlaylist:")
+        self.narration_folder_button = self._make_file_icon_button(
+            "openNarrationFolder:",
+            "Open the project narration folder.",
+        )
+        self.narration_playlist_button = self._make_button("Create Playlist", "createNarrationPlaylist:")
+        self.narration_playlist_update_button = self._make_button("Update Playlist", "updateNarrationPlaylist:")
+        self.narration_playlist_edit_button = self._make_button("Edit Playlist", "editNarrationPlaylist:")
+        self.narration_summary_label = self._make_label("No narrator audio available.", size=12.0)
         for control in (
             self.music_label,
             self.music_field,
@@ -2483,6 +2608,14 @@ class GPXTrackerController(NSObject):
             self.music_summary_label,
             self.normalize_video_audio_button,
             self.video_normalization_summary_label,
+            self.narration_label,
+            self.narration_field,
+            self.narration_playlist_select_button,
+            self.narration_folder_button,
+            self.narration_playlist_button,
+            self.narration_playlist_update_button,
+            self.narration_playlist_edit_button,
+            self.narration_summary_label,
         ):
             self.root_view.addSubview_(control)
 
@@ -2508,6 +2641,8 @@ class GPXTrackerController(NSObject):
         self.progress_bar.setDoubleValue_(0.0)
         self.progress_bar.setHidden_(True)
         self.root_view.addSubview_(self.progress_bar)
+
+        self._install_main_window_regions()
 
         self.workflow_assistant_bubble = WorkflowAssistantBubbleView.alloc().initWithController_(self)
         self.root_view.addSubview_(self.workflow_assistant_bubble)
@@ -2547,6 +2682,57 @@ class GPXTrackerController(NSObject):
         self._configure_tooltips()
         self._configure_key_view_loop()
         self.refresh_section_status_indicators()
+
+    def _install_main_window_regions(self):
+        """Move existing controls into fixed header/footer and scrolling workflow views."""
+        header_controls = (
+            self.header_text_label,
+            self.header_logo_view,
+            self.parameter_button,
+            self.help_button,
+            self.version_label,
+            self.assistant_checkbox,
+        )
+        footer_controls = (
+            self.slideshow_box,
+            self.slideshow_divider,
+            self.slideshow_label,
+            self.slideshow_start_button,
+            self.slideshow_continue_button,
+            self.pdf_summary_button,
+            self.quit_button,
+            self.status_label,
+            self.progress_bar,
+        )
+        header_ids = {id(control) for control in header_controls}
+        footer_ids = {id(control) for control in footer_controls}
+        existing_controls = list(self.root_view.subviews())
+
+        self.main_header_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, MAIN_HEADER_HEIGHT))
+        self.main_footer_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, MAIN_FOOTER_HEIGHT))
+        self.workflow_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 100))
+        self.workflow_scroll.setHasVerticalScroller_(True)
+        self.workflow_scroll.setHasHorizontalScroller_(False)
+        self.workflow_scroll.setAutohidesScrollers_(True)
+        self.workflow_scroll.setDrawsBackground_(False)
+        self.workflow_scroll.setBorderType_(0)
+        self.workflow_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 100))
+        self.workflow_scroll.setDocumentView_(self.workflow_view)
+        self.workflow_document_height = 0.0
+        self.main_layout_initialized = False
+
+        for control in existing_controls:
+            control.removeFromSuperview()
+            if id(control) in header_ids:
+                self.main_header_view.addSubview_(control)
+            elif id(control) in footer_ids:
+                self.main_footer_view.addSubview_(control)
+            else:
+                self.workflow_view.addSubview_(control)
+
+        self.root_view.addSubview_(self.workflow_scroll)
+        self.root_view.addSubview_(self.main_header_view)
+        self.root_view.addSubview_(self.main_footer_view)
 
     def _make_box_label(self, text):
         label = self._make_label(text, size=14.0, bold=True, centered=False)
@@ -2720,7 +2906,10 @@ class GPXTrackerController(NSObject):
         self.project_dir_field.setToolTip_("Type or choose the project directory. The dropdown offers the last ten adventure folders. Missing directories are created when selected.")
         self.project_dir_button.setToolTip_("Choose or create the project directory.")
         self.title_field_label.setToolTip_("Select, create, rename, or copy an Adventure in the current project directory.")
-        self.title_field.setToolTip_("The dropdown lists Adventures in this directory. Use Edit before changing the active Adventure name.")
+        self.title_field.setToolTip_(
+            "The dropdown lists valid Adventures and copied templates that need adaptation. "
+            "Use Edit before changing the active Adventure name."
+        )
         self.adventure_name_edit_button.setToolTip_(
             "Unlock the Adventure name for one rename or copy operation."
         )
@@ -2778,7 +2967,7 @@ class GPXTrackerController(NSObject):
         self.control_file_field.setToolTip_("The active slide-show control file. The dropdown lists .lst files in this project directory.")
         self.control_file_create_button.setToolTip_("Create the sorted slide-show control file. Missing media GPS is inferred from a uniquely matching timed track when current generated maps are available; adjacent media is then associated with nearby stages.")
         self.control_file_edit_button.setToolTip_("Open the editable control-file table.")
-        self.control_file_update_button.setToolTip_("Update the existing control file with current map references and imported, missing, invalid, legacy, or changed media. Map rendering remains in Map Generation.")
+        self.control_file_update_button.setToolTip_("Update the existing control file with current map references and imported, missing, invalid, legacy, or changed media. Map rendering remains in Maps.")
         self.control_file_summary_label.setToolTip_("Shows whether a control file exists and counts images, videos, track maps, media-location maps, dates, and the overview map.")
 
         self.music_box.setToolTip_("Optional background music and playlist controls.")
@@ -2818,6 +3007,9 @@ class GPXTrackerController(NSObject):
             "from the project audio folder."
         )
         self.music_summary_label.setToolTip_("Shows the number of playable audio files and whether playlist or alphabetical ordering is used.")
+        self.no_music_checkbox.setToolTip_("Disable both background music and narration for the slide show.")
+        self.narration_field.setToolTip_("Selected narrator playlist in the project's fixed narration folder.")
+        self.narration_folder_button.setToolTip_("Open the narration folder to add narrator files or chapter folders.")
         self.normalize_video_audio_button.setToolTip_(
             "Prepare reusable project video copies with normalized audio. Originals remain unchanged and current copies are skipped."
         )
@@ -2860,7 +3052,8 @@ class GPXTrackerController(NSObject):
         self.control_file_field.setNextKeyView_(self.control_file_create_button)
         self.control_file_create_button.setNextKeyView_(self.control_file_edit_button)
         self.control_file_edit_button.setNextKeyView_(self.control_file_update_button)
-        self.control_file_update_button.setNextKeyView_(self.no_music_checkbox)
+        self.control_file_update_button.setNextKeyView_(self.audio_disclosure_button)
+        self.audio_disclosure_button.setNextKeyView_(self.no_music_checkbox)
         self.no_music_checkbox.setNextKeyView_(self.music_help_button)
         self.music_help_button.setNextKeyView_(self.music_field)
         self.music_field.setNextKeyView_(self.music_playlist_select_button)
@@ -2868,7 +3061,13 @@ class GPXTrackerController(NSObject):
         self.music_choose_button.setNextKeyView_(self.music_playlist_button)
         self.music_playlist_button.setNextKeyView_(self.music_playlist_update_button)
         self.music_playlist_update_button.setNextKeyView_(self.music_playlist_edit_button)
-        self.music_playlist_edit_button.setNextKeyView_(self.normalize_video_audio_button)
+        self.music_playlist_edit_button.setNextKeyView_(self.narration_field)
+        self.narration_field.setNextKeyView_(self.narration_playlist_select_button)
+        self.narration_playlist_select_button.setNextKeyView_(self.narration_folder_button)
+        self.narration_folder_button.setNextKeyView_(self.narration_playlist_button)
+        self.narration_playlist_button.setNextKeyView_(self.narration_playlist_update_button)
+        self.narration_playlist_update_button.setNextKeyView_(self.narration_playlist_edit_button)
+        self.narration_playlist_edit_button.setNextKeyView_(self.normalize_video_audio_button)
         self.normalize_video_audio_button.setNextKeyView_(self.slideshow_start_button)
         self.slideshow_start_button.setNextKeyView_(self.slideshow_continue_button)
         self.slideshow_continue_button.setNextKeyView_(self.pdf_summary_button)
@@ -2880,101 +3079,136 @@ class GPXTrackerController(NSObject):
 
     def layout_window(self):
         bounds = self.root_view.bounds()
-        width = bounds.size.width
-        height = bounds.size.height
-        required_height = required_main_window_height(
-            bool(self.parameters.get("audio.enabled", False))
+        width = max(float(bounds.size.width), float(MIN_WINDOW_WIDTH))
+        height = max(float(bounds.size.height), float(MIN_WINDOW_HEIGHT))
+        progress_visible = not bool(self.progress_bar.isHidden())
+        footer_height = (
+            MAIN_FOOTER_PROGRESS_HEIGHT if progress_visible else MAIN_FOOTER_HEIGHT
         )
-        self.window.setMinSize_((MIN_WINDOW_WIDTH, required_height))
-        if height + 0.5 < required_height:
-            old_frame = self.window.frame()
-            old_top = old_frame.origin.y + old_frame.size.height
-            self.window.setContentSize_(NSMakeSize(max(width, MIN_WINDOW_WIDTH), required_height))
-            new_frame = self.window.frame()
-            new_origin_y = old_top - new_frame.size.height
-            screen = self.window.screen()
-            if screen is not None:
-                new_origin_y = max(screen.visibleFrame().origin.y, new_origin_y)
-            self.window.setFrameOrigin_(NSMakePoint(old_frame.origin.x, new_origin_y))
-            bounds = self.root_view.bounds()
-            width = bounds.size.width
-            height = bounds.size.height
+        workflow_height = max(1.0, height - MAIN_HEADER_HEIGHT - footer_height)
 
+        self.main_header_view.setFrame_(
+            NSMakeRect(0.0, height - MAIN_HEADER_HEIGHT, width, MAIN_HEADER_HEIGHT)
+        )
+        self.main_footer_view.setFrame_(NSMakeRect(0.0, 0.0, width, footer_height))
+        self.workflow_scroll.setFrame_(
+            NSMakeRect(0.0, footer_height, width, workflow_height)
+        )
+
+        clip_view = self.workflow_scroll.contentView()
+        old_document_height = max(float(self.workflow_document_height), workflow_height)
+        old_visible_height = float(clip_view.bounds().size.height)
+        old_origin_y = float(clip_view.bounds().origin.y)
+        distance_from_top = max(
+            0.0,
+            old_document_height - (old_origin_y + old_visible_height),
+        )
+
+        audio_details_visible = bool(
+            self.parameters.get("audio.enabled", False)
+            and self.audio_section_expanded
+        )
+        media_only = str(
+            self.parameters.get("trackmaps.route_source", "automatic")
+        ) == "media"
+        required_document_height = main_workflow_document_height(
+            audio_details_visible,
+            media_only,
+        )
+        document_height = max(workflow_height, required_document_height)
+        self.workflow_document_height = document_height
+        self.workflow_view.setFrame_(NSMakeRect(0.0, 0.0, width, document_height))
+
+        self._layout_main_header(width)
+        self._layout_main_workflow(width, document_height, media_only, audio_details_visible)
+        self._layout_main_footer(width, footer_height, progress_visible)
+
+        visible_height = float(clip_view.bounds().size.height)
+        if self.main_layout_initialized:
+            target_y = document_height - visible_height - distance_from_top
+        else:
+            target_y = document_height - visible_height
+            self.main_layout_initialized = True
+        clip_view.scrollToPoint_(NSMakePoint(0.0, max(0.0, target_y)))
+        self.workflow_scroll.reflectScrolledClipView_(clip_view)
+        self.layout_workflow_assistant()
+
+    def _layout_main_header(self, width):
         left_x = PADDING
-        field_x = left_x + LABEL_WIDTH + INNER_GAP
-        usable_width = width - 2 * PADDING
-        description_width = usable_width - LABEL_WIDTH - INNER_GAP
-        project_field_width = description_width - FILE_BUTTON_WIDTH - INNER_GAP
-        gpx_choose_width = 76.0
-        photo_tracks_width = 116.0
-        gpx_field_width = (
-            description_width
-            - gpx_choose_width
-            - FILE_BUTTON_WIDTH
-            - EDIT_BUTTON_WIDTH
-            - photo_tracks_width
-            - 4 * INNER_GAP
+        logo_size = 64.0
+        logo_x = width - PADDING - logo_size
+        parameter_size = 34.0
+        parameter_x = logo_x - parameter_size - INNER_GAP
+        help_width = 62.0
+        help_x = parameter_x - help_width - INNER_GAP
+        assistant_width = 92.0
+        assistant_x = help_x - assistant_width - INNER_GAP
+        version_width = 132.0
+        version_x = assistant_x - version_width - INNER_GAP
+        self.header_text_label.setFrame_(
+            NSMakeRect(left_x, 22.0, max(180.0, version_x - left_x - INNER_GAP), 34.0)
         )
+        self.version_label.setFrame_(NSMakeRect(version_x, 31.0, version_width, 16.0))
+        self.assistant_checkbox.setFrame_(
+            NSMakeRect(assistant_x, 23.0, assistant_width, parameter_size)
+        )
+        self.help_button.setFrame_(NSMakeRect(help_x, 21.0, help_width, parameter_size))
+        self.parameter_button.setFrame_(
+            NSMakeRect(parameter_x, 21.0, parameter_size, parameter_size)
+        )
+        self.header_logo_view.setFrame_(NSMakeRect(logo_x, 6.0, logo_size, logo_size))
 
+    def _layout_main_workflow(self, width, height, media_only, audio_details_visible):
+        left_x = PADDING
+        section_label_x = PADDING + SECTION_STATUS_SIZE + 4.0
+        field_x = left_x + LABEL_WIDTH + INNER_GAP
+        usable_width = width - 2.0 * PADDING
+        description_width = usable_width - LABEL_WIDTH - INNER_GAP
         current_top = height - PADDING
 
-        title_height = 50.0
-        logo_size = 112.0
-        logo_x = field_x + description_width - logo_size
-        parameter_button_size = 34.0
-        parameter_button_x = logo_x - parameter_button_size - INNER_GAP
-        help_button_width = 62.0
-        help_button_x = parameter_button_x - help_button_width - INNER_GAP
-        assistant_width = 92.0
-        assistant_x = help_button_x - assistant_width - INNER_GAP
-        version_width = 140.0
-        version_x = assistant_x - version_width - INNER_GAP
-        text_width = max(180.0, version_x - left_x - INNER_GAP)
-        self.header_text_label.setFrame_(
-            NSMakeRect(left_x, current_top - title_height + 13.0, text_width, 34.0)
-        )
-        self.parameter_button.setFrame_(
-            NSMakeRect(parameter_button_x, current_top - title_height + 12.0, parameter_button_size, parameter_button_size)
-        )
-        self.help_button.setFrame_(
-            NSMakeRect(help_button_x, current_top - title_height + 12.0, help_button_width, parameter_button_size)
-        )
-        self.assistant_checkbox.setFrame_(
-            NSMakeRect(assistant_x, current_top - title_height + 14.0, assistant_width, parameter_button_size)
-        )
-        self.version_label.setFrame_(
-            NSMakeRect(version_x, current_top - title_height + 21.0, version_width, 16.0)
-        )
-        self.header_logo_view.setFrame_(
-            NSMakeRect(logo_x, current_top - logo_size + 26.0, logo_size, logo_size)
-        )
-        current_top -= title_height + 4.0
+        def section_header(status, label, divider, label_width):
+            nonlocal current_top
+            row_y = current_top - FIELD_HEIGHT
+            if status is not None:
+                status.setFrame_(
+                    NSMakeRect(PADDING, row_y + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT)
+                )
+                label_x = section_label_x
+            else:
+                label_x = PADDING
+            label.setFrame_(NSMakeRect(label_x, row_y + 5.0, label_width, 18.0))
+            divider.setFrame_(
+                NSMakeRect(label_x, current_top - 1.0, max(20.0, width - PADDING - label_x), 1.0)
+            )
+            current_top = row_y - ROW_GAP
+            return row_y
 
-        section_label_x = PADDING + SECTION_STATUS_SIZE + 4.0
-        self.adventure_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
-        self.adventure_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, 86.0, 18.0))
-        self.adventure_divider.setFrame_(
+        # Adventure: the project directory now shares the section heading row.
+        header_y = section_header(
+            self.adventure_status_checkbox,
+            self.adventure_box,
+            self.adventure_divider,
+            86.0,
+        )
+        project_field_width = description_width - FILE_BUTTON_WIDTH - INNER_GAP
+        self.project_dir_field.setFrame_(
+            NSMakeRect(field_x, header_y, project_field_width, FIELD_HEIGHT)
+        )
+        self.project_dir_button.setFrame_(
             NSMakeRect(
-                section_label_x,
-                current_top + 7.0,
-                max(20.0, width - PADDING - section_label_x),
-                1.0,
+                field_x + project_field_width + INNER_GAP,
+                header_y,
+                FILE_BUTTON_WIDTH,
+                FILE_BUTTON_WIDTH,
             )
         )
-        current_top -= 22.0
+        self.project_dir_label.setHidden_(True)
 
         row_y = current_top - FIELD_HEIGHT
-        self.project_dir_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        self.project_dir_field.setFrame_(NSMakeRect(field_x, row_y, project_field_width, FIELD_HEIGHT))
-        self.project_dir_button.setFrame_(NSMakeRect(field_x + project_field_width + INNER_GAP, row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH))
-
-        row_y -= FIELD_HEIGHT + ROW_GAP
-        self.title_field_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         adventure_edit_width = 62.0
         adventure_name_width = description_width - adventure_edit_width - INNER_GAP
-        self.title_field.setFrame_(
-            NSMakeRect(field_x, row_y, adventure_name_width, FIELD_HEIGHT)
-        )
+        self.title_field_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
+        self.title_field.setFrame_(NSMakeRect(field_x, row_y, adventure_name_width, FIELD_HEIGHT))
         self.adventure_name_edit_button.setFrame_(
             NSMakeRect(
                 field_x + adventure_name_width + INNER_GAP,
@@ -2983,17 +3217,25 @@ class GPXTrackerController(NSObject):
                 FIELD_HEIGHT,
             )
         )
+        current_top = row_y - ROW_GAP
 
-        row_y -= DESCRIPTION_HEIGHT + ROW_GAP
-        self.description_label.setFrame_(NSMakeRect(left_x, row_y + DESCRIPTION_HEIGHT - 18.0, LABEL_WIDTH, 18.0))
-        self.description_scroll.setFrame_(NSMakeRect(field_x, row_y, description_width, DESCRIPTION_HEIGHT))
+        row_y = current_top - DESCRIPTION_HEIGHT
+        self.description_label.setFrame_(
+            NSMakeRect(left_x, row_y + DESCRIPTION_HEIGHT - 18.0, LABEL_WIDTH, 18.0)
+        )
+        self.description_scroll.setFrame_(
+            NSMakeRect(field_x, row_y, description_width, DESCRIPTION_HEIGHT)
+        )
         self.description_text.setFrame_(NSMakeRect(0, 0, description_width, DESCRIPTION_HEIGHT))
         description_container = self.description_text.textContainer()
         if description_container is not None:
-            description_container.setContainerSize_(NSMakeSize(description_width, 10_000_000.0))
+            description_container.setContainerSize_(
+                NSMakeSize(description_width, 10_000_000.0)
+            )
             description_container.setWidthTracksTextView_(True)
+        current_top = row_y - ROW_GAP
 
-        row_y -= FIELD_HEIGHT + ROW_GAP
+        row_y = current_top - FIELD_HEIGHT
         title_image_button_width = 82.0
         title_image_field_width = (
             description_width
@@ -3001,9 +3243,7 @@ class GPXTrackerController(NSObject):
             - title_image_button_width
             - 2.0 * INNER_GAP
         )
-        self.title_image_label.setFrame_(
-            NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0)
-        )
+        self.title_image_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
         self.title_image_field.setFrame_(
             NSMakeRect(field_x, row_y, title_image_field_width, FIELD_HEIGHT)
         )
@@ -3017,212 +3257,192 @@ class GPXTrackerController(NSObject):
         )
         self.title_image_default_button.setFrame_(
             NSMakeRect(
-                field_x
-                + title_image_field_width
-                + INNER_GAP
-                + FILE_BUTTON_WIDTH
-                + INNER_GAP,
+                field_x + title_image_field_width + FILE_BUTTON_WIDTH + 2.0 * INNER_GAP,
                 row_y,
                 title_image_button_width,
                 FIELD_HEIGHT,
             )
         )
-
         current_top = row_y - BLOCK_GAP
 
-        self.gpx_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
-        self.gpx_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, 78.0, 18.0))
+        # GPX retains its compact source selector in the heading and details below.
+        header_y = section_header(
+            self.gpx_status_checkbox,
+            self.gpx_box,
+            self.gpx_divider,
+            78.0,
+        )
         self.gpx_no_gpx_checkbox.setFrame_(
-            NSMakeRect(field_x, current_top - 21.0, 220.0, FIELD_HEIGHT)
+            NSMakeRect(field_x, header_y, 220.0, FIELD_HEIGHT)
         )
-        self.gpx_divider.setFrame_(
-            NSMakeRect(
-                section_label_x,
-                current_top + 7.0,
-                max(20.0, width - PADDING - section_label_x),
-                1.0,
-            )
-        )
-        current_top -= 22.0
-        media_only = str(self.parameters.get("trackmaps.route_source", "automatic")) == "media"
+        row_y = current_top - FIELD_HEIGHT
+        gpx_choose_width = 76.0
+        photo_tracks_width = 116.0
         if media_only:
-            row_y = current_top - FIELD_HEIGHT
             self.gpx_photo_tracks_button.setFrame_(
                 NSMakeRect(field_x, row_y, photo_tracks_width, FIELD_HEIGHT)
             )
         else:
-            row_y = current_top - FIELD_HEIGHT
+            gpx_field_width = (
+                description_width
+                - gpx_choose_width
+                - FILE_BUTTON_WIDTH
+                - EDIT_BUTTON_WIDTH
+                - photo_tracks_width
+                - 4.0 * INNER_GAP
+            )
             self.gpx_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
             self.gpx_field.setFrame_(NSMakeRect(field_x, row_y, gpx_field_width, FIELD_HEIGHT))
-            self.gpx_button.setFrame_(
-                NSMakeRect(field_x + gpx_field_width + INNER_GAP, row_y, gpx_choose_width, FIELD_HEIGHT)
-            )
+            x = field_x + gpx_field_width + INNER_GAP
+            self.gpx_button.setFrame_(NSMakeRect(x, row_y, gpx_choose_width, FIELD_HEIGHT))
+            x += gpx_choose_width + INNER_GAP
             self.gpx_folder_button.setFrame_(
-                NSMakeRect(
-                    field_x + gpx_field_width + gpx_choose_width + 2 * INNER_GAP,
-                    row_y,
-                    FILE_BUTTON_WIDTH,
-                    FILE_BUTTON_WIDTH,
-                )
+                NSMakeRect(x, row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH)
             )
+            x += FILE_BUTTON_WIDTH + INNER_GAP
             self.gpx_edit_button.setFrame_(
-                NSMakeRect(
-                    field_x + gpx_field_width + gpx_choose_width + FILE_BUTTON_WIDTH + 3 * INNER_GAP,
-                    row_y - 1.0,
-                    EDIT_BUTTON_WIDTH,
-                    FIELD_HEIGHT + 2.0,
-                )
+                NSMakeRect(x, row_y - 1.0, EDIT_BUTTON_WIDTH, FIELD_HEIGHT + 2.0)
             )
+            x += EDIT_BUTTON_WIDTH + INNER_GAP
             self.gpx_photo_tracks_button.setFrame_(
-                NSMakeRect(
-                    field_x
-                    + gpx_field_width
-                    + gpx_choose_width
-                    + FILE_BUTTON_WIDTH
-                    + EDIT_BUTTON_WIDTH
-                    + 4 * INNER_GAP,
-                    row_y - 1.0,
-                    photo_tracks_width,
-                    FIELD_HEIGHT + 2.0,
-                )
+                NSMakeRect(x, row_y - 1.0, photo_tracks_width, FIELD_HEIGHT + 2.0)
             )
-            row_y -= 18.0
+            summary_y = row_y - 18.0
             self.gpx_summary_label.setFrame_(
-                NSMakeRect(
-                    field_x,
-                    row_y,
-                    description_width,
-                    18.0,
-                )
+                NSMakeRect(field_x, summary_y, description_width, 18.0)
             )
-
+            row_y = summary_y
         current_top = row_y - BLOCK_GAP
-        self.media_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
-        self.media_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, 168.0, 18.0))
-        self.media_divider.setFrame_(
-            NSMakeRect(
-                section_label_x,
-                current_top + 7.0,
-                max(20.0, width - PADDING - section_label_x),
-                1.0,
-            )
+
+        # Media actions share the heading row; only the status remains below.
+        header_y = section_header(
+            self.media_status_checkbox,
+            self.media_box,
+            self.media_divider,
+            58.0,
         )
-        current_top -= 22.0
-        row_y = current_top - FIELD_HEIGHT
-        self.media_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        media_button_start = field_x
-        self.media_import_button.setFrame_(NSMakeRect(media_button_start, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        self.media_view_button.setFrame_(NSMakeRect(media_button_start + SMALL_BUTTON_WIDTH + INNER_GAP, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        self.media_edit_button.setFrame_(NSMakeRect(media_button_start + 2 * (SMALL_BUTTON_WIDTH + INNER_GAP), row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH))
-        place_names_x = media_button_start + 2 * (SMALL_BUTTON_WIDTH + INNER_GAP) + FILE_BUTTON_WIDTH + 2 * INNER_GAP
-        self.media_place_names_checkbox.setFrame_(NSMakeRect(place_names_x, row_y, 180.0, FIELD_HEIGHT))
+        self.media_label.setHidden_(True)
+        x = field_x
+        self.media_import_button.setFrame_(NSMakeRect(x, header_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
+        x += SMALL_BUTTON_WIDTH + INNER_GAP
+        self.media_view_button.setFrame_(NSMakeRect(x, header_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
+        x += SMALL_BUTTON_WIDTH + INNER_GAP
+        self.media_edit_button.setFrame_(
+            NSMakeRect(x, header_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH)
+        )
+        x += FILE_BUTTON_WIDTH + 2.0 * INNER_GAP
+        self.media_place_names_checkbox.setFrame_(
+            NSMakeRect(x, header_y, 160.0, FIELD_HEIGHT)
+        )
         metadata_width = 180.0
-        metadata_x = field_x + description_width - metadata_width
-        self.media_metadata_button.setFrame_(NSMakeRect(metadata_x, row_y, metadata_width, FIELD_HEIGHT))
-        media_summary_y = row_y - 18.0
+        self.media_metadata_button.setFrame_(
+            NSMakeRect(field_x + description_width - metadata_width, header_y, metadata_width, FIELD_HEIGHT)
+        )
+        summary_y = current_top - 18.0
         self.media_summary_label.setFrame_(
-            NSMakeRect(
-                field_x,
-                media_summary_y,
-                max(120.0, width - PADDING - field_x),
-                18.0,
-            )
+            NSMakeRect(field_x, summary_y, description_width, 18.0)
         )
-
-        current_top = media_summary_y - BLOCK_GAP
-        self.track_maps_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
-        self.track_maps_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, 112.0, 18.0))
-        self.track_maps_divider.setFrame_(
-            NSMakeRect(
-                section_label_x,
-                current_top + 7.0,
-                max(20.0, width - PADDING - section_label_x),
-                1.0,
-            )
-        )
-        current_top -= 22.0
-        row_y = current_top - FIELD_HEIGHT
-        self.gpx_track_images_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        track_button_x = field_x
-        self.gpx_make_plots_button.setFrame_(NSMakeRect(track_button_x, row_y, 190.0, FIELD_HEIGHT))
-        view_x = track_button_x + 190.0 + INNER_GAP
-        self.gpx_view_plots_button.setFrame_(NSMakeRect(view_x, row_y, 92.0, FIELD_HEIGHT))
-        folder_x = view_x + 92.0 + INNER_GAP
-        self.gpx_edit_plots_button.setFrame_(NSMakeRect(folder_x, row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH))
-        cancel_x = folder_x + FILE_BUTTON_WIDTH + INNER_GAP
-        self.gpx_cancel_plots_button.setFrame_(NSMakeRect(cancel_x, row_y, 72.0, FIELD_HEIGHT))
-        row_y -= 18.0
-        self.track_maps_summary_label.setFrame_(
-            NSMakeRect(
-                field_x,
-                row_y,
-                description_width,
-                18.0,
-            )
-        )
-
-        current_top = row_y - BLOCK_GAP
-        self.control_file_status_checkbox.setFrame_(NSMakeRect(PADDING, current_top - FIELD_HEIGHT + 5.0, SECTION_STATUS_SIZE, FIELD_HEIGHT))
-        self.control_box.setFrame_(NSMakeRect(section_label_x, current_top - 18.0, 182.0, 18.0))
-        self.control_divider.setFrame_(
-            NSMakeRect(
-                section_label_x,
-                current_top + 7.0,
-                max(20.0, width - PADDING - section_label_x),
-                1.0,
-            )
-        )
-        current_top -= 22.0
-        row_y = current_top - FIELD_HEIGHT
-        self.control_file_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        self.control_file_field.setFrame_(NSMakeRect(field_x, row_y, description_width, FIELD_HEIGHT))
-        row_y -= FIELD_HEIGHT + 2.0
-        self.control_file_create_button.setFrame_(NSMakeRect(field_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        edit_x = field_x + SMALL_BUTTON_WIDTH + INNER_GAP
-        self.control_file_edit_button.setFrame_(NSMakeRect(edit_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        update_x = edit_x + SMALL_BUTTON_WIDTH + INNER_GAP
-        self.control_file_update_button.setFrame_(NSMakeRect(update_x, row_y, 154.0, FIELD_HEIGHT))
-        summary_y = row_y - 18.0
-        self.control_file_summary_label.setFrame_(
-            NSMakeRect(
-                field_x,
-                summary_y,
-                max(120.0, width - PADDING - field_x),
-                18.0,
-            )
-        )
-
         current_top = summary_y - BLOCK_GAP
-        self.music_box.setFrame_(NSMakeRect(PADDING, current_top - 18.0, 52.0, 18.0))
+
+        # Map actions share the heading row.
+        header_y = section_header(
+            self.track_maps_status_checkbox,
+            self.track_maps_box,
+            self.track_maps_divider,
+            44.0,
+        )
+        self.gpx_track_images_label.setHidden_(True)
+        x = field_x
+        self.gpx_make_plots_button.setFrame_(NSMakeRect(x, header_y, 190.0, FIELD_HEIGHT))
+        x += 190.0 + INNER_GAP
+        self.gpx_view_plots_button.setFrame_(NSMakeRect(x, header_y, 92.0, FIELD_HEIGHT))
+        x += 92.0 + INNER_GAP
+        self.gpx_edit_plots_button.setFrame_(
+            NSMakeRect(x, header_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH)
+        )
+        x += FILE_BUTTON_WIDTH + INNER_GAP
+        self.gpx_cancel_plots_button.setFrame_(NSMakeRect(x, header_y, 72.0, FIELD_HEIGHT))
+        summary_y = current_top - 18.0
+        self.track_maps_summary_label.setFrame_(
+            NSMakeRect(field_x, summary_y, description_width, 18.0)
+        )
+        current_top = summary_y - BLOCK_GAP
+
+        # Control-file selector and actions share one heading row.
+        header_y = section_header(
+            self.control_file_status_checkbox,
+            self.control_box,
+            self.control_divider,
+            92.0,
+        )
+        self.control_file_label.setHidden_(True)
+        create_width = 76.0
+        edit_width = 76.0
+        update_width = 154.0
+        control_field_width = max(
+            220.0,
+            description_width
+            - create_width
+            - edit_width
+            - update_width
+            - 3.0 * INNER_GAP,
+        )
+        self.control_file_field.setFrame_(
+            NSMakeRect(field_x, header_y, control_field_width, FIELD_HEIGHT)
+        )
+        x = field_x + control_field_width + INNER_GAP
+        self.control_file_create_button.setFrame_(
+            NSMakeRect(x, header_y, create_width, FIELD_HEIGHT)
+        )
+        x += create_width + INNER_GAP
+        self.control_file_edit_button.setFrame_(
+            NSMakeRect(x, header_y, edit_width, FIELD_HEIGHT)
+        )
+        x += edit_width + INNER_GAP
+        self.control_file_update_button.setFrame_(
+            NSMakeRect(x, header_y, update_width, FIELD_HEIGHT)
+        )
+        summary_y = current_top - 18.0
+        self.control_file_summary_label.setFrame_(
+            NSMakeRect(field_x, summary_y, description_width, 18.0)
+        )
+        current_top = summary_y - BLOCK_GAP
+
+        # Audio keeps its always-available controls in the heading row.
+        header_y = section_header(None, self.music_box, self.music_divider, 52.0)
+        disclosure_x = PADDING + 58.0
+        self.audio_disclosure_button.setFrame_(
+            NSMakeRect(disclosure_x, header_y + 2.0, 24.0, 24.0)
+        )
         self.no_music_checkbox.setFrame_(
-            NSMakeRect(field_x, current_top - 21.0, 110.0, FIELD_HEIGHT)
+            NSMakeRect(disclosure_x + 30.0, header_y, 110.0, FIELD_HEIGHT)
         )
         self.music_help_button.setFrame_(
-            NSMakeRect(field_x + 112.0, current_top - 21.0, 42.0, FIELD_HEIGHT)
+            NSMakeRect(disclosure_x + 142.0, header_y, 42.0, FIELD_HEIGHT)
         )
-        self.music_divider.setFrame_(
+        normalize_x = field_x + 190.0
+        self.normalize_video_audio_button.setFrame_(
+            NSMakeRect(normalize_x, header_y, 170.0, FIELD_HEIGHT)
+        )
+        self.video_normalization_summary_label.setFrame_(
             NSMakeRect(
-                PADDING,
-                current_top + 7.0,
-                max(20.0, width - 2 * PADDING),
-                1.0,
+                normalize_x + 178.0,
+                header_y + 4.0,
+                max(120.0, width - PADDING - normalize_x - 178.0),
+                18.0,
             )
         )
-        current_top -= 22.0
-        music_enabled = bool(self.parameters.get("audio.enabled", False))
-        if music_enabled:
+
+        if audio_details_visible:
             row_y = current_top - FIELD_HEIGHT
             self.music_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
             music_action_width = (
-                68.0
-                + FILE_BUTTON_WIDTH
-                + 100.0
-                + 100.0
-                + 84.0
-                + 5 * INNER_GAP
+                68.0 + FILE_BUTTON_WIDTH + 100.0 + 100.0 + 84.0 + 5.0 * INNER_GAP
             )
             music_field_width = max(200.0, description_width - music_action_width)
-            self.music_field.setFrame_(NSMakeRect(field_x, row_y, music_field_width, FIELD_HEIGHT))
+            self.music_field.setFrame_(
+                NSMakeRect(field_x, row_y, music_field_width, FIELD_HEIGHT)
+            )
             playlist_select_x = field_x + music_field_width + INNER_GAP
             self.music_playlist_select_button.setFrame_(
                 NSMakeRect(playlist_select_x, row_y, 68.0, FIELD_HEIGHT)
@@ -3232,7 +3452,9 @@ class GPXTrackerController(NSObject):
                 NSMakeRect(music_choose_x, row_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH)
             )
             playlist_x = music_choose_x + FILE_BUTTON_WIDTH + INNER_GAP
-            self.music_playlist_button.setFrame_(NSMakeRect(playlist_x, row_y, 100.0, FIELD_HEIGHT))
+            self.music_playlist_button.setFrame_(
+                NSMakeRect(playlist_x, row_y, 100.0, FIELD_HEIGHT)
+            )
             playlist_update_x = playlist_x + 100.0 + INNER_GAP
             self.music_playlist_update_button.setFrame_(
                 NSMakeRect(playlist_update_x, row_y, 100.0, FIELD_HEIGHT)
@@ -3245,61 +3467,96 @@ class GPXTrackerController(NSObject):
             self.music_summary_label.setFrame_(
                 NSMakeRect(field_x, music_summary_y, description_width, 18.0)
             )
-            current_top = music_summary_y - BLOCK_GAP
-        else:
-            current_top -= 4.0
-
-        normalization_y = current_top - FIELD_HEIGHT
-        self.normalize_video_audio_button.setFrame_(
-            NSMakeRect(field_x, normalization_y, 170.0, FIELD_HEIGHT)
-        )
-        self.video_normalization_summary_label.setFrame_(
-            NSMakeRect(
-                field_x + 178.0,
-                normalization_y + 4.0,
-                max(120.0, description_width - 178.0),
-                18.0,
+            narration_y = music_summary_y - FIELD_HEIGHT - 4.0
+            self.narration_label.setFrame_(
+                NSMakeRect(left_x, narration_y + 4.0, LABEL_WIDTH, 18.0)
             )
-        )
-        current_top = normalization_y - BLOCK_GAP
+            self.narration_field.setFrame_(
+                NSMakeRect(field_x, narration_y, music_field_width, FIELD_HEIGHT)
+            )
+            self.narration_playlist_select_button.setFrame_(
+                NSMakeRect(playlist_select_x, narration_y, 68.0, FIELD_HEIGHT)
+            )
+            self.narration_folder_button.setFrame_(
+                NSMakeRect(music_choose_x, narration_y, FILE_BUTTON_WIDTH, FILE_BUTTON_WIDTH)
+            )
+            self.narration_playlist_button.setFrame_(
+                NSMakeRect(playlist_x, narration_y, 100.0, FIELD_HEIGHT)
+            )
+            self.narration_playlist_update_button.setFrame_(
+                NSMakeRect(playlist_update_x, narration_y, 100.0, FIELD_HEIGHT)
+            )
+            self.narration_playlist_edit_button.setFrame_(
+                NSMakeRect(playlist_edit_x, narration_y, 84.0, FIELD_HEIGHT)
+            )
+            self.narration_summary_label.setFrame_(
+                NSMakeRect(field_x, narration_y - 18.0, description_width, 18.0)
+            )
 
-        self.slideshow_box.setFrame_(NSMakeRect(PADDING, current_top - 18.0, 118.0, 18.0))
+    def _layout_main_footer(self, width, height, progress_visible):
+        left_x = PADDING
+        field_x = left_x + LABEL_WIDTH + INNER_GAP
+        description_width = width - 2.0 * PADDING - LABEL_WIDTH - INNER_GAP
+        row_y = height - FIELD_HEIGHT - 6.0
         self.slideshow_divider.setFrame_(
-            NSMakeRect(
-                PADDING,
-                current_top + 7.0,
-                max(20.0, width - 2 * PADDING),
-                1.0,
-            )
+            NSMakeRect(PADDING, height - 1.0, width - 2.0 * PADDING, 1.0)
         )
-        current_top -= 22.0
-        row_y = current_top - FIELD_HEIGHT
-        self.slideshow_label.setFrame_(NSMakeRect(left_x, row_y + 4.0, LABEL_WIDTH, 18.0))
-        start_x = field_x
-        self.slideshow_start_button.setFrame_(NSMakeRect(start_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        continue_x = start_x + SMALL_BUTTON_WIDTH + INNER_GAP
-        self.slideshow_continue_button.setFrame_(NSMakeRect(continue_x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT))
-        pdf_x = continue_x + SMALL_BUTTON_WIDTH + INNER_GAP
-        self.pdf_summary_button.setFrame_(NSMakeRect(pdf_x, row_y, 124.0, FIELD_HEIGHT))
-        quit_x = field_x + description_width - BUTTON_WIDTH
-        self.quit_button.setFrame_(NSMakeRect(quit_x, row_y, BUTTON_WIDTH, FIELD_HEIGHT))
-        progress_visible = not bool(self.progress_bar.isHidden())
-        status_bottom = row_y - STATUS_HEIGHT - 4.0
-        progress_bottom = (
-            status_bottom - PROGRESS_HEIGHT - 4.0
-            if progress_visible
-            else status_bottom
+        self.slideshow_box.setFrame_(
+            NSMakeRect(PADDING, row_y + 5.0, 118.0, 18.0)
         )
-        self.status_label.setFrame_(NSMakeRect(field_x, status_bottom, description_width, STATUS_HEIGHT))
+        self.slideshow_label.setHidden_(True)
+        x = field_x
+        self.slideshow_start_button.setFrame_(
+            NSMakeRect(x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT)
+        )
+        x += SMALL_BUTTON_WIDTH + INNER_GAP
+        self.slideshow_continue_button.setFrame_(
+            NSMakeRect(x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT)
+        )
+        x += SMALL_BUTTON_WIDTH + INNER_GAP
+        self.pdf_summary_button.setFrame_(NSMakeRect(x, row_y, 124.0, FIELD_HEIGHT))
+        self.quit_button.setFrame_(
+            NSMakeRect(field_x + description_width - BUTTON_WIDTH, row_y, BUTTON_WIDTH, FIELD_HEIGHT)
+        )
+        status_y = 8.0
+        self.status_label.setFrame_(
+            NSMakeRect(field_x, status_y, description_width, STATUS_HEIGHT)
+        )
+        progress_y = status_y + STATUS_HEIGHT + 4.0
         self.progress_bar.setFrame_(
             NSMakeRect(
                 field_x,
-                progress_bottom,
+                progress_y,
                 description_width,
                 PROGRESS_HEIGHT if progress_visible else 0.0,
             )
         )
-        self.layout_workflow_assistant()
+
+    def _resize_main_window_for_audio_visibility(self, was_visible, is_visible):
+        """Resize by the Audio-detail delta while preserving the window's top edge."""
+        if bool(was_visible) == bool(is_visible) or self.window is None:
+            return
+        old_frame = self.window.frame()
+        old_content = self.window.contentView().bounds().size
+        old_top = float(old_frame.origin.y + old_frame.size.height)
+        maximum_height = None
+        screen = self.window.screen() or NSScreen.mainScreen()
+        if screen is not None:
+            chrome_height = max(0.0, float(old_frame.size.height - old_content.height))
+            maximum_height = float(screen.visibleFrame().size.height) - chrome_height
+        target_height = audio_disclosure_window_height(
+            float(old_content.height),
+            bool(was_visible),
+            bool(is_visible),
+            maximum_height,
+        )
+        self.window.setContentSize_(NSMakeSize(float(old_content.width), target_height))
+        new_frame = self.window.frame()
+        origin_y = old_top - float(new_frame.size.height)
+        if screen is not None:
+            visible = screen.visibleFrame()
+            origin_y = max(float(visible.origin.y), origin_y)
+        self.window.setFrameOrigin_(NSMakePoint(float(old_frame.origin.x), origin_y))
 
     def set_status(self, message: str):
         self.status_label.setStringValue_(message)
@@ -3740,7 +3997,7 @@ class GPXTrackerController(NSObject):
         )
         return prepare_with_options(str(gpx_path), **options)
 
-    def _regenerate_tracks_summary_json(self, gpx_path):
+    def _regenerate_tracks_summary_json(self, gpx_path, track_processing_callback=None):
         project_name = self._current_project_name()
         trackimages_dir = self._track_images_dir()
         if not project_name or gpx_path is None or trackimages_dir is None:
@@ -3769,9 +4026,11 @@ class GPXTrackerController(NSObject):
             gpx_maximum_vdop=self.parameters["gpx.maximum_vdop"],
             fallback_walking_speed_kmh=self.parameters["gpx.fallback_walking_speed_kmh"],
             adventure_processing_parameters=self._track_summary_parameter_signature(),
+            track_processing_callback=track_processing_callback,
         )
         table_json_path = result.get("table_json_path")
-        return Path(table_json_path).resolve(strict=False) if table_json_path else None
+        summary_path = Path(table_json_path).resolve(strict=False) if table_json_path else None
+        return summary_path, result
 
     def _track_plot_match_key(self, path_or_name):
         name = Path(str(path_or_name)).name
@@ -4430,6 +4689,55 @@ class GPXTrackerController(NSObject):
         )
         return self._format_gpx_summary_from_tracks(gpx_path, tracks)
 
+    @staticmethod
+    def _format_gpx_summary_from_compact(gpx_path, payload):
+        """Format the status label from an already generated compact summary."""
+        rows = payload.get("tracks", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            return f"Tracks: 0 | Name: {gpx_path.name} | Date range: N/A"
+        dates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("start_time", "end_time"):
+                text = str(row.get(key) or "").strip()
+                for date_format in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M"):
+                    try:
+                        dates.append(datetime.strptime(text, date_format))
+                        break
+                    except ValueError:
+                        continue
+        range_text = (
+            f"{local_datetime_text(min(dates))} - {local_datetime_text(max(dates))}"
+            if dates else "N/A"
+        )
+        return f"Tracks: {len(rows)} | Name: {gpx_path.name} | Date range: {range_text}"
+
+    def derivedTrackUpdateFinished_(self, result):
+        """Install status from one background derived-data refresh."""
+        if not isinstance(result, dict):
+            return
+        error = result.get("error")
+        if error:
+            show_alert("Could not update derived GPX data.", str(error))
+            self.set_status("Derived GPX data update failed.")
+            return
+        gpx_path = Path(result["gpx_path"])
+        current = self._current_single_gpx_path()
+        if current is not None and current.resolve(strict=False) == gpx_path.resolve(strict=False):
+            self.gpx_summary_label.setStringValue_(str(result["summary_text"]))
+        status = result.get("map_status")
+        if isinstance(status, dict):
+            self.track_maps_status_cache = status
+            self.track_maps_summary_label.setStringValue_(
+                self._format_track_maps_summary_from_status(status)
+            )
+        self.reset_progress()
+        self.refresh_section_status_indicators()
+        self.set_status(
+            f"Updated derived track data for {result['track_count']} tracks; no map images were changed."
+        )
+
     def update_gpx_summary(self, gpx_path):
         self.gpx_summary_label.setStringValue_(self._format_gpx_summary(gpx_path))
         self.refresh_track_maps_summary()
@@ -4768,6 +5076,9 @@ class GPXTrackerController(NSObject):
             self.workflow_assistant_bubble.setHidden_(True)
             return
         content = self._assistant_stage_content(stage, message)
+        stage_changed = stage != self.workflow_assistant_bubble.position_stage
+        if stage_changed:
+            target.scrollRectToVisible_(target.bounds())
         container = (0.0, 0.0, self.root_view.bounds().size.width, self.root_view.bounds().size.height)
         converted_target = self.root_view.convertRect_fromView_(target.bounds(), target)
         target_rect = (
@@ -4777,7 +5088,6 @@ class GPXTrackerController(NSObject):
             converted_target.size.height,
         )
         size = assistant_bubble_size(content)
-        stage_changed = stage != self.workflow_assistant_bubble.position_stage
         self.workflow_assistant_bubble.setAssistantStage_(stage)
         self.workflow_assistant_bubble.setTargetRect_(target_rect)
         if self.workflow_assistant_bubble.hasUserPosition():
@@ -4898,6 +5208,8 @@ class GPXTrackerController(NSObject):
             "slideshow_resume_history": list(self.slideshow_resume_history),
             "music_source": self._stored_optional_project_path(self.music_source),
             "music_playlist": self._stored_optional_project_path(self.music_playlist),
+            "narration_playlist": self._stored_optional_project_path(self.narration_playlist),
+            "ui": {"audio_section_expanded": bool(self.audio_section_expanded)},
             "workflow_assistant": dict(self.workflow_assistant_state),
         }
 
@@ -4935,6 +5247,83 @@ class GPXTrackerController(NSObject):
             return None
         self.music_source = audio_dir
         return audio_dir
+
+    def _ensure_project_narration_directory(self, show_errors=True):
+        if self.current_project_dir is None:
+            return None
+        try:
+            narration_dir = ensure_project_narration_directory(self.current_project_dir)
+        except OSError as exc:
+            if show_errors:
+                show_alert("Could not create the project narration folder.", str(exc))
+            return None
+        self.narration_source = narration_dir
+        return narration_dir
+
+    def _set_narration_playlist(self, playlist, *, mark_dirty=False):
+        directory = self._ensure_project_narration_directory(show_errors=False)
+        candidate = Path(playlist).expanduser().resolve(strict=False) if playlist is not None else None
+        if candidate is not None and not playlist_belongs_to_audio_directory(candidate, directory):
+            candidate = None
+        changed = candidate != self.narration_playlist
+        self.narration_playlist = candidate
+        self.narration_field.setStringValue_(str(candidate) if candidate is not None else "")
+        self._refresh_narration_summary()
+        if mark_dirty and changed:
+            self.mark_dirty(immediate=True)
+        return candidate
+
+    def _ensure_default_narration_playlist(self, show_errors=True):
+        if self.current_project_dir is None:
+            return None
+        name = str(self.committed_adventure_name or "").strip()
+        if not name and self.current_project_file is not None:
+            name = self.current_project_file.stem
+        if not name:
+            return None
+        try:
+            return ensure_default_narration_playlist(self.current_project_dir, name)
+        except OSError as exc:
+            if show_errors:
+                show_alert("Could not create the default narration playlist.", str(exc))
+            return None
+
+    def _preferred_narration_playlist(self):
+        directory = self._ensure_project_narration_directory(show_errors=False)
+        if directory is None:
+            return None
+        candidate = directory / f"{project_filename_base(self._current_project_name())}.playlist"
+        return candidate if candidate.is_file() else None
+
+    def _refresh_narration_summary(self):
+        if not hasattr(self, "narration_summary_label"):
+            return
+        directory = self._ensure_project_narration_directory(show_errors=False)
+        if directory is None:
+            self.narration_summary_label.setStringValue_("No project narration folder available.")
+            return
+        files = audio_files_in_directory(directory)
+        playlist = self.narration_playlist
+        if playlist is None or not Path(playlist).is_file():
+            playlist = self._preferred_narration_playlist() or self._ensure_default_narration_playlist(False)
+            self.narration_playlist = playlist
+            self.narration_field.setStringValue_(str(playlist) if playlist else "")
+        parsed = load_audio_playlist(directory, playlist) if playlist else None
+        details = [f"{len(files)} narrator audio", f"{len(album_directories(files, directory))} folders"]
+        if playlist:
+            details.append(Path(playlist).name)
+        if parsed is not None and parsed.warnings:
+            details.append(f"{len(parsed.warnings)} warnings")
+        self.narration_summary_label.setStringValue_(", ".join(details))
+        available = bool(files)
+        for control in (
+            self.narration_playlist_select_button,
+            self.narration_folder_button,
+            self.narration_playlist_button,
+            self.narration_playlist_update_button,
+            self.narration_playlist_edit_button,
+        ):
+            control.setEnabled_(True if control is self.narration_folder_button else available or bool(playlist))
 
     def _set_music_playlist(self, playlist, *, mark_dirty=False):
         """Select one playlist from the fixed audio folder, or use alphabetical order."""
@@ -5072,12 +5461,22 @@ class GPXTrackerController(NSObject):
             return
         self.project_file_menu_refreshing = True
         try:
-            records, errors = discover_adventures(self.current_project_dir)
+            records, templates, errors = discover_adventure_candidates(
+                self.current_project_dir
+            )
             self.adventure_records = records
-            self.adventure_combo_paths = [record.path for record in records]
+            self.adventure_templates = templates
+            self.adventure_combo_entries = [
+                ("valid", record) for record in records
+            ] + [("template", record) for record in templates]
             current_name = str(self.title_field.stringValue()).strip()
             self.title_field.removeAllItems()
-            self.title_field.addItemsWithObjectValues_([record.project_name for record in records])
+            labels = [record.project_name for record in records]
+            labels.extend(
+                f"{record.project_name} — {record.path.name} (Needs adaptation)"
+                for record in templates
+            )
+            self.title_field.addItemsWithObjectValues_(labels)
             self.title_field.setStringValue_(current_name)
 
             gpx_value = str(self.gpx_field.stringValue()).strip()
@@ -5095,8 +5494,72 @@ class GPXTrackerController(NSObject):
             show_alert("Some Adventure files could not be used.", "\n".join(errors))
 
     def _find_adventure_file_in_directory(self, project_dir):
-        records, _errors = discover_adventures(project_dir)
+        records, _templates, _errors = discover_adventure_candidates(project_dir)
         return records[0].path if records else None
+
+    def _choose_copied_adventure_recovery(self, project_dir, templates):
+        """Choose a copied template and target name without changing active state."""
+        if not templates:
+            return None
+        suggested_name = project_filename_base(Path(project_dir).name)
+        while True:
+            accessory = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 520.0, 82.0))
+            template_label = self._make_label("Copied Adventure")
+            template_label.setFrame_(NSMakeRect(0.0, 56.0, 132.0, 20.0))
+            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                NSMakeRect(138.0, 52.0, 382.0, FIELD_HEIGHT), False
+            )
+            popup.addItemsWithTitles_(
+                [
+                    f"{record.path.name} — {record.project_name}"
+                    for record in templates
+                ]
+            )
+            name_label = self._make_label("New Adventure name")
+            name_label.setFrame_(NSMakeRect(0.0, 16.0, 132.0, 20.0))
+            name_field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(138.0, 12.0, 382.0, FIELD_HEIGHT)
+            )
+            name_field.setStringValue_(suggested_name)
+            accessory.addSubview_(template_label)
+            accessory.addSubview_(popup)
+            accessory.addSubview_(name_label)
+            accessory.addSubview_(name_field)
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Copied Adventures found")
+            alert.setInformativeText_(
+                "These Adventures still record their previous project directory. "
+                "Create a valid Adventure in this folder from the selected template, "
+                "or start with a blank Adventure. Existing project files are shared "
+                "and are not copied again."
+            )
+            alert.setAccessoryView_(accessory)
+            alert.addButtonWithTitle_("Create from Selected")
+            alert.addButtonWithTitle_("Create Blank Adventure")
+            alert.addButtonWithTitle_("Cancel")
+            response = int(alert.runModal())
+            if response not in {1000, 1001}:
+                return None
+            requested_name = project_filename_base(str(name_field.stringValue()).strip())
+            suggested_name = requested_name
+            target = Path(project_dir) / f"{requested_name}.adv"
+            if target.exists():
+                show_alert(
+                    "Adventure name is already in use.",
+                    f"{target.name} already exists. Choose another name or load the existing Adventure.",
+                )
+                continue
+            if response == 1001:
+                return {"action": "blank", "name": requested_name}
+            index = int(popup.indexOfSelectedItem())
+            if index < 0 or index >= len(templates):
+                index = 0
+            return {
+                "action": "copy",
+                "name": requested_name,
+                "template": templates[index],
+            }
 
     def _auto_load_adventure_from_directory(self, project_dir):
         adv_path = self._find_adventure_file_in_directory(project_dir)
@@ -5113,6 +5576,76 @@ class GPXTrackerController(NSObject):
         else:
             self.project_dir_field.setStringValue_(str(previous_directory))
 
+    def _initialize_blank_adventure_fields(self, resolved, suggested_name=None):
+        """Populate the existing new-Adventure workflow without creating a file."""
+        old_audio_details_visible = bool(
+            self.parameters.get("audio.enabled", False)
+            and self.audio_section_expanded
+        )
+        self.adventure_autosave_suspended += 1
+        try:
+            self.parameters = default_parameters()
+            self.audio_section_expanded = False
+            provider_preference = load_map_provider_preference()
+            preferred_provider = str(
+                provider_preference.get("preferred_output_provider", "")
+            )
+            preferred_credential = str(
+                provider_preference.get("credential_id", "default")
+            )
+            if preferred_provider in {"osm", "esri"} or (
+                provider_requires_credential(preferred_provider)
+                and provider_preference.get("credential_verified", False)
+                and read_provider_credential(preferred_provider, preferred_credential)
+            ):
+                self.parameters["maps.output_provider"] = preferred_provider
+                self.parameters["maps.credential_id"] = preferred_credential
+            self._sync_legacy_parameter_controls()
+            self._resize_main_window_for_audio_visibility(
+                old_audio_details_visible,
+                False,
+            )
+            self.current_project_file = None
+            suggested = project_filename_base(suggested_name or resolved.name)
+            self.title_field.setStringValue_(suggested)
+            self.committed_adventure_name = ""
+            self._set_adventure_name_editing(True)
+            self.track_map_base = suggested
+            self._set_gpx_field_value(f"{suggested}.gpx", manual=False)
+            self.current_control_file = resolved / f"{suggested}-sorted.lst"
+            self.control_file_field.setStringValue_(self.current_control_file.name)
+            self.music_source = self._ensure_project_audio_directory(show_errors=True)
+            self._set_music_playlist(
+                self._ensure_default_music_playlist(show_errors=True),
+                mark_dirty=False,
+            )
+            self.narration_source = self._ensure_project_narration_directory(show_errors=True)
+            self._set_narration_playlist(
+                self._ensure_default_narration_playlist(show_errors=True),
+                mark_dirty=False,
+            )
+            self._refresh_music_summary()
+            self._refresh_narration_summary()
+            self.description_text.setString_("")
+            self.title_image = None
+            self.title_image_field.setStringValue_("")
+            self.slideshow_resume_history = []
+            assistant_enabled = bool(self.workflow_assistant_state.get("enabled", True))
+            self.workflow_assistant_state = normalize_assistant_state(
+                None, existing_adventure=False
+            )
+            self.workflow_assistant_state["enabled"] = assistant_enabled
+            self.assistant_place_names_pending_save = False
+        finally:
+            self.adventure_autosave_suspended = max(
+                0, self.adventure_autosave_suspended - 1
+            )
+        self.saved_project_payload = None
+        self._refresh_project_file_menus()
+        self._remember_recent_adventure(resolved)
+        self.refresh_section_status_indicators()
+        self.set_status("Enter or confirm the Adventure name to create it.")
+
     def _activate_project_directory(self, project_dir, allow_create=True):
         candidate = Path(project_dir).expanduser()
         if not candidate.is_absolute():
@@ -5126,7 +5659,9 @@ class GPXTrackerController(NSObject):
         ):
             self.project_dir_field.setStringValue_(str(candidate))
             self._ensure_project_audio_directory(show_errors=True)
+            self._ensure_project_narration_directory(show_errors=True)
             self._refresh_music_summary()
+            self._refresh_narration_summary()
             return True
         if candidate.exists() and not candidate.is_dir():
             show_alert("The selected path is not a directory.", str(candidate))
@@ -5141,6 +5676,29 @@ class GPXTrackerController(NSObject):
             self._restore_project_directory_field(previous_directory)
             return False
 
+        recovered_path = None
+        blank_name = None
+        if candidate.is_dir():
+            records, templates, _errors = discover_adventure_candidates(candidate)
+            if not records and templates:
+                recovery = self._choose_copied_adventure_recovery(candidate, templates)
+                if recovery is None:
+                    self._restore_project_directory_field(previous_directory)
+                    return False
+                if recovery["action"] == "copy":
+                    try:
+                        recovered_path, _payload = create_adventure_from_template(
+                            recovery["template"].path,
+                            candidate,
+                            recovery["name"],
+                        )
+                    except (OSError, AdventureFormatError, ValueError) as exc:
+                        show_alert("Could not adapt the copied Adventure.", str(exc))
+                        self._restore_project_directory_field(previous_directory)
+                        return False
+                else:
+                    blank_name = recovery["name"]
+
         self.project_dir_field.setStringValue_(str(candidate))
         self.directory_activation_in_progress = True
         try:
@@ -5150,9 +5708,9 @@ class GPXTrackerController(NSObject):
         if resolved is None:
             self._restore_project_directory_field(previous_directory)
             return False
-        records, _errors = discover_adventures(resolved)
-        if records:
-            adventure_file = records[0].path
+        records, _templates, _errors = discover_adventure_candidates(resolved)
+        if recovered_path is not None or (records and blank_name is None):
+            adventure_file = recovered_path or records[0].path
             loaded = self.load_project_configuration(adventure_file, flush_current=False)
             if not loaded:
                 self.current_project_dir = previous_directory
@@ -5164,42 +5722,10 @@ class GPXTrackerController(NSObject):
                         pass
             return loaded
 
-        self.adventure_autosave_suspended += 1
-        try:
-            self.parameters = default_parameters()
-            self._sync_legacy_parameter_controls()
-            self.current_project_file = None
-            suggested = project_filename_base(resolved.name)
-            self.title_field.setStringValue_(suggested)
-            self.committed_adventure_name = ""
-            self._set_adventure_name_editing(True)
-            self.track_map_base = suggested
-            self._set_gpx_field_value(f"{suggested}.gpx", manual=False)
-            self.current_control_file = resolved / f"{suggested}-sorted.lst"
-            self.control_file_field.setStringValue_(self.current_control_file.name)
-            self.music_source = self._ensure_project_audio_directory(
-                show_errors=True
-            )
-            self._set_music_playlist(
-                self._ensure_default_music_playlist(show_errors=True),
-                mark_dirty=False,
-            )
-            self._refresh_music_summary()
-            self.description_text.setString_("")
-            self.title_image = None
-            self.title_image_field.setStringValue_("")
-            self.slideshow_resume_history = []
-            assistant_enabled = bool(self.workflow_assistant_state.get("enabled", True))
-            self.workflow_assistant_state = normalize_assistant_state(None, existing_adventure=False)
-            self.workflow_assistant_state["enabled"] = assistant_enabled
-            self.assistant_place_names_pending_save = False
-        finally:
-            self.adventure_autosave_suspended = max(0, self.adventure_autosave_suspended - 1)
-        self.saved_project_payload = None
-        self._refresh_project_file_menus()
-        self._remember_recent_adventure(resolved)
-        self.refresh_section_status_indicators()
-        self.set_status("Enter or confirm the Adventure name to create it.")
+        self._initialize_blank_adventure_fields(resolved, blank_name)
+        if blank_name is not None:
+            self.adventureNameCommitted_(self.title_field)
+            return self.current_project_file is not None
         return True
 
     def _update_loaded_project_fields(self, data):
@@ -5232,6 +5758,12 @@ class GPXTrackerController(NSObject):
             self._stored_optional_project_path(self.title_image)
             if self.title_image is not None
             else ""
+        )
+        ui_state = data.get("ui", {})
+        self.audio_section_expanded = bool(
+            ui_state.get("audio_section_expanded", False)
+            if isinstance(ui_state, dict)
+            else False
         )
         raw_parameters = data["parameters"]
         raw_values = (
@@ -5274,6 +5806,13 @@ class GPXTrackerController(NSObject):
         if loaded_playlist is None:
             loaded_playlist = self._ensure_default_music_playlist(show_errors=True)
         self._set_music_playlist(loaded_playlist, mark_dirty=False)
+        self.narration_source = self._ensure_project_narration_directory(show_errors=True)
+        narration_playlist = self._resolve_optional_project_path(data.get("narration_playlist"))
+        if not playlist_belongs_to_audio_directory(narration_playlist, self.narration_source):
+            narration_playlist = self._preferred_narration_playlist()
+        if narration_playlist is None:
+            narration_playlist = self._ensure_default_narration_playlist(show_errors=True)
+        self._set_narration_playlist(narration_playlist, mark_dirty=False)
         self.workflow_assistant_state = normalize_assistant_state(
             data.get("workflow_assistant"),
             existing_adventure=True,
@@ -5669,17 +6208,28 @@ class GPXTrackerController(NSObject):
             show_alert("Could not load adventure.", str(exc))
             return False
 
+        old_audio_details_visible = bool(
+            self.parameters.get("audio.enabled", False)
+            and self.audio_section_expanded
+        )
         self._update_loaded_project_fields(data)
+        self._resize_main_window_for_audio_visibility(
+            old_audio_details_visible,
+            bool(self.parameters.get("audio.enabled", False) and self.audio_section_expanded),
+        )
         normalized_music_source = self._stored_optional_project_path(
             self.music_source
         )
         normalized_music_playlist = self._stored_optional_project_path(
             self.music_playlist
         )
+        normalized_narration_playlist = self._stored_optional_project_path(self.narration_playlist)
         music_paths_changed = (
             str(data.get("music_source", "") or "") != normalized_music_source
             or str(data.get("music_playlist", "") or "")
             != normalized_music_playlist
+            or str(data.get("narration_playlist", "") or "")
+            != normalized_narration_playlist
         )
         self.current_project_file = record.path
         self._set_adventure_name_editing(False)
@@ -5720,9 +6270,25 @@ class GPXTrackerController(NSObject):
 
     def _apply_parameter_values(self, values, propagate_to_editor=True):
         old_parameters = dict(self.parameters)
-        self.parameters = normalize_parameters(values)
+        old_audio_details_visible = bool(
+            old_parameters.get("audio.enabled", False)
+            and self.audio_section_expanded
+        )
+        new_parameters = normalize_parameters(values)
+        credential_id = str(new_parameters.get("maps.credential_id", "default"))
+        for key in ("maps.interactive_provider", "maps.output_provider"):
+            provider = str(new_parameters.get(key, "osm"))
+            if provider_requires_credential(provider) and not request_provider_api_key(
+                provider, credential_id
+            ):
+                return False
+        self.parameters = new_parameters
         changed = changed_parameter_keys(old_parameters, self.parameters)
         self._sync_legacy_parameter_controls()
+        self._resize_main_window_for_audio_visibility(
+            old_audio_details_visible,
+            bool(self.parameters.get("audio.enabled", False) and self.audio_section_expanded),
+        )
         if changed & map_affecting_parameter_keys():
             self.track_maps_status_cache = None
             self.track_maps_summary_label.setStringValue_("Track-map settings changed; use Update to refresh affected maps.")
@@ -5763,6 +6329,26 @@ class GPXTrackerController(NSObject):
                 elif route_source in {"automatic", "gpx"}:
                     self.workflow_assistant_state["journey_source_confirmed"] = self._has_existing_gpx_file()
                 self.start_async_project_status_refresh("journey source changed")
+            if "maps.output_provider" in changed or "maps.credential_id" in changed:
+                provider = str(self.parameters.get("maps.output_provider", "osm"))
+                credential_id = str(self.parameters.get("maps.credential_id", "default"))
+                provider_preference = load_map_provider_preference()
+                verified = bool(
+                    provider == "osm"
+                    or (
+                        provider_preference.get("preferred_output_provider") == provider
+                        and provider_preference.get("credential_id", "default") == credential_id
+                        and provider_preference.get("credential_verified", False)
+                    )
+                )
+                try:
+                    save_map_provider_preference(
+                        provider,
+                        credential_id,
+                        credential_verified=verified,
+                    )
+                except OSError as exc:
+                    show_alert("Could not remember the map-provider preference.", str(exc))
         else:
             sent_live = self._send_running_slideshow_settings(
                 set(),
@@ -5771,7 +6357,132 @@ class GPXTrackerController(NSObject):
             self.set_status("Adventure settings unchanged.")
         if sent_live and restore_slideshow_display:
             self.slideshow_restore_after_settings_pending = False
+        if self.pending_map_provider_action is not None:
+            self.performSelector_withObject_afterDelay_(
+                "resumePendingMapProviderAction:", None, 0.0
+            )
         return True
+
+    def _show_map_provider_settings(self, provider, pending_action=None):
+        """Open Map Service settings with an advanced provider preselected."""
+        self.pending_map_provider_action = pending_action
+        self._show_parameter_editor_section(
+            "Map Service",
+            draft_overrides={"maps.output_provider": str(provider)},
+            show_advanced=True,
+        )
+
+    def _ensure_automatic_map_provider(self, pending_action=None):
+        """Resolve first-use production-provider setup before starting a worker."""
+        provider = str(self.parameters.get("maps.output_provider", "osm")).lower()
+        credential_id = str(self.parameters.get("maps.credential_id", "default"))
+        preference = load_map_provider_preference()
+        if provider == "custom":
+            error = validate_custom_xyz_configuration(
+                self.parameters.get("maps.custom_url", ""),
+                self.parameters.get("maps.custom_attribution", ""),
+            )
+            if error:
+                show_alert("Custom XYZ needs configuration.", error)
+                self._show_map_provider_settings("custom", pending_action)
+                return False
+            validation = validate_custom_xyz_access(
+                self.parameters.get("maps.custom_url", ""),
+                timeout_seconds=float(self.parameters.get("maps.request_timeout_seconds", 12.0)),
+            )
+            if not validation.valid:
+                show_alert("Custom XYZ could not be validated.", validation.message)
+                return False
+            try:
+                save_map_provider_preference("custom", credential_id, credential_verified=True)
+            except OSError as exc:
+                show_alert("Could not remember the map-provider preference.", str(exc))
+            return True
+        if provider == "esri":
+            verified = bool(
+                preference.get("preferred_output_provider") == "esri"
+                and preference.get("credential_verified", False)
+            )
+            if verified:
+                return True
+            validation = validate_provider_credential(
+                "esri",
+                timeout_seconds=float(self.parameters.get("maps.request_timeout_seconds", 12.0)),
+            )
+            if not validation.valid:
+                show_alert("Esri could not be validated.", validation.message)
+                return False
+            try:
+                save_map_provider_preference("esri", credential_id, credential_verified=True)
+            except OSError as exc:
+                show_alert("Could not remember the map-provider preference.", str(exc))
+            return True
+        if provider_requires_credential(provider):
+            stored_key = read_provider_credential(provider, credential_id)
+            key_present = bool(stored_key)
+            verified = bool(
+                preference.get("preferred_output_provider") == provider
+                and preference.get("credential_id", "default") == credential_id
+                and preference.get("credential_verified", False)
+            )
+            if key_present and verified:
+                return True
+            if key_present:
+                validation = validate_provider_credential(
+                    provider,
+                    stored_key,
+                    timeout_seconds=float(self.parameters.get("maps.request_timeout_seconds", 12.0)),
+                )
+                if validation.valid:
+                    try:
+                        save_map_provider_preference(
+                            provider, credential_id, credential_verified=True
+                        )
+                    except OSError as exc:
+                        show_alert("Could not remember the map-provider preference.", str(exc))
+                    return True
+                if validation.network_error:
+                    show_alert("Map provider could not be verified.", validation.message)
+                    return False
+        elif provider == "osm" and preference.get("preferred_output_provider") == "osm":
+            return True
+
+        preferred = str(preference.get("preferred_output_provider") or provider or "geoapify")
+        result = run_map_provider_setup(
+            preferred_provider=preferred,
+            credential_id=credential_id,
+            timeout_seconds=float(self.parameters.get("maps.request_timeout_seconds", 12.0)),
+        )
+        action = str(result.get("action", "cancel"))
+        if action == "settings":
+            self._show_map_provider_settings(result.get("provider", "custom"), pending_action)
+            return False
+        if action == "cancel":
+            self.pending_map_provider_action = None
+            self.set_status("Map-provider setup cancelled.")
+            return False
+        selected_provider = str(result.get("provider", provider))
+        self.parameters["maps.output_provider"] = selected_provider
+        self._sync_legacy_parameter_controls()
+        self.mark_dirty(immediate=True)
+        if action == "unverified":
+            show_alert(
+                "Map provider saved but not verified.",
+                "The provider must be reachable and the API key must validate before automatic maps can be downloaded.",
+            )
+            return False
+        return True
+
+    def resumePendingMapProviderAction_(self, _payload):
+        pending = self.pending_map_provider_action
+        self.pending_map_provider_action = None
+        if not pending:
+            return
+        action, payload = pending
+        if action == "automatic_maps":
+            self.startAutomaticMapGeneration_(payload or [])
+        elif action == "control_assets":
+            self._start_assistant_control_assets_creation()
 
     def _send_running_slideshow_settings(self, changed_keys, *, restore_display=False):
         """Send changed settings to the active player through its command file."""
@@ -5817,16 +6528,17 @@ class GPXTrackerController(NSObject):
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Existing names are protected from accidental typing; click Edit before renaming or copying one, optionally including its GPX, control file, and generated maps.\n"
+            "   If a complete project folder was copied in Finder, choose a copied Adventure marked Needs adaptation. The GUI creates a valid Adventure for the new folder while sharing its already copied GPX, control, map, music, and narration files.\n"
             "3. Use the gear beside the myCamino logo to adjust project settings. During a slide show, press s to open Settings directly at Slide Show. Header controls and Time-Lapse options are grouped in their own subsections below thin dividers. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Apply updates an active slide show immediately and auto-saves the settings with the Adventure.\n"
             "4. For a new Adventure, confirm a detected GPX file, choose other GPX files, or select No GPX file - use only photos. One detected file is used directly; several detected or selected files are joined in the GPX Editor. Cancelling a chooser leaves the source unconfirmed. The same media-only choice remains visible in the GPX Files section and is saved with the Adventure.\n"
             "5. Accept photos and videos already in the Adventure folder or import more. Existing files are skipped rather than copied again. One retained Adventure Processing window then shows metadata extraction, optional place-name lookup, map generation, and control-file work with phase headings and progress in its title. Add place names is selected by default; Skip omits only that slower phase.\n"
-            "6. Map Generation automatically creates only missing or outdated maps and always creates Standard and Time-Lapse variants consecutively for each affected stage. The manual Generate and Update Maps button is mainly for repairs, changed settings, or retried downloads. Completed metadata and maps remain available if a later phase fails or is cancelled.\n"
+            "6. Maps automatically creates only missing or outdated maps and always creates Standard and Time-Lapse variants consecutively for each affected stage. Before the first automatic download, choose a hosted provider and store your own API key in macOS Keychain, use Esri or Custom XYZ through Map Service Settings, or defer setup and retain limited public OSM use. Manage Map Provider in Settings reopens this setup. The manual Generate and Update Maps button is mainly for repairs, changed settings, or retried downloads. Completed metadata and maps remain available if a later phase fails or is cancelled.\n"
             "7. If no control file exists, Adventure Processing creates it after successful map generation. If an edited control file already exists, the program asks before opening Update Control File and never replaces it automatically. GPX journeys combine media with measured stages; media-only journeys group located media by date. Missing media GPS can be inferred when its exposure time falls inside exactly one timed GPX track.\n"
             "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. For later additions or corrections, press Update Control File instead of recreating the complete list. It checks map references and automatically finds imported, missing, invalid, legacy, and changed media. One review shows required reference corrections and recommended media updates. Map images themselves are rendered in Map Generation. Choose Other Media deliberately rechecks otherwise current files; changed GPS can trigger a targeted place-name update.\n"
-            "11. Music is a separate optional section and new Adventures start with No Music selected. Every project has a fixed audio folder, which is created automatically and recreated if missing. Clear No Music, click the folder icon, and copy audio files or complete album directories into that folder. Choose selects one of the .playlist files stored there; without a playlist, titles play alphabetically. Create Playlist makes another named playlist, and Update Playlist appends newly found audio without replacing your edits. Insert MUS rows for #MUSIC commands that control playlist titles, jumps, loops, volume, and audio on/off. Insert CTL rows for #CONTROL commands that define slide-show labels and jumps, change display duration or transition style, pause, or end the show. Editing either row type opens its command reference. A manual Audio Off with the a key always has priority. Normalize Video Audio is always available: it prepares reusable copies without modifying originals or delaying slide-show startup. Press n during playback to switch normalized video sound on or off.\n"
+            "11. Audio is optional and new Adventures start with No Audio selected, which disables both music and narration. Use the +/− button to expand or collapse the remembered Audio details. Music uses the fixed audio folder; narration uses the fixed narration folder. Both playlist rows provide Choose, Create, Update, Edit, and folder controls. MUS rows control persistent music transport, PLY rows play a finite music selection and then resume the interrupted title, and NAR rows play finite narration sequences while the visuals continue. Narration can leave music unchanged, reduce it, or fade and pause it through Settings > Audio. Insert CTL rows for slide-show flow and timing. The a key toggles all audio. Normalize Video Audio remains available independently.\n"
             "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
-            "13. Update Metadata Extraction in the Photos and Video Clips section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
+            "13. Update Metadata Extraction in the Media section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
             "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
             "15. In the control-file editor, use the row-type filter or Reset Filter. Right-click photos or videos to Hide/Unhide them. CAPTION rows label the immediately following medium; FONT rows change following caption and header fonts. Press Start Slide Show Here at the bottom or in the context menu to launch from an exact row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
             "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
@@ -6812,7 +7524,7 @@ class GPXTrackerController(NSObject):
     def showParameterEditor_(self, _sender):
         self._show_parameter_editor_section()
 
-    def _show_parameter_editor_section(self, section=None):
+    def _show_parameter_editor_section(self, section=None, *, draft_overrides=None, show_advanced=None):
         """Open Adventure Settings, optionally selecting one section."""
         if self.parameter_editor_controller is None:
             self.parameter_editor_controller = CocoaParameterEditor.alloc().init()
@@ -6821,12 +7533,45 @@ class GPXTrackerController(NSObject):
                 sections=SECTION_ORDER,
                 values=self.parameters,
                 apply_callback=self._apply_parameters_from_shared_editor,
+                manage_map_provider_callback=self._manage_map_provider_from_settings,
+                cancel_callback=self._parameter_editor_cancelled,
             )
         else:
             self.parameter_editor_controller.update_values(self.parameters)
         if section in SECTION_ORDER:
             self.parameter_editor_controller.current_section = section
+        if show_advanced is not None:
+            self.parameter_editor_controller.show_advanced = bool(show_advanced)
         self.parameter_editor_controller.show()
+        if draft_overrides:
+            self.parameter_editor_controller.draft.update(draft_overrides)
+            self.parameter_editor_controller._render_section()
+
+    def _manage_map_provider_from_settings(self, draft):
+        credential_id = str(draft.get("maps.credential_id", "default"))
+        result = run_map_provider_setup(
+            preferred_provider=str(draft.get("maps.output_provider", "geoapify")),
+            credential_id=credential_id,
+            timeout_seconds=float(draft.get("maps.request_timeout_seconds", 12.0)),
+        )
+        action = str(result.get("action", "cancel"))
+        if action == "cancel":
+            return None
+        provider = str(result.get("provider", draft.get("maps.output_provider", "osm")))
+        if action == "settings" and provider == "custom":
+            self.parameter_editor_controller.show_advanced = True
+        return {"maps.output_provider": provider}
+
+    def _parameter_editor_cancelled(self):
+        if self.pending_map_provider_action is not None:
+            action = self.pending_map_provider_action[0]
+            self.pending_map_provider_action = None
+            self.set_status("Map-provider setup cancelled; automatic Map Generation remains pending.")
+            if action == "automatic_maps" and self.geolocations_running:
+                self._finish_geolocations_run(
+                    "Map-provider setup was deferred.",
+                    "Metadata is ready; configure a production map provider to continue automatic Map Generation.",
+                )
 
     @objc.IBAction
     def selectParameterSection_(self, sender):
@@ -6846,7 +7591,7 @@ class GPXTrackerController(NSObject):
     def parameterValueChanged_(self, _sender):
         key = self.parameter_tag_to_key.get(int(_sender.tag()))
         self._capture_parameter_controls()
-        if key == "maps.provider":
+        if key in {"maps.interactive_provider", "maps.output_provider"}:
             self.performSelector_withObject_afterDelay_("refreshParameterSection:", None, 0.0)
 
     def refreshParameterSection_(self, _payload):
@@ -6995,9 +7740,13 @@ class GPXTrackerController(NSObject):
         if not hasattr(self, "no_music_checkbox"):
             return
         enabled = bool(self.parameters.get("audio.enabled", False))
+        expanded = bool(self.audio_section_expanded)
+        details_visible = enabled and expanded
         self.no_music_checkbox.setState_(
             NSControlStateValueOff if enabled else NSControlStateValueOn
         )
+        self.audio_disclosure_button.setTitle_("−" if details_visible else "+")
+        self.audio_disclosure_button.setEnabled_(enabled)
         for control in (
             self.music_label,
             self.music_field,
@@ -7007,25 +7756,56 @@ class GPXTrackerController(NSObject):
             self.music_playlist_update_button,
             self.music_playlist_edit_button,
             self.music_summary_label,
+            self.narration_label,
+            self.narration_field,
+            self.narration_playlist_select_button,
+            self.narration_folder_button,
+            self.narration_playlist_button,
+            self.narration_playlist_update_button,
+            self.narration_playlist_edit_button,
+            self.narration_summary_label,
         ):
-            control.setHidden_(not enabled)
+            control.setHidden_(not details_visible)
         self._refresh_video_normalization_summary()
 
     @objc.IBAction
+    def toggleAudioSection_(self, _sender):
+        if not bool(self.parameters.get("audio.enabled", False)):
+            return
+        was_visible = bool(self.audio_section_expanded)
+        self.audio_section_expanded = not bool(self.audio_section_expanded)
+        self._sync_music_controls()
+        self._resize_main_window_for_audio_visibility(
+            was_visible,
+            self.audio_section_expanded,
+        )
+        self.layout_window()
+        self.mark_dirty(immediate=True)
+
+    @objc.IBAction
     def noMusicChanged_(self, sender):
+        was_visible = bool(
+            self.parameters.get("audio.enabled", False)
+            and self.audio_section_expanded
+        )
         enabled = int(sender.state()) != NSControlStateValueOn
         self.parameters["audio.enabled"] = enabled
         if enabled:
             self._ensure_project_audio_directory(show_errors=True)
+            self._ensure_project_narration_directory(show_errors=True)
             self._refresh_music_summary()
+            self._refresh_narration_summary()
         self._sync_music_controls()
+        self._resize_main_window_for_audio_visibility(
+            was_visible,
+            enabled and self.audio_section_expanded,
+        )
         self.layout_window()
         self.mark_dirty(immediate=True)
         self.set_status(
-            "Background music enabled. Use the folder icon to copy audio files "
-            "and album directories into the project audio folder."
+            "Audio enabled. Music and narration directives are active."
             if enabled
-            else "No Music selected; slide shows will start without background music."
+            else "No Audio selected; music and narration will not play."
         )
 
     def _video_normalization_settings(self):
@@ -7542,6 +8322,15 @@ class GPXTrackerController(NSObject):
                     parse_music_parameters(str(row.get("name", "")))
                 except MusicSyntaxError as exc:
                     show_alert(f"Invalid music directive in row {index}.", str(exc))
+                    return False
+            elif row_type in {"PLY", "NAR"}:
+                try:
+                    parse_audio_selection_parameters(
+                        str(row.get("name", "")),
+                        "#PLAY" if row_type == "PLY" else "#NARRATOR",
+                    )
+                except AudioSelectionSyntaxError as exc:
+                    show_alert(f"Invalid audio selection in row {index}.", str(exc))
                     return False
             elif row_type == "CTL":
                 try:
@@ -8856,6 +9645,16 @@ class GPXTrackerController(NSObject):
             except MusicSyntaxError as exc:
                 show_alert("Invalid #MUSIC directive.", str(exc))
                 return
+        if str(candidate.get("type", "")).upper() in {"PLY", "NAR"} and str(candidate.get("name", "")).strip():
+            row_type = str(candidate.get("type", "")).upper()
+            try:
+                parse_audio_selection_parameters(
+                    str(candidate.get("name", "")),
+                    "#PLAY" if row_type == "PLY" else "#NARRATOR",
+                )
+            except AudioSelectionSyntaxError as exc:
+                show_alert("Invalid audio selection.", str(exc))
+                return
         if str(candidate.get("type", "")).upper() == "CTL" and str(candidate.get("name", "")).strip():
             try:
                 directive = parse_control_parameters(str(candidate.get("name", "")))
@@ -8883,6 +9682,8 @@ class GPXTrackerController(NSObject):
             self.control_table_view.setNeedsDisplay_(True)
         if str(candidate.get("type", "")).upper() == "MUS":
             self.performSelector_withObject_afterDelay_("showMusicDirectiveHelp:", None, 0.01)
+        elif str(candidate.get("type", "")).upper() in {"PLY", "NAR"}:
+            self.performSelector_withObject_afterDelay_("showAudioSelectionHelp:", None, 0.01)
         elif str(candidate.get("type", "")).upper() == "CTL":
             self.performSelector_withObject_afterDelay_("showControlDirectiveHelp:", None, 0.01)
         elif str(candidate.get("type", "")).upper() in {"CAP", "FNT"}:
@@ -8944,7 +9745,7 @@ class GPXTrackerController(NSObject):
             "Separate entries with commas. Pathnames containing spaces or commas may be "
             "put in double quotes; commas require quotes. Commands and $labels are "
             "case-insensitive.\n\n"
-            "$LABEL or pathname   queue titles, then resume the interrupted title\n"
+            "#PLAY: selections    play finite lists/ranges, then resume music\n"
             "#JUMP/#GOTO $LABEL   continue the playlist from a label\n"
             "#ON / #OFF           open or close the control-file audio gate\n"
             "#CONTINUE            cancel a queue or loop without a hard cut\n"
@@ -8981,6 +9782,39 @@ class GPXTrackerController(NSObject):
             "#LABEL $CHAPTER2\n"
             "#DURATION 5, #TRANSITION FADE\n"
             "#GOTO $CHAPTER2"
+        )
+
+    def _audio_selection_help_content(self):
+        row_type = "PLY"
+        indexes = self._selected_control_table_indexes() if self.control_table_view is not None else []
+        if indexes:
+            row_type = str(self.control_table_rows[indexes[0]].get("type", "PLY")).upper()
+        if row_type == "NAR":
+            source = self.narration_source
+            playlist_path = self.narration_playlist or self._preferred_narration_playlist()
+        else:
+            source = self.music_source
+            playlist_path = self.music_playlist or self._preferred_music_playlist(self.music_source)
+        labels = []
+        if source is not None:
+            parsed = load_audio_playlist(Path(source), Path(playlist_path) if playlist_path else None)
+            labels = sorted(
+                {f"${label}" for item_labels in parsed.labels_at_index.values() for label in item_labels},
+                key=str.casefold,
+            )
+        label_text = ", ".join(labels) if labels else "No labels are currently available."
+        return (
+            "#PLAY and #NARRATOR selections\n\n"
+            "#PLAY temporarily plays music and then resumes the interrupted title "
+            "at its saved position. #NARRATOR plays the selected narrator files once "
+            "and then waits for the next narrator row. Visual playback continues.\n\n"
+            "Use comma-separated labels and pathnames. An isolated hyphen between two "
+            "labels selects the inclusive playlist range. Quote or backslash-escape "
+            "filenames containing blanks, commas, quotes, backslashes, or ambiguous hyphens.\n\n"
+            "Examples:\n"
+            "#PLAY: $INTRO, $A - $D, \"Special Song.mp3\"\n"
+            "#NARRATOR: $STAGE_1, $DETAIL_A - $DETAIL_C\n\n"
+            f"Available labels:\n{label_text}"
         )
 
     def _caption_directive_help_content(self):
@@ -9085,9 +9919,16 @@ class GPXTrackerController(NSObject):
             window.contentView().addSubview_(scroll)
             self.music_directive_help_window = window
             self.music_directive_help_text = text_view
+        self.music_directive_help_window.setTitle_("Music Directive Help")
         self.music_directive_help_text.setString_(self._music_directive_help_content())
         self._position_music_directive_help_window(_sender)
         self.music_directive_help_window.orderFront_(None)
+
+    def showAudioSelectionHelp_(self, _sender):
+        """Reuse the music panel for finite music/narrator selection syntax."""
+        self.showMusicDirectiveHelp_(_sender)
+        self.music_directive_help_window.setTitle_("Play and Narrator Help")
+        self.music_directive_help_text.setString_(self._audio_selection_help_content())
 
     def _position_control_directive_help_window(self, anchor_view=None):
         """Reuse the proven music-help placement for the CONTROL panel."""
@@ -9916,8 +10757,37 @@ class GPXTrackerController(NSObject):
         field = notification.object()
         if field is self.title_field:
             index = int(self.title_field.indexOfSelectedItem())
-            if 0 <= index < len(self.adventure_combo_paths):
-                self.load_project_configuration(self.adventure_combo_paths[index])
+            if 0 <= index < len(self.adventure_combo_entries):
+                kind, record = self.adventure_combo_entries[index]
+                if kind == "valid":
+                    self.load_project_configuration(record.path)
+                    return
+                if not self.flush_adventure_autosave():
+                    self.title_field.setStringValue_(self.committed_adventure_name)
+                    return
+                recovery = self._choose_copied_adventure_recovery(
+                    self.current_project_dir, [record]
+                )
+                if recovery is None:
+                    self.title_field.setStringValue_(self.committed_adventure_name)
+                    return
+                if recovery["action"] == "copy":
+                    try:
+                        target, _payload = create_adventure_from_template(
+                            record.path,
+                            self.current_project_dir,
+                            recovery["name"],
+                        )
+                    except (OSError, AdventureFormatError, ValueError) as exc:
+                        show_alert("Could not adapt the copied Adventure.", str(exc))
+                        self.title_field.setStringValue_(self.committed_adventure_name)
+                        return
+                    self.load_project_configuration(target, flush_current=False)
+                else:
+                    self._initialize_blank_adventure_fields(
+                        self.current_project_dir, recovery["name"]
+                    )
+                    self.adventureNameCommitted_(self.title_field)
         elif field is self.gpx_field:
             self.gpxSelectionCommitted_(self.gpx_field)
         elif field is self.control_file_field:
@@ -9952,6 +10822,10 @@ class GPXTrackerController(NSObject):
                 self.control_file_field.setStringValue_(self.current_control_file.name)
                 self._set_music_playlist(
                     self._ensure_default_music_playlist(show_errors=True),
+                    mark_dirty=False,
+                )
+                self._set_narration_playlist(
+                    self._ensure_default_narration_playlist(show_errors=True),
                     mark_dirty=False,
                 )
                 self.current_project_file = target
@@ -10307,7 +11181,8 @@ class GPXTrackerController(NSObject):
             "font_factor": parameter_values["trackmaps.font_factor"],
             "background_color": parameter_values["trackmaps.background_color"],
             "title_color": parameter_values["trackmaps.title_color"],
-            "map_provider": parameter_values["maps.provider"],
+            "map_provider": parameter_values["maps.output_provider"],
+            "map_credential_id": parameter_values["maps.credential_id"],
             "custom_map_url": parameter_values["maps.custom_url"],
             "custom_map_attribution": parameter_values["maps.custom_attribution"],
             "maximum_map_zoom": maximum_zoom,
@@ -10365,7 +11240,15 @@ class GPXTrackerController(NSObject):
                 status_callback(message)
 
         tracks_summary_path = None
-        skip_remaining_maps = False
+        skip_remaining_maps = bool(
+            media_only
+            and str(self.parameters.get("maps.output_provider", "osm")) == "osm"
+        )
+        if skip_remaining_maps:
+            report(
+                "Public OpenStreetMap will not download missing tiles during automatic project "
+                "generation. Configure a production provider or generate one selected map manually."
+            )
         if not media_only:
             if gpx_path is None or not gpx_path.is_file():
                 raise ValueError(
@@ -10391,6 +11274,10 @@ class GPXTrackerController(NSObject):
             update_numbers = self._track_map_update_numbers(gpx_path, context)
             include_overview = 0 in update_numbers
             track_numbers = [number for number in update_numbers if number > 0]
+            public_osm_automatic = (
+                str(self.parameters.get("maps.output_provider", "osm")) == "osm"
+                and bool(update_numbers)
+            )
 
             def paired_progress(_current, _total, name, layout):
                 if cancel_event.is_set():
@@ -10404,8 +11291,8 @@ class GPXTrackerController(NSObject):
             try:
                 result = execute_map_variants_from_context(
                     context,
-                    selected_track_numbers=track_numbers,
-                    plot_overview=include_overview,
+                    selected_track_numbers=[] if public_osm_automatic else track_numbers,
+                    plot_overview=False if public_osm_automatic else include_overview,
                     map_layouts=("standard", "time-lapse"),
                     render_parameters_by_layout={
                         "standard": self._track_map_parameter_signature("standard"),
@@ -10414,6 +11301,15 @@ class GPXTrackerController(NSObject):
                     progress_callback=paired_progress,
                 )
                 created_paths.extend(result.get("created_paths", []))
+                if public_osm_automatic:
+                    message = (
+                        "Public OpenStreetMap is limited to manually selected individual maps. "
+                        "Choose a production provider in Settings or use Generate and Update Maps "
+                        "for one map at a time."
+                    )
+                    failures.append({"filename": "GPX maps", "error": message})
+                    skip_remaining_maps = True
+                    report(message)
             except Exception as exc:
                 if cancel_event.is_set():
                     raise GeoLocationsCancelled("Aborted.") from exc
@@ -10476,6 +11372,15 @@ class GPXTrackerController(NSObject):
     def startAutomaticMapGeneration_(self, imported_paths):
         """Run selective map maintenance after automatic metadata preparation."""
         if self.geolocations_thread is not None and self.geolocations_thread.is_alive():
+            return
+        if not self._ensure_automatic_map_provider(
+            ("automatic_maps", list(imported_paths or []))
+        ):
+            if self.pending_map_provider_action is None and self.geolocations_running:
+                self._finish_geolocations_run(
+                    "Map-provider setup was deferred.",
+                    "Metadata is ready; configure a production map provider to continue automatic Map Generation.",
+                )
             return
         project_dir = self._resolve_project_directory(
             allow_create=False,
@@ -10730,6 +11635,10 @@ class GPXTrackerController(NSObject):
         control_path = self._control_file_path()
         trackimages_dir = self._track_images_dir()
         if project_dir is None or control_path is None or trackimages_dir is None:
+            return
+        if not self.assistant_control_skip_maps and not self._ensure_automatic_map_provider(
+            ("control_assets", None)
+        ):
             return
         if control_path.exists():
             if not confirm_alert(
@@ -11947,6 +12856,101 @@ class GPXTrackerController(NSObject):
             return
         self.set_status(f"Opened {playlist_path.name} in TextEdit.")
 
+    def _narration_playlist_path(self):
+        return Path(self.narration_playlist) if self.narration_playlist is not None else self._preferred_narration_playlist()
+
+    @objc.IBAction
+    def narrationPlaylistCommitted_(self, _sender):
+        directory = self._ensure_project_narration_directory(show_errors=True)
+        if directory is None:
+            return
+        text = str(self.narration_field.stringValue()).strip()
+        path = Path(text).expanduser() if text else None
+        if path is not None and not path.is_absolute():
+            path = directory / path
+        if path is None or not path.is_file() or not playlist_belongs_to_audio_directory(path, directory):
+            show_alert("Narration playlist is not usable.", "Choose a .playlist file in the narration folder.")
+            self._refresh_narration_summary()
+            return
+        self._set_narration_playlist(path, mark_dirty=True)
+
+    @objc.IBAction
+    def chooseNarrationPlaylist_(self, _sender):
+        directory = self._ensure_project_narration_directory(show_errors=True)
+        if directory is None:
+            return
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setAllowedFileTypes_(["playlist"])
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(directory)))
+        if panel.runModal() == NSModalResponseOK and panel.URL() is not None:
+            path = Path(str(panel.URL().path())).resolve(strict=False)
+            if playlist_belongs_to_audio_directory(path, directory):
+                self._set_narration_playlist(path, mark_dirty=True)
+
+    @objc.IBAction
+    def openNarrationFolder_(self, _sender):
+        directory = self._ensure_project_narration_directory(show_errors=True)
+        if directory is not None:
+            NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(str(directory)))
+            self.set_status("Opened the narration folder. Copy narrator files or chapter folders into it.")
+
+    @objc.IBAction
+    def createNarrationPlaylist_(self, _sender):
+        directory = self._ensure_project_narration_directory(show_errors=True)
+        files = audio_files_in_directory(directory) if directory is not None else []
+        if not files:
+            show_alert("No narrator audio found.", f"Copy supported audio files into:\n{directory}")
+            return
+        panel = NSSavePanel.savePanel()
+        panel.setAllowedFileTypes_(["playlist"])
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(directory)))
+        panel.setNameFieldStringValue_(f"{project_filename_base(self._current_project_name())}.playlist")
+        if panel.runModal() != NSModalResponseOK or panel.URL() is None:
+            return
+        path = Path(str(panel.URL().path())).with_suffix(".playlist").resolve(strict=False)
+        if not playlist_belongs_to_audio_directory(path, directory):
+            show_alert("Create the playlist in the narration folder.", str(directory))
+            return
+        try:
+            write_text_atomic(path, generated_playlist_text(files, directory))
+        except OSError as exc:
+            show_alert("Could not create the narration playlist.", str(exc))
+            return
+        self._set_narration_playlist(path, mark_dirty=True)
+
+    @objc.IBAction
+    def updateNarrationPlaylist_(self, sender):
+        directory = self._ensure_project_narration_directory(show_errors=True)
+        files = audio_files_in_directory(directory) if directory is not None else []
+        path = self._narration_playlist_path()
+        if not files:
+            show_alert("No narrator audio found.", f"Copy supported audio files into:\n{directory}")
+            return
+        if path is None or not path.is_file():
+            self.createNarrationPlaylist_(sender)
+            return
+        try:
+            updated, missing = updated_playlist_text(path.read_text(encoding="utf-8"), files, directory)
+            if missing:
+                write_text_atomic(path, updated)
+        except (OSError, UnicodeError) as exc:
+            show_alert("Could not update the narration playlist.", str(exc))
+            return
+        self._set_narration_playlist(path, mark_dirty=True)
+        self.set_status(f"Added {len(missing)} narrator file(s)." if missing else "Narration playlist is current.")
+
+    @objc.IBAction
+    def editNarrationPlaylist_(self, sender):
+        path = self._narration_playlist_path()
+        if path is None or not path.is_file():
+            self.createNarrationPlaylist_(sender)
+            path = self._narration_playlist_path()
+        if path is not None and path.is_file():
+            NSWorkspace.sharedWorkspace().openFile_withApplication_(str(path), "TextEdit")
+
     @staticmethod
     def _format_resume_datetime(value):
         text = str(value or "").strip()
@@ -12613,6 +13617,16 @@ class GPXTrackerController(NSObject):
             str(settings["audio.music_volume_percent"]),
             "--video-volume-percent",
             str(settings["audio.video_volume_percent"]),
+            "--narration-volume-percent",
+            str(settings["audio.narration_volume_percent"]),
+            "--narration-music-behavior",
+            str(settings["audio.narration_music_behavior"]),
+            "--narration-music-reduction-percent",
+            str(settings["audio.narration_music_reduction_percent"]),
+            "--narration-video-reduction-percent",
+            str(settings["audio.narration_video_reduction_percent"]),
+            "--narration-transition-seconds",
+            str(settings["audio.narration_transition_seconds"]),
             "--video-normalization-target-lufs",
             str(settings["audio.video_normalization_target_lufs"]),
             "--video-normalization-max-boost-db",
@@ -12639,6 +13653,12 @@ class GPXTrackerController(NSObject):
                 playlist_path = self._preferred_music_playlist(self.music_source)
             if playlist_path is not None and Path(playlist_path).is_file():
                 args.extend(["--music-playlist", str(Path(playlist_path).resolve(strict=False))])
+            narration_dir = self._ensure_project_narration_directory(show_errors=False)
+            if narration_dir is not None:
+                args.extend(["--narration", str(Path(narration_dir).resolve(strict=False))])
+                narration_playlist = self.narration_playlist or self._preferred_narration_playlist()
+                if narration_playlist is not None and Path(narration_playlist).is_file():
+                    args.extend(["--narration-playlist", str(Path(narration_playlist).resolve(strict=False))])
         if not settings["timelapse.overview_as_media"]:
             args.append("--time-lapse-overview-fullscreen")
         if not settings["timelapse.overview_on_stage_map_dual"]:
@@ -12685,6 +13705,14 @@ class GPXTrackerController(NSObject):
                     [
                         "--resume-audio-state",
                         json.dumps(audio_state, ensure_ascii=False, separators=(",", ":")),
+                    ]
+                )
+            narration_state = resume_position.get("narration")
+            if isinstance(narration_state, dict):
+                args.extend(
+                    [
+                        "--resume-narration-state",
+                        json.dumps(narration_state, ensure_ascii=False, separators=(",", ":")),
                     ]
                 )
             control_state = resume_position.get("control")
@@ -13519,7 +14547,8 @@ class GPXTrackerController(NSObject):
             "fallback_walking_speed_kmh": values["gpx.fallback_walking_speed_kmh"],
             "map_layout": "standard",
             "track_edge_margin_fraction": values["trackmaps.edge_margin_fraction"],
-            "map_provider": values["maps.provider"],
+            "map_provider": values["maps.output_provider"],
+            "map_credential_id": values["maps.credential_id"],
             "custom_map_url": values["maps.custom_url"],
             "custom_map_attribution": values["maps.custom_attribution"],
             "maximum_map_zoom": maximum_zoom,
@@ -13544,6 +14573,78 @@ class GPXTrackerController(NSObject):
             if Path(item["output_image"]).exists()
         )
         return count
+
+    def _public_osm_tile_summary(self, context, selected_number):
+        """Estimate required and cached public OSM tiles for one manual plan."""
+        coordinates = []
+        if int(selected_number) == 0:
+            coordinates = [
+                point
+                for track in context.get("tracks", [])
+                for point in track.get("points", [])
+            ]
+        else:
+            for track in context.get("tracks", []):
+                if int(track.get("table_number", -1)) == int(selected_number):
+                    coordinates = list(track.get("points", []))
+                    break
+            if not coordinates:
+                for item in context.get("media_map_items", []):
+                    if int(item.get("selection_number", -1)) == int(selected_number):
+                        coordinates = list(item.get("coordinates", []))
+                        break
+        if not coordinates:
+            return "Tile estimate unavailable; cached tiles will still be reused."
+        try:
+            import contextily as cx
+            import mercantile
+
+            latitudes = [float(point[0]) for point in coordinates]
+            longitudes = [float(point[1]) for point in coordinates]
+            latitude_span = max(max(latitudes) - min(latitudes), 0.002)
+            longitude_span = max(max(longitudes) - min(longitudes), 0.002)
+            padding = 0.08
+            south = max(-85.0, min(latitudes) - latitude_span * padding)
+            north = min(85.0, max(latitudes) + latitude_span * padding)
+            west = max(-180.0, min(longitudes) - longitude_span * padding)
+            east = min(180.0, max(longitudes) + longitude_span * padding)
+            zoom = min(
+                int(self.parameters["trackmaps.zoom"]),
+                int(self.parameters["maps.maximum_zoom"]),
+            )
+            provider = contextily_provider(cx, "osm")
+            urls = {
+                provider_tile_url(provider, tile.x, tile.y, tile.z)
+                for tile in mercantile.tiles(west, south, east, north, zoom)
+            }
+            cached = cached_contextily_tile_urls(DEFAULT_TILE_CACHE_DIR)
+            cached_count = sum(url in cached for url in urls)
+            return (
+                f"Estimated tiles at zoom {zoom}: {len(urls)} required, "
+                f"{cached_count} cached, {len(urls) - cached_count} downloads. "
+                "Both map variants reuse this cache."
+            )
+        except Exception as exc:
+            return f"Tile estimate unavailable ({exc}); cached tiles will still be reused."
+
+    def _confirm_public_osm_manual_plan(self, context, selected_numbers):
+        if self.parameters.get("maps.output_provider", "osm") != "osm":
+            return True
+        if len(selected_numbers) != 1:
+            show_alert(
+                "Public OpenStreetMap permits only one manually selected map plan.",
+                "Select one overview or one stage. Both Standard and Time-Lapse variants will be "
+                "generated together, reusing cached tiles.",
+            )
+            return False
+        detail = self._public_osm_tile_summary(context, selected_numbers[0])
+        return confirm_alert(
+            "Generate this map with Public OpenStreetMap?",
+            detail
+            + "\n\nRequests are serial, identified as myCamino, throttled, and cached for at least seven days.",
+            "Generate",
+            "Cancel",
+        )
 
     def _start_plot_creation(self, project_name, gpx_path, trackimages_dir, common_options, selection_context, selected_numbers):
         removed_obsolete = self._cleanup_obsolete_track_map_files(selection_context)
@@ -13725,6 +14826,8 @@ class GPXTrackerController(NSObject):
             if selected is None:
                 self.set_status("Map generation cancelled.")
                 return
+            if not self._confirm_public_osm_manual_plan(context, selected):
+                return
             self._start_media_only_plot_creation(context, selected)
             return
         validated = self._validate_plot_request()
@@ -13755,6 +14858,8 @@ class GPXTrackerController(NSObject):
         )
         if selected_numbers is None:
             self.set_status("Map generation cancelled.")
+            return
+        if not self._confirm_public_osm_manual_plan(selection_context, selected_numbers):
             return
         self._start_plot_creation(
             project_name,
@@ -14015,26 +15120,65 @@ class GPXTrackerController(NSObject):
             self.mark_dirty()
             self._refresh_project_file_menus()
             if returned_path.exists():
-                try:
-                    self.populate_track_summary(returned_path)
-                    summary_path = self._regenerate_tracks_summary_json(returned_path)
-                    self.refresh_track_maps_summary()
-                    self.refresh_control_file_display()
-                except (OSError, RuntimeError, ValueError) as exc:
-                    show_alert("Could not reload the GPX file after editing.", str(exc))
-                    self.set_status("GPX file handling failed.")
-                    return False
                 refreshed_identity = gpx_file_identity(returned_path)
                 if refreshed_identity is not None:
                     handled_gpx_identities.add(refreshed_identity)
+                total = len(getattr(self.gpx_editor_controller, "tracks", []) or [])
+                counter = {"value": 0}
+
+                def report_track_progress():
+                    counter["value"] += 1
+                    current = counter["value"]
+                    label = f"Updating derived track data {current}/{total or '?'}"
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "setStatusFromWorker:", label, False
+                    )
+                    if total:
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            "setProgressFromWorker:", (current, total), False
+                        )
+
+                def update_derived_data():
+                    try:
+                        summary_path, context = self._regenerate_tracks_summary_json(
+                            returned_path,
+                            track_processing_callback=report_track_progress,
+                        )
+                        payload = (
+                            json.loads(summary_path.read_text(encoding="utf-8"))
+                            if summary_path is not None else {}
+                        )
+                        result = {
+                            "gpx_path": str(returned_path),
+                            "summary_path": str(summary_path) if summary_path else "",
+                            "summary_text": self._format_gpx_summary_from_compact(
+                                returned_path, payload
+                            ),
+                            "track_count": len(payload.get("tracks", [])),
+                            "map_status": self._track_maps_status_from_context(
+                                returned_path,
+                                context,
+                                self._existing_track_plot_path,
+                            ),
+                        }
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        result = {"error": str(exc), "gpx_path": str(returned_path)}
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "derivedTrackUpdateFinished:", result, False
+                    )
+
+                threading.Thread(
+                    target=update_derived_data,
+                    name="myCamino-derived-track-data",
+                    daemon=True,
+                ).start()
             else:
-                summary_path = None
+                self.set_status(f"GPX file is no longer available: {returned_path}")
+                return False
             if source == "save":
-                suffix = f"; updated {summary_path.name}" if summary_path is not None else ""
-                self.set_status(f"Updated GPX summary from saved file {returned_path}{suffix}")
+                self.set_status(f"Saved {returned_path.name}; updating derived track data in the background.")
             else:
-                suffix = f"; updated {summary_path.name}" if summary_path is not None else ""
-                self.set_status(f"Continuing with {returned_path}{suffix}")
+                self.set_status(f"Continuing with {returned_path}; updating derived track data in the background.")
             return True
 
         def handle_editor_close(returned_output_path):
@@ -14460,7 +15604,17 @@ class GPXTrackerController(NSObject):
         self.window.center()
         self.window.makeKeyAndOrderFront_(None)
         if self.startup_project_file is not None and self.startup_project_file.exists():
-            if self.load_project_configuration(self.startup_project_file.resolve()):
+            startup_file = self.startup_project_file.resolve()
+            records, templates, _errors = discover_adventure_candidates(
+                startup_file.parent
+            )
+            if any(record.path == startup_file for record in templates):
+                loaded = self._activate_project_directory(
+                    startup_file.parent, allow_create=True
+                )
+            else:
+                loaded = self.load_project_configuration(startup_file)
+            if loaded:
                 self.window.makeFirstResponder_(self.title_field)
                 return
         if self.startup_project_directory is not None:

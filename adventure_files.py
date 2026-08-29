@@ -42,6 +42,20 @@ class AdventureRecord:
         return str(self.payload["project_name"])
 
 
+@dataclass(frozen=True)
+class RelocatableAdventureRecord:
+    """A current-format Adventure copied away from its recorded directory."""
+
+    path: Path
+    payload: dict
+    modified_time: float
+    recorded_project_directory: Path
+
+    @property
+    def project_name(self) -> str:
+        return str(self.payload["project_name"])
+
+
 def filename_base(text: str) -> str:
     cleaned = (text or "").strip().replace("/", "-")
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
@@ -110,6 +124,66 @@ def load_adventure(path: str | os.PathLike) -> AdventureRecord:
     return AdventureRecord(adv_path, payload, adv_path.stat().st_mtime)
 
 
+def _read_adventure_payload(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AdventureFormatError(f"Could not read {path.name}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise AdventureFormatError(f"{path.name}: Adventure content is not an object")
+    return payload
+
+
+def load_relocatable_adventure(path: str | os.PathLike) -> RelocatableAdventureRecord:
+    """Load an Adventure whose only location error is its copied project root."""
+    adv_path = Path(path).expanduser().resolve(strict=False)
+    payload = _read_adventure_payload(adv_path)
+    recorded_text = str(payload.get("project_directory", "")).strip()
+    recorded_directory = Path(recorded_text).expanduser().resolve(strict=False)
+    current_directory = adv_path.parent.resolve(strict=False)
+    if not recorded_text or not Path(recorded_text).expanduser().is_absolute():
+        raise AdventureFormatError(f"{adv_path.name}: Adventure project_directory is not absolute")
+    if recorded_directory == current_directory:
+        raise AdventureFormatError(f"{adv_path.name}: Adventure does not need directory adaptation")
+
+    candidate = dict(payload)
+    candidate["project_directory"] = str(current_directory)
+    try:
+        validate_adventure_payload(candidate, adv_path)
+    except AdventureFormatError as exc:
+        raise AdventureFormatError(f"{adv_path.name}: {exc}") from exc
+    return RelocatableAdventureRecord(
+        adv_path,
+        dict(payload),
+        adv_path.stat().st_mtime,
+        recorded_directory,
+    )
+
+
+def discover_adventure_candidates(
+    project_dir: str | os.PathLike,
+) -> tuple[list[AdventureRecord], list[RelocatableAdventureRecord], list[str]]:
+    """Discover valid Adventures, copied templates, and genuinely invalid files."""
+    directory = Path(project_dir).expanduser().resolve(strict=False)
+    records: list[AdventureRecord] = []
+    templates: list[RelocatableAdventureRecord] = []
+    errors: list[str] = []
+    for path in sorted(directory.glob("*.adv"), key=lambda item: item.name.casefold()):
+        if path.name.startswith("."):
+            continue
+        try:
+            records.append(load_adventure(path))
+            continue
+        except AdventureFormatError as strict_error:
+            try:
+                templates.append(load_relocatable_adventure(path))
+            except AdventureFormatError:
+                errors.append(str(strict_error))
+    records.sort(key=lambda item: (-item.modified_time, item.path.name.casefold()))
+    templates.sort(key=lambda item: (-item.modified_time, item.path.name.casefold()))
+    return records, templates, errors
+
+
 def discover_adventures(project_dir: str | os.PathLike) -> tuple[list[AdventureRecord], list[str]]:
     directory = Path(project_dir).expanduser().resolve(strict=False)
     records: list[AdventureRecord] = []
@@ -123,6 +197,77 @@ def discover_adventures(project_dir: str | os.PathLike) -> tuple[list[AdventureR
             errors.append(str(exc))
     records.sort(key=lambda item: (-item.modified_time, item.path.name.casefold()))
     return records, errors
+
+
+def _rebase_copied_project_paths(value, old_root: Path, new_root: Path):
+    if isinstance(value, dict):
+        return {
+            key: _rebase_copied_project_paths(item, old_root, new_root)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_rebase_copied_project_paths(item, old_root, new_root) for item in value]
+    if not isinstance(value, str) or not value.strip():
+        return value
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return value
+    resolved = path.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(old_root)
+    except ValueError:
+        return value
+    return str((new_root / relative).resolve(strict=False))
+
+
+def _atomic_create_json(path: Path, payload: dict) -> Path:
+    """Atomically create a JSON file while refusing to replace any destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            raise FileExistsError(f"Destination already exists: {path}") from None
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def create_adventure_from_template(
+    template_path: str | os.PathLike,
+    project_dir: str | os.PathLike,
+    new_name: str,
+) -> tuple[Path, dict]:
+    """Create a valid Adventure from a copied template without duplicating assets."""
+    directory = Path(project_dir).expanduser().resolve(strict=False)
+    template = load_relocatable_adventure(template_path)
+    if template.path.parent.resolve(strict=False) != directory:
+        raise AdventureFormatError("Adventure template must be inside the selected project directory")
+
+    target_base = filename_base(new_name)
+    target_path = (directory / f"{target_base}.adv").resolve(strict=False)
+    payload = _rebase_copied_project_paths(
+        template.payload,
+        template.recorded_project_directory,
+        directory,
+    )
+    payload["adventure_format_version"] = ADVENTURE_FORMAT_VERSION
+    payload["project_name"] = target_base
+    payload["project_directory"] = str(directory)
+    payload.pop("slideshow_resume_position", None)
+    payload["slideshow_resume_history"] = []
+    payload = validate_adventure_payload(payload, target_path)
+    _atomic_create_json(target_path, payload)
+    return target_path, payload
 
 
 def project_file_names(project_dir: Path, suffix: str) -> list[str]:
@@ -249,6 +394,7 @@ def rename_or_copy_adventure(
                 ("control_file", current["control_file"]),
                 ("track_map_base", current["track_map_base"]),
                 ("music_playlist", current.get("music_playlist", "")),
+                ("narration_playlist", current.get("narration_playlist", "")),
             ):
                 if not value:
                     continue
@@ -284,6 +430,21 @@ def rename_or_copy_adventure(
                     )
                 except ValueError:
                     target_payload["music_playlist"] = str(target_playlist)
+        narration_value = str(current.get("narration_playlist", "") or "").strip()
+        if narration_value:
+            source_narration_playlist = Path(narration_value).expanduser()
+            if not source_narration_playlist.is_absolute():
+                source_narration_playlist = project_dir / source_narration_playlist
+            source_narration_playlist = source_narration_playlist.resolve(strict=False)
+            if source_narration_playlist.exists():
+                target_narration_playlist = source_narration_playlist.with_name(f"{target_base}.playlist")
+                mapping[source_narration_playlist] = target_narration_playlist
+                try:
+                    target_payload["narration_playlist"] = str(
+                        target_narration_playlist.relative_to(project_dir.resolve(strict=False))
+                    )
+                except ValueError:
+                    target_payload["narration_playlist"] = str(target_narration_playlist)
         target_payload["gpx_file"] = target_gpx.name
         target_payload["control_file"] = target_control.name
         target_payload["track_map_base"] = target_base

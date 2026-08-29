@@ -15,7 +15,8 @@ The repository contains two applications:
 
 - Import GPX tracks, photographs and videos from a multi-day journey.
 - Generate stage and overview maps using OpenStreetMap or another configured
-  tile provider.
+  tile provider. Guided first-use setup links to supported provider accounts;
+  hosted API keys remain in the user's macOS Keychain.
 - Display route progress as a time-lapse with a moving position marker.
 - Show photographs and videos together with the applicable map, track,
   elevation, place, date and time information.

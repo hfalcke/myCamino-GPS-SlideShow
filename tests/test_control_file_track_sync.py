@@ -38,6 +38,8 @@ from GPSTrackShowGUI import (
     next_control_table_search_position,
     parse_slideshow_control_line,
     required_main_window_height,
+    main_workflow_document_height,
+    audio_disclosure_window_height,
     serialize_slideshow_control_row,
     slideshow_process_is_running,
     track_endpoint_place_completeness,
@@ -150,7 +152,7 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             [label for _key, label in CONTROL_TABLE_FILTERS],
             [
                 "All Rows", "No Media", "Media", "Maps",
-                "MUS – Music control", "CTL – Slide-show control",
+                "MUS – Music control", "PLY – Temporary music", "NAR – Narrator", "CTL – Slide-show control",
                 "CAP – Photo/video caption", "FNT – Label font",
                 "IMG – Image", "VID – Video",
                 "MAP – Overview map", "TRK – Track map",
@@ -158,14 +160,16 @@ class ControlFileTrackSyncTests(unittest.TestCase):
                 "LOC – Media location map", "DAT – Date",
             ],
         )
-        rows = [{"type": value} for value in ("DAT", "MUS", "CTL", "CAP", "FNT", "IMG", "TRK", "VID", "LOC")]
-        self.assertEqual(visible_control_row_indexes(rows, "media"), [5, 7])
-        self.assertEqual(visible_control_row_indexes(rows, "maps"), [6, 8])
+        rows = [{"type": value} for value in ("DAT", "MUS", "PLY", "NAR", "CTL", "CAP", "FNT", "IMG", "TRK", "VID", "LOC")]
+        self.assertEqual(visible_control_row_indexes(rows, "media"), [7, 9])
+        self.assertEqual(visible_control_row_indexes(rows, "maps"), [8, 10])
         self.assertEqual(visible_control_row_indexes(rows, "mus"), [1])
-        self.assertEqual(visible_control_row_indexes(rows, "ctl"), [2])
-        self.assertEqual(visible_control_row_indexes(rows, "cap"), [3])
-        self.assertEqual(visible_control_row_indexes(rows, "fnt"), [4])
-        self.assertEqual(control_table_filter_anchor_index(rows, [7], "mus"), 1)
+        self.assertEqual(visible_control_row_indexes(rows, "ply"), [2])
+        self.assertEqual(visible_control_row_indexes(rows, "nar"), [3])
+        self.assertEqual(visible_control_row_indexes(rows, "ctl"), [4])
+        self.assertEqual(visible_control_row_indexes(rows, "cap"), [5])
+        self.assertEqual(visible_control_row_indexes(rows, "fnt"), [6])
+        self.assertEqual(control_table_filter_anchor_index(rows, [9], "mus"), 1)
 
     def test_jump_to_show_requires_a_running_player(self):
         self.assertFalse(slideshow_process_is_running(None))
@@ -176,12 +180,29 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             slideshow_process_is_running(SimpleNamespace(poll=lambda: 0))
         )
 
-    def test_main_window_reserves_space_for_video_normalization(self):
-        self.assertGreater(
+    def test_main_window_scrolls_instead_of_forcing_audio_height(self):
+        self.assertEqual(
             required_main_window_height(True),
             required_main_window_height(False),
         )
-        self.assertGreaterEqual(required_main_window_height(False), 780.0)
+        self.assertEqual(required_main_window_height(False), 560.0)
+        self.assertGreater(
+            main_workflow_document_height(True),
+            main_workflow_document_height(False),
+        )
+        self.assertLess(
+            main_workflow_document_height(False, media_only=True),
+            main_workflow_document_height(False),
+        )
+
+    def test_audio_disclosure_removes_its_window_space(self):
+        self.assertEqual(audio_disclosure_window_height(746.0, True, False), 642.0)
+        self.assertEqual(audio_disclosure_window_height(642.0, False, True), 746.0)
+        self.assertEqual(audio_disclosure_window_height(560.0, True, False), 560.0)
+        self.assertEqual(
+            audio_disclosure_window_height(700.0, False, True, 730.0),
+            730.0,
+        )
 
     def test_processing_output_does_not_wait_synchronously_for_main_thread(self):
         calls = []
@@ -351,6 +372,14 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertEqual(serialize_slideshow_control_row(row), "#MUSIC: #ON, #JUMP $STAGE")
         merge_entry = parse_control_file_entries(["#MUSIC: #ON, #JUMP $STAGE"])[0]
         self.assertEqual((merge_entry["type"], merge_entry["line"]), ("music", "#MUSIC: #ON, #JUMP $STAGE"))
+
+    def test_gui_round_trips_play_and_narrator_rows(self):
+        play = parse_slideshow_control_line("#PLAY: $A, $B - $D")
+        narrator = parse_slideshow_control_line('#NARRATOR: $INTRO, "Chapter one.mp3"')
+        self.assertEqual(play["type"], "PLY")
+        self.assertEqual(narrator["type"], "NAR")
+        self.assertEqual(serialize_slideshow_control_row(play), "#PLAY: $A, $B - $D")
+        self.assertEqual(serialize_slideshow_control_row(narrator), '#NARRATOR: $INTRO, "Chapter one.mp3"')
 
     def test_gui_round_trips_slide_show_control_directive(self):
         row = parse_slideshow_control_line("#CONTROL: #LABEL $START, #DURATION 5")

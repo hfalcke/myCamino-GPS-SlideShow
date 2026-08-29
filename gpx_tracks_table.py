@@ -34,8 +34,12 @@ from plot_metadata_utils import (
 )
 from basemap_tile_utils import tolerate_missing_tiles
 from map_provider_utils import (
+    DEFAULT_TILE_CACHE_DIR,
+    TileProviderAccessError,
+    configure_contextily_cache,
     contextily_provider,
     contextily_request_timeout,
+    provider_attribution,
     provider_display_name,
 )
 from map_overlay import MAP_CONTENT_VERSION, json_overlay_geometry
@@ -835,6 +839,7 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "track_fingerprint": track.get("track_fingerprint"),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
                 "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
+                "track_data_sidecar": track.get("track_data_sidecar"),
                 "erstellungsdatum": format_datetime_local(track["time"]),
                 "dauer": format_duration(track["duration"]),
                 "laenge_km": round(track["length_km"], 1),
@@ -875,6 +880,51 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
         "source_gpx": os.path.abspath(gpx_path),
         "tracks": track_items,
     }
+
+
+def derived_track_data_payload(track, fallback_walking_speed_kmh=3.5):
+    """Return map-independent geometry, timing, elevation, and speed data."""
+    return {
+        "version": 1,
+        "track_number": track.get("table_number"),
+        "original_sequence_number": track.get("original_sequence_number"),
+        "track_name": track.get("name", ""),
+        "track_fingerprint": track.get("track_fingerprint"),
+        "timing_status": track.get("timing_status", "recorded"),
+        "has_absolute_time": bool(track.get("has_absolute_time")),
+        "gpx_processing": track.get("processing_options", {}),
+        "raw_point_count": track.get("raw_point_count", 0),
+        "retained_point_count": track.get("filtered_point_count", 0),
+        "rejection_counts": track.get("rejection_counts", {}),
+        "processed_geometry_source": "timed_track_points",
+        "timed_track_points": timed_points_payload(
+            track.get("point_records", []), fallback_walking_speed_kmh
+        ),
+        "running_speed": running_speed_metadata(track),
+    }
+
+
+def write_derived_track_data(context):
+    """Write one current sidecar per track without touching any map image."""
+    args = context["args"]
+    root = Path(context["output_dir"]) / f"{context['output_base']}-trackdata"
+    root.mkdir(parents=True, exist_ok=True)
+    expected = set()
+    for track in context["tracks"]:
+        relative_path = Path(str(track["track_data_sidecar"]))
+        output_path = Path(context["output_dir"]) / relative_path
+        expected.add(output_path.resolve(strict=False))
+        write_plot_metadata(
+            derived_track_data_payload(track, args.fallback_walking_speed_kmh),
+            output_path,
+        )
+    for stale_path in root.glob("*.json"):
+        if stale_path.resolve(strict=False) not in expected:
+            try:
+                stale_path.unlink()
+            except OSError:
+                pass
+    return root
 
 
 def processed_point_json_record(point):
@@ -1142,6 +1192,7 @@ def basemap_provider(
     custom_url="",
     custom_attribution="",
     maximum_zoom=19,
+    credential_id="default",
 ):
     """Return the selected basemap provider."""
     selected = "esri" if use_esri else provider
@@ -1151,6 +1202,7 @@ def basemap_provider(
         custom_url,
         custom_attribution,
         maximum_zoom,
+        credential_id,
     )
 
 
@@ -1327,6 +1379,7 @@ def render_track_plot(
     custom_map_attribution="",
     maximum_map_zoom=19,
     map_request_timeout_seconds=12.0,
+    map_credential_id="default",
     minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
     media_map_date=None,
     background_only=True,
@@ -1563,7 +1616,8 @@ def render_track_plot(
     ax.set_ylim(min_y, max_y)
     ax.set_aspect("equal", adjustable="box")
     try:
-        with contextily_request_timeout(cx, map_request_timeout_seconds):
+        configure_contextily_cache(cx, DEFAULT_TILE_CACHE_DIR)
+        with contextily_request_timeout(cx, map_request_timeout_seconds, map_provider):
             with tolerate_missing_tiles(cx) as missing_tile_report:
                 cx.add_basemap(
                     ax,
@@ -1574,9 +1628,12 @@ def render_track_plot(
                         custom_map_url,
                         custom_map_attribution,
                         maximum_map_zoom,
+                        map_credential_id,
                     ),
                     zoom=effective_zoom,
                 )
+    except TileProviderAccessError:
+        raise
     except Exception as exc:
         provider_name = provider_display_name("esri" if use_esri else map_provider)
         raise RuntimeError(
@@ -1634,6 +1691,10 @@ def render_track_plot(
             "max_y": max_y,
         },
         "basemap": provider_display_name("esri" if use_esri else map_provider),
+        "map_attribution": provider_attribution(
+            "esri" if use_esri else map_provider,
+            custom_map_attribution,
+        ),
         "effective_zoom": effective_zoom,
         "missing_basemap_tiles": missing_tile_report.count,
         "minimum_short_dimension_m": (
@@ -1745,6 +1806,7 @@ def render_media_location_map(
     custom_map_attribution="",
     maximum_map_zoom=19,
     map_request_timeout_seconds=12.0,
+    map_credential_id="default",
     minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
     map_layout="standard",
     track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
@@ -1791,6 +1853,7 @@ def render_media_location_map(
         custom_map_attribution=custom_map_attribution,
         maximum_map_zoom=maximum_map_zoom,
         map_request_timeout_seconds=map_request_timeout_seconds,
+        map_credential_id=map_credential_id,
         minimum_short_dimension_m=minimum_short_dimension_m,
         media_map_date=media_date,
         media_map_title=stage_name,
@@ -1856,6 +1919,7 @@ def render_media_overview_map(
     custom_map_attribution="",
     maximum_map_zoom=19,
     map_request_timeout_seconds=12.0,
+    map_credential_id="default",
     adventure_render_parameters=None,
 ):
     """Render one shared overview basemap for a media-only Adventure."""
@@ -1890,6 +1954,7 @@ def render_media_overview_map(
         custom_map_attribution=custom_map_attribution,
         maximum_map_zoom=maximum_map_zoom,
         map_request_timeout_seconds=map_request_timeout_seconds,
+        map_credential_id=map_credential_id,
         background_only=True,
     )
     fingerprint = media_overview_fingerprint(points)
@@ -2054,12 +2119,13 @@ def build_argument_parser():
     )
     parser.add_argument(
         "--map-provider",
-        choices=("osm", "esri", "custom"),
+        choices=("osm", "geoapify", "thunderforest", "stadia", "esri", "custom"),
         default="osm",
         help="Basemap provider for plots (default: osm). --esri remains a compatibility alias.",
     )
     parser.add_argument("--custom-map-url", default="", help="Custom tile URL containing {z}, {x}, and {y}.")
     parser.add_argument("--custom-map-attribution", default="", help="Attribution for a custom tile provider.")
+    parser.add_argument("--map-credential-id", default="default", help="macOS Keychain account name for the provider API key.")
     parser.add_argument("--maximum-map-zoom", type=int, default=19, help="Maximum zoom supported by the provider.")
     parser.add_argument("--map-request-timeout-seconds", type=float, default=12.0, help="Timeout for one tile request.")
     parser.add_argument(
@@ -2391,6 +2457,9 @@ def prepare_run_context(args):
         track["track_plot_time_lapse_image_filename"] = time_lapse_track_map_name(
             track["track_plot_image_filename"]
         )
+        track["track_data_sidecar"] = (
+            f"{safe_base}-trackdata/{track['table_number']:0{number_width}d}.json"
+        )
 
     selected_numbers = []
     if args.plot_tracks:
@@ -2488,6 +2557,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
         if args.verbose:
             print(f"PDF gespeichert: {context['pdf_output_path']}")
     if not args.nojson and write_summary:
+        write_derived_track_data(context)
         table_summary = build_table_summary_data(
             gpx_path,
             tracks,
@@ -2530,6 +2600,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
             custom_map_attribution=args.custom_map_attribution,
             maximum_map_zoom=args.maximum_map_zoom,
             map_request_timeout_seconds=args.map_request_timeout_seconds,
+            map_credential_id=getattr(args, "map_credential_id", "default"),
             background_only=getattr(args, "background_only", True),
         )
         render_parameters = getattr(args, "adventure_overview_render_parameters", None)
@@ -2655,6 +2726,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                 args.custom_map_attribution,
                 args.maximum_map_zoom,
                 args.map_request_timeout_seconds,
+                getattr(args, "map_credential_id", "default"),
                 background_only=getattr(args, "background_only", True),
             )
             render_parameters = getattr(args, "adventure_render_parameters", None)
@@ -2887,6 +2959,7 @@ def namespace_from_options(gpx_file, **overrides):
         custom_map_attribution="",
         maximum_map_zoom=19,
         map_request_timeout_seconds=12.0,
+        map_credential_id="default",
         zoom=8,
         size=DEFAULT_IMAGE_SIZE,
         fontsize=1.0,

@@ -300,7 +300,7 @@ Common keys:
 - `u`: clear plot selection.
 - `e`: open or focus elevation profile.
 - Cmd-Z / Shift-Cmd-Z: undo or redo the last track edit.
-- Cmd-X: cut a track at the current cursor point in a track plot.
+- Cmd-X: cut a track after the current cursor point in a track plot.
 - `q`: close plot window.
 
 Mouse:
@@ -325,7 +325,7 @@ Track editing keys:
 - `m` does not open the point information overlay.
 - Delete/Backspace: delete the point range from marker to cursor after
   confirmation.
-- `x`: cut the track at the cursor after confirmation.
+- `x`: cut the track after the cursor after confirmation.
 - `a`, `i`, `h`, `+`, `-`, `c`, `z`, Shift-`Z`, `p`, `e`, `q`: same general behavior
   as the overview plot.
 
@@ -372,7 +372,8 @@ Inspector actions:
 - Save inspector edits to memory.
 - Save & Exit to save edits to memory and close the inspector.
 - Readjust Time to recalculate selected waypoint timestamps.
-- Split Track to split at the selected waypoint.
+- Split Track Above to move the selected waypoint and all following waypoints into
+  a new track.
 
 The main editor Save writes all accepted inspector edits to disk.
 

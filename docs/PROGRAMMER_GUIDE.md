@@ -123,6 +123,14 @@ Important GUI support classes:
 - Window delegate classes retain lifecycle hooks and should be kept alive while
   their windows are open.
 
+Adventure discovery keeps strict format-2 loading separate from copied-folder
+recovery. `discover_adventure_candidates()` returns valid records, relocatable
+templates whose only structural problem is their recorded project root, and
+genuinely invalid files. `create_adventure_from_template()` creates a new file
+without replacing an existing destination, rebases only absolute paths below
+the old project root, retains shared relative project assets, and clears resume
+history. Normal `load_adventure()` validation remains strict.
+
 The main window is built manually in `_build_window()` and positioned in
 `layout_window()`. Help text is mostly in `_configure_tooltips()`.
 
@@ -171,11 +179,11 @@ The explicit **No GPX file - use only photos** checkbox lives in the main GPX se
 persists through `trackmaps.route_source = "media"`; it is intentionally not an
 assistant-only choice.
 
-Music has an independent compact section. `audio.enabled` defaults to false
-for new Adventures and controls whether music arguments are passed to the
-player. The GUI always creates `<project>/audio` and uses it as
-`music_source`; the selected `.playlist` file must be a direct child of that
-directory. The small Help link beside No Music calls the same retained
+Audio has an independent compact section. `audio.enabled` defaults to false
+for new Adventures and controls whether both music and narration arguments are
+passed to the player. The GUI always creates `<project>/audio` and
+`<project>/narration`; each selected `.playlist` must be a direct child of its
+corresponding directory. The small Help link beside No Audio calls the retained
 `showMusicDirectiveHelp_()` controller used when a `MUS` row is edited, so the
 main window and control-file editor cannot develop different command
 references. Loading an older Adventure without `audio.enabled` enables music
@@ -314,6 +322,24 @@ Track-map sidecars store `adventure_render_parameters`; the track summary stores
 signatures. Legacy outputs remain current only while the corresponding settings
 still equal their old defaults.
 
+Map access is centralized in `map_provider_utils.py`. Settings distinguish
+`maps.interactive_provider` from `maps.output_provider`; credentials are read
+from macOS Keychain using only `maps.credential_id` from the Adventure. The
+provider catalog and non-secret machine preference live in
+`map_provider_setup.py`; the latter stores only provider, credential identifier,
+and validation status under Application Support. `cocoa_map_provider_setup.py`
+implements the shared first-use flow. Hosted keys are validated with one minimal
+tile request before Keychain storage. Offline storage is marked unverified and
+must pass validation before automatic rendering. Esri and Custom XYZ return to
+Map Service Settings; Custom XYZ requires HTTPS, XYZ placeholders, attribution,
+and a successful test tile. Provider dashboard pages are opened in the browser
+but never scraped or automated. The shared Contextily cache, stable identifying
+User-Agent, serial request pacing,
+OSM seven-day minimum retention, terminal 403 handling, and 429 reporting apply
+to GPX Editor, generated maps, and PDF maps. Automatic whole-project jobs never
+fetch missing public OSM tiles; that endpoint is limited to interactive use and
+one explicitly selected map plan.
+
 ## Shared GPX Processing
 
 `gpx_import.py` is the common document-level importer. It accepts GPX 1.0 and
@@ -344,14 +370,14 @@ signature; XML edits invalidate only the affected track. Parameter changes are
 processed on one background worker using XML snapshots, with AppKit updates
 returned to the main thread.
 
-Summary and map sidecars record processing options, raw/retained counts,
-rejection counts, segment-preserving geometry, processed elevation, and timed
-points. Retained point records also preserve explicit horizontal/vertical
+The compact summary points to one map-independent derived-data sidecar per
+track. Those sidecars record processing options, raw/retained counts, rejection
+counts, segment-preserving geometry, processed elevation, timed points, and
+running speed. Retained point records also preserve explicit horizontal/vertical
 uncertainty, HDOP, VDOP, PDOP, satellite count, and fix type when present; PDOP,
 satellites, and fix are metadata only in this version. Geometry parameters are
 part of map freshness signatures. Running-speed window and stationary-threshold
-changes are intentionally sidecar-only: `upgrade_timed_track_sidecars(...)`
-updates `timed_track_points` and `running_speed` JSON without touching PNG maps.
+changes update these small sidecars without touching PNG maps.
 
 When a project directory is selected, the GUI creates it if needed, discovers
 all valid `.adv` files, and loads the newest one. Adventure, GPX, and control
@@ -390,18 +416,17 @@ back to modification times only for older metadata that does not contain
 fingerprints.
 
 The global `*-summary.json` intentionally contains only compact per-track
-statistics, endpoints, processing settings, fingerprints, and plot filenames.
-Point-by-point processed geometry and `timed_track_points` belong only to the
-matching per-track map sidecars. This avoids duplicating hundreds of megabytes
-of data in large Adventures while preserving the timing data needed by the
-Time-Lapse player.
+statistics, endpoints, processing settings, fingerprints, plot filenames, and
+`track_data_sidecar` references. Point-by-point processed geometry and
+`timed_track_points` live in `<base>-trackdata/NNNN.json`; map sidecars retain
+image projection/layout metadata and remain a transition fallback. This avoids
+duplicating data and allows timing/GPS inference to remain current while an
+expensive PNG is visibly stale.
 
-After `GPXEditor.py` saves an accepted changed GPX file, the main GUI regenerates
-the track summary JSON with `run_gpx_tracks_table_with_options(...)` without
-rendering maps. Closing the editor does not repeat that work when the same file
-version was already handled or the GPX file was unchanged. This keeps
-control-file operations consistent while leaving slow map rendering under
-explicit user control.
+After `GPXEditor.py` saves an accepted changed GPX file, the main GUI returns
+immediately and regenerates the compact summary and all derived sidecars in one
+background traversal without rendering maps. Progress is reported per track.
+Closing the editor does not repeat work for the same file version.
 
 The GUI deliberately tolerates legacy plot file names when detecting existing
 plots. Matching code normalizes track plot names so old zero-padding variants
@@ -462,12 +487,13 @@ The normal Create action calls `GetGeoLocations.py` with equivalent options:
 - track-order sorting based on the GUI track ordering selection
 
 Create and Update Control File enable lazy media GPS inference. The compact track
-summary supplies only each stage's start/end time, name, fingerprint, and Track
-Map filenames. `LazyTrackGpsResolver` performs this inexpensive interval check
-before opening any detailed sidecar. Only a media timestamp inside exactly one
-valid interval can proceed. Its matching Standard Track Map sidecar is loaded
-on demand, with the Time-Lapse sidecar as fallback, and must have the current
-track fingerprint and valid monotonic `timed_track_points`. The parsed timeline
+summary supplies only each stage's start/end time, name, fingerprint, map names,
+and derived-sidecar path. `LazyTrackGpsResolver` performs this inexpensive
+interval check before opening any detailed data. Only a media timestamp inside
+exactly one valid interval can proceed. The matching derived sidecar is loaded
+on demand and must have the current fingerprint and valid monotonic
+`timed_track_points`; Standard and Time-Lapse map sidecars are fallback inputs
+for projects not yet refreshed. The parsed timeline
 is cached once per track and surrounding points are found with binary search.
 The resolver never reparses the GPX file and never extrapolates beyond a stage.
 At a `<trkseg>` boundary it selects the nearer endpoint instead of
@@ -484,7 +510,8 @@ time. Debug processing uses the identical order and records the selected source.
 
 Inferred sidecars contain `gps_source: track_time_interpolation` and a nested
 `gps_inference` object with the track identity/fingerprint, bounding times,
-fraction, timing-estimation flag, and source map sidecar. Embedded GPS always
+fraction, timing-estimation flag, and source derived-data sidecar (or transitional
+map-sidecar fallback). Embedded GPS always
 wins. A changed fingerprint causes only inferred GPS to be revalidated; a
 changed coordinate clears its old reverse-geocoded place so metadata
 maintenance can resolve it again. Place-name writes must preserve this
@@ -623,6 +650,10 @@ Supported line types:
 - `#MediaMap: filename`: date-only location map for media not assigned to a track.
 - `#Date:` or `#Datum:`: date section line.
 - `#MUSIC: command, target, ...`: ordered non-display music transport commands.
+- `#PLAY: target, $A - $D, ...`: finite music selection followed by exact
+  return to the interrupted title.
+- `#NARRATOR: target, $A - $D, ...`: finite narration selection on the retained
+  narrator channel.
 - `#CONTROL: command, ...`: ordered non-display slide-show timing, style,
   label, jump, pause, and end commands.
 - `#CAPTION: command, ..., text`: a retained visual caption for the immediately
@@ -659,6 +690,8 @@ The GUI table maps these to row types:
 - `LOC`: media-only location map
 - `DAT`: date row
 - `MUS`: music directive
+- `PLY`: temporary music selection
+- `NAR`: narrator selection
 - `CTL`: slide-show control directive
 
 The editable Type combo displays the canonical short code in its closed cell
@@ -744,6 +777,15 @@ crossfading. Videos and Space pause audio transiently, while `a` changes the
 independent user-enabled state. This manual state always has priority over the
 control-file gate.
 
+`#PLAY:` and `#NARRATOR:` share one selection parser and playlist resolver.
+Selections preserve order and duplicates and expand inclusive label ranges.
+The narration controller retains at most two additional players, plays only
+the requested finite sequence, and reports active-state changes to music and
+video gain. Music may remain parallel, be reduced, or be faded and paused;
+video gain is independently reduced during narration. Both playlist-generation
+workflows call the same recursive discovery, label generation, and append-only
+update functions.
+
 The effective music gain is the configured music percentage multiplied by the
 0–9 directive level and the retained slot's crossfade envelope. A level change
 therefore updates both players during a crossfade. Video players use the
@@ -757,9 +799,10 @@ single/line/range/album/all loops, a 0–9 gain level, and `#ON/#OFF`. Targets
 open the control gate; volume and gate actions do not cancel transport modes.
 The player reports unresolved targets but keeps the current title running.
 
-Player entry points accept `music_source`, `music_playlist`, crossfade,
+Player entry points accept music and narration sources/playlists, crossfade,
 music/video gain, normalized-video preference, and normalization-signature
-settings. CLI equivalents include `--music`, `--music-playlist`,
+settings. CLI equivalents include `--music`, `--music-playlist`, `--narration`,
+`--narration-playlist`, narration gain/reduction options,
 `--audio-crossfade-seconds`, `--music-volume-percent`,
 `--video-volume-percent`, `--use-normalized-videos`, and
 `--no-normalized-videos`. A directory without an explicit playlist
@@ -1010,7 +1053,7 @@ times, interpolates missing intervals by cumulative distance, and falls back to
 the current time as a fabricated absolute anchor. It returns repaired in-memory
 values only. GPX files are changed only by an explicit GPX Editor save.
 
-Track-map sidecars include `timed_track_points`, an ordered list of latitude,
+Derived track-data sidecars include `timed_track_points`, an ordered list of latitude,
 longitude, elapsed seconds, optional ISO timestamp, absolute-time flag,
 estimated-time flag, elevation in metres, segment identity, and cumulative
 stage distance. Summaries carry `timing_status` and `has_absolute_time`.
@@ -1070,6 +1113,12 @@ Core classes:
   distance and visible-elevation scaling, and retains its own temporary help
   window and close timer.
 - `TrackInspectorController`: waypoint-level editor for one track.
+
+`EditorTableView.menuForEvent_()` applies standard macOS context-click
+selection and asks the controller for a freshly validated Track menu. Shared
+helpers handle disjoint-group movement, block duplication, and copy naming.
+Context and header sorting both call `sort_by_column()`; selected-row sorting
+replaces only the selected slots and includes processed moving-average speed.
 
 The editor writes:
 

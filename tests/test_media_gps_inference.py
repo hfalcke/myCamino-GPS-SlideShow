@@ -29,6 +29,7 @@ class MediaGpsInferenceTests(unittest.TestCase):
         coordinates=((50.0, 8.0), (52.0, 10.0)),
     ):
         path = self.project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "track_fingerprint": fingerprint,
             "timed_track_points": [
@@ -51,7 +52,7 @@ class MediaGpsInferenceTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def _track(self, sidecar, number=1, fingerprint="track-fingerprint"):
+    def _track(self, sidecar, number=1, fingerprint="track-fingerprint", derived=None):
         return geo.TrackInfo(
             start_time=self.start,
             track_plot_image_filename=sidecar.with_suffix(".png").name,
@@ -59,6 +60,7 @@ class MediaGpsInferenceTests(unittest.TestCase):
             end_time=self.start + timedelta(minutes=10),
             track_name="Stage",
             track_fingerprint=fingerprint,
+            derived_sidecar_path=derived,
             map_sidecar_paths=(sidecar,),
         )
 
@@ -137,6 +139,19 @@ class MediaGpsInferenceTests(unittest.TestCase):
         self.assertAlmostEqual(second.latitude, 51.5)
         self.assertAlmostEqual(second.longitude, 9.5)
         self.assertTrue(first.gps_inference["timing_estimated"])
+
+    def test_current_derived_timeline_precedes_stale_map_sidecar(self):
+        stale_map = self._write_timeline("map.json", "old")
+        derived = self._write_timeline(
+            "trackdata/0001.json",
+            "track-fingerprint",
+            coordinates=((40.0, 5.0), (40.2, 5.2)),
+        )
+        resolver = self._resolver(self._track(stale_map, derived=derived))
+        record = self._record(self.start + timedelta(minutes=5))
+        self.assertTrue(resolver.apply(record))
+        self.assertAlmostEqual(record.latitude, 40.1)
+        self.assertEqual(record.gps_inference["track_data_sidecar"], "0001.json")
 
     def test_segment_boundary_uses_nearest_endpoint(self):
         sidecar = self._write_timeline(segments=(0, 1))

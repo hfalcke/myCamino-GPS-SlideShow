@@ -473,6 +473,7 @@ class TrackInfo:
     end_time: Optional[datetime] = None
     track_name: Optional[str] = None
     track_fingerprint: Optional[str] = None
+    derived_sidecar_path: Optional[Path] = None
     map_sidecar_paths: tuple[Path, ...] = ()
     timing_status: str = "recorded"
     has_absolute_time: bool = True
@@ -1590,6 +1591,17 @@ def track_map_sidecar_candidates(
     return tuple(result)
 
 
+def track_derived_sidecar_path(item: dict[str, Any], tracks_path: Path) -> Optional[Path]:
+    """Resolve a compact-summary reference to map-independent track data."""
+    raw_value = item.get("track_data_sidecar")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    path = Path(raw_value.strip()).expanduser()
+    if not path.is_absolute():
+        path = tracks_path.parent / path
+    return path.resolve(strict=False)
+
+
 def maybe_shorten_output_path(path_text: object, photolist: Path) -> Optional[str]:
     """Shorten a path to basename when it points into the photolist directory."""
     if not isinstance(path_text, str):
@@ -1837,6 +1849,7 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
                 end_time=end_time,
                 track_name=track_name,
                 track_fingerprint=track_fingerprint,
+                derived_sidecar_path=track_derived_sidecar_path(item, tracks_path),
                 map_sidecar_paths=track_map_sidecar_candidates(item, tracks_path, photolist),
                 timing_status=timing_status,
                 has_absolute_time=bool(
@@ -1861,6 +1874,7 @@ class LazyTrackGpsResolver:
         self._timeline_cache: dict[int, Optional[TrackTimeline]] = {}
         self._reference_records: list[tuple[datetime, float, float, str]] = []
         self._warned: set[str] = set()
+        self._missing_timing_tracks: set[int] = set()
         self.inferred_count = 0
         self.refreshed_count = 0
         self.cleared_count = 0
@@ -2020,7 +2034,11 @@ class LazyTrackGpsResolver:
         if cache_key in self._timeline_cache:
             return self._timeline_cache[cache_key]
         timeline = None
-        for sidecar_path in track.map_sidecar_paths:
+        candidates = (
+            ((track.derived_sidecar_path,) if track.derived_sidecar_path is not None else ())
+            + track.map_sidecar_paths
+        )
+        for sidecar_path in candidates:
             if not sidecar_path.is_file():
                 continue
             try:
@@ -2036,10 +2054,7 @@ class LazyTrackGpsResolver:
                 break
         self._timeline_cache[cache_key] = timeline
         if timeline is None:
-            self._warn_once(
-                f"timeline:{cache_key}",
-                f"Track #{cache_key} has no current timed map sidecar; run Generate and Update Maps to infer media GPS.",
-            )
+            self._missing_timing_tracks.add(cache_key)
         return timeline
 
     @staticmethod
@@ -2166,11 +2181,17 @@ class LazyTrackGpsResolver:
         record.latitude = latitude
         record.longitude = longitude
         record.gps_source = "track_time_interpolation"
+        source_key = (
+            "track_data_sidecar"
+            if track.derived_sidecar_path is not None
+            and timeline.source_path == track.derived_sidecar_path
+            else "track_map_sidecar"
+        )
         record.gps_inference = {
             "track_number": track.original_sequence_number,
             "track_name": track.track_name,
             "track_fingerprint": track.track_fingerprint,
-            "track_map_sidecar": timeline.source_path.name,
+            source_key: timeline.source_path.name,
             **details,
         }
         if disambiguation_details:
@@ -2183,6 +2204,12 @@ class LazyTrackGpsResolver:
         return True
 
     def emit_summary(self) -> None:
+        if self._missing_timing_tracks:
+            print(
+                f"Warning: {len(self._missing_timing_tracks)} tracks lack usable timing data; "
+                "media GPS could not be inferred for those tracks.",
+                flush=True,
+            )
         if self.inferred_count or self.refreshed_count or self.cleared_count:
             print(
                 "Track-time GPS inference: "
@@ -5522,13 +5549,17 @@ def update_track_endpoint_places(
     progress_offset: int = 0,
     progress_total: int = 0,
 ) -> int:
-    """Resolve GPX start/end places before media and patch matching map sidecars."""
+    """Resolve GPX start/end places and patch current derived/map sidecars."""
     if tracks_summary is None:
         return progress_offset
     track_payloads: list[tuple[TrackInfo, list[tuple[Path, dict[str, Any]]]]] = []
     for track in tracks_summary.tracks:
         payloads = []
-        for sidecar_path in track.map_sidecar_paths:
+        sidecar_paths = (
+            ((track.derived_sidecar_path,) if track.derived_sidecar_path is not None else ())
+            + track.map_sidecar_paths
+        )
+        for sidecar_path in sidecar_paths:
             if not sidecar_path.is_file():
                 continue
             try:

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 
 MUSIC_DIRECTIVE_PREFIX = "#MUSIC:"
+PLAY_DIRECTIVE_PREFIX = "#PLAY:"
+NARRATOR_DIRECTIVE_PREFIX = "#NARRATOR:"
 CONTROL_DIRECTIVE_PREFIX = "#CONTROL:"
 CAPTION_DIRECTIVE_PREFIX = "#CAPTION:"
 FONT_DIRECTIVE_PREFIX = "#FONT:"
@@ -29,6 +31,10 @@ CONTROL_TRANSITIONS = (
 
 class MusicSyntaxError(ValueError):
     """Raised when a #MUSIC directive cannot be parsed unambiguously."""
+
+
+class AudioSelectionSyntaxError(ValueError):
+    """Raised when a finite #PLAY or #NARRATOR selection is malformed."""
 
 
 class ControlSyntaxError(ValueError):
@@ -52,6 +58,18 @@ class MusicAction:
 @dataclass(frozen=True)
 class MusicDirective:
     actions: tuple[MusicAction, ...]
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class AudioSelectionItem:
+    kind: str
+    value: object
+
+
+@dataclass(frozen=True)
+class AudioSelectionDirective:
+    items: tuple[AudioSelectionItem, ...]
     source: str = ""
 
 
@@ -326,6 +344,109 @@ def parse_music_directive(line: str) -> MusicDirective | None:
 
 def is_music_directive(line: str) -> bool:
     return str(line or "").strip().upper().startswith(MUSIC_DIRECTIVE_PREFIX)
+
+
+def _split_audio_selection_fields(text: str, directive: str) -> list[tuple[str, bool]]:
+    """Split CSV-like fields while remembering whether a pathname was protected."""
+    fields: list[tuple[str, bool]] = []
+    current: list[str] = []
+    quoted = False
+    escaped = False
+    protected = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            protected = True
+        elif char == "\\":
+            escaped = True
+            protected = True
+        elif char == '"':
+            if quoted and index + 1 < len(text) and text[index + 1] == '"':
+                current.append('"')
+                protected = True
+                index += 1
+            else:
+                quoted = not quoted
+                protected = True
+        elif char == "," and not quoted:
+            fields.append(("".join(current).strip(), protected))
+            current = []
+            protected = False
+        else:
+            current.append(char)
+        index += 1
+    if escaped:
+        raise AudioSelectionSyntaxError(f"{directive} ends with an incomplete escape")
+    if quoted:
+        raise AudioSelectionSyntaxError(f"{directive} contains an unterminated quote")
+    fields.append(("".join(current).strip(), protected))
+    return fields
+
+
+def _parse_audio_selection_field(field: str, protected: bool) -> AudioSelectionItem:
+    text = str(field or "").strip()
+    if not text:
+        raise AudioSelectionSyntaxError("empty item in audio selection")
+    match = re.fullmatch(r"(\$[A-Za-z0-9_-]+)\s+-\s+(\$[A-Za-z0-9_-]+)", text)
+    if match:
+        return AudioSelectionItem(
+            "range",
+            (
+                normalize_playlist_label(match.group(1)),
+                normalize_playlist_label(match.group(2)),
+            ),
+        )
+    if text.startswith("$"):
+        try:
+            return AudioSelectionItem("label", normalize_playlist_label(text))
+        except MusicSyntaxError as exc:
+            raise AudioSelectionSyntaxError(str(exc)) from exc
+    if re.search(r"[\s,-]", text) and not protected:
+        raise AudioSelectionSyntaxError(
+            "pathnames containing blanks, commas, or hyphens must be quoted or backslash-escaped"
+        )
+    return AudioSelectionItem("path", text)
+
+
+def parse_audio_selection_parameters(parameters: str, directive: str) -> AudioSelectionDirective:
+    """Parse a finite list of labels, paths, and inclusive label ranges."""
+    text = str(parameters or "").strip()
+    if not text:
+        raise AudioSelectionSyntaxError(f"{directive} requires at least one label, range, or pathname")
+    if "\n" in text or "\r" in text:
+        raise AudioSelectionSyntaxError(f"{directive} must occupy one control-file line")
+    fields = _split_audio_selection_fields(text, directive)
+    return AudioSelectionDirective(
+        tuple(_parse_audio_selection_field(field, protected) for field, protected in fields),
+        text,
+    )
+
+
+def _parse_prefixed_audio_selection(line: str, prefix: str) -> AudioSelectionDirective | None:
+    disabled, text = split_disabled_control_line(line)
+    stripped = text.strip()
+    if disabled or not stripped.upper().startswith(prefix):
+        return None
+    return parse_audio_selection_parameters(stripped[len(prefix) :], prefix[:-1])
+
+
+def parse_play_directive(line: str) -> AudioSelectionDirective | None:
+    return _parse_prefixed_audio_selection(line, PLAY_DIRECTIVE_PREFIX)
+
+
+def parse_narrator_directive(line: str) -> AudioSelectionDirective | None:
+    return _parse_prefixed_audio_selection(line, NARRATOR_DIRECTIVE_PREFIX)
+
+
+def is_play_directive(line: str) -> bool:
+    return not split_disabled_control_line(line)[0] and split_disabled_control_line(line)[1].strip().upper().startswith(PLAY_DIRECTIVE_PREFIX)
+
+
+def is_narrator_directive(line: str) -> bool:
+    return not split_disabled_control_line(line)[0] and split_disabled_control_line(line)[1].strip().upper().startswith(NARRATOR_DIRECTIVE_PREFIX)
 
 
 def normalize_control_transition(value: object) -> str:

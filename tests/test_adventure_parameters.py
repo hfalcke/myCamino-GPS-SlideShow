@@ -34,6 +34,10 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertFalse(defaults["audio.enabled"])
         self.assertEqual(defaults["audio.music_volume_percent"], 65.0)
         self.assertEqual(defaults["audio.video_volume_percent"], 100.0)
+        self.assertEqual(defaults["audio.narration_volume_percent"], 100.0)
+        self.assertEqual(defaults["audio.narration_music_behavior"], "reduce")
+        self.assertEqual(defaults["audio.narration_music_reduction_percent"], 25.0)
+        self.assertEqual(defaults["audio.narration_video_reduction_percent"], 25.0)
         self.assertTrue(defaults["audio.use_normalized_videos"])
         self.assertTrue(defaults["slideshow.elevation_profile"])
         self.assertTrue(defaults["slideshow.clock"])
@@ -178,7 +182,7 @@ class AdventureParameterTests(unittest.TestCase):
 
     def test_custom_provider_requires_template_and_attribution(self):
         values = default_parameters()
-        values["maps.provider"] = "custom"
+        values["maps.output_provider"] = "custom"
         values["maps.custom_url"] = "https://tiles.example/{z}/{x}.png"
         errors = validate_parameters(values)
         self.assertIn("maps.custom_url", errors)
@@ -186,6 +190,14 @@ class AdventureParameterTests(unittest.TestCase):
         values["maps.custom_url"] = "https://tiles.example/{z}/{x}/{y}.png"
         values["maps.custom_attribution"] = "Example Maps"
         self.assertEqual(validate_parameters(values), {})
+
+    def test_legacy_shared_map_provider_migrates_to_both_roles(self):
+        values = normalize_parameters(
+            {"version": 19, "values": {"maps.provider": "esri"}}
+        )
+        self.assertEqual(values["maps.interactive_provider"], "esri")
+        self.assertEqual(values["maps.output_provider"], "esri")
+        self.assertNotIn("maps.provider", values)
 
     def test_cross_field_geocoder_pacing_is_validated(self):
         values = default_parameters()
@@ -246,7 +258,7 @@ class AdventureParameterTests(unittest.TestCase):
         values = default_parameters()
         normal_keys = {spec.key for spec in visible_specs_for_section("Map Service", values)}
         self.assertNotIn("maps.custom_url", normal_keys)
-        values["maps.provider"] = "custom"
+        values["maps.output_provider"] = "custom"
         custom_keys = {spec.key for spec in visible_specs_for_section("Map Service", values)}
         self.assertIn("maps.custom_url", custom_keys)
         self.assertIn("maps.custom_attribution", custom_keys)
