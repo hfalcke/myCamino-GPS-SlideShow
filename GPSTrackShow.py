@@ -935,7 +935,7 @@ def parse_args(argv: list[str]) -> Config:
     )
     parser.add_argument("--background-color", default="black", help="Background color.")
     parser.add_argument("--header-stage-name", choices=("on", "off"), default="on", help="Show the stage name in the centered slide-show header.")
-    parser.add_argument("--header-track-details", choices=("on", "off"), default="on", help="Show track length and duration in the centered slide-show header.")
+    parser.add_argument("--header-track-details", choices=("on", "off"), default="on", help="Show track length, duration, ascent, and descent in the centered slide-show header.")
     parser.add_argument("--header-place-name", choices=("on", "off"), default="on", help="Show the current place in the centered slide-show header.")
     parser.add_argument("--header-track-stats", choices=("on", "off"), default="on", help="Show track statistics at the right of the slide-show header.")
     parser.add_argument("--header-background", choices=("black", "transparent", "off"), default="black", help="Header layout for all media and maps; black uses the selected background color and fits content below it, while transparent and off remain full-frame.")
@@ -1828,15 +1828,14 @@ def speedometer_layout(
     metadata: Optional[dict],
     has_date: bool,
 ) -> tuple[tuple[float, float, float, float], float]:
-    """Place a clock-sized gauge beside the clock with room for its value."""
+    """Place a clock-sized gauge fully inside the same header band."""
     clock_frame, clock_size = time_lapse_clock_layout(image_rect, metadata, has_date)
     dial_size = max(20.0, float(clock_size))
-    frame_width = dial_size * 1.18
-    frame_height = dial_size * 1.24
+    frame_width = dial_size
+    frame_height = dial_size
     margin = max(2.0, dial_size * 0.05)
     frame_x = clock_frame[0] + clock_frame[2] + margin
-    # Align the dial center, rather than the taller value-bearing view, to the clock.
-    frame_y = clock_frame[1] + clock_size / 2.0 - (frame_height - dial_size / 2.0)
+    frame_y = clock_frame[1]
     image_x, _image_y, image_width, _image_height = image_rect
     frame_x = min(frame_x, image_x + image_width - margin - frame_width)
     return (frame_x, frame_y, frame_width, frame_height), dial_size
@@ -2441,6 +2440,17 @@ def normalized_track_duration(value: object) -> Optional[str]:
     return f"{hours:02d}:{minutes:02d}"
 
 
+def format_elevation_change(value: object, arrow: str) -> Optional[str]:
+    """Format ascent/descent compactly for the centered stage header."""
+    metres = safe_float(value)
+    if metres is None:
+        return None
+    metres = max(0.0, metres)
+    if metres < 1000.0:
+        return f"{arrow}{metres:.0f} m"
+    return f"{arrow}{metres / 1000.0:.1f} km"
+
+
 def track_endpoint_place(metadata: object, endpoint: str) -> Optional[str]:
     """Return one concise stored start/end place from a Track Map sidecar."""
     if not isinstance(metadata, dict):
@@ -2501,7 +2511,7 @@ def track_header_lines(
     omit_date: bool = False,
     details_override: Optional[str] = None,
 ) -> tuple[str, ...]:
-    """Build the dynamic GPX-stage title, optional date, and length/duration."""
+    """Build the dynamic GPX-stage title, date, and compact track statistics."""
     payload = metadata if isinstance(metadata, dict) else {}
     lines: list[str] = []
     title = track_display_title(payload, title_mode)
@@ -2512,12 +2522,18 @@ def track_header_lines(
     duration = normalized_track_duration(payload.get("track_duration"))
     details = str(details_override or "").strip()
     if not details:
-        if length is not None and duration is not None:
-            details = f"{max(0.0, length):.1f} km - {duration} h"
-        elif length is not None:
-            details = f"{max(0.0, length):.1f} km"
-        elif duration is not None:
-            details = f"{duration} h"
+        detail_parts = []
+        if length is not None:
+            detail_parts.append(f"{max(0.0, length):.1f} km")
+        if duration is not None:
+            detail_parts.append(f"{duration} h")
+        ascent = format_elevation_change(payload.get("ascent_m"), "↑")
+        descent = format_elevation_change(payload.get("descent_m"), "↓")
+        if ascent:
+            detail_parts.append(ascent)
+        if descent:
+            detail_parts.append(descent)
+        details = " - ".join(detail_parts)
     if date_text and not omit_date:
         lines.append(f"{date_text} · {details}" if details else date_text)
     elif details:
@@ -2656,15 +2672,16 @@ if APPKIT_AVAILABLE:
         def drawRect_(self, _dirty_rect):
             bounds = self.bounds()
             width, height = float(bounds.size.width), float(bounds.size.height)
-            size = min(width / 1.18, height / 1.24)
+            size = min(width, height)
             if size <= 4.0:
                 return
-            center = (width / 2.0, height - size / 2.0)
+            center = (width / 2.0, height / 2.0)
             radius = size * 0.48
             ns_color((0.0, 0.0, 0.0, 0.52)).setFill()
-            NSBezierPath.bezierPathWithOvalInRect_(
+            dial = NSBezierPath.bezierPathWithOvalInRect_(
                 NSMakeRect(center[0] - radius, center[1] - radius, 2 * radius, 2 * radius)
-            ).fill()
+            )
+            dial.fill()
             ns_color(COLOR_NAMES["white"]).setStroke()
             for tick in range(9):
                 angle = math.radians(210.0 - 240.0 * tick / 8.0)
@@ -2673,9 +2690,9 @@ if APPKIT_AVAILABLE:
                 path = NSBezierPath.bezierPath()
                 path.moveToPoint_((center[0] + inner * math.cos(angle), center[1] + inner * math.sin(angle)))
                 path.lineToPoint_((center[0] + outer * math.cos(angle), center[1] + outer * math.sin(angle)))
-                path.setLineWidth_(max(1.0, size * 0.018))
+                path.setLineWidth_(max(1.5, size * 0.028))
                 path.stroke()
-            scale_font = NSFont.systemFontOfSize_(max(7.0, size * 0.09))
+            scale_font = NSFont.boldSystemFontOfSize_(max(9.0, size * 0.115))
             label_ticks = (0, 2, 4, 6, 8) if size >= 92.0 else (0, 4, 8)
             for tick in label_ticks:
                 value = self.maximum_speed * tick / 8.0
@@ -2697,16 +2714,16 @@ if APPKIT_AVAILABLE:
             needle.moveToPoint_(center)
             needle.lineToPoint_((center[0] + radius * 0.72 * math.cos(angle), center[1] + radius * 0.72 * math.sin(angle)))
             ns_color(COLOR_NAMES["red"]).setStroke()
-            needle.setLineWidth_(max(2.0, size * 0.035))
+            needle.setLineWidth_(max(3.0, size * 0.052))
             needle.setLineCapStyle_(NSRoundLineCapStyle)
             needle.stroke()
-            font = NSFont.boldSystemFontOfSize_(max(8.0, size * 0.105))
+            font = NSFont.boldSystemFontOfSize_(max(10.0, size * 0.135))
             label = f"{self.current_speed:.1f} km/h"
             label_size = NSString.stringWithString_(label).sizeWithAttributes_({NSFontAttributeName: font})
             NSString.stringWithString_(label).drawAtPoint_withAttributes_(
                 (
                     (width - label_size.width) / 2.0,
-                    max(0.0, (height - size - label_size.height) / 2.0),
+                    center[1] - radius * 0.69 - label_size.height / 2.0,
                 ),
                 {NSFontAttributeName: font, NSForegroundColorAttributeName: ns_color(COLOR_NAMES["white"])},
             )
@@ -2902,7 +2919,7 @@ if APPKIT_AVAILABLE:
             frame, _dial_size = speedometer_layout(
                 (float(image_rect.origin.x), float(image_rect.origin.y), float(image_rect.size.width), float(image_rect.size.height)),
                 self.map_metadata,
-                True,
+                bool(self.clock_overlay_key and self.clock_overlay_key[2]),
             )
             self.speedometer_view.setFrame_(NSMakeRect(*frame))
             self.speedometer_view.setSpeed_maximum_(speed, maximum)
@@ -6650,7 +6667,7 @@ class CocoaImagePresenter:
                 float(reference.size.height),
             ),
             self.header_metadata,
-            bool(self.clock_date_text),
+            bool(self.clock_time is not None and self.clock_date_text),
         )
         self.speedometer_view.setFrame_(NSMakeRect(*frame))
         self.speedometer_view.setSpeed_maximum_(speed, maximum)
@@ -8464,6 +8481,11 @@ class GPSTrackShowApp:
         row = self._summary_tracks_by_map_filename().get(
             canonical_track_map_name(track_path.name)
         )
+        if isinstance(row, dict):
+            metadata = dict(metadata or {})
+            for key in ("ascent_m", "descent_m"):
+                if row.get(key) is not None:
+                    metadata[key] = row[key]
         relative = row.get("track_data_sidecar") if isinstance(row, dict) else None
         summary_path = self.compact_track_summary_path
         if not isinstance(relative, str) or summary_path is None:
@@ -9149,6 +9171,11 @@ class GPSTrackShowApp:
             self.time_lapse_stage_start_marker_latlon = None
             if self.time_lapse_current_media is not None:
                 row_index, entry = self.time_lapse_current_media
+                # Time-Lapse maps omit the baked header because their retained
+                # view draws it separately. Restore the Standard stage asset
+                # before handing the current medium back to Cocoa presenters.
+                if self.current_stage_index is not None:
+                    self._prepare_standard_stage_assets(self.current_stage_index)
                 self.time_lapse_current_media = None
                 self.time_lapse_media_image = None
                 self.time_lapse_media_draw_frame = True

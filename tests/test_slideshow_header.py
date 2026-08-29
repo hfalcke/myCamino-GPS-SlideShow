@@ -16,6 +16,7 @@ from GPSTrackShow import (
     header_content_rect,
     map_image_rect_and_scale,
     photo_track_metrics,
+    photo_track_speedometer,
     runtime_header_band,
     runtime_header_text_shadow_color,
     selected_stage_header_lines,
@@ -70,6 +71,29 @@ class SlideshowHeaderTests(unittest.TestCase):
                 "Stage traveled: 12,3 km",
                 "Height: 456 m",
             ),
+        )
+
+    def test_standard_photo_uses_nearest_timed_running_speed(self):
+        metadata = {
+            "running_speed": {"maximum_running_speed_kmh": 7.8},
+            "timed_track_points": [
+                {
+                    "lat": 50.0,
+                    "lon": 8.0,
+                    "cumulative_distance_km": 0.0,
+                    "running_speed_kmh": 3.2,
+                },
+                {
+                    "lat": 50.1,
+                    "lon": 8.1,
+                    "cumulative_distance_km": 12.3,
+                    "running_speed_kmh": 5.4,
+                },
+            ],
+        }
+        self.assertEqual(
+            photo_track_speedometer(metadata, 50.099, 8.099),
+            (5.4, 10.0),
         )
 
     def test_runtime_header_uses_saved_fraction_when_map_fills_frame(self):
@@ -235,6 +259,7 @@ class SlideshowHeaderTests(unittest.TestCase):
                     set_header_reference_image=lambda *_args: None,
                     set_header=lambda *args: headers.append(args),
                     set_clock_time=lambda *_args: None,
+                    set_speedometer=lambda *_args: None,
                     set_place_text=lambda *_args: None,
                     set_info_text=lambda *_args: None,
                     transition_to=lambda *_args, **_kwargs: None,
@@ -252,6 +277,7 @@ class SlideshowHeaderTests(unittest.TestCase):
                     header_shadow_color=(0.0, 0.0, 0.0, 1.0),
                     header_track_stats=True,
                     clock=False,
+                    speedometer=True,
                 )
                 app.photo_presenter = presenter
                 app.map_presenter = None

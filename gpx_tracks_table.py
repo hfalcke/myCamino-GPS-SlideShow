@@ -948,6 +948,8 @@ def derived_track_data_payload(track, fallback_walking_speed_kmh=3.5):
         "raw_point_count": track.get("raw_point_count", 0),
         "retained_point_count": track.get("filtered_point_count", 0),
         "rejection_counts": track.get("rejection_counts", {}),
+        "ascent_m": round(float(track.get("ascent_m") or 0.0), 1),
+        "descent_m": round(float(track.get("descent_m") or 0.0), 1),
         "processed_geometry_source": "timed_track_points",
         "timed_track_points": timed_points_payload(
             track.get("point_records", []), fallback_walking_speed_kmh
@@ -2817,6 +2819,8 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "track_start_time": format_datetime_local_seconds(track["start_time"]),
                     "track_length_km": round(track["length_km"], 1),
                     "track_duration": format_duration(track["duration"]),
+                    "ascent_m": round(float(track.get("ascent_m") or 0.0), 1),
+                    "descent_m": round(float(track.get("descent_m") or 0.0), 1),
                     "timing_status": track.get("timing_status", "recorded"),
                     "has_absolute_time": bool(track.get("has_absolute_time")),
                     "line_color": args.line_color,

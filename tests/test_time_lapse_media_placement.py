@@ -22,6 +22,7 @@ from GPSTrackShow import (
     endpoint_tangent,
     external_jump_command_row,
     fixed_arrow_normal,
+    format_elevation_change,
     inset_rect,
     largest_clear_corner_rects,
     map_plot_rect,
@@ -45,6 +46,7 @@ from GPSTrackShow import (
     simplify_display_path,
     should_show_stage_overview_preview,
     slideshow_transition_completion_allowed,
+    speedometer_layout,
     time_lapse_marker_style,
     time_lapse_overview_display_seconds,
     time_lapse_clock_layout,
@@ -210,6 +212,8 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             "track_date": "16.07.2026",
             "track_length_km": 21.45,
             "track_duration": "7:03",
+            "ascent_m": 451.2,
+            "descent_m": 1516.0,
             "track_endpoint_places": {
                 "start": {"place": "Zubiri"},
                 "end": {"place": "Pamplona"},
@@ -223,17 +227,23 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             track_header_lines(metadata),
             (
                 "Zubiri - Pamplona",
-                "16.07.2026 · 21.4 km - 07:03 h",
+                "16.07.2026 · 21.4 km - 07:03 h - ↑451 m - ↓1.5 km",
             ),
         )
         self.assertEqual(
             track_header_lines(metadata, omit_date=True),
-            ("Zubiri - Pamplona", "21.4 km - 07:03 h"),
+            ("Zubiri - Pamplona", "21.4 km - 07:03 h - ↑451 m - ↓1.5 km"),
         )
         self.assertEqual(
             track_display_title(metadata, "track_name"),
             "JW Internal Name",
         )
+
+    def test_elevation_change_switches_to_one_decimal_kilometres(self):
+        self.assertEqual(format_elevation_change(999.4, "↑"), "↑999 m")
+        self.assertEqual(format_elevation_change(1000.0, "↑"), "↑1.0 km")
+        self.assertEqual(format_elevation_change(2349.0, "↓"), "↓2.3 km")
+        self.assertIsNone(format_elevation_change(None, "↑"))
 
     def test_track_header_falls_back_to_track_name_without_endpoint_places(self):
         metadata = {
@@ -406,6 +416,35 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertEqual(calls, ["static"])
         self.assertIsNone(app.time_lapse_media_image)
         self.assertFalse(app.time_lapse_overview_preview_active)
+
+    def test_leaving_time_lapse_restores_standard_stage_map_before_media(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        entry = SimpleNamespace(source_name="photo.jpeg")
+        app.time_lapse_active = True
+        app.time_lapse_handle = None
+        app.current_phase = PlaybackPhase.MEDIA
+        app.current_stage_index = 3
+        app.time_lapse_stage = SimpleNamespace(map_index=17)
+        app.time_lapse_current_media = (21, entry)
+        app.time_lapse_stage_start_marker_latlon = (50.0, 7.0)
+        calls = []
+        app._clear_time_lapse_views = lambda: calls.append("clear")
+        app._prepare_standard_stage_assets = lambda stage_index: calls.append(
+            ("restore", stage_index)
+        )
+        app._handle_photo = lambda current_entry: calls.append(
+            ("photo", current_entry.source_name)
+        )
+        app._show_temporary_status_overlay = lambda *_args: None
+
+        app._toggle_time_lapse_mode()
+
+        self.assertEqual(
+            calls,
+            ["clear", ("restore", 3), ("photo", "photo.jpeg")],
+        )
+        self.assertFalse(app.time_lapse_active)
+        self.assertIsNone(app.time_lapse_stage)
 
     def test_media_only_stage_uses_first_known_photo_coordinate_on_overview(self):
         metadata = {
@@ -1378,6 +1417,24 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertLessEqual(frame[1] + frame[3], 760.0)
         self.assertLessEqual(frame[0] + frame[2], 1280.0)
         self.assertGreater(clock_size, 50.0)
+
+    def test_speedometer_dial_tracks_clock_size_on_small_and_large_screens(self):
+        metadata = {
+            "axes_box_fraction": {
+                "left": 0.001,
+                "bottom": 0.002,
+                "width": 0.998,
+                "height": 0.86,
+            }
+        }
+        for rect in ((0.0, 0.0, 1280.0, 720.0), (0.0, 0.0, 3840.0, 2160.0)):
+            _clock_frame, clock_size = time_lapse_clock_layout(rect, metadata, True)
+            gauge_frame, dial_size = speedometer_layout(rect, metadata, True)
+            self.assertAlmostEqual(dial_size, clock_size)
+            self.assertAlmostEqual(gauge_frame[2], dial_size)
+            self.assertAlmostEqual(gauge_frame[3], dial_size)
+            self.assertGreaterEqual(gauge_frame[1], 0.0)
+            self.assertLessEqual(gauge_frame[1] + gauge_frame[3], rect[3])
 
     def test_clock_date_uses_the_stage_header_title_font_size(self):
         metadata = {
