@@ -804,6 +804,117 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertEqual(ticks, ["tick"])
         self.assertTrue(app.manual_mode)
 
+    def test_time_lapse_arrow_indexes_move_one_media_in_each_direction(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        first = object()
+        second = object()
+        third = object()
+        app.time_lapse_media_queue = [
+            (0.2, 10, first),
+            (0.5, 20, second),
+            (0.8, 30, third),
+        ]
+        app.time_lapse_current_media = (20, second)
+        app.time_lapse_media_cursor = 2
+
+        self.assertEqual(app._time_lapse_adjacent_media_index(True), 2)
+        self.assertEqual(app._time_lapse_adjacent_media_index(False), 0)
+
+        app.time_lapse_current_media = None
+        self.assertEqual(app._time_lapse_adjacent_media_index(True), 2)
+        self.assertEqual(app._time_lapse_adjacent_media_index(False), 1)
+
+    def test_time_lapse_arrow_keys_select_adjacent_media_while_media_is_visible(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        first = object()
+        second = object()
+        app.config = SimpleNamespace(debug=False)
+        app.awaiting_intro_start = False
+        app.time_lapse_active = True
+        app.time_lapse_stage = SimpleNamespace(relation=None)
+        app.time_lapse_media_queue = [(0.25, 10, first), (0.75, 20, second)]
+        app.time_lapse_media_cursor = 1
+        app.time_lapse_current_media = (10, first)
+        app.time_lapse_control_row_cursor = -1
+        app.time_lapse_audio_row_cursor = -1
+        app.time_lapse_control_deferred = False
+        app.time_lapse_handle = None
+        app.time_lapse_navigation_generation = 0
+        app.active_callback = None
+        app.photo_presenter = None
+        app.map_presenter = None
+        app._cancel_control_pause = lambda continue_after=False: False
+        calls = []
+
+        def end_media(redraw=True):
+            calls.append(("end", redraw))
+            app.time_lapse_current_media = None
+
+        def start_media(row, entry, **_options):
+            calls.append(("start", row, entry))
+            app.time_lapse_current_media = (row, entry)
+            return True
+
+        app._end_time_lapse_media = end_media
+        app._start_time_lapse_media = start_media
+        app._continue_time_lapse_after_navigation = lambda: calls.append(("resume",))
+        app._finish_time_lapse_stage = lambda: calls.append(("finish",))
+
+        app._step_forward()
+        self.assertIn(("start", 20, second), calls)
+        self.assertNotIn(("finish",), calls)
+
+        calls.clear()
+        app._step_backward()
+        self.assertIn(("start", 10, first), calls)
+        self.assertEqual(app.time_lapse_media_cursor, 1)
+
+    def test_time_lapse_arrow_navigation_cancels_old_callbacks_and_sets_hold(self):
+        class Handle:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        active = Handle()
+        tick = Handle()
+        app.active_callback = active
+        app.time_lapse_handle = tick
+        app.time_lapse_navigation_generation = 4
+        app.photo_presenter = None
+        app.map_presenter = None
+
+        with patch("GPSTrackShow.time.monotonic", return_value=100.0):
+            app._begin_time_lapse_arrow_navigation()
+
+        self.assertTrue(active.cancelled)
+        self.assertTrue(tick.cancelled)
+        self.assertIsNone(app.active_callback)
+        self.assertIsNone(app.time_lapse_handle)
+        self.assertEqual(app.time_lapse_navigation_generation, 5)
+        self.assertEqual(app.time_lapse_navigation_hold_until, 101.0)
+
+    def test_time_lapse_tick_waits_for_navigation_hold_and_ignores_old_generation(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.time_lapse_navigation_generation = 7
+        app.time_lapse_navigation_hold_until = 101.0
+        app.running = True
+        app.time_lapse_active = True
+        app.paused = False
+        app.manual_mode = False
+        scheduled = []
+        app._schedule_time_lapse_tick = (
+            lambda delay, generation=None: scheduled.append((delay, generation))
+        )
+
+        with patch("GPSTrackShow.time.monotonic", return_value=100.0):
+            app._time_lapse_tick(6)
+            app._time_lapse_tick(7)
+
+        self.assertEqual(scheduled, [(1.0, 7)])
+
     def test_axes_metadata_excludes_header_from_map_placement(self):
         image_rect = (100.0, 50.0, 800.0, 400.0)
         metadata = {

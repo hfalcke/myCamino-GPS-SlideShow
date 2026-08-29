@@ -307,6 +307,7 @@ DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
 MEMORY_WATCHDOG_INTERVAL_SECONDS = 5.0
 HELP_OVERLAY_PERSISTENCE_SECONDS = 5.0
+TIME_LAPSE_NAVIGATION_HOLD_SECONDS = 1.0
 GIBIBYTE = 1024**3
 DEFAULT_DOT_COLOR_NAME = "red"
 DEFAULT_DOT_SIZE = 6
@@ -7995,6 +7996,8 @@ class GPSTrackShowApp:
         self.time_lapse_control_deferred = False
         self.time_lapse_handle = None
         self.time_lapse_last_tick = None
+        self.time_lapse_navigation_generation = 0
+        self.time_lapse_navigation_hold_until = 0.0
         self.time_lapse_current_media: Optional[tuple[int, PhotoListEntry]] = None
         self.time_lapse_media_image = None
         self.time_lapse_caption = None
@@ -9273,7 +9276,84 @@ class GPSTrackShowApp:
             )
             return
         self.time_lapse_last_tick = time.monotonic()
-        self._time_lapse_tick()
+        delay = max(
+            0.0,
+            float(getattr(self, "time_lapse_navigation_hold_until", 0.0))
+            - self.time_lapse_last_tick,
+        )
+        if delay > 0.0:
+            self._schedule_time_lapse_tick(delay)
+        else:
+            self._time_lapse_tick()
+
+    def _begin_time_lapse_arrow_navigation(self) -> None:
+        """Invalidate pending playback work and start a fresh navigation hold."""
+        self.time_lapse_navigation_generation = int(
+            getattr(self, "time_lapse_navigation_generation", 0)
+        ) + 1
+        self.time_lapse_navigation_hold_until = (
+            time.monotonic() + TIME_LAPSE_NAVIGATION_HOLD_SECONDS
+        )
+        if getattr(self, "active_callback", None) is not None:
+            self.active_callback.cancel()
+            self.active_callback = None
+        if getattr(self, "time_lapse_handle", None) is not None:
+            self.time_lapse_handle.cancel()
+            self.time_lapse_handle = None
+        for presenter in (
+            getattr(self, "photo_presenter", None),
+            getattr(self, "map_presenter", None),
+        ):
+            if presenter is not None and hasattr(presenter, "cancel_pending"):
+                presenter.cancel_pending()
+
+    def _time_lapse_adjacent_media_index(self, forward: bool) -> int:
+        """Return the neighboring media-queue index for one arrow-key step."""
+        cursor = int(getattr(self, "time_lapse_media_cursor", 0))
+        current_media = getattr(self, "time_lapse_current_media", None)
+        if current_media is not None:
+            current_row = current_media[0]
+            current_index = next(
+                (
+                    index
+                    for index, (_fraction, row_index, _entry) in enumerate(
+                        getattr(self, "time_lapse_media_queue", ())
+                    )
+                    if row_index == current_row
+                ),
+                max(-1, cursor - 1),
+            )
+            return current_index + (1 if forward else -1)
+        return cursor if forward else cursor - 1
+
+    def _navigate_to_time_lapse_media(self, queue_index: int) -> bool:
+        """Display one exact media event and retain the automatic playback mode."""
+        if not 0 <= queue_index < len(self.time_lapse_media_queue):
+            return False
+        if self.time_lapse_current_media is not None:
+            self._end_time_lapse_media(redraw=False)
+        fraction, row_index, entry = self.time_lapse_media_queue[queue_index]
+        self.time_lapse_overview_preview_active = False
+        self.time_lapse_overview_inset_active = False
+        self.time_lapse_stage_map_preview_active = False
+        if row_index < int(getattr(self, "time_lapse_control_row_cursor", -1)):
+            self._reconstruct_control_state_before(row_index)
+            self.time_lapse_control_row_cursor = row_index - 1
+        if row_index < int(getattr(self, "time_lapse_audio_row_cursor", -1)):
+            self._sync_audio_row(row_index - 1)
+            self.time_lapse_audio_row_cursor = row_index - 1
+        self.time_lapse_progress = min(1.0, fraction)
+        self.time_lapse_media_cursor = queue_index + 1
+        if not self._start_time_lapse_media(
+            row_index,
+            entry,
+            navigation_generation=int(
+                getattr(self, "time_lapse_navigation_generation", 0)
+            ),
+        ):
+            return bool(self.time_lapse_control_deferred)
+        self._continue_time_lapse_after_navigation()
+        return True
 
     def _prepare_standard_stage_assets(self, stage_index: int) -> bool:
         """Load one stage's map context without displaying intermediate rows."""
@@ -9448,39 +9528,15 @@ class GPSTrackShowApp:
             self._begin_intro_playback()
             return
         if self.time_lapse_active and self.time_lapse_stage is not None:
-            if getattr(self, "time_lapse_stage_map_preview_active", False):
-                if self.active_callback is not None:
-                    self.active_callback.cancel()
-                    self.active_callback = None
-                self._continue_after_time_lapse_stage_map()
-                return
-            if self.time_lapse_overview_preview_active:
-                if self.active_callback is not None:
-                    self.active_callback.cancel()
-                    self.active_callback = None
-                self._continue_after_time_lapse_overview()
+            self._begin_time_lapse_arrow_navigation()
+            target_media_index = self._time_lapse_adjacent_media_index(True)
+            if self._navigate_to_time_lapse_media(target_media_index):
                 return
             if self.time_lapse_stage.relation is not None:
-                if self.time_lapse_handle is not None:
-                    self.time_lapse_handle.cancel()
-                    self.time_lapse_handle = None
                 self._advance_special_time_lapse()
                 return
-            if self.time_lapse_handle is not None:
-                self.time_lapse_handle.cancel()
-                self.time_lapse_handle = None
             if self.time_lapse_current_media is not None:
                 self._end_time_lapse_media()
-                self._continue_time_lapse_after_navigation()
-                return
-            if self.time_lapse_media_cursor < len(self.time_lapse_media_queue):
-                fraction, row_index, entry = self.time_lapse_media_queue[self.time_lapse_media_cursor]
-                self.time_lapse_media_cursor += 1
-                self.time_lapse_progress = min(1.0, fraction)
-                if not self._start_time_lapse_media(row_index, entry) and self.time_lapse_control_deferred:
-                    return
-                self._continue_time_lapse_after_navigation()
-                return
             self.time_lapse_progress = 1.0
             self._finish_time_lapse_stage()
             return
@@ -9555,9 +9611,10 @@ class GPSTrackShowApp:
         debug_print(self.config, "Backward navigation requested")
         self._cancel_control_pause(continue_after=False)
         if self.time_lapse_active and self.time_lapse_stage is not None:
-            if self.time_lapse_handle is not None:
-                self.time_lapse_handle.cancel()
-                self.time_lapse_handle = None
+            self._begin_time_lapse_arrow_navigation()
+            target_media_index = self._time_lapse_adjacent_media_index(False)
+            if self._navigate_to_time_lapse_media(target_media_index):
+                return
             if getattr(self, "time_lapse_stage_map_preview_active", False):
                 if should_show_stage_overview_preview(
                     self.map_presenter is not None,
@@ -9585,20 +9642,6 @@ class GPSTrackShowApp:
                 self.time_lapse_overview_inset_active = False
                 self.time_lapse_media_image = None
                 self._show_previous_time_lapse_stage_or_intro()
-                return
-            target_media_index = (
-                self.time_lapse_media_cursor - 2
-                if self.time_lapse_current_media is not None
-                else self.time_lapse_media_cursor - 1
-            )
-            if target_media_index >= 0:
-                self._end_time_lapse_media(redraw=False)
-                fraction, row_index, entry = self.time_lapse_media_queue[target_media_index]
-                self.time_lapse_progress = min(1.0, fraction)
-                self.time_lapse_media_cursor = target_media_index + 1
-                if not self._start_time_lapse_media(row_index, entry) and self.time_lapse_control_deferred:
-                    return
-                self._continue_time_lapse_after_navigation()
                 return
             if self.time_lapse_stage.relation in {None, ""}:
                 self._show_time_lapse_phase_before_motion()
@@ -11141,7 +11184,7 @@ class GPSTrackShowApp:
     def _cancel_time_lapse_stage(self):
         """Cancel all callbacks and transient state owned by the active stage."""
         self.first_overview_waiting_for_fullscreen_role = None
-        if self.time_lapse_handle is not None:
+        if getattr(self, "time_lapse_handle", None) is not None:
             self.time_lapse_handle.cancel()
             self.time_lapse_handle = None
         self.time_lapse_overview_preview_active = False
@@ -11507,9 +11550,20 @@ class GPSTrackShowApp:
     def _schedule_special_time_lapse_advance(self, delay: float) -> None:
         if self.time_lapse_handle is not None:
             self.time_lapse_handle.cancel()
+        generation = int(getattr(self, "time_lapse_navigation_generation", 0))
+        hold_remaining = max(
+            0.0,
+            float(getattr(self, "time_lapse_navigation_hold_until", 0.0))
+            - time.monotonic(),
+        )
         self.time_lapse_handle = self.schedule_callback(
-            max(0.0, delay),
-            self._advance_special_time_lapse,
+            max(0.0, delay, hold_remaining),
+            lambda expected=generation: (
+                self._advance_special_time_lapse()
+                if expected
+                == int(getattr(self, "time_lapse_navigation_generation", 0))
+                else None
+            ),
         )
 
     def _advance_special_time_lapse(self) -> None:
@@ -11558,10 +11612,46 @@ class GPSTrackShowApp:
         if not self.paused and not self.manual_mode:
             self._time_lapse_tick()
 
-    def _time_lapse_tick(self):
+    def _schedule_time_lapse_tick(
+        self,
+        delay: float,
+        generation: Optional[int] = None,
+    ) -> None:
+        """Schedule one tick that becomes harmless after later navigation."""
+        if self.time_lapse_handle is not None:
+            self.time_lapse_handle.cancel()
+        expected_generation = (
+            int(getattr(self, "time_lapse_navigation_generation", 0))
+            if generation is None
+            else int(generation)
+        )
+        self.time_lapse_handle = self.schedule_callback(
+            max(0.0, float(delay)),
+            lambda expected=expected_generation: self._time_lapse_tick(expected),
+        )
+
+    def _time_lapse_tick(self, navigation_generation: Optional[int] = None):
+        current_generation = int(
+            getattr(self, "time_lapse_navigation_generation", 0)
+        )
+        if (
+            navigation_generation is not None
+            and int(navigation_generation) != current_generation
+        ):
+            return
+        self.time_lapse_handle = None
         if not self.running or not self.time_lapse_active or self.paused or self.manual_mode:
             return
         now = time.monotonic()
+        hold_remaining = (
+            float(getattr(self, "time_lapse_navigation_hold_until", 0.0)) - now
+        )
+        if hold_remaining > 0.0:
+            self._schedule_time_lapse_tick(
+                hold_remaining,
+                generation=current_generation,
+            )
+            return
         elapsed = max(0.0, now - (self.time_lapse_last_tick or now))
         self.time_lapse_last_tick = now
         next_fraction = None
@@ -11599,7 +11689,7 @@ class GPSTrackShowApp:
                 self._end_time_lapse_media(redraw=False)
             self._finish_time_lapse_stage()
             return
-        self.time_lapse_handle = self.schedule_callback(0.020, self._time_lapse_tick)
+        self._schedule_time_lapse_tick(0.020, generation=current_generation)
 
     def _start_time_lapse_media(
         self,
@@ -11607,15 +11697,29 @@ class GPSTrackShowApp:
         entry: PhotoListEntry,
         *,
         controls_synced: bool = False,
+        navigation_generation: Optional[int] = None,
     ) -> bool:
+        if (
+            navigation_generation is not None
+            and int(navigation_generation)
+            != int(getattr(self, "time_lapse_navigation_generation", 0))
+        ):
+            return False
         if not controls_synced:
             state = {"asynchronous": False, "result": False}
 
             def continue_start() -> None:
+                if (
+                    navigation_generation is not None
+                    and int(navigation_generation)
+                    != int(getattr(self, "time_lapse_navigation_generation", 0))
+                ):
+                    return
                 state["result"] = self._start_time_lapse_media(
                     row_index,
                     entry,
                     controls_synced=True,
+                    navigation_generation=navigation_generation,
                 )
                 if not state["asynchronous"] or not state["result"]:
                     return
@@ -11628,10 +11732,7 @@ class GPSTrackShowApp:
                             self.time_lapse_media_remaining or self.config.duration
                         )
                 elif not self.manual_mode and not self.paused:
-                    self.time_lapse_handle = self.schedule_callback(
-                        0.020,
-                        self._time_lapse_tick,
-                    )
+                    self._schedule_time_lapse_tick(0.020)
 
             deferred = self._sync_time_lapse_controls_through(
                 row_index,

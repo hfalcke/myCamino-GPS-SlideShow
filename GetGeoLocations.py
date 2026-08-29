@@ -594,10 +594,18 @@ def index_media_file_identities(
         if status != "available" or not isinstance(payload, dict):
             if status == "missing":
                 report.missing += 1
+                message = (
+                    f"No metadata sidecar yet for {media_path.name}; "
+                    "metadata will be extracted in the next phase."
+                )
             else:
                 report.invalid += 1
+                message = (
+                    f"Invalid metadata sidecar for {media_path.name} "
+                    f"({reason or status}); it will be repaired in the next phase."
+                )
             if detail_callback is not None:
-                detail_callback(f"Skipping {media_path.name}: {reason or status}.")
+                detail_callback(message)
         elif valid_media_file_identity(payload.get("source_file_identity")):
             report.already_indexed += 1
         else:
@@ -4947,6 +4955,36 @@ def _control_track_map_file_exists(project_dir: Path, filename: str) -> bool:
     )
 
 
+def _control_map_reference_targets_project(project_dir: Path, reference: str) -> bool:
+    """Return whether a control reference resolves to this project's map asset."""
+    text = str(reference or "").strip()
+    if not text:
+        return False
+    reference_path = Path(text).expanduser()
+    name = reference_path.name
+    names = (
+        track_map_variant_names(name, prefer_time_lapse=False)
+        if re.match(r"^\d+_", name)
+        else [name]
+    )
+    project_candidates = {
+        candidate.resolve(strict=False)
+        for candidate_name in names
+        for candidate in (
+            project_dir / candidate_name,
+            project_dir / "trackimages" / candidate_name,
+        )
+        if candidate.is_file()
+    }
+    if not project_candidates:
+        return False
+    if reference_path.is_absolute():
+        return reference_path.resolve(strict=False) in project_candidates
+    if reference_path.parent == Path("."):
+        return True
+    return (project_dir / reference_path).resolve(strict=False) in project_candidates
+
+
 def _canonical_control_track_map_name(filename: str) -> str:
     canonical = canonical_track_map_name(Path(str(filename)).name)
     return normalize_track_plot_filename_for_match(canonical)
@@ -4990,17 +5028,18 @@ def analyze_track_map_reference_updates(
             control_path.read_text(encoding="utf-8").splitlines()
         )
 
-    existing_names = {
-        normalize_filename_for_match(str(entry.get("name", "")))
-        for entry in control_entries if entry.get("name")
-    }
     existing_map_keys = {
         (
             _canonical_control_track_map_name(str(entry.get("name", ""))),
             entry.get("date"),
         )
         for entry in control_entries
-        if entry.get("type") == "map" and entry.get("name")
+        if entry.get("type") == "map"
+        and entry.get("name")
+        and _control_map_reference_targets_project(
+            project,
+            str(entry.get("name", "")),
+        )
     }
     expected_map_names = {
         _canonical_control_track_map_name(Path(track.track_plot_image_filename).name)
@@ -5021,8 +5060,17 @@ def analyze_track_map_reference_updates(
     if tracks_summary.overview_image:
         overview_filename = Path(tracks_summary.overview_image).name
         overview_name = normalize_filename_for_match(overview_filename)
+        current_overview_exists = any(
+            entry.get("type") == "overview"
+            and normalize_filename_for_match(str(entry.get("name", ""))) == overview_name
+            and _control_map_reference_targets_project(
+                project,
+                str(entry.get("name", "")),
+            )
+            for entry in control_entries
+        )
         if (
-            overview_name not in existing_names
+            not current_overview_exists
             and _control_track_map_file_exists(project, overview_filename)
         ):
             plan.missing_overview.append(overview_filename)
@@ -5049,7 +5097,7 @@ def analyze_track_map_reference_updates(
         if entry_type == "overview":
             if (
                 normalize_filename_for_match(name) != expected_overview
-                or not _control_track_map_file_exists(project, name)
+                or not _control_map_reference_targets_project(project, name)
             ):
                 plan.obsolete_overview.append(name)
         elif entry_type == "map":
@@ -5057,7 +5105,7 @@ def analyze_track_map_reference_updates(
             if (
                 normalized_map not in expected_map_names
                 or entry.get("date") not in expected_map_dates.get(normalized_map, set())
-                or not _control_track_map_file_exists(project, name)
+                or not _control_map_reference_targets_project(project, name)
             ):
                 plan.obsolete_tracks.append(name)
         elif entry_type in {"map_before", "map_after"}:
@@ -5094,7 +5142,7 @@ def analyze_track_map_reference_updates(
             if (
                 replacement
                 and normalized == _canonical_control_track_map_name(replacement)
-                and _control_track_map_file_exists(project, name)
+                and _control_map_reference_targets_project(project, name)
             ):
                 continue
             if replacement and _control_track_map_file_exists(project, replacement):
@@ -5714,6 +5762,7 @@ def commit_media_update_plan(
     geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
     media_map_options: Optional[dict[str, Any]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    detail_callback: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     _track_map_plan: Optional[TrackMapReferenceUpdatePlan] = None,
     _control_update_result: Optional[ControlFileUpdateResult] = None,
@@ -5972,6 +6021,20 @@ def commit_media_update_plan(
     finally:
         if map_temp_dir is not None:
             map_temp_dir.cleanup()
+    if detail_callback is not None:
+        for item in selected_items:
+            if item.sidecar_write_required and (
+                item.update_metadata or item.add_to_control
+            ):
+                detail_callback(f"Saved metadata sidecar for {item.media_path.name}.")
+            else:
+                detail_callback(f"Kept current metadata sidecar for {item.media_path.name}.")
+        if result.media_maps_regenerated:
+            detail_callback(
+                f"Saved {result.media_maps_regenerated} updated media-location map(s)."
+            )
+        if staged_control_text is not None and plan.control_file is not None:
+            detail_callback(f"Saved updated control file {plan.control_file.name}.")
     if progress_callback is not None:
         progress_callback(total, total, "")
     return result

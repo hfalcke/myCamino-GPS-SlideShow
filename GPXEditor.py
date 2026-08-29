@@ -3601,8 +3601,10 @@ class TrackInspectorController(NSObject):
             raw = original_raw.get(point.source_index)
             if raw is not None and raw.element is not None:
                 quality_by_element[raw.element] = (point.horizontal_status, point.elevation_status)
-                if point.running_speed_kmh is not None:
-                    running_speed_by_element[raw.element] = f"{point.running_speed_kmh:.1f}"
+        for source_index, speed in processed.running_speeds_by_source_index().items():
+            raw = original_raw.get(source_index)
+            if raw is not None and raw.element is not None:
+                running_speed_by_element[raw.element] = f"{speed:.1f}"
         extra = []
         row_fields = []
         row_refs = []

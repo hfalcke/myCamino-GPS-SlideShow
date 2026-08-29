@@ -340,6 +340,114 @@ class SharedGpxProcessingTests(unittest.TestCase):
                 if actual_value is not None:
                     self.assertAlmostEqual(actual_value, expected_value, places=9)
 
+    def test_running_speed_lookup_interpolates_smoothing_only_points_by_distance(self):
+        raw = [
+            RawTrackPoint(0, 0, 0, 42.5103887944, -5.4266003951),
+            RawTrackPoint(1, 0, 1, 42.5104641477, -5.4266667797),
+            RawTrackPoint(2, 0, 2, 42.5105494336, -5.4267212621),
+        ]
+        processed = process_raw_points(
+            raw,
+            ProcessingOptions(
+                horizontal_smoothing_distance_m=0,
+                minimum_point_spacing_m=10,
+                elevation_smoothing_distance_m=0,
+                maximum_horizontal_accuracy_m=0,
+                maximum_vertical_accuracy_m=0,
+                maximum_hdop=0,
+                maximum_vdop=0,
+            ),
+        )
+        self.assertEqual(processed.raw_points[1].horizontal_status, "smoothing only")
+        processed.points[0].running_speed_kmh = 4.842
+        processed.points[1].running_speed_kmh = 4.865
+
+        speeds = processed.running_speeds_by_source_index()
+        distances = processed.source_distances_km()
+        fraction = (
+            (distances[1] - distances[0])
+            / (distances[2] - distances[0])
+        )
+        expected = 4.842 + fraction * (4.865 - 4.842)
+
+        self.assertAlmostEqual(speeds[0], 4.842)
+        self.assertAlmostEqual(speeds[1], expected)
+        self.assertAlmostEqual(speeds[2], 4.865)
+        self.assertEqual(f"{speeds[1]:.1f}", "4.9")
+
+    def test_running_speed_lookup_does_not_fill_quality_rejections(self):
+        raw = [
+            RawTrackPoint(0, 0, 0, 50.0, 7.0000),
+            RawTrackPoint(1, 0, 1, 50.0, 7.0001),
+            RawTrackPoint(2, 0, 2, 50.0, 7.0002, hdop=50),
+            RawTrackPoint(3, 0, 3, 50.0, 7.0003),
+        ]
+        processed = process_raw_points(
+            raw,
+            ProcessingOptions(0, 100, 0, 0, 0, 20, 0),
+        )
+        processed.points[0].running_speed_kmh = 4.0
+        processed.points[-1].running_speed_kmh = 6.0
+
+        speeds = processed.running_speeds_by_source_index()
+
+        self.assertIn(1, speeds)
+        self.assertEqual(processed.raw_points[2].horizontal_status, "HDOP")
+        self.assertNotIn(2, speeds)
+
+    def test_running_speed_lookup_never_extrapolates_from_one_anchor(self):
+        raw = [
+            RawTrackPoint(index, 0, index, 50.0, 7.0 + index * 0.00008)
+            for index in range(5)
+        ]
+        processed = process_raw_points(raw, ProcessingOptions(0, 10, 0, 0, 0, 0, 0))
+        for point in processed.points:
+            point.running_speed_kmh = None
+        processed.points[1].running_speed_kmh = 4.0
+        processed.points[2].running_speed_kmh = 5.0
+
+        speeds = processed.running_speeds_by_source_index()
+
+        self.assertNotIn(1, speeds)
+        self.assertIn(3, speeds)
+
+    def test_running_speed_lookup_does_not_cross_segments(self):
+        raw = []
+        for segment_index, latitude in enumerate((50.0, 51.0)):
+            for point_index in range(3):
+                raw.append(
+                    RawTrackPoint(
+                        len(raw),
+                        segment_index,
+                        point_index,
+                        latitude,
+                        7.0 + point_index * 0.00008,
+                    )
+                )
+        processed = process_raw_points(raw, ProcessingOptions(0, 10, 0, 0, 0, 0, 0))
+        for point in processed.points:
+            point.running_speed_kmh = None
+        processed.segments[0].points[-1].running_speed_kmh = 4.0
+        processed.segments[1].points[0].running_speed_kmh = 5.0
+
+        speeds = processed.running_speeds_by_source_index()
+
+        self.assertNotIn(1, speeds)
+        self.assertNotIn(4, speeds)
+
+    def test_running_speed_lookup_adds_nothing_when_spacing_is_disabled(self):
+        raw = [
+            RawTrackPoint(index, 0, index, 50.0, 7.0 + index * 0.00008)
+            for index in range(4)
+        ]
+        processed = process_raw_points(raw, ProcessingOptions(0, 0, 0, 0, 0, 0, 0))
+        for index, point in enumerate(processed.points):
+            point.running_speed_kmh = 4.0 + index
+
+        speeds = processed.running_speeds_by_source_index()
+
+        self.assertEqual(speeds, {0: 4.0, 1: 5.0, 2: 6.0, 3: 7.0})
+
     def test_gpx_10_route_is_converted_to_canonical_track(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "route.gpx"

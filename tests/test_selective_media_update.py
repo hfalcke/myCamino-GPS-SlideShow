@@ -414,6 +414,39 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         payload = json.loads(media_sidecar_path(media).read_text(encoding="utf-8"))
         self.assertEqual(payload["source_file_identity"]["algorithm"], "sha256")
 
+    def test_identity_indexing_explains_missing_sidecar_is_prepared_next(self):
+        media = self._media("new.jpeg")
+        details = []
+
+        report = geo.index_media_file_identities(
+            self.project,
+            detail_callback=details.append,
+        )
+
+        self.assertEqual(report.missing, 1)
+        self.assertEqual(
+            details,
+            [
+                "No metadata sidecar yet for new.jpeg; "
+                "metadata will be extracted in the next phase."
+            ],
+        )
+
+    def test_identity_indexing_explains_invalid_sidecar_is_repaired_next(self):
+        media = self._media("broken.jpeg")
+        media_sidecar_path(media).write_text("{broken", encoding="utf-8")
+        details = []
+
+        report = geo.index_media_file_identities(
+            self.project,
+            detail_callback=details.append,
+        )
+
+        self.assertEqual(report.invalid, 1)
+        self.assertEqual(len(details), 1)
+        self.assertTrue(details[0].startswith("Invalid metadata sidecar for broken.jpeg"))
+        self.assertTrue(details[0].endswith("it will be repaired in the next phase."))
+
     def test_copied_legacy_sidecar_is_indexed_only_when_source_content_matches(self):
         source_dir = self.project / "original"
         source_dir.mkdir()
@@ -525,6 +558,35 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         self.assertIn("Extracted details.jpeg:", details[0])
         self.assertIn("2024-07-15 12:34:56", details[0])
         self.assertIn("GPS 50.123457, 8.765432", details[0])
+
+    def test_control_update_commit_accepts_and_reports_detail_callback(self):
+        media = self._media("new.jpeg")
+        record = self._record(
+            media,
+            datetime(2024, 7, 15, 12, 34, 56).astimezone(),
+            latitude=50.1234567,
+            longitude=8.7654321,
+        )
+        with patch.object(geo, "build_record_from_photo", return_value=record):
+            plan = geo.analyze_control_file_updates(
+                self.project,
+                [media],
+                control_file=None,
+                tracks_summary_path=None,
+                actions={media.name: "repair"},
+                media_only=True,
+            )
+        details = []
+
+        result = geo.commit_control_file_update_plan(
+            plan,
+            update_place_names=False,
+            detail_callback=details.append,
+        )
+
+        self.assertEqual(result.media.refreshed_sidecars, 1)
+        self.assertTrue(media_sidecar_path(media).is_file())
+        self.assertEqual(details, ["Saved metadata sidecar for new.jpeg."])
 
     def test_import_discovery_checks_only_imported_files(self):
         imported = self._media("imported.jpeg")
@@ -690,6 +752,63 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         )
         self.assertEqual(plan.track_maps.change_count, 0)
         self.assertIsNone(plan.track_maps.warning)
+
+    def test_copied_project_replaces_absolute_map_references_to_old_project(self):
+        summary = self._track_summary()
+        with tempfile.TemporaryDirectory() as old_directory:
+            old_trackimages = Path(old_directory) / "trackimages"
+            old_trackimages.mkdir()
+            old_overview = old_trackimages / "Trip.png"
+            old_stage = old_trackimages / "0001_Current_stage.png"
+            old_overview.write_bytes(b"old overview")
+            old_stage.write_bytes(b"old stage")
+            self.control.write_text(
+                f"#Overviewmap: {old_overview}\n"
+                "#Datum: Montag, 15.07.2024\n"
+                f"#Map: {old_stage}\n",
+                encoding="utf-8",
+            )
+
+            plan = geo.analyze_control_file_updates(
+                self.project,
+                [],
+                control_file=self.control,
+                tracks_summary_path=summary,
+            )
+
+            self.assertEqual(plan.track_maps.missing_overview, ["Trip.png"])
+            self.assertEqual(
+                plan.track_maps.missing_tracks,
+                ["0001_Current_stage.png"],
+            )
+            self.assertEqual(plan.track_maps.obsolete_overview, [str(old_overview)])
+            self.assertEqual(plan.track_maps.obsolete_tracks, [str(old_stage)])
+            geo.commit_control_file_update_plan(plan, update_place_names=False)
+
+        text = self.control.read_text(encoding="utf-8")
+        self.assertIn("#Overviewmap: Trip.png", text)
+        self.assertIn("#Map: 0001_Current_stage.png", text)
+        self.assertNotIn(str(old_directory), text)
+
+    def test_absolute_references_inside_current_project_remain_valid(self):
+        summary = self._track_summary()
+        overview = self.project / "trackimages" / "Trip.png"
+        stage = self.project / "trackimages" / "0001_Current_stage.png"
+        self.control.write_text(
+            f"#Overviewmap: {overview}\n"
+            "#Datum: Montag, 15.07.2024\n"
+            f"#Map: {stage}\n",
+            encoding="utf-8",
+        )
+
+        plan = geo.analyze_control_file_updates(
+            self.project,
+            [],
+            control_file=self.control,
+            tracks_summary_path=summary,
+        )
+
+        self.assertEqual(plan.track_maps.change_count, 0)
 
     def test_date_shifted_track_map_is_moved_even_when_filename_is_unchanged(self):
         summary = self._track_summary()

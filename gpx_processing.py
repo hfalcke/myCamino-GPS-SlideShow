@@ -207,6 +207,10 @@ class ProcessedTrack:
                 continue
             anchors = {point.source_index: point.segment_distance_km for point in retained}
             anchor_indexes = sorted(anchors)
+            raw_positions = {
+                point.source_index: position for position, point in enumerate(raw)
+            }
+            raw_cumulative = _cumulative_distances(raw)
             for point in raw:
                 source_index = point.source_index
                 if source_index in anchors:
@@ -219,13 +223,72 @@ class ProcessedTrack:
                     right_position = bisect_right(anchor_indexes, source_index)
                     left_index = anchor_indexes[right_position - 1]
                     right_index = anchor_indexes[right_position]
-                    fraction = _raw_distance_fraction(raw, left_index, source_index, right_index)
+                    left_position = raw_positions[left_index]
+                    point_position = raw_positions[source_index]
+                    right_position = raw_positions[right_index]
+                    span = raw_cumulative[right_position] - raw_cumulative[left_position]
+                    fraction = (
+                        (point_position - left_position) / max(right_position - left_position, 1)
+                        if span <= 0.0
+                        else (
+                            raw_cumulative[point_position] - raw_cumulative[left_position]
+                        )
+                        / span
+                    )
                     segment_distance = anchors[left_index] + (
                         anchors[right_index] - anchors[left_index]
                     ) * fraction
                 distances[source_index] = cumulative_start + segment_distance
             cumulative_start += segment.length_km
         return distances
+
+    def running_speeds_by_source_index(self) -> dict[int, float]:
+        """Map retained and interpolable raw points to running speed."""
+        speeds = {
+            point.source_index: point.running_speed_kmh
+            for point in self.points
+            if point.running_speed_kmh is not None
+        }
+        source_distances = self.source_distances_km()
+        for segment in self.segments:
+            anchors = [
+                point
+                for point in segment.points
+                if point.running_speed_kmh is not None
+            ]
+            if len(anchors) < 2:
+                continue
+            anchor_indexes = [point.source_index for point in anchors]
+            for raw in segment.raw_points:
+                if raw.horizontal_status != "smoothing only":
+                    continue
+                right_position = bisect_right(anchor_indexes, raw.source_index)
+                if right_position == 0 or right_position >= len(anchors):
+                    continue
+                left = anchors[right_position - 1]
+                right = anchors[right_position]
+                left_distance = source_distances.get(left.source_index)
+                point_distance = source_distances.get(raw.source_index)
+                right_distance = source_distances.get(right.source_index)
+                if (
+                    left_distance is None
+                    or point_distance is None
+                    or right_distance is None
+                    or right_distance <= left_distance
+                ):
+                    continue
+                fraction = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (point_distance - left_distance)
+                        / (right_distance - left_distance),
+                    ),
+                )
+                speeds[raw.source_index] = left.running_speed_kmh + fraction * (
+                    right.running_speed_kmh - left.running_speed_kmh
+                )
+        return speeds
 
 
 def local_tag_name(tag: str) -> str:
@@ -364,25 +427,6 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         + math.cos(first_lat) * math.cos(second_lat) * math.sin(delta_lon / 2.0) ** 2
     )
     return EARTH_RADIUS_KM * 2.0 * math.asin(min(1.0, math.sqrt(value)))
-
-
-def _raw_distance_fraction(
-    raw_points: list[RawTrackPoint],
-    left_source_index: int,
-    source_index: int,
-    right_source_index: int,
-) -> float:
-    positions = {point.source_index: index for index, point in enumerate(raw_points)}
-    left = positions[left_source_index]
-    current = positions[source_index]
-    right = positions[right_source_index]
-    distances = [0.0]
-    for previous, point in zip(raw_points[left:right], raw_points[left + 1 : right + 1]):
-        distances.append(distances[-1] + haversine_km(previous.lat, previous.lon, point.lat, point.lon))
-    total = distances[-1]
-    if total <= 0.0:
-        return (current - left) / max(right - left, 1)
-    return distances[current - left] / total
 
 
 def extract_raw_track_points(track_element: ET.Element) -> list[RawTrackPoint]:
