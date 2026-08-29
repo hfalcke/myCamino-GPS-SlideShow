@@ -47,12 +47,15 @@ from track_map_layout_utils import (
 )
 from elevation_profile_cache import (
     ELEVATION_PROFILE_HEIGHT,
+    ELEVATION_PROFILE_PLOT_RECT,
     ELEVATION_PROFILE_WIDTH,
     elevation_profile_cache_is_current,
     elevation_profile_cache_paths,
     elevation_profile_manifest,
+    elevation_profile_marker_point,
     elevation_profile_ranges,
     elevation_profile_segments,
+    elevation_profile_state_at_distance,
 )
 from map_overlay import map_uses_dynamic_overlays, placement_obstacle_points, scene_from_metadata
 from audio_playlist import (
@@ -300,6 +303,7 @@ TRANSITION_STEPS = 14
 WIPE_TRANSITION_MS = 1000
 WIPE_TRANSITION_STEPS = 100
 FIRST_STAGE_OVERVIEW_STARTUP_GRACE_SECONDS = 1.0
+FULLSCREEN_PLAYBACK_START_TIMEOUT_SECONDS = 3.0
 INTRO_AUTO_ADVANCE_SECONDS = 30.0
 SLIDESHOW_CHECKPOINT_VERSION = 5
 MUSIC_RESUME_STATE_VERSION = 1
@@ -611,6 +615,11 @@ class WindowTarget:
     header_metadata: Optional[dict] = None
     caption: Optional[CaptionDirective] = None
     caption_font: Optional[CaptionFontState] = None
+    map_metadata: Optional[dict] = None
+    elevation_profile_image: object = None
+    elevation_profile_metadata: Optional[dict] = None
+    profile_pilgrim_marker: Optional[tuple[float, float]] = None
+    profile_media_marker: Optional[tuple[float, float]] = None
 
 
 @dataclass
@@ -990,8 +999,8 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument("--no-fullscreen", action="store_false", dest="fullscreen", default=None, help="Start in windowed mode.")
     parser.add_argument("--switch-display", "-s", action="store_true", dest="window_swap", help="Switch photo/map display assignment at startup.")
     parser.add_argument("--clock", "-c", choices=["on", "off"], default="on", help="Include the analog clock in the header when time is known.")
-    parser.add_argument("--elevation-profile", action="store_true", default=True, help="Show a cached elevation profile at the beginning of each GPX stage (default).")
-    parser.add_argument("--no-elevation-profile", action="store_false", dest="elevation_profile", help="Do not show elevation profiles at stage starts.")
+    parser.add_argument("--elevation-profile", action="store_true", default=True, help="Show cached elevation profiles for GPX stages (default); separate map windows retain them throughout each stage.")
+    parser.add_argument("--no-elevation-profile", action="store_false", dest="elevation_profile", help="Do not show elevation profiles.")
     parser.add_argument(
         "--collage-size-range",
         default="33-66",
@@ -1959,6 +1968,21 @@ def runtime_header_text_shadow_color(
     )
 
 
+def runtime_header_metrics_font_size(
+    base_font_size: float,
+    display_scale: float,
+    usable_height: float,
+) -> float:
+    """Return the larger, three-row font used by the right statistics block."""
+    return max(
+        8.0,
+        min(
+            float(base_font_size) * 0.82 * float(display_scale),
+            float(usable_height) / 3.15,
+        ),
+    )
+
+
 def draw_runtime_header(
     image_rect: tuple[float, float, float, float],
     metadata: Optional[dict],
@@ -2021,7 +2045,11 @@ def draw_runtime_header(
             )
 
     if metrics_lines:
-        font_size = max(8.0, min(float(base_font_size) * 0.62 * display_scale, usable_height / 3.35))
+        font_size = runtime_header_metrics_font_size(
+            base_font_size,
+            display_scale,
+            usable_height,
+        )
         font = caption_font(CaptionFontState(font_size, font_style, font_family))
         line_height = max(font_size + 1.0, usable_height / 3.0)
         right_x = header_x + header_width - max(5.0, header_width * 0.012)
@@ -2729,6 +2757,176 @@ if APPKIT_AVAILABLE:
             )
 
 
+    class ElevationProfileOverlayView(NSView):
+        """Retained route-free profile inset with lightweight position markers."""
+
+        def initWithFrame_(self, frame):
+            self = objc.super(ElevationProfileOverlayView, self).initWithFrame_(frame)
+            if self is None:
+                return None
+            self.map_image = None
+            self.map_metadata = None
+            self.profile_image = None
+            self.profile_metadata = None
+            self.pilgrim_marker = None
+            self.media_marker = None
+            self.header_background_style = "off"
+            self.header_visible = False
+            self.profile_layout_key = None
+            self.profile_layout_rect = None
+            self.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            self.setHidden_(True)
+            return self
+
+        def isOpaque(self):
+            return False
+
+        @objc.python_method
+        def configure(
+            self,
+            map_image,
+            map_metadata,
+            profile_image,
+            profile_metadata,
+            pilgrim_marker=None,
+            media_marker=None,
+            *,
+            header_background_style="off",
+            header_visible=False,
+        ) -> None:
+            layout_changed = (
+                map_image is not self.map_image
+                or map_metadata is not self.map_metadata
+                or profile_image is not self.profile_image
+                or str(header_background_style or "off") != self.header_background_style
+                or bool(header_visible) != self.header_visible
+            )
+            self.map_image = map_image
+            self.map_metadata = map_metadata
+            self.profile_image = profile_image
+            self.profile_metadata = profile_metadata
+            self.pilgrim_marker = pilgrim_marker
+            self.media_marker = media_marker
+            self.header_background_style = str(header_background_style or "off")
+            self.header_visible = bool(header_visible)
+            if layout_changed:
+                self.profile_layout_key = None
+                self.profile_layout_rect = None
+            visible = map_image is not None and profile_image is not None and profile_metadata is not None
+            self.setHidden_(not visible)
+            if visible:
+                self.setNeedsDisplay_(True)
+
+        @objc.python_method
+        def clear(self) -> None:
+            self.configure(None, None, None, None)
+
+        def _marker_view_point(self, marker, profile_rect):
+            if marker is None or self.profile_image is None:
+                return None
+            try:
+                distance, elevation = marker
+            except (TypeError, ValueError):
+                return None
+            point = elevation_profile_marker_point(
+                self.profile_metadata,
+                distance,
+                elevation,
+            )
+            if point is None:
+                return None
+            profile_width, profile_height = image_size_tuple(self.profile_image)
+            return (
+                profile_rect[0] + point[0] / max(1.0, profile_width) * profile_rect[2],
+                profile_rect[1] + point[1] / max(1.0, profile_height) * profile_rect[3],
+            )
+
+        @staticmethod
+        def _draw_solid_marker(point, radius: float) -> None:
+            white = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(point[0] - radius - 1.5, point[1] - radius - 1.5, 2.0 * radius + 3.0, 2.0 * radius + 3.0)
+            )
+            ns_color(COLOR_NAMES["white"]).setFill()
+            white.fill()
+            red = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(point[0] - radius, point[1] - radius, 2.0 * radius, 2.0 * radius)
+            )
+            ns_color(COLOR_NAMES["red"]).setFill()
+            red.fill()
+
+        @staticmethod
+        def _draw_ring_marker(point, radius: float) -> None:
+            ring = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(point[0] - radius, point[1] - radius, 2.0 * radius, 2.0 * radius)
+            )
+            ns_color(COLOR_NAMES["white"]).setStroke()
+            ring.setLineWidth_(max(3.0, radius * 0.55))
+            ring.stroke()
+            ns_color(COLOR_NAMES["red"]).setStroke()
+            ring.setLineWidth_(max(1.5, radius * 0.30))
+            ring.stroke()
+
+        def drawRect_(self, _dirty_rect):
+            if self.map_image is None or self.profile_image is None:
+                return
+            bounds = self.bounds()
+            image_rect, _scale = map_image_rect_and_scale(
+                (0.0, 0.0, float(bounds.size.width), float(bounds.size.height)),
+                image_size_tuple(self.map_image),
+                self.map_metadata,
+                self.header_background_style,
+                self.header_visible,
+            )
+            layout_key = (
+                round(float(bounds.size.width), 3),
+                round(float(bounds.size.height), 3),
+                id(self.map_image),
+                id(self.map_metadata),
+                id(self.profile_image),
+                self.header_background_style,
+                self.header_visible,
+            )
+            if self.profile_layout_key != layout_key or self.profile_layout_rect is None:
+                self.profile_layout_rect = unframed_media_rect_for_map_view(
+                    self.map_image,
+                    self.map_metadata,
+                    self.profile_image,
+                    image_rect,
+                )
+                self.profile_layout_key = layout_key
+            profile_rect = self.profile_layout_rect
+            profile_width, profile_height = image_size_tuple(self.profile_image)
+            NSGraphicsContext.saveGraphicsState()
+            try:
+                shadow = NSShadow.alloc().init()
+                shadow.setShadowOffset_(NSMakeSize(8.0, -8.0))
+                shadow.setShadowBlurRadius_(14.0)
+                shadow.setShadowColor_(
+                    NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.58)
+                )
+                shadow.set()
+                self.profile_image.drawInRect_fromRect_operation_fraction_(
+                    NSMakeRect(*profile_rect),
+                    NSMakeRect(0.0, 0.0, profile_width, profile_height),
+                    NSCompositingOperationSourceOver,
+                    1.0,
+                )
+            finally:
+                NSGraphicsContext.restoreGraphicsState()
+            pilgrim_point = self._marker_view_point(self.pilgrim_marker, profile_rect)
+            media_point = self._marker_view_point(self.media_marker, profile_rect)
+            radius = max(3.0, min(10.0, min(profile_rect[2], profile_rect[3]) * 0.025))
+            if pilgrim_point is not None:
+                if media_point is not None and math.hypot(
+                    media_point[0] - pilgrim_point[0],
+                    media_point[1] - pilgrim_point[1],
+                ) > radius * 1.5:
+                    self._draw_ring_marker(media_point, radius)
+                self._draw_solid_marker(pilgrim_point, radius)
+            elif media_point is not None:
+                self._draw_ring_marker(media_point, radius)
+
+
     class TimeLapseMapView(NSView):
         """Draw retained maps plus a changing arrow/media layer without image churn."""
 
@@ -2789,6 +2987,8 @@ if APPKIT_AVAILABLE:
             self.speedometer_view = SpeedometerView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
             self.speedometer_view.setHidden_(True)
             self.addSubview_(self.speedometer_view)
+            self.elevation_profile_view = ElevationProfileOverlayView.alloc().initWithFrame_(self.bounds())
+            self.addSubview_(self.elevation_profile_view)
             self.caption_view = NSImageView.alloc().initWithFrame_(self.bounds())
             self.caption_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             self.caption_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
@@ -2884,6 +3084,8 @@ if APPKIT_AVAILABLE:
 
         def _raise_clock_overlay(self):
             """Keep the clock above an optional AVPlayer child view."""
+            self.elevation_profile_view.removeFromSuperview()
+            self.addSubview_(self.elevation_profile_view)
             self.clock_view.removeFromSuperview()
             self.addSubview_(self.clock_view)
             self.speedometer_view.removeFromSuperview()
@@ -2929,6 +3131,7 @@ if APPKIT_AVAILABLE:
             """Drop heavyweight content while a closed Cocoa window stays retained."""
             self._update_clock_overlay(None, None, False)
             self._update_speedometer(None, None, False)
+            self.elevation_profile_view.clear()
             self.map_image = None
             self.map_metadata = None
             self.route_points = []
@@ -4362,7 +4565,7 @@ def render_elevation_profile_image(metadata: object):
     try:
         NSColor.colorWithSRGBRed_green_blue_alpha_(0.97, 0.97, 0.98, 1.0).setFill()
         NSBezierPath.fillRect_(NSMakeRect(0.0, 0.0, width, height))
-        plot = NSMakeRect(88.0, 54.0, width - 118.0, height - 112.0)
+        plot = NSMakeRect(*ELEVATION_PROFILE_PLOT_RECT)
         grid_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.68, 0.68, 0.72, 0.65)
         axis_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.12, 0.12, 0.14, 1.0)
         label_font = NSFont.systemFontOfSize_(20.0)
@@ -4489,7 +4692,22 @@ def load_or_create_elevation_profile(track_map_path: Path, metadata: object):
 def unframed_media_rect_for_map(map_image, metadata: object, media_image) -> tuple[float, float, float, float]:
     """Return the largest route-free map rectangle for unframed content."""
     map_width, map_height = image_size_tuple(map_image)
-    image_rect = (0.0, 0.0, map_width, map_height)
+    return unframed_media_rect_for_map_view(
+        map_image,
+        metadata,
+        media_image,
+        (0.0, 0.0, map_width, map_height),
+    )
+
+
+def unframed_media_rect_for_map_view(
+    map_image,
+    metadata: object,
+    media_image,
+    image_rect: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Return the largest route-free media rectangle in display coordinates."""
+    map_width, map_height = image_size_tuple(map_image)
     clear_rects = cached_clear_box_options(
         metadata,
         image_rect,
@@ -4510,7 +4728,14 @@ def unframed_media_rect_for_map(map_image, metadata: object, media_image) -> tup
                 x, y = scale_metadata_pixel_to_image(x, y, metadata, map_image)
             except Exception:
                 continue
-            projected.append((x, map_height - y))
+            scale_x = image_rect[2] / max(1.0, map_width)
+            scale_y = image_rect[3] / max(1.0, map_height)
+            projected.append(
+                (
+                    image_rect[0] + x * scale_x,
+                    image_rect[1] + (map_height - y) * scale_y,
+                )
+            )
         stage_kind = scene_from_metadata(metadata, show_header=False).stage_kind
         clear_rects = clear_corner_rect_options(
             placement_rect,
@@ -6271,6 +6496,7 @@ class CocoaImagePresenter:
         self.clock_view = self._make_image_view(host_view.bounds())
         self.speedometer_view = SpeedometerView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
         self.speedometer_view.setHidden_(True)
+        self.elevation_profile_view = ElevationProfileOverlayView.alloc().initWithFrame_(host_view.bounds())
         self.place_view = self._make_image_view(host_view.bounds())
         self.caption_view = self._make_image_view(host_view.bounds())
         self.info_view = self._make_image_view(host_view.bounds())
@@ -6290,6 +6516,7 @@ class CocoaImagePresenter:
         host_view.addSubview_(self.header_view)
         host_view.addSubview_(self.clock_view)
         host_view.addSubview_(self.speedometer_view)
+        host_view.addSubview_(self.elevation_profile_view)
         host_view.addSubview_(self.place_view)
         host_view.addSubview_(self.caption_view)
         host_view.addSubview_(self.info_view)
@@ -6329,6 +6556,7 @@ class CocoaImagePresenter:
             self.overlay_view,
             self.header_view,
             self.clock_view,
+            self.elevation_profile_view,
             self.place_view,
             self.info_view,
             self.fade_view,
@@ -6349,6 +6577,7 @@ class CocoaImagePresenter:
             "header_view",
             "clock_view",
             "speedometer_view",
+            "elevation_profile_view",
             "place_view",
             "caption_view",
             "info_view",
@@ -6368,6 +6597,7 @@ class CocoaImagePresenter:
                 pass
         self.current_image = None
         self.layout_canvas = None
+        self.elevation_profile_view.clear()
 
     def stop_video(self, detach_view: bool = True) -> None:
         """Stop and remove any active AVPlayer view."""
@@ -6395,6 +6625,7 @@ class CocoaImagePresenter:
         """Keep controls and text overlays above an optional video layer."""
         for view in (
             self.overlay_view,
+            self.elevation_profile_view,
             self.header_view,
             self.clock_view,
             self.speedometer_view,
@@ -6408,6 +6639,33 @@ class CocoaImagePresenter:
         ):
             view.removeFromSuperview()
             self.host_view.addSubview_(view)
+
+    def set_elevation_profile(
+        self,
+        map_image,
+        map_metadata,
+        profile_image,
+        profile_metadata,
+        pilgrim_marker=None,
+        media_marker=None,
+        *,
+        visible=True,
+    ) -> None:
+        """Configure the retained route-free profile shown over a map target."""
+        if not visible:
+            self.elevation_profile_view.clear()
+            return
+        self.elevation_profile_view.configure(
+            map_image,
+            map_metadata,
+            profile_image,
+            profile_metadata,
+            pilgrim_marker,
+            media_marker,
+            header_background_style="off",
+            header_visible=False,
+        )
+        self._raise_overlay_views()
 
     def play_video(
         self,
@@ -8119,6 +8377,7 @@ class GPSTrackShowApp:
         self.time_lapse_navigation_generation = 0
         self.time_lapse_navigation_hold_until = 0.0
         self.time_lapse_current_media: Optional[tuple[int, PhotoListEntry]] = None
+        self.time_lapse_media_profile_state: Optional[dict] = None
         self.time_lapse_media_image = None
         self.time_lapse_caption = None
         self.time_lapse_caption_font = None
@@ -8145,6 +8404,8 @@ class GPSTrackShowApp:
         self.time_lapse_overview_has_been_displayed = False
         self.fullscreen_window_roles: set[str] = set()
         self.first_overview_waiting_for_fullscreen_role: Optional[str] = None
+        self.startup_playback_callback: Optional[Callable[[], None]] = None
+        self.startup_fullscreen_wait_handle = None
         self.resume_progress_pending = config.resume_progress
         self.resume_media_index_pending = config.resume_media_index
         self.resume_phase_pending = config.resume_phase
@@ -8317,6 +8578,66 @@ class GPSTrackShowApp:
                 getattr(self, "current_track_metadata", None),
             )
         return self.current_elevation_profile_image
+
+    def _has_persistent_dual_profile_host(self) -> bool:
+        """Return whether a separate non-photo map can host the profile."""
+        return bool(
+            getattr(self, "map_presenter", None) is not None
+            and not getattr(self.config, "join_windows", False)
+        )
+
+    def _uses_persistent_dual_profile(self) -> bool:
+        return bool(
+            self._has_persistent_dual_profile_host()
+            and self.elevation_profiles_enabled
+        )
+
+    @staticmethod
+    def _profile_marker_from_track_state(state: object) -> Optional[tuple[float, float]]:
+        """Convert a processed track state to a profile distance/elevation pair."""
+        if not isinstance(state, dict):
+            return None
+        distance = safe_float(
+            state.get("stage_distance_km", state.get("stage_km"))
+        )
+        elevation = safe_float(state.get("elevation_m"))
+        if distance is None:
+            return None
+        return (distance, elevation) if elevation is not None else (distance, float("nan"))
+
+    def _dual_profile_target_values(
+        self,
+        map_image,
+        map_metadata: object,
+        *,
+        pilgrim_state: object = None,
+        media_state: object = None,
+    ) -> dict:
+        """Build retained profile fields for one logical secondary-map target."""
+        if not self._has_persistent_dual_profile_host():
+            return {}
+        if not isinstance(self.current_track_metadata, dict):
+            return {}
+        profile = self._current_elevation_profile() if self.elevation_profiles_enabled else None
+        return {
+            "map_metadata": map_metadata if isinstance(map_metadata, dict) else None,
+            "elevation_profile_image": profile,
+            "elevation_profile_metadata": self.current_track_metadata,
+            "profile_pilgrim_marker": self._profile_marker_from_track_state(
+                pilgrim_state
+            ),
+            "profile_media_marker": self._profile_marker_from_track_state(media_state),
+        }
+
+    def _profile_track_state_at_distance(self, distance_km: float) -> Optional[dict]:
+        """Return the profile state nearest one processed stage distance."""
+        state = elevation_profile_state_at_distance(
+            self.current_track_metadata,
+            distance_km,
+        )
+        if state is None:
+            return None
+        return {"stage_km": state[0], "elevation_m": state[1]}
 
     def _stage_map_with_elevation_profile(self, relation: Optional[str] = None):
         """Show profiles on the roomier Time-Lapse map without changing map context."""
@@ -9177,6 +9498,7 @@ class GPSTrackShowApp:
                 if self.current_stage_index is not None:
                     self._prepare_standard_stage_assets(self.current_stage_index)
                 self.time_lapse_current_media = None
+                self.time_lapse_media_profile_state = None
                 self.time_lapse_media_image = None
                 self.time_lapse_media_draw_frame = True
                 self.time_lapse_media_marker_latlon = None
@@ -9298,7 +9620,29 @@ class GPSTrackShowApp:
     def _toggle_elevation_profiles(self) -> None:
         """Toggle cached stage-start elevation profiles for this session."""
         self.elevation_profiles_enabled = not self.elevation_profiles_enabled
-        if (
+        if self._has_persistent_dual_profile_host():
+            if self.time_lapse_active and self.time_lapse_stage is not None:
+                self._set_time_lapse_views()
+            else:
+                map_target = self.role_targets.get("map")
+                if map_target is not None:
+                    profile = (
+                        self._current_elevation_profile()
+                        if self.elevation_profiles_enabled
+                        else None
+                    )
+                    map_target = replace(
+                        map_target,
+                        elevation_profile_image=profile,
+                        elevation_profile_metadata=(
+                            self.current_track_metadata
+                            if profile is not None
+                            else map_target.elevation_profile_metadata
+                        ),
+                    )
+                    self.role_targets["map"] = map_target
+                    self._show_targets([map_target], on_complete=None)
+        elif (
             self.time_lapse_active
             and self.time_lapse_stage is not None
             and self.time_lapse_stage_map_preview_active
@@ -9550,7 +9894,11 @@ class GPSTrackShowApp:
             targets = [
                 WindowTarget(
                     "photo",
-                    self._stage_map_with_elevation_profile(stage.directive.relation),
+                    (
+                        self.current_track_image
+                        if self._uses_persistent_dual_profile()
+                        else self._stage_map_with_elevation_profile(stage.directive.relation)
+                    ),
                     Transition.SWITCH,
                 )
             ]
@@ -9560,6 +9908,15 @@ class GPSTrackShowApp:
                         "map",
                         overview,
                         Transition.SWITCH if immediate else Transition.FADE,
+                        **(
+                            self._dual_profile_target_values(
+                                overview,
+                                self.current_overview_metadata,
+                                pilgrim_state=self._profile_track_state_at_distance(0.0),
+                            )
+                            if stage.directive.relation is None
+                            else {}
+                        ),
                     )
                 )
             next_callback = self._advance
@@ -9709,7 +10066,11 @@ class GPSTrackShowApp:
                 else None
             )
             if resume_media is None:
-                self.resume_phase_pending = PlaybackPhase.ELEVATION_PROFILE.value
+                self.resume_phase_pending = (
+                    PlaybackPhase.STAGE_OVERVIEW.value
+                    if self._has_persistent_dual_profile_host()
+                    else PlaybackPhase.ELEVATION_PROFILE.value
+                )
             self._prime_context_before_index(previous_stage.map_index)
             self._start_time_lapse_stage(
                 previous_stage.map_index,
@@ -9729,7 +10090,10 @@ class GPSTrackShowApp:
         if self.time_lapse_current_media is not None:
             self._end_time_lapse_media(redraw=False)
         self.time_lapse_media_cursor = 0
-        if self._current_elevation_profile() is not None:
+        if (
+            not self._has_persistent_dual_profile_host()
+            and self._current_elevation_profile() is not None
+        ):
             self._begin_time_lapse_stage_map_preview()
             return
         if should_show_stage_overview_preview(
@@ -10075,6 +10439,7 @@ class GPSTrackShowApp:
         role = str(role)
         self.fullscreen_window_roles.add(role)
         self._refresh_header_layouts()
+        self._finish_startup_fullscreen_wait()
         self._finish_first_overview_fullscreen_wait(role)
 
     def window_did_exit_fullscreen(self, role: str) -> None:
@@ -10092,6 +10457,91 @@ class GPSTrackShowApp:
             return None
         role = "map" if self.screen_swap and self.map_presenter is not None else "photo"
         return None if role in self.fullscreen_window_roles else role
+
+    def _startup_fullscreen_roles(self) -> set[str]:
+        """Return native fullscreen windows that must settle before resume playback."""
+        if not self.fullscreen_active:
+            return set()
+        roles = {"photo"} if self.photo_window is not None else set()
+        if (
+            self.map_window is not None
+            and not self.config.join_windows
+            and len(self._available_screens()) > 1
+        ):
+            roles.add("map")
+        return roles
+
+    def _show_startup_overview_preview(self) -> None:
+        """Keep stage-specific launches off a blank screen while fullscreen settles."""
+        if self.current_overview_image is None:
+            overview_line = next(
+                (
+                    self.playlist_lines[index]
+                    for index in range(
+                        min(self.playlist_index, len(self.playlist_lines) - 1),
+                        -1,
+                        -1,
+                    )
+                    if self.playlist_lines[index].strip().startswith("#Overviewmap:")
+                ),
+                None,
+            )
+            if overview_line is not None:
+                try:
+                    self._handle_overview(overview_line.partition(":")[2].strip())
+                except Exception as exc:
+                    warn_message(f"could not prepare startup overview: {exc}")
+        if self.current_overview_image is None:
+            return
+        targets = [
+            WindowTarget("photo", self.current_overview_image, Transition.SWITCH)
+        ]
+        if self.map_presenter is not None:
+            targets.append(
+                WindowTarget("map", self.current_overview_image, Transition.SWITCH)
+            )
+        self.role_targets.update(
+            {target.presenter_name: target for target in targets}
+        )
+        self._show_targets(targets, on_complete=None)
+
+    def _begin_non_intro_playback(self) -> None:
+        """Start sound and playlist advancement after native windows are stable."""
+        if not self.running:
+            return
+        self.music_controller.start(self.playlist_index)
+        self._show_startup_hint()
+        self._advance()
+
+    def _wait_for_startup_fullscreen(self, callback: Callable[[], None]) -> None:
+        """Defer a stage-specific start until every fullscreen window is ready."""
+        pending = self._startup_fullscreen_roles() - self.fullscreen_window_roles
+        if not pending:
+            self.schedule_callback(0.0, callback)
+            return
+        self.startup_playback_callback = callback
+        self.startup_fullscreen_wait_handle = self.schedule_callback(
+            FULLSCREEN_PLAYBACK_START_TIMEOUT_SECONDS,
+            lambda: self._finish_startup_fullscreen_wait(force=True),
+        )
+
+    def _finish_startup_fullscreen_wait(self, *, force: bool = False) -> None:
+        """Release one deferred startup after fullscreen completion or timeout."""
+        callback = self.startup_playback_callback
+        if callback is None:
+            return
+        if not force and (
+            self._startup_fullscreen_roles() - self.fullscreen_window_roles
+        ):
+            return
+        self.startup_playback_callback = None
+        handle = self.startup_fullscreen_wait_handle
+        self.startup_fullscreen_wait_handle = None
+        if handle is not None and not force:
+            handle.cancel()
+        # Let AppKit complete the current fullscreen notification before the
+        # first stage installs its retained canvases and starts its timer.
+        self.schedule_callback(0.05, callback)
 
     def _finish_first_overview_fullscreen_wait(self, role: str) -> None:
         """Redraw the first overview and start its timer after fullscreen settles."""
@@ -10132,9 +10582,34 @@ class GPSTrackShowApp:
             )
         return self.current_overview_image
 
-    def _raise_time_lapse_map_view(self) -> None:
-        """Reattach a parked Time-Lapse view above the presenter's image layers."""
-        view = self.time_map_view
+    def _current_standard_profile_media_state(self) -> Optional[dict]:
+        """Resolve the current Standard medium from its saved row and sidecar."""
+        row_index = self.current_display_index
+        if row_index is None or not 0 <= row_index < len(self.playlist_lines):
+            return None
+        line = self.playlist_lines[row_index]
+        if line.lstrip().startswith("#"):
+            return None
+        try:
+            entry = parse_photo_entry(line)
+        except Exception:
+            return None
+        path = resolve_path(self.config.photodir, entry.source_name)
+        metadata = try_read_photo_metadata(media_sidecar_path(path), path) or {}
+        latitude = safe_float(metadata.get("latitude"))
+        longitude = safe_float(metadata.get("longitude"))
+        if latitude is None or longitude is None:
+            latitude, longitude = entry.latitude, entry.longitude
+        return photo_track_state(
+            self.current_track_metadata,
+            latitude,
+            longitude,
+            parse_iso_datetime(metadata.get("datetime_iso")),
+        )
+
+    @staticmethod
+    def _raise_time_lapse_view(view) -> None:
+        """Reattach one retained Time-Lapse canvas above standard image layers."""
         if view is None:
             return
         host = view.superview()
@@ -10145,6 +10620,15 @@ class GPSTrackShowApp:
         host.addSubview_(view)
         view.setHidden_(False)
         view.setNeedsDisplay_(True)
+
+    def _raise_time_lapse_views(self) -> None:
+        """Expose both Time-Lapse canvases in deterministic front-to-back order."""
+        for view in (self.time_photo_view, self.time_map_view):
+            self._raise_time_lapse_view(view)
+
+    def _raise_time_lapse_map_view(self) -> None:
+        """Reattach a restored map canvas above its presenter's image layers."""
+        self._raise_time_lapse_view(self.time_map_view)
 
     def _refresh_separate_map_window_content(self) -> None:
         """Populate a newly created or restored secondary window immediately."""
@@ -10160,7 +10644,54 @@ class GPSTrackShowApp:
             if self.map_presenter is not None:
                 self.map_presenter.set_content_visible(True)
                 if overview_image is not None:
-                    self.map_presenter.transition_to(overview_image, Transition.SWITCH)
+                    media_state = (
+                        self._current_standard_profile_media_state()
+                        if getattr(self, "current_phase", None) == PlaybackPhase.MEDIA
+                        else None
+                    )
+                    profile_allowed = bool(
+                        getattr(self, "current_stage_index", None) is not None
+                        and 0 <= self.current_stage_index < len(getattr(self, "stages", ()))
+                        and self.stages[self.current_stage_index].directive.relation is None
+                    )
+                    target = WindowTarget(
+                        "map",
+                        overview_image,
+                        Transition.SWITCH,
+                        **(
+                            self._dual_profile_target_values(
+                                overview_image,
+                                self.current_overview_metadata,
+                                pilgrim_state=(
+                                    self._profile_track_state_at_distance(0.0)
+                                    if media_state is None
+                                    else None
+                                ),
+                                media_state=media_state,
+                            )
+                            if profile_allowed
+                            else {}
+                        ),
+                    )
+                    if hasattr(self, "role_targets"):
+                        self.role_targets["map"] = target
+                    self.map_presenter.transition_to(
+                        overview_image,
+                        Transition.SWITCH,
+                    )
+                    if hasattr(self.map_presenter, "set_elevation_profile"):
+                        self.map_presenter.set_elevation_profile(
+                            target.image,
+                            target.map_metadata,
+                            target.elevation_profile_image,
+                            target.elevation_profile_metadata,
+                            target.profile_pilgrim_marker,
+                            target.profile_media_marker,
+                            visible=bool(
+                                self._uses_persistent_dual_profile()
+                                and target.elevation_profile_image is not None
+                            ),
+                        )
         content = self.map_window.contentView()
         content.setNeedsDisplay_(True)
         self.map_window.displayIfNeeded()
@@ -10434,9 +10965,8 @@ class GPSTrackShowApp:
         elif self.intro_available:
             self.schedule_callback(0.0, self._start_intro_sequence)
         else:
-            self.music_controller.start(self.playlist_index)
-            self._show_startup_hint()
-            self.schedule_callback(0.0, self._advance)
+            self._show_startup_overview_preview()
+            self._wait_for_startup_fullscreen(self._begin_non_intro_playback)
         self.app.activateIgnoringOtherApps_(True)
         if self.owns_run_loop:
             self.app.run()
@@ -11158,6 +11688,7 @@ class GPSTrackShowApp:
         if self.screen_swap and self.map_presenter is not None:
             stage_view, overview_view = overview_view, stage_view
         if stage_view is not None:
+            stage_view.elevation_profile_view.clear()
             stage_view.setHidden_(False)
             stage_view.marker_color = self.config.dot_color
             stage_view.marker_radius = self.config.dot_size
@@ -11281,13 +11812,31 @@ class GPSTrackShowApp:
             overview_view.overlay_shadow_color = self.config.header_shadow_color
             overview_view.map_header_font_factor = self.config.map_header_font_factor
             overview_view.header_row_count = 3
+            overview_map_image = self.current_stage_overview_image or self.current_overview_image
             overview_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(
-                self.current_stage_overview_image or self.current_overview_image,
+                overview_map_image,
                 self.current_overview_metadata,
                 self.time_lapse_points,
                 arrow,
                 None,
                 False,
+            )
+            profile = (
+                self._current_elevation_profile()
+                if self._uses_persistent_dual_profile() and not special_stage
+                else None
+            )
+            overview_view.elevation_profile_view.configure(
+                overview_map_image,
+                self.current_overview_metadata,
+                profile,
+                self.current_track_metadata,
+                self._profile_marker_from_track_state(marker_state),
+                self._profile_marker_from_track_state(
+                    self.time_lapse_media_profile_state
+                ),
+                header_background_style=overview_view.header_background_style,
+                header_visible=bool(self.header_visible),
             )
             overview_view._update_clock_overlay(
                 self.time_lapse_clock_time,
@@ -11299,6 +11848,7 @@ class GPSTrackShowApp:
                 speedometer_maximum,
                 bool(self.header_visible and self.config.speedometer),
             )
+            overview_view._raise_clock_overlay()
         self._publish_live_state()
 
     def _clear_time_lapse_views(self):
@@ -11312,14 +11862,26 @@ class GPSTrackShowApp:
             if presenter is not None:
                 presenter.set_content_visible(True)
 
-    def _suspend_standard_playback_for_time_lapse(self):
-        """Stop every standard timer/transition before exposing time-lapse views."""
+    def _suspend_standard_playback_for_time_lapse(
+        self,
+        *,
+        hide_content: bool = True,
+    ):
+        """Stop standard playback and optionally perform the visible view handoff."""
         if self.active_callback is not None:
             self.active_callback.cancel()
             self.active_callback = None
         for presenter in (self.photo_presenter, self.map_presenter):
             if presenter is not None:
                 presenter.cancel_pending()
+        if not hide_content:
+            return
+        # Presenters add their image layers after the retained Time-Lapse views
+        # are created.  Raise both canvases at every activation so the first
+        # stage has the same header and overlay ordering as subsequent stages.
+        self._raise_time_lapse_views()
+        for presenter in (self.photo_presenter, self.map_presenter):
+            if presenter is not None:
                 presenter.set_content_visible(False)
 
     def _cancel_time_lapse_stage(self):
@@ -11333,6 +11895,7 @@ class GPSTrackShowApp:
         self.time_lapse_stage_map_preview_active = False
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
+        self.time_lapse_media_profile_state = None
         self.time_lapse_media_image = None
         self.time_lapse_media_draw_frame = True
         self.time_lapse_media_marker_latlon = None
@@ -11361,7 +11924,9 @@ class GPSTrackShowApp:
     ):
         if self.current_overview_image is None:
             raise RuntimeError("encountered #Map before #Overviewmap")
-        self._suspend_standard_playback_for_time_lapse()
+        # Cancel obsolete transitions immediately, but retain the visible Intro
+        # or previous slide while maps and the optional profile are prepared.
+        self._suspend_standard_playback_for_time_lapse(hide_content=False)
         self.time_lapse_stage = self._collect_time_lapse_stage(map_index, filename, relation)
         self.current_stage_index = stage_index_for_playlist_row(self.stages, map_index)
         self.current_stage_media_position = None
@@ -11369,6 +11934,7 @@ class GPSTrackShowApp:
         self.time_lapse_control_row_cursor = map_index
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
+        self.time_lapse_media_profile_state = None
         self.time_lapse_media_image = None
         self.time_lapse_media_draw_frame = True
         self.time_lapse_media_marker_latlon = None
@@ -11465,6 +12031,12 @@ class GPSTrackShowApp:
             # Restart its visible overview/profile sequence and let the queue
             # present that medium normally afterward.
             resume_media = None
+        if self._uses_persistent_dual_profile() and relation is None:
+            # Profile creation/loading may take noticeable time on first use.
+            # Complete it before exposing the retained canvases, avoiding a
+            # black interval between the Intro and the first Time-Lapse stage.
+            self._current_elevation_profile()
+        self._suspend_standard_playback_for_time_lapse(hide_content=True)
         if resume_media is not None:
             for index, (fraction, row_index, entry) in enumerate(queue):
                 if row_index == resume_media[0]:
@@ -11635,6 +12207,7 @@ class GPSTrackShowApp:
         if (
             start_fraction <= 0.0
             and resume_media is None
+            and not self._has_persistent_dual_profile_host()
             and self._current_elevation_profile() is not None
         ):
             self._begin_time_lapse_stage_map_preview()
@@ -11648,7 +12221,10 @@ class GPSTrackShowApp:
             return
         if self.time_lapse_stage.relation is None:
             self.time_lapse_media_draw_frame = True
-            if self._current_elevation_profile() is not None:
+            if (
+                not self._has_persistent_dual_profile_host()
+                and self._current_elevation_profile() is not None
+            ):
                 self._begin_time_lapse_stage_map_preview()
             else:
                 self._begin_time_lapse_motion()
@@ -11895,6 +12471,10 @@ class GPSTrackShowApp:
         self._sync_time_lapse_audio_through(row_index)
         self.playlist_index = row_index + 1
         self.time_lapse_current_media = (row_index, entry)
+        self.time_lapse_media_profile_state = interpolate_timeline_state(
+            self.time_lapse_points,
+            self.time_lapse_progress,
+        )
         self.current_phase = PlaybackPhase.TIME_LAPSE
         if self.current_stage_index is not None:
             stage = self.stages[self.current_stage_index]
@@ -11941,6 +12521,7 @@ class GPSTrackShowApp:
     def _end_time_lapse_media(self, redraw: bool = True):
         self._stop_time_lapse_video()
         self.time_lapse_current_media = None
+        self.time_lapse_media_profile_state = None
         self.time_lapse_media_image = None
         self.time_lapse_caption = None
         self.time_lapse_caption_font = None
@@ -11975,6 +12556,7 @@ class GPSTrackShowApp:
         self.playlist_index = self.time_lapse_stage.next_index
         self.time_lapse_stage = None
         self.time_lapse_current_media = None
+        self.time_lapse_media_profile_state = None
         self.time_lapse_media_image = None
         self.time_lapse_media_marker_latlon = None
         self.time_lapse_stage_start_marker_latlon = None
@@ -12481,7 +13063,11 @@ class GPSTrackShowApp:
             overview_image = self.current_overview_image
             warn_message("overview or stage metadata missing; skipping stage highlighting")
         debug_print(self.config, "Overview image ready; preparing stage display sequence")
-        track_image = self._stage_map_with_elevation_profile(relation_title)
+        track_image = (
+            self.current_track_image
+            if self._uses_persistent_dual_profile()
+            else self._stage_map_with_elevation_profile(relation_title)
+        )
 
         if self.photo_presenter is not None:
             # Always show the overview as a full-screen single image on the photo side,
@@ -12503,7 +13089,20 @@ class GPSTrackShowApp:
             self.current_phase = PlaybackPhase.STAGE_MAP
             targets = [
                 WindowTarget("photo", track_image, self.active_transition),
-                WindowTarget("map", overview_image, Transition.FADE),
+                WindowTarget(
+                    "map",
+                    overview_image,
+                    Transition.FADE,
+                    **(
+                        self._dual_profile_target_values(
+                            overview_image,
+                            self.current_overview_metadata,
+                            pilgrim_state=self._profile_track_state_at_distance(0.0),
+                        )
+                        if relation_title is None
+                        else {}
+                    ),
+                ),
             ]
             next_callback = self._advance
             description = "Stage map and Tour overview"
@@ -12649,6 +13248,12 @@ class GPSTrackShowApp:
         # Retain available statistics even when currently hidden so a live
         # Settings Apply can reveal them without advancing to another medium.
         media_datetime = parse_iso_datetime(photo_metadata.get("datetime_iso"))
+        profile_media_state = photo_track_state(
+            self.current_track_metadata,
+            latitude,
+            longitude,
+            media_datetime,
+        )
         header_metrics = photo_track_metrics(
             self.current_track_metadata,
             latitude,
@@ -12744,10 +13349,28 @@ class GPSTrackShowApp:
                 warn_message("track metadata missing; skipping photo position marker on track map")
 
         if self.map_presenter is not None and marked_track is not None:
+            profile_allowed = bool(
+                self.current_stage_index is not None
+                and 0 <= self.current_stage_index < len(self.stages)
+                and self.stages[self.current_stage_index].directive.relation is None
+            )
             final_state = DisplayState(
                 targets=[
                     make_photo_target(photo_transition),
-                    WindowTarget("map", marked_track, self.config.transition),
+                    WindowTarget(
+                        "map",
+                        marked_track,
+                        self.config.transition,
+                        **(
+                            self._dual_profile_target_values(
+                                marked_track,
+                                self.current_track_metadata,
+                                media_state=profile_media_state,
+                            )
+                            if profile_allowed
+                            else {}
+                        ),
+                    ),
                 ],
                 next_callback=self._advance,
                 auto_delay=video_delay if video_path is not None else self.config.duration,
@@ -12881,6 +13504,20 @@ class GPSTrackShowApp:
                     and target.running_speed_kmh is not None
                 ),
             )
+            if hasattr(presenter, "set_elevation_profile"):
+                presenter.set_elevation_profile(
+                    target.image,
+                    target.map_metadata,
+                    target.elevation_profile_image,
+                    target.elevation_profile_metadata,
+                    target.profile_pilgrim_marker,
+                    target.profile_media_marker,
+                    visible=bool(
+                        target.presenter_name == "map"
+                        and self._uses_persistent_dual_profile()
+                        and target.elevation_profile_image is not None
+                    ),
+                )
             presenter.set_place_text(None, False, int(active_font.size), self.config.font_color)
             presenter.set_info_text(target.info_text if target.presenter_name == "photo" else None)
             if target.presenter_name == "photo":
@@ -13255,6 +13892,7 @@ class GPSTrackShowApp:
             "trackmaps.gpx_overlay": ("gpx_overlay_mode", str),
             "trackmaps.route_width": ("route_width", float),
             "trackmaps.font_factor": ("map_header_font_factor", float),
+            "trackmaps.track_title": ("track_title_mode", str),
         }
         for key, (attribute, converter) in simple_values.items():
             if key in values:
@@ -13263,6 +13901,11 @@ class GPSTrackShowApp:
                     converted = "black" if converted == "reserved" else converted
                     if converted not in {"off", "transparent", "black"}:
                         continue
+                if attribute == "track_title_mode" and converted not in {
+                    "endpoint_places",
+                    "track_name",
+                }:
+                    continue
                 object.__setattr__(self.config, attribute, converted)
 
         if any(key in values for key in ("slideshow.font_size", "slideshow.font_family", "slideshow.font_style")):

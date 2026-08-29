@@ -14,6 +14,12 @@ from track_map_layout_utils import canonical_track_map_name
 ELEVATION_PROFILE_RENDER_VERSION = 1
 ELEVATION_PROFILE_WIDTH = 1200
 ELEVATION_PROFILE_HEIGHT = 360
+ELEVATION_PROFILE_PLOT_RECT = (
+    88.0,
+    54.0,
+    ELEVATION_PROFILE_WIDTH - 118.0,
+    ELEVATION_PROFILE_HEIGHT - 112.0,
+)
 
 
 def elevation_profile_visible_range(
@@ -87,6 +93,62 @@ def elevation_profile_ranges(
         x_max = x_min + 0.001
     y_range = elevation_profile_visible_range(rows, x_min, x_max)
     return ((x_min, x_max), y_range) if y_range is not None else None
+
+
+def elevation_profile_state_at_distance(
+    metadata: object,
+    distance_km: float,
+) -> tuple[float, float] | None:
+    """Return a segment-safe distance/elevation point for one route position."""
+    segments = elevation_profile_segments(metadata)
+    candidates: list[tuple[float, float]] = []
+    target = float(distance_km)
+    if not math.isfinite(target):
+        return None
+    for segment in segments:
+        if not segment:
+            continue
+        candidates.extend((segment[0], segment[-1]))
+        if target < segment[0][0] or target > segment[-1][0]:
+            continue
+        for start, end in zip(segment, segment[1:]):
+            if not start[0] <= target <= end[0]:
+                continue
+            span = end[0] - start[0]
+            fraction = 0.0 if span <= 0.0 else (target - start[0]) / span
+            return (
+                target,
+                start[1] + (end[1] - start[1]) * fraction,
+            )
+        return min(segment, key=lambda point: abs(point[0] - target))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda point: abs(point[0] - target))
+
+
+def elevation_profile_marker_point(
+    metadata: object,
+    distance_km: float,
+    elevation_m: float | None = None,
+) -> tuple[float, float] | None:
+    """Map a route position into the cached elevation-profile image."""
+    segments = elevation_profile_segments(metadata)
+    ranges = elevation_profile_ranges(segments)
+    state = elevation_profile_state_at_distance(metadata, distance_km)
+    if ranges is None or state is None:
+        return None
+    distance = state[0]
+    elevation = state[1] if elevation_m is None else float(elevation_m)
+    if not math.isfinite(elevation):
+        elevation = state[1]
+    (x_min, x_max), (y_min, y_max) = ranges
+    plot_x, plot_y, plot_width, plot_height = ELEVATION_PROFILE_PLOT_RECT
+    x = plot_x + ((distance - x_min) / max(0.001, x_max - x_min)) * plot_width
+    y = plot_y + ((elevation - y_min) / max(1.0, y_max - y_min)) * plot_height
+    return (
+        max(plot_x, min(plot_x + plot_width, x)),
+        max(plot_y, min(plot_y + plot_height, y)),
+    )
 
 
 def elevation_profile_cache_paths(track_map_path: str | Path) -> tuple[Path, Path]:

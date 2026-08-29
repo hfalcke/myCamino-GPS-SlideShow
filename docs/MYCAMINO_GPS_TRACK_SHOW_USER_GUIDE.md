@@ -208,16 +208,16 @@ stage it adopts the fixed arrow angle and is mirrored when necessary so that it
 faces from the stage start toward its end. The overview keeps an arrow when the
 pilgrim is selected; transport symbols appear on both stage and overview maps.
 
-**Show elevation profile** is enabled by default. At the beginning of every
-GPX-backed Time-Lapse stage, the marked Tour Overview appears first inside the
-Stage Map, followed by the processed elevation profile and then route motion
-and media. Standard styles include the profile in their initial Stage Map. The
-profile uses the roomier Time-Lapse map variant while a separate overview
-screen keeps its centered map. Its vertical axis follows the track minimum and
-maximum with five percent headroom rather than starting at zero. The first use
-creates a PNG under `trackimages/elevation-profiles`; later shows reuse it
-until the track or its GPX processing settings change. Press `e` during a show
-to toggle these stage-start profiles for the current session.
+**Show elevation profile** is enabled by default. With one window, every
+GPX-backed stage retains the existing introductory profile phase. With a
+separate map window, the profile instead remains visible throughout the stage
+on the map that does not display photos or videos. It is placed in the largest
+route-free area. A solid red dot follows the Time-Lapse pilgrim and a red ring
+marks the currently displayed photo or video. Its vertical axis follows the
+track minimum and maximum with five percent headroom rather than starting at
+zero. The first use creates a PNG under `trackimages/elevation-profiles`; later
+shows reuse it until the track or its GPX processing settings change. Press
+`e` during a show to toggle all elevation-profile displays for the session.
 
 The Locations radius groups nearby GPS positions under an already determined
 place name. A larger radius reduces the number of lookups and can speed up
@@ -300,7 +300,7 @@ again.
 
 GPX-stage maps reserve a 25% taller black header. By default their title uses
 the reverse-geocoded start and destination of the track (`PLACE1 - PLACE2`);
-**Settings > Map Generation > Track title** can instead select the GPX track
+**Settings > Slide Show > Header > Track title** can instead select the GPX track
 name. If either endpoint name is unavailable, the GPX track name is used as a
 safe fallback. The subtitle shows
 `DATE · NN.N km - HH:MM h`. During Time-Lapse, an active clock removes the
@@ -594,8 +594,9 @@ image/video/map type, and Date. **Reset Filter** returns to All Rows. The select
 where possible; otherwise the nearest preceding matching row is selected.
 Filtering never changes the saved row order, and search uses only visible rows.
 
-**Start Slide Show Here** is available both at the bottom and in the row
-context menu. **Jump to Show** immediately selects the latest row reported by
+Press **Choose** in the main window's Start Slide Show section to open the
+control-file editor. **Start Slide Show Here** is available both at the bottom
+and in the row context menu. **Jump to Show** immediately selects the latest row reported by
 the running player and then follows playback. In a filtered view it follows the
 nearest preceding matching row, such as the current Track Map or Music command.
 While following, selecting one different row jumps the running slide show to
@@ -917,7 +918,8 @@ with one slide-show window. At the beginning of every new Time-Lapse stage, the
 overview is shown by default as a framed medium over the stage map for the
 current media duration, including when a separate overview window is active.
 The current stage route is projected into that smaller overview and highlighted
-there, followed by the elevation profile and animated route. Settings can
+there, followed by the animated route. The separate overview map retains the
+elevation profile throughout the stage. Settings can
 disable the duplicate inset for a separate display or restore a full-screen
 overview instead. In a Standard show, the single-window sequence is
 Stage Map, marked Tour Overview, then media. The marked overview uses a runtime
@@ -926,9 +928,10 @@ duplicated baked-in title. A computer with two or more displays starts
 with a separate overview window. Settings can force either Single window or
 Separate overview window regardless of display count.
 
-In automatic Time-Lapse playback, the temporary overview advances to the
-elevation profile and then to the moving stage after the configured media
-duration for each static phase. Left/Right step through these visible phases;
+In single-window automatic Time-Lapse playback, the temporary overview advances
+to the elevation profile and then to the moving stage after the configured media
+duration for each static phase. In separate-window playback the persistent
+profile does not add another phase. Left/Right step through the visible phases;
 going left from the overview enters the previous stage rather than merely
 rewinding the moving marker. In Standard playback,
 the track map is shown once at the beginning of each stage. The Settings option

@@ -987,11 +987,13 @@ intentionally skipping a media row. Entering Time-Lapse cancels the standard
 continuation timer and presenter transitions, then hides every standard
 content layer so both modes cannot animate concurrently.
 
-Every fresh Time-Lapse stage first displays the overview in the stage view as a
-framed medium for `--duration`, then the optional elevation profile for the
-same duration, and finally starts route motion. This sequence is retained when
-a separate overview window is active; that window continues to show its
-centered overview simultaneously.
+Every fresh single-window Time-Lapse stage first displays the overview in the
+stage view as a framed medium for `--duration`, then the optional elevation
+profile for the same duration, and finally starts route motion. With a separate
+map window, a retained profile overlay instead stays on the non-photo map for
+the entire stage and the duplicate profile phase is skipped. The overlay reuses
+the cached PNG and the existing clear-box placement geometry. Only its solid
+pilgrim marker and media-position ring are redrawn during playback.
 `timelapse.overview_on_stage_map_dual` defaults to true and controls only this
 additional dual-display inset; single-window playback always retains the
 overview phase.

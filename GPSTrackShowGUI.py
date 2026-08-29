@@ -2839,9 +2839,11 @@ class GPXTrackerController(NSObject):
         self.slideshow_start_button = self._make_button("Start", "startSelectedSlideShow:")
         self.slideshow_continue_button = self._make_button("Continue", "continueSelectedSlideShow:")
         self.slideshow_continue_button.setEnabled_(False)
+        self.slideshow_choose_button = self._make_button("Choose", "editControlFile:")
         self.pdf_summary_button = self._make_button("PDF Summary", "exportPdfSummary:")
         self.root_view.addSubview_(self.slideshow_start_button)
         self.root_view.addSubview_(self.slideshow_continue_button)
+        self.root_view.addSubview_(self.slideshow_choose_button)
         self.root_view.addSubview_(self.pdf_summary_button)
 
         self.status_label = self._make_status_label("Choose or create an adventure directory to begin.")
@@ -2911,6 +2913,7 @@ class GPXTrackerController(NSObject):
             self.slideshow_label,
             self.slideshow_start_button,
             self.slideshow_continue_button,
+            self.slideshow_choose_button,
             self.pdf_summary_button,
             self.quit_button,
             self.status_label,
@@ -3199,6 +3202,9 @@ class GPXTrackerController(NSObject):
         self.slideshow_continue_button.setToolTip_(
             "Choose one of the last twenty automatically saved slide-show checkpoints, including its music position."
         )
+        self.slideshow_choose_button.setToolTip_(
+            "Open the control-file editor, choose an exact row, and use Start Slide Show Here."
+        )
         self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
         self.music_label.setToolTip_("The active playlist inside the project's fixed audio folder.")
         self.music_field.setToolTip_(
@@ -3285,7 +3291,8 @@ class GPXTrackerController(NSObject):
         self.narration_playlist_edit_button.setNextKeyView_(self.normalize_video_audio_button)
         self.normalize_video_audio_button.setNextKeyView_(self.slideshow_start_button)
         self.slideshow_start_button.setNextKeyView_(self.slideshow_continue_button)
-        self.slideshow_continue_button.setNextKeyView_(self.pdf_summary_button)
+        self.slideshow_continue_button.setNextKeyView_(self.slideshow_choose_button)
+        self.slideshow_choose_button.setNextKeyView_(self.pdf_summary_button)
         self.pdf_summary_button.setNextKeyView_(self.quit_button)
         self.quit_button.setNextKeyView_(self.assistant_checkbox)
         self.assistant_checkbox.setNextKeyView_(self.help_button)
@@ -3726,6 +3733,10 @@ class GPXTrackerController(NSObject):
         )
         x += SMALL_BUTTON_WIDTH + INNER_GAP
         self.slideshow_continue_button.setFrame_(
+            NSMakeRect(x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT)
+        )
+        x += SMALL_BUTTON_WIDTH + INNER_GAP
+        self.slideshow_choose_button.setFrame_(
             NSMakeRect(x, row_y, SMALL_BUTTON_WIDTH, FIELD_HEIGHT)
         )
         x += SMALL_BUTTON_WIDTH + INNER_GAP
@@ -6903,9 +6914,9 @@ class GPXTrackerController(NSObject):
             "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
             "13. Update Metadata Extraction in the Media section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
             "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
-            "15. In the control-file editor, use the row-type filter or Reset Filter. The Previews popup offers Off, Small, Medium, and Large; thumbnails load progressively without blocking scrolling. Right-click photos or videos to Hide/Unhide them. CAPTION rows label the immediately following medium; FONT rows change following caption and header fonts. Press Start Slide Show Here at the bottom or in the context menu to launch from an exact row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
+            "15. In the control-file editor, use the row-type filter or Reset Filter. The Previews popup offers Off, Small, Medium, and Large; thumbnails load progressively without blocking scrolling. Right-click photos or videos to Hide/Unhide them. CAPTION rows label the immediately following medium; FONT rows change following caption and header fonts. Press Choose in Start Slide Show to open this editor, then use Start Slide Show Here at the bottom or in the context menu to launch from an exact row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
             "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
-            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Its temporary help hint disappears after five seconds. Press Space or Right/Down to leave the title immediately; otherwise it advances automatically after 30 seconds. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile at its beginning by default; press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Every playback style uses the same clock, three-line title area, and track statistics. Settings independently select stage name, track length and duration, place name, clock, and statistics. One Header layout applies to photos, Time-Lapse maps, and overview maps. No box and Semi-transparent overlay retain the full screen and align the header to the fitted image edge. Header area is the default; it uses the slideshow Background color and fits the display beneath it while maps retain the full width. Font color also controls the clock, time, and date, and Shadow color defaults to black. The Time-Lapse marker can be a pilgrim, bicycle, car, airplane, or arrow. Selected title fields are packed from the top without empty lines; the first line is larger. Press c to toggle the complete header, and a to pause or resume background audio.\n\n"
+            "16. A fresh Start begins with the Adventure title, summary, description, and optional title image over the Tour Overview, followed by the clean overview. Its temporary help hint disappears after five seconds. Press Space or Right/Down to leave the title immediately; otherwise it advances automatically after 30 seconds. Choose the title image below Description; Use First selects the first still image in the control file. Each GPX Stage Map shows a cached min/max elevation profile by default; with a separate map window it remains visible throughout the stage, with a solid red pilgrim dot and a red ring for the displayed medium. Press e to toggle these profiles for the running show. Each one-window stage then continues with its marked Tour Overview and media. Cursor keys move through those phases and across stage boundaries; Command-cursor jumps directly between Stage Maps. Settings can optionally show the marked track map again before every photo or video. Every playback style uses the same clock, three-line title area, and track statistics. Settings independently select stage name, track length and duration, place name, clock, and statistics. One Header layout applies to photos, Time-Lapse maps, and overview maps. No box and Semi-transparent overlay retain the full screen and align the header to the fitted image edge. Header area is the default; it uses the slideshow Background color and fits the display beneath it while maps retain the full width. Font color also controls the clock, time, and date, and Shadow color defaults to black. The Time-Lapse marker can be a pilgrim, bicycle, car, airplane, or arrow. Selected title fields are packed from the top without empty lines; the first line is larger. Press c to toggle the complete header, and a to pause or resume background audio.\n\n"
             "Workflow Assistant:\n"
             "- Assistant in the header is enabled for new Adventures and offers a recommended action for the next incomplete step. Return activates the default action.\n"
             "- It guides Project directory, Adventure name, the two explicit GPX or photo-only choices, explicit media acceptance/import, metadata using the visible place-name option, combined control/map creation, and the first slide-show start.\n"

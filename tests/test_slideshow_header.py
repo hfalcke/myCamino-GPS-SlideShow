@@ -18,6 +18,7 @@ from GPSTrackShow import (
     photo_track_metrics,
     photo_track_speedometer,
     runtime_header_band,
+    runtime_header_metrics_font_size,
     runtime_header_text_shadow_color,
     selected_stage_header_lines,
     time_lapse_header_title_font_size,
@@ -25,6 +26,16 @@ from GPSTrackShow import (
 
 
 class SlideshowHeaderTests(unittest.TestCase):
+    def test_right_header_statistics_use_a_readable_three_row_font(self):
+        self.assertAlmostEqual(
+            runtime_header_metrics_font_size(30.0, 1.0, 210.0),
+            24.6,
+        )
+        self.assertLessEqual(
+            runtime_header_metrics_font_size(80.0, 2.0, 90.0),
+            90.0 / 3.15,
+        )
+
     def test_header_defaults_are_shared(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,6 +48,21 @@ class SlideshowHeaderTests(unittest.TestCase):
         self.assertTrue(config.header_track_stats)
         self.assertEqual(config.header_background, "black")
         self.assertEqual(config.header_shadow_color, (0.0, 0.0, 0.0, 1.0))
+
+    def test_live_settings_apply_track_title_source(self):
+        app = object.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(track_title_mode="endpoint_places")
+        app.photo_presenter = None
+        app.map_presenter = None
+        app._refresh_photo_overlays = lambda: None
+        app._show_temporary_status_overlay = lambda *_args: None
+
+        app._apply_runtime_settings({"trackmaps.track_title": "track_name"})
+
+        self.assertEqual(app.config.track_title_mode, "track_name")
+
+        app._apply_runtime_settings({"trackmaps.track_title": "unsupported"})
+        self.assertEqual(app.config.track_title_mode, "track_name")
 
     def test_custom_header_shadow_color_is_parsed(self):
         with tempfile.TemporaryDirectory() as directory:

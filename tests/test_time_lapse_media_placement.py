@@ -65,6 +65,49 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertEqual(time_lapse_overview_display_seconds(3.0, True), 4.0)
         self.assertEqual(time_lapse_overview_display_seconds(3.0, False), 3.0)
 
+    def test_stage_specific_start_waits_for_both_fullscreen_windows(self):
+        callbacks = []
+
+        class HandleStub:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.fullscreen_active = True
+        app.photo_window = object()
+        app.map_window = object()
+        app.config = SimpleNamespace(join_windows=False)
+        app.fullscreen_window_roles = set()
+        app.startup_playback_callback = None
+        app.startup_fullscreen_wait_handle = None
+        app._available_screens = lambda: [object(), object()]
+
+        def schedule(delay, callback):
+            handle = HandleStub()
+            callbacks.append((delay, callback, handle))
+            return handle
+
+        app.schedule_callback = schedule
+        started = []
+        app._wait_for_startup_fullscreen(lambda: started.append(True))
+        timeout_handle = callbacks[0][2]
+
+        app.fullscreen_window_roles.add("photo")
+        app._finish_startup_fullscreen_wait()
+        self.assertEqual(started, [])
+        self.assertIsNotNone(app.startup_playback_callback)
+
+        app.fullscreen_window_roles.add("map")
+        app._finish_startup_fullscreen_wait()
+        self.assertTrue(timeout_handle.cancelled)
+        self.assertIsNone(app.startup_playback_callback)
+        self.assertEqual(callbacks[-1][0], 0.05)
+        callbacks[-1][1]()
+        self.assertEqual(started, [True])
+
     def test_car_and_bike_use_the_pilgrim_route_orientation(self):
         for style in ("car", "bike"):
             self.assertEqual(
@@ -581,6 +624,42 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
 
         self.assertEqual(calls, ["profile"])
 
+    def test_dual_screen_overview_continues_directly_to_motion(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(join_windows=False)
+        app.map_presenter = object()
+        app.time_lapse_stage = SimpleNamespace(relation=None)
+        app.time_lapse_active = True
+        app.time_lapse_media_draw_frame = True
+        calls = []
+        app._current_elevation_profile = lambda: object()
+        app._begin_time_lapse_stage_map_preview = lambda: calls.append("profile")
+        app._begin_time_lapse_motion = lambda: calls.append("motion")
+
+        app._continue_after_time_lapse_overview()
+
+        self.assertEqual(calls, ["motion"])
+
+    def test_dual_profile_target_keeps_pilgrim_and_media_states(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(join_windows=False)
+        app.map_presenter = object()
+        app.elevation_profiles_enabled = True
+        app.current_track_metadata = {"processed_track_segments": [[{}]]}
+        profile = object()
+        app._current_elevation_profile = lambda: profile
+
+        values = app._dual_profile_target_values(
+            object(),
+            {"map_kind": "overview"},
+            pilgrim_state={"stage_distance_km": 4.0, "elevation_m": 220.0},
+            media_state={"stage_km": 3.0, "elevation_m": 210.0},
+        )
+
+        self.assertIs(values["elevation_profile_image"], profile)
+        self.assertEqual(values["profile_pilgrim_marker"], (4.0, 220.0))
+        self.assertEqual(values["profile_media_marker"], (3.0, 210.0))
+
     def test_time_lapse_profile_continues_to_motion(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.time_lapse_stage = SimpleNamespace(relation=None)
@@ -781,6 +860,92 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertTrue(view.retired)
         self.assertTrue(resource["disposed"])
         self.assertIs(app.retired_map_resources[0], resource)
+
+    def test_time_lapse_activation_raises_both_canvases_before_hiding_presenters(self):
+        events = []
+
+        class HostStub:
+            def __init__(self, role):
+                self.role = role
+
+            def bounds(self):
+                return f"{self.role} bounds"
+
+            def addSubview_(self, view):
+                events.append(("raise", view.role))
+
+        class ViewStub:
+            def __init__(self, role):
+                self.role = role
+                self.host = HostStub(role)
+
+            def superview(self):
+                return self.host
+
+            def removeFromSuperview(self):
+                events.append(("remove", self.role))
+
+            def setFrame_(self, frame):
+                events.append(("frame", self.role, frame))
+
+            def setHidden_(self, hidden):
+                events.append(("hidden", self.role, hidden))
+
+            def setNeedsDisplay_(self, needed):
+                events.append(("display", self.role, needed))
+
+        class PresenterStub:
+            def __init__(self, role):
+                self.role = role
+
+            def cancel_pending(self):
+                events.append(("cancel", self.role))
+
+            def set_content_visible(self, visible):
+                events.append(("presenter", self.role, visible))
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.active_callback = None
+        app.time_photo_view = ViewStub("photo")
+        app.time_map_view = ViewStub("map")
+        app.photo_presenter = PresenterStub("photo")
+        app.map_presenter = PresenterStub("map")
+
+        app._suspend_standard_playback_for_time_lapse(hide_content=True)
+
+        first_hide = min(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "presenter"
+        )
+        self.assertIn(("raise", "photo"), events[:first_hide])
+        self.assertIn(("raise", "map"), events[:first_hide])
+        self.assertIn(("presenter", "photo", False), events)
+        self.assertIn(("presenter", "map", False), events)
+
+    def test_time_lapse_preparation_cancels_callbacks_without_hiding_current_slide(self):
+        class PresenterStub:
+            def __init__(self):
+                self.cancelled = False
+                self.visibility = []
+
+            def cancel_pending(self):
+                self.cancelled = True
+
+            def set_content_visible(self, visible):
+                self.visibility.append(visible)
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.active_callback = None
+        app.photo_presenter = PresenterStub()
+        app.map_presenter = PresenterStub()
+
+        app._suspend_standard_playback_for_time_lapse(hide_content=False)
+
+        self.assertTrue(app.photo_presenter.cancelled)
+        self.assertTrue(app.map_presenter.cancelled)
+        self.assertEqual(app.photo_presenter.visibility, [])
+        self.assertEqual(app.map_presenter.visibility, [])
 
     def test_w_parks_map_window_without_closing_native_object(self):
         class WindowStub:
