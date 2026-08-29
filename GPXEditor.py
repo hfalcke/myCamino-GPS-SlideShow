@@ -48,6 +48,8 @@ from AppKit import (
     NSEventModifierFlagShift,
     NSFont,
     NSFontAttributeName,
+    NSFontManager,
+    NSBoldFontMask,
     NSForegroundColorAttributeName,
     NSGraphicsContext,
     NSImage,
@@ -56,6 +58,7 @@ from AppKit import (
     NSImageOnly,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSMakePoint,
     NSMakeRect,
     NSMakeSize,
     NSMenu,
@@ -72,6 +75,7 @@ from AppKit import (
     NSScrollView,
     NSSortDescriptor,
     NSTableColumn,
+    NSTableRowView,
     NSTableView,
     NSTableViewNoColumnAutoresizing,
     NSTextField,
@@ -205,6 +209,7 @@ GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
 NS = {"gpx": GPX_NAMESPACE}
 ET.register_namespace("", GPX_NAMESPACE)
 MYCAMINO_EXT_TAG = "mycamino_gpx_editor"
+MYCAMINO_ORDER_NUMBER_ATTR = "order_number"
 STANDALONE_SETTINGS_PATH = (
     Path.home() / "Library" / "Application Support" / "myCamino GPX Editor" / "settings.json"
 )
@@ -530,6 +535,43 @@ def get_or_create_track_extensions(track_element: ET.Element) -> ET.Element:
     return extensions
 
 
+def find_mycamino_track_extension(track_element: ET.Element) -> ET.Element | None:
+    extensions = track_element.find("gpx:extensions", NS)
+    if extensions is None:
+        return None
+    for candidate in list(extensions):
+        if candidate.tag == MYCAMINO_EXT_TAG or candidate.tag.endswith(
+            "}" + MYCAMINO_EXT_TAG
+        ):
+            return candidate
+    return None
+
+
+def get_or_create_mycamino_track_extension(
+    track_element: ET.Element,
+) -> ET.Element:
+    node = find_mycamino_track_extension(track_element)
+    if node is not None:
+        return node
+    return ET.SubElement(get_or_create_track_extensions(track_element), MYCAMINO_EXT_TAG)
+
+
+def stored_track_order_number(track_element: ET.Element) -> int | None:
+    node = find_mycamino_track_extension(track_element)
+    if node is None:
+        return None
+    try:
+        value = int(str(node.get(MYCAMINO_ORDER_NUMBER_ATTR) or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def has_stored_track_order_number(track_element: ET.Element) -> bool:
+    node = find_mycamino_track_extension(track_element)
+    return bool(node is not None and MYCAMINO_ORDER_NUMBER_ATTR in node.attrib)
+
+
 def format_gpx_time(dt_value: datetime) -> str:
     return dt_value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -748,6 +790,14 @@ class TrackRecord:
         node.set("hidden", "yes" if hidden else "no")
 
     @property
+    def stored_order_number(self) -> int | None:
+        return stored_track_order_number(self.element)
+
+    def set_order_number(self, number: int):
+        node = get_or_create_mycamino_track_extension(self.element)
+        node.set(MYCAMINO_ORDER_NUMBER_ATTR, str(int(number)))
+
+    @property
     def time(self) -> datetime | None:
         track_time = parse_time(self.element.findtext("gpx:time", default="", namespaces=NS))
         if track_time is not None:
@@ -786,6 +836,20 @@ class TrackRecord:
         return points
 
 
+class SummaryTrackRowView(NSTableRowView):
+    """Table row that separates the aggregate values from track rows."""
+
+    def drawRect_(self, dirty_rect):
+        objc.super(SummaryTrackRowView, self).drawRect_(dirty_rect)
+        bounds = self.bounds()
+        NSColor.separatorColor().setStroke()
+        path = NSBezierPath.bezierPath()
+        path.setLineWidth_(1.0)
+        path.moveToPoint_(NSMakePoint(bounds.origin.x, bounds.size.height - 0.5))
+        path.lineToPoint_(NSMakePoint(bounds.size.width, bounds.size.height - 0.5))
+        path.stroke()
+
+
 class EditorTableDataSource(NSObject):
     def initWithController_(self, controller):
         self = objc.super(EditorTableDataSource, self).init()
@@ -806,6 +870,8 @@ class EditorTableDataSource(NSObject):
         self.controller.edit_table_value(row, str(table_column.identifier()), str(value))
 
     def tableView_shouldSelectRow_(self, _table_view, row):
+        if row < 0 or row >= len(self.controller.tracks):
+            return False
         clicked_column = _table_view.clickedColumn()
         if clicked_column >= 0:
             column = _table_view.tableColumns()[clicked_column]
@@ -814,6 +880,34 @@ class EditorTableDataSource(NSObject):
                 self.controller.edit_table_value(row, "show", "no" if current == "yes" else "yes")
                 return False
         return True
+
+    def tableView_willDisplayCell_forTableColumn_row_(
+        self, table_view, cell, _table_column, row
+    ):
+        base_font = self.controller.table_font(12)
+        if row == len(self.controller.tracks):
+            font = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(
+                base_font, NSBoldFontMask
+            )
+            cell.setFont_(font or NSFont.boldSystemFontOfSize_(12))
+            cell.setTextColor_(NSColor.controlTextColor())
+            return
+        cell.setFont_(base_font)
+        if 0 <= row < len(self.controller.tracks) and self.controller.tracks[row].hidden:
+            if table_view.isRowSelected_(row):
+                selected_color = getattr(NSColor, "alternateSelectedControlTextColor", None)
+                cell.setTextColor_(
+                    selected_color() if selected_color is not None else NSColor.controlTextColor()
+                )
+            else:
+                cell.setTextColor_(NSColor.disabledControlTextColor())
+        else:
+            cell.setTextColor_(NSColor.controlTextColor())
+
+    def tableView_rowViewForRow_(self, _table_view, row):
+        if row == len(self.controller.tracks):
+            return SummaryTrackRowView.alloc().initWithFrame_(NSZeroRect)
+        return None
 
     def tableView_shouldEditTableColumn_row_(self, _table_view, table_column, row):
         return self.controller.is_editable_cell(row, str(table_column.identifier()))
@@ -841,7 +935,12 @@ class EditorTableDataSource(NSObject):
         self.controller.pending_header_column = str(table_column.identifier())
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table_view, row_indexes, pasteboard):
-        rows = [index for index in range(row_indexes.firstIndex(), row_indexes.lastIndex() + 1) if row_indexes.containsIndex_(index)]
+        rows = [
+            index
+            for index in range(row_indexes.firstIndex(), row_indexes.lastIndex() + 1)
+            if row_indexes.containsIndex_(index)
+            and index < len(self.controller.tracks)
+        ]
         if not rows:
             return False
         pasteboard.declareTypes_owner_([DRAG_TYPE], None)
@@ -933,12 +1032,26 @@ def duplicate_track_records(
         duplicate_name = unique_track_copy_name(source.name, existing_names)
         get_or_create_track_name(element).text = duplicate_name
         existing_names.append(duplicate_name)
-        duplicates.append(TrackRecord(next_nr, element, source.source_file))
+        duplicate = TrackRecord(next_nr, element, source.source_file)
+        duplicate.set_order_number(next_nr)
+        duplicates.append(duplicate)
         next_nr += 1
     insert_at = max(indexes) + 1
     result = list(tracks)
     result[insert_at:insert_at] = duplicates
     return result, duplicates, next_nr
+
+
+def renumber_track_records(tracks: list[TrackRecord]) -> int:
+    """Assign persistent 1-based numbers in current row order."""
+    for number, track in enumerate(tracks, start=1):
+        track.nr = number
+        track.set_order_number(number)
+    return len(tracks) + 1
+
+
+def visible_track_count(tracks: Iterable[TrackRecord]) -> int:
+    return sum(1 for track in tracks if not track.hidden)
 
 
 TRACK_SORT_CRITERIA = (
@@ -5011,6 +5124,11 @@ class GPXEditorController(NSObject):
                 "addTracksFromPhotos:",
                 "Create editable estimated tracks from photo/video GPS positions and add them to this editor.",
             ),
+            (
+                "Renumber Tracks",
+                "renumberTracks:",
+                "Assign persistent track numbers 1 through N in the current row order.",
+            ),
             ("Save", "save:", "Save all tracks to the output GPX filename."),
             ("Save & Exit", "saveAndExit:", "Save the GPX file and exit the editor."),
             ("PNG", "savePng:", "Save the current selected-track plot as a PNG image."),
@@ -5112,6 +5230,12 @@ class GPXEditorController(NSObject):
             "Sort Selected Tracks…",
             "sortSelectedTracks:",
             count >= 2,
+        )
+        self._track_context_item(
+            menu,
+            "Renumber Tracks",
+            "renumberTracks:",
+            bool(self.tracks),
         )
         self._track_context_item(
             menu, "Duplicate Selected Tracks", "duplicateSelectedTracks:", count > 0
@@ -5218,6 +5342,9 @@ class GPXEditorController(NSObject):
         project_x = PADDING + 104 + gap + 140 + gap
         self.project_label.setFrame_(NSMakeRect(project_x, project_y + FIELD_HEIGHT + 2, 220, 18))
         self.project_field.setFrame_(NSMakeRect(project_x, project_y, 310, FIELD_HEIGHT))
+        self.buttons["Renumber Tracks"].setFrame_(
+            NSMakeRect(project_x + 318, project_y, 132, BUTTON_HEIGHT)
+        )
         undo_size = BUTTON_HEIGHT
         redo_x = width - PADDING - undo_size
         undo_x = redo_x - gap - undo_size
@@ -5991,9 +6118,10 @@ class GPXEditorController(NSObject):
                 }
             )
         if self.tracks:
+            visible_count = visible_track_count(self.tracks)
             rows.append(
                 {
-                    "row": str(len(self.tracks) + 1),
+                    "row": str(visible_count),
                     "nr": "",
                     "show": "",
                     "name": "Average / Total",
@@ -6468,6 +6596,9 @@ class GPXEditorController(NSObject):
         missing_timestamps = 0
         converted_routes = 0
         converted_waypoint_tracks = 0
+        reassigned_order_numbers = 0
+        used_numbers = {track.nr for track in self.tracks}
+        next_available_number = max(used_numbers, default=0) + 1
         self.last_load_dir = paths[0].parent
         for path in paths:
             try:
@@ -6495,12 +6626,24 @@ class GPXEditorController(NSObject):
             for source_index, trk in enumerate(document.tracks):
                 # load_gpx_document returns detached normalized elements for
                 # converted inputs and owned editable elements for GPX 1.1.
+                stored_number = stored_track_order_number(trk)
+                if stored_number is not None and stored_number not in used_numbers:
+                    assigned_number = stored_number
+                else:
+                    while next_available_number in used_numbers:
+                        next_available_number += 1
+                    assigned_number = next_available_number
+                    next_available_number += 1
+                    if stored_number is not None or has_stored_track_order_number(trk):
+                        reassigned_order_numbers += 1
+                used_numbers.add(assigned_number)
                 record = TrackRecord(
-                    self.next_nr,
+                    assigned_number,
                     trk,
                     str(path),
                     source_track_index=source_index,
                 )
+                record.set_order_number(assigned_number)
                 fingerprint, cached_metrics = cached_tracks[source_index]
                 record.processed_fingerprint = fingerprint
                 if cached_metrics is not None:
@@ -6509,7 +6652,7 @@ class GPXEditorController(NSObject):
                     metrics_cache_hits += 1
                 self.tracks.append(record)
                 added_records.append(record)
-                self.next_nr += 1
+                self.next_nr = max(self.next_nr, assigned_number + 1)
         ignored_parts = []
         if removed_invalid_coordinates:
             ignored_parts.append(f"{removed_invalid_coordinates} point(s) with invalid coordinates")
@@ -6529,6 +6672,10 @@ class GPXEditorController(NSObject):
             )
         if metrics_cache_hits:
             ignored_parts.append(f"reused cached metrics for {metrics_cache_hits} track(s)")
+        if reassigned_order_numbers:
+            ignored_parts.append(
+                f"reassigned {reassigned_order_numbers} duplicate or invalid track number(s)"
+            )
         ignored_suffix = f" Import details: {', '.join(ignored_parts)}." if ignored_parts else ""
         return added_records, ignored_suffix
 
@@ -7846,6 +7993,7 @@ class GPXEditorController(NSObject):
             anchor.set("lat", f"{self.anchor[0]:.8f}")
             anchor.set("lon", f"{self.anchor[1]:.8f}")
         for track in self.tracks:
+            track.set_order_number(track.nr)
             output_track = copy.deepcopy(track.element)
             for child in list(output_track):
                 if child.tag == qname("time"):
@@ -8150,6 +8298,21 @@ class GPXEditorController(NSObject):
         self.update_selection_field()
         self.mark_dirty(f"Duplicated {len(duplicates)} selected track(s).")
         self.refresh_open_plot_views()
+
+    @objc.IBAction
+    def renumberTracks_(self, _sender):
+        if not self.tracks:
+            return
+        selected_tracks = list(self.selected_tracks())
+        self.push_undo()
+        self.next_nr = renumber_track_records(self.tracks)
+        self.selected_nrs = [track.nr for track in selected_tracks]
+        self.duration_diagnostic_cache.clear()
+        self.update_selection_field()
+        self.mark_dirty(
+            f"Renumbered {len(self.tracks)} track(s) in current row order."
+        )
+        self.redraw_open_plot_views()
 
     def sort_by_column(self, column: str, ascending: bool | None = None, update_header: bool = True, source: str = "direct"):
         if not self.tracks:
@@ -8979,6 +9142,7 @@ class GPXEditorController(NSObject):
                     segment.remove(point)
         get_or_create_track_name(new_track).text = f"{track.name} part 2"
         new_record = TrackRecord(self.next_nr, new_track, track.source_file)
+        new_record.set_order_number(self.next_nr)
         self.next_nr += 1
         insert_at = self.tracks.index(track) + 1
         self.tracks.insert(insert_at, new_record)
@@ -9021,6 +9185,7 @@ class GPXEditorController(NSObject):
         if first_new_time is not None:
             get_or_create_track_time(new_track).text = format_gpx_time(first_new_time)
         new_record = TrackRecord(self.next_nr, new_track, track.source_file)
+        new_record.set_order_number(self.next_nr)
         self.next_nr += 1
         insert_at = self.tracks.index(track) + 1
         self.tracks.insert(insert_at, new_record)
@@ -9087,8 +9252,8 @@ class GPXEditorController(NSObject):
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "Add Tracks loads GPX files into the table. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
-            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint inspector. Right-click a selected row to inspect, plot, sort, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row.\n\n"
-            "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
+            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint inspector. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row.\n\n"
+            "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber Tracks records the current row order as persistent track numbers; after another sort, sorting by Track Number restores that order. Hidden rows remain numbered but are gray and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
             "Plot Overview opens an overview using the configured map service. If tracks are selected, the overview zooms to those tracks and highlights them in red; selecting different tracks in the table updates the red highlight. Click a track in the overview to select it in the table. Double-click a point in the overview to open that track in the inspector and track map at the same point.\n\n"
             "Plot Track(s) opens a detailed map for the selected track. View File opens the original GPX source file of the selected track in TextEdit and asks whether unsaved edits should be saved first. Click or drag on a map to move the white cursor dot and arrow to the nearest waypoint. Double-click a track point to open its waypoint inspector. Press i to show or hide point information; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z zooms out to the full map extent; q closes the plot window. In the track map, m or Shift-click sets a marker, Delete removes the marker-to-cursor point range after confirmation, and x cuts the track at the cursor after confirmation.\n\n"

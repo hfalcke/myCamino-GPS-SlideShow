@@ -19,6 +19,7 @@ GPX_NS = {"gpx": GPX_NAMESPACE}
 EARTH_RADIUS_KM = 6371.0088
 DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M = 500.0
 DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH = 1.5
+TRACK_FINGERPRINT_VERSION = 2
 
 HORIZONTAL_ACCURACY_NAMES = {
     "accuracy",
@@ -234,12 +235,110 @@ def local_tag_name(tag: str) -> str:
 def semantic_track_fingerprint(track_element: ET.Element) -> str:
     """Return a stable content hash independent of XML formatting whitespace."""
     parts = []
+    order_only_nodes = {
+        id(element)
+        for element in track_element.iter()
+        if local_tag_name(element.tag) == "mycamino_gpx_editor"
+        and set(element.attrib) <= {"order_number"}
+        and not (element.text or "").strip()
+        and len(element) == 0
+    }
     for element in track_element.iter():
         tag = local_tag_name(element.tag)
-        attrs = "|".join(f"{key}={value}" for key, value in sorted(element.attrib.items()))
+        if id(element) in order_only_nodes:
+            continue
+        if (
+            tag == "extensions"
+            and not element.attrib
+            and not (element.text or "").strip()
+            and len(element) > 0
+            and all(id(child) in order_only_nodes for child in element)
+        ):
+            continue
+        attributes = dict(element.attrib)
+        if tag == "mycamino_gpx_editor":
+            attributes.pop("order_number", None)
         text = (element.text or "").strip()
+        if (
+            tag == "mycamino_gpx_editor"
+            and not attributes
+            and not text
+            and len(element) == 0
+        ):
+            continue
+        attrs = "|".join(
+            f"{key}={value}" for key, value in sorted(attributes.items())
+        )
         parts.append(f"{tag}\t{attrs}\t{text}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _fingerprint_value(value: float | None, precision: int = 9) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.{precision}f}"
+
+
+def geometry_fingerprint_from_segments(segments: Iterable[Iterable[object]]) -> str:
+    """Hash segment-preserving processed latitude/longitude geometry."""
+    digest = hashlib.sha256()
+    digest.update(f"track-geometry-v{TRACK_FINGERPRINT_VERSION}\n".encode("ascii"))
+    for segment in segments:
+        digest.update(b"segment\n")
+        for point in segment:
+            if isinstance(point, dict):
+                latitude = point.get("lat")
+                longitude = point.get("lon")
+            elif isinstance(point, (tuple, list)) and len(point) >= 2:
+                latitude, longitude = point[0], point[1]
+            else:
+                latitude = getattr(point, "lat", None)
+                longitude = getattr(point, "lon", None)
+            digest.update(
+                f"{_fingerprint_value(latitude)}\t{_fingerprint_value(longitude)}\n".encode(
+                    "ascii"
+                )
+            )
+    return digest.hexdigest()
+
+
+def processed_track_geometry_fingerprint(processed: ProcessedTrack) -> str:
+    return geometry_fingerprint_from_segments(
+        segment.points for segment in processed.segments
+    )
+
+
+def processed_track_data_fingerprint(processed: ProcessedTrack) -> str:
+    """Hash processed geometry, elevation, timing, and segment boundaries."""
+    return data_fingerprint_from_segments(segment.points for segment in processed.segments)
+
+
+def data_fingerprint_from_segments(segments: Iterable[Iterable[object]]) -> str:
+    """Hash processed point records from objects, dictionaries, or sequences."""
+    digest = hashlib.sha256()
+    digest.update(f"track-data-v{TRACK_FINGERPRINT_VERSION}\n".encode("ascii"))
+    for segment in segments:
+        digest.update(b"segment\n")
+        for point in segment:
+            if isinstance(point, dict):
+                latitude = point.get("lat")
+                longitude = point.get("lon")
+                elevation = point.get("elevation_m")
+                time_value = point.get("time_iso", point.get("time"))
+            else:
+                latitude = getattr(point, "lat", None)
+                longitude = getattr(point, "lon", None)
+                elevation = getattr(point, "elevation_m", None)
+                time_value = getattr(point, "time", None)
+            timestamp = time_value.isoformat() if isinstance(time_value, datetime) else str(time_value or "")
+            digest.update(
+                (
+                    f"{_fingerprint_value(latitude)}\t"
+                    f"{_fingerprint_value(longitude)}\t"
+                    f"{_fingerprint_value(elevation, 6)}\t{timestamp}\n"
+                ).encode("utf-8")
+            )
+    return digest.hexdigest()
 
 
 def parse_time(value: str | None) -> datetime | None:

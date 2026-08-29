@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import inspect
 import os
 import re
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 from gpx_processing import (
     DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
     DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
+    TRACK_FINGERPRINT_VERSION,
     ProcessingOptions,
     RawTrackPoint,
     extract_raw_track_points,
@@ -21,6 +23,8 @@ from gpx_processing import (
     parse_time,
     process_raw_points,
     process_track_element,
+    processed_track_data_fingerprint,
+    processed_track_geometry_fingerprint,
     semantic_track_fingerprint as shared_semantic_track_fingerprint,
 )
 from gpx_import import load_gpx_document, timing_status_for_track
@@ -294,6 +298,19 @@ def semantic_track_fingerprint(track_element):
     return shared_semantic_track_fingerprint(track_element)
 
 
+def persistent_track_order_number(track_element):
+    """Return the positive myCamino order number stored on a track, if any."""
+    for element in track_element.iter():
+        if element.tag.rsplit("}", 1)[-1].casefold() != "mycamino_gpx_editor":
+            continue
+        try:
+            value = int(str(element.attrib.get("order_number", "")).strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+    return None
+
+
 # AI prompt: "Write a summarizer for one GPX <trk> element that extracts display
 # fields, timing, geometry, length, endpoints, and the point list for plotting."
 def summarize_track(
@@ -356,6 +373,8 @@ def summarize_track(
 
     first_point = None if processed.first_point is None else (processed.first_point.lat, processed.first_point.lon)
     last_point = None if processed.last_point is None else (processed.last_point.lat, processed.last_point.lon)
+    geometry_fingerprint = processed_track_geometry_fingerprint(processed)
+    data_fingerprint = processed_track_data_fingerprint(processed)
 
     return {
         "name": track_name,
@@ -386,7 +405,11 @@ def summarize_track(
         "raw_point_count": len(raw_points),
         "rejection_counts": processed.rejection_counts,
         "processing_options": processed.options.as_dict(),
-        "track_fingerprint": semantic_track_fingerprint(track_element),
+        "track_fingerprint": data_fingerprint,
+        "track_fingerprint_version": TRACK_FINGERPRINT_VERSION,
+        "track_geometry_fingerprint": geometry_fingerprint,
+        "track_data_fingerprint": data_fingerprint,
+        "legacy_semantic_track_fingerprint": semantic_track_fingerprint(track_element),
     }
 
 
@@ -411,9 +434,21 @@ def parse_gpx_file(
     document = load_gpx_document(file_path)
 
     tracks = []
-    for original_sequence_number, track_element in enumerate(document.tracks, start=1):
+    used_order_numbers = set()
+    next_order_number = 1
+    track_total = len(document.tracks)
+    callback_parameter_count = None
+    if track_processing_callback is not None:
+        try:
+            callback_parameter_count = len(inspect.signature(track_processing_callback).parameters)
+        except (TypeError, ValueError):
+            callback_parameter_count = 0
+    for source_sequence_number, track_element in enumerate(document.tracks, start=1):
         if track_processing_callback is not None:
-            track_processing_callback()
+            if callback_parameter_count and callback_parameter_count >= 2:
+                track_processing_callback(source_sequence_number, track_total)
+            else:
+                track_processing_callback()
         track = summarize_track(
             track_element,
             remove_prefix,
@@ -428,6 +463,15 @@ def parse_gpx_file(
             running_speed_window_distance_m,
             stationary_speed_threshold_kmh,
         )
+        stored_order_number = persistent_track_order_number(track_element)
+        if stored_order_number is not None and stored_order_number not in used_order_numbers:
+            original_sequence_number = stored_order_number
+        else:
+            while next_order_number in used_order_numbers:
+                next_order_number += 1
+            original_sequence_number = next_order_number
+            next_order_number += 1
+        used_order_numbers.add(original_sequence_number)
         track["original_sequence_number"] = original_sequence_number
         track["timing_status"] = timing_status_for_track(track_element)
         track["has_absolute_time"] = track["start_time"] is not None
@@ -440,8 +484,8 @@ def parse_gpx_file(
             "media"
             if media_derived
             else "route"
-            if original_sequence_number > document.report.track_count
-            and original_sequence_number
+            if source_sequence_number > document.report.track_count
+            and source_sequence_number
             <= document.report.track_count + document.report.converted_routes
             else "waypoints"
             if document.report.converted_waypoint_tracks
@@ -515,7 +559,9 @@ def sort_tracks(tracks, sort_date, sort_distance, sort_original=False):
     anchor_point, anchor_name = assign_anchor_distances(tracks)
 
     if sort_original:
-        pass
+        tracks.sort(
+            key=lambda track: int(track.get("original_sequence_number", 0))
+        )
     elif sort_distance:
         tracks.sort(
             key=lambda track: (
@@ -837,6 +883,9 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "original_sequence_number": track["original_sequence_number"],
                 "track_name": track["name"],
                 "track_fingerprint": track.get("track_fingerprint"),
+                "track_fingerprint_version": track.get("track_fingerprint_version"),
+                "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
+                "track_data_fingerprint": track.get("track_data_fingerprint"),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
                 "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                 "track_data_sidecar": track.get("track_data_sidecar"),
@@ -890,6 +939,9 @@ def derived_track_data_payload(track, fallback_walking_speed_kmh=3.5):
         "original_sequence_number": track.get("original_sequence_number"),
         "track_name": track.get("name", ""),
         "track_fingerprint": track.get("track_fingerprint"),
+        "track_fingerprint_version": track.get("track_fingerprint_version"),
+        "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
+        "track_data_fingerprint": track.get("track_data_fingerprint"),
         "timing_status": track.get("timing_status", "recorded"),
         "has_absolute_time": bool(track.get("has_absolute_time")),
         "gpx_processing": track.get("processing_options", {}),
@@ -1384,6 +1436,7 @@ def render_track_plot(
     media_map_date=None,
     background_only=True,
     media_map_title="",
+    map_cache_only=False,
 ):
     """Render one overview or one single-track plot."""
     try:
@@ -1617,7 +1670,12 @@ def render_track_plot(
     ax.set_aspect("equal", adjustable="box")
     try:
         configure_contextily_cache(cx, DEFAULT_TILE_CACHE_DIR)
-        with contextily_request_timeout(cx, map_request_timeout_seconds, map_provider):
+        with contextily_request_timeout(
+            cx,
+            map_request_timeout_seconds,
+            map_provider,
+            cache_only=map_cache_only,
+        ):
             with tolerate_missing_tiles(cx) as missing_tile_report:
                 cx.add_basemap(
                     ax,
@@ -1811,6 +1869,7 @@ def render_media_location_map(
     map_layout="standard",
     track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
     adventure_render_parameters=None,
+    map_cache_only=False,
 ):
     """Render a date-only map containing all supplied media coordinates."""
     points = [
@@ -1857,6 +1916,7 @@ def render_media_location_map(
         minimum_short_dimension_m=minimum_short_dimension_m,
         media_map_date=media_date,
         media_map_title=stage_name,
+        map_cache_only=map_cache_only,
     )
     media_clear_options = metadata.pop("media_clear_box_options", None)
     rich_media_points = list(media_points) if isinstance(media_points, (list, tuple)) else [
@@ -1921,6 +1981,7 @@ def render_media_overview_map(
     map_request_timeout_seconds=12.0,
     map_credential_id="default",
     adventure_render_parameters=None,
+    map_cache_only=False,
 ):
     """Render one shared overview basemap for a media-only Adventure."""
     points = [
@@ -1956,6 +2017,7 @@ def render_media_overview_map(
         map_request_timeout_seconds=map_request_timeout_seconds,
         map_credential_id=map_credential_id,
         background_only=True,
+        map_cache_only=map_cache_only,
     )
     fingerprint = media_overview_fingerprint(points)
     metadata.update(
@@ -2602,6 +2664,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
             map_request_timeout_seconds=args.map_request_timeout_seconds,
             map_credential_id=getattr(args, "map_credential_id", "default"),
             background_only=getattr(args, "background_only", True),
+            map_cache_only=getattr(args, "map_cache_only", False),
         )
         render_parameters = getattr(args, "adventure_overview_render_parameters", None)
         if not isinstance(render_parameters, dict):
@@ -2614,6 +2677,9 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                 "source_track_fingerprints": [
                     track.get("track_fingerprint")
                     for track in tracks
+                ],
+                "source_track_geometry_fingerprints": [
+                    track.get("track_geometry_fingerprint") for track in tracks
                 ],
                 "output_image": context["overview_path"],
                 "output_metadata": context["overview_metadata_path"],
@@ -2633,6 +2699,9 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                         "track_number": track["table_number"],
                         "track_name": track["name"],
                         "track_fingerprint": track.get("track_fingerprint"),
+                        "track_fingerprint_version": track.get("track_fingerprint_version"),
+                        "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
+                        "track_data_fingerprint": track.get("track_data_fingerprint"),
                         "track_plot_image_filename": track.get("track_plot_image_filename"),
                         "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                         "start_time": format_datetime_local_seconds(track["start_time"]),
@@ -2728,6 +2797,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                 args.map_request_timeout_seconds,
                 getattr(args, "map_credential_id", "default"),
                 background_only=getattr(args, "background_only", True),
+                map_cache_only=getattr(args, "map_cache_only", False),
             )
             render_parameters = getattr(args, "adventure_render_parameters", None)
             if isinstance(render_parameters, dict):
@@ -2740,6 +2810,9 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "track_number": number,
                     "track_name": track["name"],
                     "track_fingerprint": track.get("track_fingerprint"),
+                    "track_fingerprint_version": track.get("track_fingerprint_version"),
+                    "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
+                    "track_data_fingerprint": track.get("track_data_fingerprint"),
                     "track_date": format_date_local(track["time"]),
                     "track_start_time": format_datetime_local_seconds(track["start_time"]),
                     "track_length_km": round(track["length_km"], 1),
@@ -2995,6 +3068,7 @@ def namespace_from_options(gpx_file, **overrides):
         track_processing_callback=None,
         cancel_event=None,
         render_progress_callback=None,
+        map_cache_only=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)

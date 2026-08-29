@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Helpers for writing, reading, and using shared metadata JSON files."""
 
+import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime
 from math import atan, degrees, exp, isfinite, log, pi, radians, tan
 from pathlib import Path
+
+
+MEDIA_FILE_IDENTITY_VERSION = 1
+MEDIA_FILE_IDENTITY_ALGORITHM = "sha256"
 
 
 # AI prompt: "Write a converter from WGS84 longitude/latitude to Web Mercator
@@ -78,6 +85,7 @@ def build_photo_metadata_payload(
     place_details=None,
     *,
     source_file_signature=None,
+    source_file_identity=None,
     datetime_source=None,
     metadata_updated_at=None,
     place_coordinate=None,
@@ -101,6 +109,8 @@ def build_photo_metadata_payload(
                 payload[key] = place_details.get(key)
     if isinstance(source_file_signature, dict):
         payload["source_file_signature"] = dict(source_file_signature)
+    if isinstance(source_file_identity, dict):
+        payload["source_file_identity"] = dict(source_file_identity)
     if isinstance(datetime_source, str) and datetime_source.strip():
         payload["datetime_source"] = datetime_source.strip()
     if isinstance(metadata_updated_at, str) and metadata_updated_at.strip():
@@ -139,8 +149,63 @@ def media_file_signature(media_path):
     }
 
 
-def media_sidecar_freshness(media_path, payload):
-    """Return ``current``, ``changed``, or ``unknown`` for a valid sidecar."""
+def media_file_identity(media_path, *, cancel_callback=None, chunk_size=1024 * 1024):
+    """Return the authoritative full-file content identity for one medium."""
+    path = Path(media_path)
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as input_file:
+        while True:
+            if cancel_callback is not None:
+                cancel_callback()
+            chunk = input_file.read(max(64 * 1024, int(chunk_size)))
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return {
+        "version": MEDIA_FILE_IDENTITY_VERSION,
+        "algorithm": MEDIA_FILE_IDENTITY_ALGORITHM,
+        "size": size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def valid_media_file_identity(value):
+    """Return whether a stored identity uses the supported complete SHA-256 form."""
+    if not isinstance(value, dict):
+        return False
+    try:
+        version = int(value.get("version"))
+        size = int(value.get("size"))
+    except (TypeError, ValueError):
+        return False
+    digest = value.get("sha256")
+    return bool(
+        version == MEDIA_FILE_IDENTITY_VERSION
+        and str(value.get("algorithm", "")).casefold() == MEDIA_FILE_IDENTITY_ALGORITHM
+        and size >= 0
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in digest)
+    )
+
+
+def media_file_identity_matches(media_path, identity, *, cancel_callback=None):
+    """Compare one file with a supported stored full-content identity."""
+    if not valid_media_file_identity(identity):
+        return False
+    try:
+        if Path(media_path).stat().st_size != int(identity["size"]):
+            return False
+        current = media_file_identity(media_path, cancel_callback=cancel_callback)
+    except OSError:
+        return False
+    return current["sha256"].casefold() == str(identity["sha256"]).casefold()
+
+
+def media_sidecar_freshness(media_path, payload, *, verify_content=True, cancel_callback=None):
+    """Return freshness, using SHA-256 only for same-size timestamp changes."""
     stored = payload.get("source_file_signature") if isinstance(payload, dict) else None
     if not isinstance(stored, dict):
         return "unknown"
@@ -152,7 +217,52 @@ def media_sidecar_freshness(media_path, payload):
         current = media_file_signature(media_path)
     except (KeyError, OSError, TypeError, ValueError):
         return "unknown"
-    return "current" if expected == current else "changed"
+    if expected == current:
+        return "current"
+    if expected["size"] != current["size"]:
+        return "changed"
+    identity = payload.get("source_file_identity") if isinstance(payload, dict) else None
+    if not valid_media_file_identity(identity):
+        return "unknown"
+    if not verify_content:
+        return "content-check-needed"
+    return (
+        "content-current"
+        if media_file_identity_matches(
+            media_path,
+            identity,
+            cancel_callback=cancel_callback,
+        )
+        else "changed"
+    )
+
+
+def patch_media_sidecar_signature(media_path, payload, sidecar_path=None):
+    """Atomically patch only a copied file's inexpensive signature."""
+    media = Path(media_path)
+    sidecar = Path(sidecar_path) if sidecar_path is not None else media_sidecar_path(media)
+    updated = dict(payload)
+    updated["source_file_signature"] = media_file_signature(media)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=f".{sidecar.name}.",
+        suffix=".tmp",
+        dir=sidecar.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(updated, handle, indent=2, ensure_ascii=True, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temporary, sidecar)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return updated
 
 
 def legacy_media_sidecar_path(media_path):

@@ -17,6 +17,12 @@ from adventure_files import (
     load_adventure,
     rename_or_copy_adventure,
 )
+from control_media_inventory import (
+    build_control_media_inventory_payload,
+    control_media_inventory_path,
+    load_control_media_inventory,
+    write_control_media_inventory,
+)
 from json_storage import atomic_write_json
 
 
@@ -113,6 +119,9 @@ class AdventureFileTests(unittest.TestCase):
             )
             self.assertEqual(created["external_reference"], "/Volumes/Archive/music.mp3")
             self.assertEqual(created["slideshow_resume_history"], [])
+            self.assertEqual(
+                created["media_identity_source_project"], str(old_directory)
+            )
             self.assertNotIn("slideshow_resume_position", created)
             self.assertEqual(source.read_text(encoding="utf-8"), source_text)
             self.assertEqual(json.loads(source_text), original_payload)
@@ -263,6 +272,47 @@ class AdventureFileTests(unittest.TestCase):
             self.assertIn("#CONTROL: #TRANSITION FADE", copied_control)
             self.assertIn("#MapAfter: 0001_New.png", copied_control)
             self.assertIn("photo.jpeg | 12:00 | - | -", copied_control)
+
+    def test_related_copy_copies_and_retargets_control_media_inventory(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source_adv = directory / "Old.adv"
+            source_control = directory / "Old-sorted.lst"
+            source_control.write_text(
+                "#Datum: Montag, 15.07.2024\n"
+                "photo.jpeg | 12:00 | - | -\n",
+                encoding="utf-8",
+            )
+            (directory / "Old.gpx").write_text("<gpx/>", encoding="utf-8")
+            photo = directory / "photo.jpeg"
+            photo.write_bytes(b"photo")
+            inventory = load_control_media_inventory(source_control)
+            inventory_payload = build_control_media_inventory_payload(
+                inventory,
+                [photo],
+                [photo.name],
+                control_text=source_control.read_text(encoding="utf-8"),
+            )
+            write_control_media_inventory(
+                inventory_payload,
+                control_media_inventory_path(source_control),
+            )
+            payload = adventure_payload(directory, "Old")
+            atomic_write_json(source_adv, payload)
+
+            rename_or_copy_adventure(
+                source_adv,
+                payload,
+                "New",
+                "copy",
+                include_related=True,
+            )
+
+            copied_control = directory / "New-sorted.lst"
+            copied_inventory = load_control_media_inventory(copied_control)
+            self.assertTrue(copied_inventory.loaded)
+            self.assertEqual(copied_inventory.path.name, "New-sorted.lst.mycamino-state.json")
+            self.assertEqual(copied_inventory.entry(photo.name)["state"], "included")
 
     def test_rename_without_related_files_preserves_explicit_references(self):
         with TemporaryDirectory() as temporary:

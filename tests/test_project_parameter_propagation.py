@@ -12,6 +12,7 @@ from GetGeoLocations import params_from_options
 from map_provider_utils import (
     MYCAMINO_USER_AGENT,
     OSM_MINIMUM_CACHE_HOURS,
+    TileCacheMissError,
     TileProviderAccessError,
     contextily_provider,
     contextily_request_timeout,
@@ -83,6 +84,22 @@ class ProjectParameterPropagationTests(unittest.TestCase):
         with self.assertRaises(TileProviderAccessError):
             with contextily_request_timeout(contextily, 1, "osm", 0):
                 requests.get("https://tile.openstreetmap.org/1/1/1.png")
+
+    def test_cache_only_mode_never_calls_the_network(self):
+        calls = []
+
+        def original_get(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        requests = SimpleNamespace(get=original_get)
+        contextily = SimpleNamespace(tile=SimpleNamespace(requests=requests))
+        with self.assertRaises(TileCacheMissError):
+            with contextily_request_timeout(
+                contextily, 1, "osm", 0, cache_only=True
+            ):
+                requests.get("https://tile.openstreetmap.org/1/1/1.png")
+        self.assertEqual(calls, [])
+        self.assertIs(requests.get, original_get)
 
     def test_http_429_waits_once_for_retry_after(self):
         responses = iter(

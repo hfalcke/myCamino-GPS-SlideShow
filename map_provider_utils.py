@@ -30,6 +30,10 @@ class TileProviderAccessError(RuntimeError):
     """A provider deliberately refused or rate-limited a tile request."""
 
 
+class TileCacheMissError(TileProviderAccessError):
+    """A cache-only rendering job required a tile that was not cached."""
+
+
 def provider_requires_credential(provider: str) -> bool:
     return str(provider or "").strip().lower() in {"geoapify", "thunderforest", "stadia"}
 
@@ -223,6 +227,7 @@ def contextily_request_timeout(
     timeout_seconds: float,
     provider: str = "osm",
     minimum_interval_seconds: float | None = None,
+    cache_only: bool = False,
 ):
     """Apply identification, pacing, timeout, and terminal provider errors."""
     tile_module = getattr(contextily_module, "tile", None)
@@ -238,6 +243,12 @@ def contextily_request_timeout(
     ) if minimum_interval_seconds is None else max(0.0, float(minimum_interval_seconds))
 
     def get_with_timeout(*args, **kwargs):
+        if cache_only:
+            url = str(args[0] if args else kwargs.get("url", ""))
+            raise TileCacheMissError(
+                "Cached OSM tiles are incomplete. No network request was sent"
+                + (f" for {url}." if url else ".")
+            )
         kwargs.setdefault("timeout", float(timeout_seconds))
         headers = dict(kwargs.get("headers") or {})
         headers["user-agent"] = MYCAMINO_USER_AGENT

@@ -5,13 +5,17 @@ from __future__ import annotations
 import unittest
 
 from adventure_parameters import (
+    add_accepted_render_signature,
+    map_render_signature_matches,
     PARAMETER_SCHEMA_VERSION,
     SECTION_ORDER,
     default_parameters,
     map_affecting_parameter_keys,
     normalize_parameter_value,
     normalize_parameters,
+    normalize_parameter_signature,
     parameter_payload,
+    parameter_signatures_match,
     SPECS_BY_KEY,
     validate_parameters,
     visible_specs_for_section,
@@ -278,6 +282,62 @@ class AdventureParameterTests(unittest.TestCase):
         )
         self.assertNotIn("gpx.running_speed_window_distance_m", keys)
         self.assertNotIn("gpx.stationary_speed_threshold_kmh", keys)
+
+    def test_legacy_map_provider_signature_uses_explicit_alias(self):
+        saved = {"maps.provider": "osm", "trackmaps.zoom": 16}
+        expected = {"maps.output_provider": "osm", "trackmaps.zoom": 16}
+        self.assertTrue(parameter_signatures_match(saved, expected))
+        self.assertEqual(normalize_parameter_signature(saved), expected)
+        self.assertFalse(
+            parameter_signatures_match(
+                {"maps.provider": "osm"},
+                {"maps.output_provider": "geoapify"},
+            )
+        )
+
+    def test_accepted_render_signature_preserves_original_provider(self):
+        metadata = {
+            "adventure_render_parameters": {
+                "maps.output_provider": "osm",
+                "trackmaps.rendered_layout": "standard",
+            },
+            "map_attribution": "© OpenStreetMap contributors",
+        }
+        expected = {
+            "maps.output_provider": "geoapify",
+            "trackmaps.rendered_layout": "standard",
+        }
+
+        changed = add_accepted_render_signature(
+            metadata,
+            expected,
+            accepted_at="2026-08-29T12:00:00+02:00",
+        )
+
+        self.assertTrue(changed)
+        self.assertTrue(map_render_signature_matches(metadata, expected))
+        self.assertEqual(
+            metadata["adventure_render_parameters"]["maps.output_provider"],
+            "osm",
+        )
+        self.assertEqual(metadata["map_attribution"], "© OpenStreetMap contributors")
+
+    def test_new_render_setting_invalidates_previous_acceptance(self):
+        metadata = {
+            "adventure_render_parameters": {"maps.output_provider": "osm"}
+        }
+        add_accepted_render_signature(
+            metadata,
+            {"maps.output_provider": "geoapify", "trackmaps.zoom": 16},
+            accepted_at="2026-08-29T12:00:00+02:00",
+        )
+
+        self.assertFalse(
+            map_render_signature_matches(
+                metadata,
+                {"maps.output_provider": "geoapify", "trackmaps.zoom": 15},
+            )
+        )
 
 
 if __name__ == "__main__":

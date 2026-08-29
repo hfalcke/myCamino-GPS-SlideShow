@@ -22,8 +22,10 @@ from GPXEditor import (
     lonlat_to_web_mercator,
     normalize_inspector_timestamp_edit,
     qname,
+    renumber_track_records,
     reordered_selected_items,
     unique_track_copy_name,
+    visible_track_count,
     visible_simplified_polyline_runs,
 )
 
@@ -171,8 +173,22 @@ class TrackBatchOrderTests(unittest.TestCase):
         self.assertEqual(next_nr, 7)
         self.assertEqual(updated[3].source_file, "one.gpx")
         self.assertIsNot(updated[3].element, updated[0].element)
+        self.assertEqual(duplicates[0].stored_order_number, 5)
+        self.assertEqual(duplicates[1].stored_order_number, 6)
         updated[3].element.find("gpx:name", {"gpx": "http://www.topografix.com/GPX/1/1"}).text = "Changed"
         self.assertEqual(updated[0].name, "A")
+
+    def test_renumber_tracks_uses_current_rows(self):
+        tracks = [
+            self.make_track(8, "C", "one.gpx"),
+            self.make_track(3, "A", "one.gpx"),
+            self.make_track(12, "B", "one.gpx"),
+        ]
+        next_nr = renumber_track_records(tracks)
+
+        self.assertEqual([track.nr for track in tracks], [1, 2, 3])
+        self.assertEqual([track.stored_order_number for track in tracks], [1, 2, 3])
+        self.assertEqual(next_nr, 4)
 
     def test_batch_visibility_changes_only_tracks_that_need_it(self):
         visible = self.make_track(1, "Visible", "one.gpx")
@@ -191,6 +207,18 @@ class TrackBatchOrderTests(unittest.TestCase):
         self.assertTrue(hidden.hidden)
         controller.push_undo.assert_called_once_with()
         controller.mark_dirty.assert_called_once_with("Hidden 1 selected track(s).")
+
+    def test_visible_track_count_excludes_hidden_rows(self):
+        tracks = [
+            self.make_track(1, "Visible", "one.gpx"),
+            self.make_track(2, "Hidden", "one.gpx"),
+            self.make_track(3, "Also visible", "one.gpx"),
+        ]
+        tracks[1].set_hidden(True)
+        self.assertEqual(visible_track_count(tracks), 2)
+        tracks[0].set_hidden(True)
+        tracks[2].set_hidden(True)
+        self.assertEqual(visible_track_count(tracks), 0)
 
     def test_selected_moving_speed_sort_preserves_unselected_positions(self):
         tracks = [

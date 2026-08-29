@@ -10,6 +10,8 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from control_media_inventory import control_media_inventory_path
 from typing import Callable, Iterable
 
 from json_storage import atomic_write_json
@@ -263,6 +265,9 @@ def create_adventure_from_template(
     payload["adventure_format_version"] = ADVENTURE_FORMAT_VERSION
     payload["project_name"] = target_base
     payload["project_directory"] = str(directory)
+    payload["media_identity_source_project"] = str(
+        template.recorded_project_directory
+    )
     payload.pop("slideshow_resume_position", None)
     payload["slideshow_resume_history"] = []
     payload = validate_adventure_payload(payload, target_path)
@@ -412,6 +417,11 @@ def rename_or_copy_adventure(
             mapping[source_gpx] = target_gpx
         if source_control.exists():
             mapping[source_control] = target_control
+            source_control_state = control_media_inventory_path(source_control)
+            if source_control_state.exists():
+                mapping[source_control_state] = control_media_inventory_path(
+                    target_control
+                )
         mapping.update(related_track_assets(project_dir, old_map_base, target_base))
         playlist_value = str(current.get("music_playlist", "") or "").strip()
         if playlist_value:

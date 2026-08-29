@@ -12,6 +12,8 @@ from gpx_processing import (
     ProcessingOptions,
     RawTrackPoint,
     clear_processing_cache,
+    data_fingerprint_from_segments,
+    geometry_fingerprint_from_segments,
     process_raw_points,
     process_track_element,
     processing_cache_info,
@@ -150,6 +152,27 @@ class SharedGpxProcessingTests(unittest.TestCase):
         self.assertEqual(calls, [1, 2, 3])
         self.assertEqual(len(tracks), 3)
 
+    def test_parse_gpx_file_reports_track_progress_when_callback_accepts_it(self):
+        temporary_directory, path = self._write_gpx_tracks(3)
+        self.addCleanup(temporary_directory.cleanup)
+        calls = []
+
+        parse_gpx_file(
+            path,
+            "",
+            0,
+            0,
+            False,
+            0,
+            0,
+            0,
+            0,
+            0,
+            lambda current, total: calls.append((current, total)),
+        )
+
+        self.assertEqual(calls, [(1, 3), (2, 3), (3, 3)])
+
     def test_parse_gpx_file_propagates_cooperative_cancellation(self):
         temporary_directory, path = self._write_gpx_tracks(3)
         self.addCleanup(temporary_directory.cleanup)
@@ -167,6 +190,72 @@ class SharedGpxProcessingTests(unittest.TestCase):
         with self.assertRaises(CancelStatusRefresh):
             parse_gpx_file(path, "", 0, 0, False, 0, 0, 0, 0, 0, cancel_on_second_track)
         self.assertEqual(calls, 2)
+
+    def test_persistent_track_order_controls_original_sort(self):
+        temporary_directory, path = self._write_gpx_tracks(3)
+        self.addCleanup(temporary_directory.cleanup)
+        tree = ET.parse(path)
+        tracks = tree.getroot().findall(f"{{{GPX_NAMESPACE}}}trk")
+        for track, number in zip(tracks, (30, 10, 20)):
+            extensions = ET.SubElement(track, f"{{{GPX_NAMESPACE}}}extensions")
+            ET.SubElement(
+                extensions,
+                "mycamino_gpx_editor",
+                {"order_number": str(number)},
+            )
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+
+        parsed = parse_gpx_file(path, "", 0, 0, False, 0, 0, 0, 0, 0)
+        from gpx_tracks_table import sort_tracks
+
+        ordered, _anchor, _name = sort_tracks(
+            parsed, sort_date=False, sort_distance=False, sort_original=True
+        )
+        self.assertEqual(
+            [track["original_sequence_number"] for track in ordered],
+            [10, 20, 30],
+        )
+
+    def test_order_number_does_not_change_semantic_fingerprint(self):
+        track = track_xml(
+            [[
+                {"lat": 50.0, "lon": 7.0},
+                {"lat": 50.1, "lon": 7.1},
+            ]]
+        )
+        original = semantic_track_fingerprint(track)
+        extensions = ET.SubElement(track, f"{{{GPX_NAMESPACE}}}extensions")
+        editor = ET.SubElement(
+            extensions,
+            "mycamino_gpx_editor",
+            {"order_number": "1"},
+        )
+        self.assertEqual(semantic_track_fingerprint(track), original)
+        editor.set("order_number", "42")
+        self.assertEqual(semantic_track_fingerprint(track), original)
+
+    def test_versioned_geometry_and_data_fingerprints_have_separate_scope(self):
+        first = [[
+            {"lat": 50.0, "lon": 7.0, "elevation_m": 100.0, "time_iso": "2024-01-01T10:00:00+00:00"},
+            {"lat": 50.1, "lon": 7.1, "elevation_m": 110.0, "time_iso": "2024-01-01T10:05:00+00:00"},
+        ]]
+        changed_data = copy.deepcopy(first)
+        changed_data[0][1]["elevation_m"] = 120.0
+        changed_data[0][1]["time_iso"] = "2024-01-01T10:06:00+00:00"
+
+        self.assertEqual(
+            geometry_fingerprint_from_segments(first),
+            geometry_fingerprint_from_segments(changed_data),
+        )
+        self.assertNotEqual(
+            data_fingerprint_from_segments(first),
+            data_fingerprint_from_segments(changed_data),
+        )
+        split = [[first[0][0]], [first[0][1]]]
+        self.assertNotEqual(
+            geometry_fingerprint_from_segments(first),
+            geometry_fingerprint_from_segments(split),
+        )
 
     def test_untimed_points_remain_available(self):
         temporary_directory, path = self._write_gpx_tracks(1)

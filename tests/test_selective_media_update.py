@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -12,6 +13,7 @@ from unittest.mock import patch
 import GetGeoLocations as geo
 from plot_metadata_utils import (
     build_photo_metadata_payload,
+    media_file_identity,
     media_file_signature,
     media_sidecar_freshness,
     media_sidecar_path,
@@ -375,6 +377,68 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         self.assertEqual(media_sidecar_freshness(media, payload), "changed")
         payload.pop("source_file_signature")
         self.assertEqual(media_sidecar_freshness(media, payload), "unknown")
+
+    def test_same_content_with_copied_timestamp_repairs_without_extraction(self):
+        media = self._media("copied.jpeg")
+        payload = self._sidecar(media, datetime(2024, 7, 15, 12, 0))
+        payload["source_file_identity"] = media_file_identity(media)
+        media_sidecar_path(media).write_text(json.dumps(payload), encoding="utf-8")
+        stat_result = media.stat()
+        os.utime(media, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000))
+
+        self.assertEqual(media_sidecar_freshness(media, payload), "content-current")
+        with patch.object(geo, "build_record_from_photo") as extractor:
+            candidates = geo.discover_media_update_candidates(self.project)
+        self.assertEqual(candidates, [])
+        extractor.assert_not_called()
+        repaired = json.loads(media_sidecar_path(media).read_text(encoding="utf-8"))
+        self.assertEqual(repaired["source_file_signature"], media_file_signature(media))
+        self.assertEqual(repaired["place"], payload["place"])
+
+    def test_same_size_changed_content_is_detected_by_sha256(self):
+        media = self._media("content.jpeg")
+        payload = self._sidecar(media, datetime(2024, 7, 15, 12, 0))
+        payload["source_file_identity"] = media_file_identity(media)
+        original_stat = media.stat()
+        media.write_bytes(b"X" * original_stat.st_size)
+        os.utime(media, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000))
+        self.assertEqual(media_sidecar_freshness(media, payload), "changed")
+
+    def test_identity_indexing_does_not_extract_metadata(self):
+        media = self._media("index.jpeg")
+        self._sidecar(media, datetime(2024, 7, 15, 12, 0))
+        with patch.object(geo, "build_record_from_photo") as extractor:
+            report = geo.index_media_file_identities(self.project)
+        self.assertEqual(report.indexed, 1)
+        extractor.assert_not_called()
+        payload = json.loads(media_sidecar_path(media).read_text(encoding="utf-8"))
+        self.assertEqual(payload["source_file_identity"]["algorithm"], "sha256")
+
+    def test_copied_legacy_sidecar_is_indexed_only_when_source_content_matches(self):
+        source_dir = self.project / "original"
+        source_dir.mkdir()
+        source = source_dir / "copied.jpeg"
+        source.write_bytes(b"same-media")
+        media = self.project / source.name
+        media.write_bytes(source.read_bytes())
+        payload = self._sidecar(media, datetime(2024, 7, 15, 12, 0))
+        payload["source_file_signature"] = media_file_signature(source)
+        media_sidecar_path(media).write_text(json.dumps(payload), encoding="utf-8")
+        stat_result = media.stat()
+        os.utime(media, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 2_000_000))
+
+        report = geo.index_media_file_identities(
+            self.project,
+            legacy_source_project=source_dir,
+        )
+
+        self.assertEqual(report.indexed, 1)
+        self.assertEqual(report.deferred, 0)
+        indexed = json.loads(media_sidecar_path(media).read_text(encoding="utf-8"))
+        self.assertEqual(
+            indexed["source_file_identity"]["sha256"],
+            media_file_identity(source)["sha256"],
+        )
 
     def test_discovery_selects_only_clear_automatic_candidates(self):
         missing = self._media("missing.jpeg")

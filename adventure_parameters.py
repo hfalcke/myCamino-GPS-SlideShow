@@ -14,6 +14,9 @@ from gpx_processing import (
 
 
 PARAMETER_SCHEMA_VERSION = 20
+PARAMETER_SIGNATURE_ALIASES = {
+    "maps.provider": "maps.output_provider",
+}
 
 
 @dataclass(frozen=True)
@@ -407,3 +410,81 @@ def map_affecting_parameter_keys() -> frozenset[str]:
 
 def parameter_subset(values: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
     return {key: values[key] for key in keys if key in values}
+
+
+def normalize_parameter_signature(signature: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical saved signature across renamed parameter keys."""
+    normalized = dict(signature)
+    for legacy_key, current_key in PARAMETER_SIGNATURE_ALIASES.items():
+        if legacy_key not in normalized:
+            continue
+        legacy_value = normalized.pop(legacy_key)
+        normalized.setdefault(current_key, legacy_value)
+    return normalized
+
+
+def parameter_signatures_match(saved: object, expected: object) -> bool:
+    if not isinstance(saved, dict) or not isinstance(expected, dict):
+        return False
+    return normalize_parameter_signature(saved) == normalize_parameter_signature(expected)
+
+
+MAP_RENDER_ACCEPTANCE_VERSION = 1
+MAX_ACCEPTED_RENDER_SIGNATURES = 8
+
+
+def accepted_render_signature_matches(metadata: object, expected: object) -> bool:
+    """Return whether map metadata explicitly accepts the current render settings."""
+    if not isinstance(metadata, dict) or not isinstance(expected, dict):
+        return False
+    records = metadata.get("accepted_render_signatures")
+    if not isinstance(records, list):
+        return False
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if int(record.get("version", 0) or 0) != MAP_RENDER_ACCEPTANCE_VERSION:
+            continue
+        if parameter_signatures_match(record.get("parameters"), expected):
+            return True
+    return False
+
+
+def map_render_signature_matches(metadata: object, expected: object) -> bool:
+    """Match actual render settings or a deliberate user acceptance record."""
+    if not isinstance(metadata, dict):
+        return False
+    return parameter_signatures_match(
+        metadata.get("adventure_render_parameters"), expected
+    ) or accepted_render_signature_matches(metadata, expected)
+
+
+def add_accepted_render_signature(
+    metadata: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    accepted_at: str,
+) -> bool:
+    """Add one bounded acceptance record while preserving render provenance."""
+    if map_render_signature_matches(metadata, expected):
+        return False
+    normalized = normalize_parameter_signature(expected)
+    records = []
+    for record in metadata.get("accepted_render_signatures", []):
+        if not isinstance(record, dict):
+            continue
+        parameters = record.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        if normalize_parameter_signature(parameters) == normalized:
+            continue
+        records.append(record)
+    records.append(
+        {
+            "version": MAP_RENDER_ACCEPTANCE_VERSION,
+            "accepted_at": str(accepted_at),
+            "parameters": normalized,
+        }
+    )
+    metadata["accepted_render_signatures"] = records[-MAX_ACCEPTED_RENDER_SIGNATURES:]
+    return True

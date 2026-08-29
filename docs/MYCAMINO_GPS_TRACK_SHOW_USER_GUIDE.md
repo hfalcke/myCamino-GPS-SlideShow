@@ -350,7 +350,8 @@ Controls:
   Standard and Time-Lapse variants are always generated together and directly
   after one another.
 - View Maps: view the overview followed by Standard and Time-Lapse maps paired per
-  stage.
+  stage. This reads the existing control-file and compact-summary references;
+  it does not reprocess the GPX file.
 - Folder icon: open the `trackimages` folder in Finder.
 - Track ordering is configured under **Settings > Map Generation**. Choose
   `date` or `track number` for generated map order and control-file insertion.
@@ -373,9 +374,21 @@ Files created:
   route. It recalculates the rectangles only when cached data is missing or
   invalid.
 
-The summary and map sidecar files store per-track fingerprints. This lets the
-GUI decide which maps really need updating after a GPX edit instead of assuming
-all maps are stale whenever the GPX file changes.
+The summary and map sidecar files store separate versioned identities for route
+geometry and for timing/elevation data. Map images depend only on processed
+route geometry. Renaming, renumbering, copying a project, or harmless GPX XML
+normalization therefore does not redraw an unchanged map. The map-selection
+window opens immediately, then myCamino verifies old sidecars against current
+geometry in the background and repairs unique matches without downloading
+tiles. The window remains movable and can cancel this analysis. The overview is still
+updated when the complete route set or its extent changed.
+
+Media sidecars use the file's full SHA-256 content identity in addition to the
+quick size and modification-time signature. A Finder copy with an altered file
+date is hashed once; matching content reuses the existing date, GPS, place name,
+and provenance. Existing current sidecars are indexed incrementally in the
+**Indexing media identity** phase. This phase reads files but does not extract
+EXIF data or repeat place-name lookups.
 
 When maps are created or updated, obsolete numbered track-map files in
 `trackimages/` are removed if they no longer match any current GPX track. The
@@ -386,12 +399,24 @@ removed.
 Generate and Update Maps window:
 
 - Opens when you press **Generate and Update Maps**.
+- Initially shows `Analyzing track N of M`; selection and Generate become
+  available when this background check finishes.
 - Shows overview as number `0` and all tracks as numbered rows.
 - Rows marked with `*` need update.
 - Missing or outdated maps are preselected and listed in the Range field.
 - You can regenerate all maps, select rows manually, or type a range such as
   `1,2,3-6,8`.
 - Manual row selection automatically disables the all-images checkbox.
+- **Mark Selected Up to Date** accepts existing selected maps without redrawing
+  them. It is useful after changing providers when older maps should retain
+  their original appearance. Only maps whose geometry, media positions, and
+  required sidecar structure still match are accepted; missing or genuinely
+  changed maps remain marked for generation. Original provider attribution is
+  preserved.
+- For more than one map with Public OpenStreetMap selected, choose a configured
+  production provider or **Use Cached OSM Tiles Only**. Cache-only mode sends no
+  network requests and stops safely if a required tile is missing. GPX Editor
+  map views remain available as interactive, explicitly requested plots.
 
 Plot viewer window:
 
@@ -487,9 +512,10 @@ Controls:
 - Edit: open the editable control-file table.
 - Update Control File: check Track Map references and media together. It adds,
   replaces, or removes map references that no longer agree with the current
-  generated maps, finds imported, missing, invalid, or changed media,
-  and shows one review before writing. It does not render maps; use
-  **Generate and Update Maps** for that.
+  generated maps, inventories newly discovered media, finds missing, invalid,
+  legacy, or changed metadata, and shows one review before writing. **Add**,
+  **Update Metadata**, and **Move** are independent choices. It does not render
+  maps; use **Generate and Update Maps** for that.
 
 During **Create** and **Update Control File**, a photo or video without embedded
 GPS can receive a position from its exposure time. The program first compares
@@ -551,8 +577,11 @@ and map directives. Use its up/down arrows to move through the matches.
 
 Right-click a table row to Delete, Cut, Copy, Paste, Preview, or Open in
 Finder. Finder opens the containing folder with the selected image, video, or
-map file already highlighted. The Previews checkbox remains available at the
-top left when the editor window is resized.
+map file already highlighted. The **Previews** popup at the top left offers
+**Off**, **Small**, **Medium**, and **Large**. Off keeps every row compact and
+is the default on first use. The other choices enlarge only rows that can show
+a preview; directive and date rows remain compact. The choice is remembered
+for the current macOS user.
 
 Music control uses separate `MUS` rows rather than an extra column. Slide-show
 flow and timing use `CTL` rows. Press **Insert Row** or Command-I, choose the
@@ -635,8 +664,9 @@ Rows can be:
 Table features:
 
 - Scrollable vertically and horizontally.
-- Optional thumbnail previews.
-- Cached previews for smoother scrolling.
+- Off, Small, Medium, and Large thumbnail previews.
+- Previews appear progressively without blocking scrolling. Compact cached
+  thumbnails are reused when the editor is opened again.
 - File date column from media or track sidecars.
 - DAT rows are bold.
 - MAP and TRK rows are italic.
@@ -666,12 +696,29 @@ Update Control File:
 - If maps or their summary are outdated, it asks you to run **Generate and
   Update Maps** first. Metadata can still be refreshed, but track-dependent
   media placement waits for current map information.
-- Scans for clearly new or changed media and analyzes those files immediately.
-  Current files intentionally omitted from the control list are not proposed.
+- Compares project media with a companion
+  `<control-file>.mycamino-state.json` inventory. GUI imports and files first
+  discovered after an established inventory are recommended additions. On the
+  first legacy scan, media already in the control file is included; other files
+  are unclassified and remain unchecked unless they match an otherwise empty
+  stage unambiguously.
+- Keeps **Add**, **Update Metadata**, and **Move** independent. Repairing a
+  sidecar never inserts an intentionally excluded medium into the show.
+- Provides Recommended, New, Unclassified, Excluded, Included Updates, and All
+  filters with visible-row selection controls. Unchecked absent media is
+  remembered as excluded after Apply and is hidden from the normal review, but
+  remains available through the Excluded filter.
+- Treats disabled photo/video rows as included. If the control file was edited
+  outside myCamino, removed media is shown as unclassified for confirmation
+  rather than silently treated as a deliberate exclusion.
+- Shows the exact myCamino import/discovery time when known. A legacy filesystem
+  creation/copy date is marked as estimated rather than presented as exposure
+  metadata.
 - Use **Choose Other Media...** and **Recheck Selected** to inspect a Current
   file again when you nevertheless suspect its embedded metadata changed.
-- Shows old/new date, GPS, place, and proposed control section before writing;
-  recommended updates are checked and can be disabled per row.
+- Shows filename/type, membership reason, added-to-project time, exposure date,
+  GPS, place, and proposed control section before writing; recommended updates
+  are checked and can be disabled per row.
 - Inserts new media and proposes repositioning changed rows through the same
   classifier used by Create. Repositioning can be rejected per file.
 - Preserves an existing place when GPS remains within the configured
@@ -1042,6 +1089,14 @@ Tracks…** lets you choose a metric and direction while leaving every unselecte
 row in place. Duplicated tracks are inserted together after the last selected
 row and receive unique copy names. Every ordering, visibility, duplication,
 join, and deletion operation can be undone with the editor's Undo command.
+
+**Renumber Tracks** stores the current row order as persistent track numbers.
+You can therefore arrange tracks manually, renumber them, temporarily sort by
+another column, and later sort by **Track Number** to restore the recorded
+order. Hidden tracks remain part of that order, but appear gray and are not
+included in the bold summary row's visible-track count. If existing generated
+maps match by track fingerprint, myCamino relinks their numbered filenames and
+metadata without downloading tiles or rendering the images again.
 
 ## What Files Are in a Finished Project Directory
 

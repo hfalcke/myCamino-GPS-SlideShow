@@ -320,7 +320,28 @@ The registry currently propagates settings to:
 Track-map sidecars store `adventure_render_parameters`; the track summary stores
 `adventure_processing_parameters`. Freshness checks compare these normalized
 signatures. Legacy outputs remain current only while the corresponding settings
-still equal their old defaults.
+still equal their old defaults. `normalize_parameter_signature(...)` provides
+an explicit alias registry for renamed settings, currently including
+`maps.provider` to `maps.output_provider`.
+
+Processed tracks expose versioned `track_geometry_fingerprint` and
+`track_data_fingerprint` values. The geometry identity includes segment
+boundaries and processed latitude/longitude only; the data identity adds
+processed elevation and timing. Stage-map freshness uses the former, while
+derived sidecars, GPS inference, profiles, and playback use the latter.
+`track_asset_relink.reconcile_legacy_track_sidecars(...)` reconstructs legacy
+geometry identities from stored segment data and upgrades only unique matches.
+It never renders or modifies a PNG. Filename relinking then uses geometry as
+the stable asset identity. Overview metadata is modernized only when the full
+geometry set is unchanged.
+
+Media sidecars contain `source_file_signature` for the size/mtime fast path and
+version-1 `source_file_identity` with a full SHA-256 digest as the authoritative
+identity. Same-size timestamp changes trigger hashing; a matching digest patches
+only the signature atomically. `index_media_file_identities(...)` incrementally
+backfills current legacy sidecars without calling ExifTool, Spotlight, GPX
+inference, or reverse geocoding. New or refreshed sidecars always receive both
+identities.
 
 Map access is centralized in `map_provider_utils.py`. Settings distinguish
 `maps.interactive_provider` from `maps.output_provider`; credentials are read
@@ -439,10 +460,15 @@ Map Generation controls:
   default 1920x1080 output size.
 
 - `Generate and Update Maps`: opens one logical-stage selection with
-  missing/stale rows marked by `*` and preselected. Each selected stage renders
-  Standard followed immediately by Time-Lapse from one prepared GPX context.
-- `View`: opens the overview followed by Standard and Time-Lapse maps paired
-  per stage.
+  an initially disabled table, then prepares GPX tracks, reconciles stable
+  identities, relinks files, and calculates freshness on a cancellable worker.
+  The completed model marks missing/stale rows with `*` and preselects them.
+  Selection analysis does not write the compact summary or render maps. Each
+  selected stage later renders Standard followed immediately by Time-Lapse from
+  the prepared GPX context.
+- `View Maps`: indexes existing images from control-file and compact-summary
+  references, then opens the overview followed by Standard and Time-Lapse maps
+  paired per stage. It never calls GPX preparation merely to discover filenames.
 - folder icon: open `trackimages/` in Finder.
 
 Automatic generation uses the same `ProjectMapPlan` after media metadata
@@ -459,6 +485,24 @@ overview image, summary JSON, other Adventure families, or unrelated files.
 Map generation runs on a background thread. The GUI shows a Cancel button that
 sets an event. Cancellation is cooperative and stops after the current image.
 Each created image is pushed into the plot viewer immediately.
+
+Public OSM permits a single explicitly selected project map with the existing
+estimate and confirmation. A multi-map selection offers production-provider
+setup, cache-only OSM, or a return to the unchanged selection. Cache-only mode
+sets `map_cache_only` on track and media renderers; the patched request layer
+raises `TileCacheMissError` before any uncached request. A cache miss preserves
+completed images and offers provider setup or the previous selection. GPX
+Editor viewport plots are interactive and intentionally remain separate from
+this project-map safeguard.
+
+**Mark Selected Up to Date** records a bounded
+`accepted_render_signatures` list in eligible map sidecars. Freshness accepts
+either the actual `adventure_render_parameters` or one matching acceptance;
+the original provider and attribution remain rendering provenance. Eligibility
+still requires current geometry fingerprints, current overview membership or
+media coordinates, the current map-content version, and both map variants.
+The sidecar updates run on the selection worker and never render images or call
+the tile layer.
 
 ## Geolocation and Control-File Pipeline
 
@@ -499,6 +543,30 @@ The resolver never reparses the GPX file and never extrapolates beyond a stage.
 At a `<trkseg>` boundary it selects the nearer endpoint instead of
 interpolating across the gap.
 
+Control-file media membership is independent of metadata freshness.
+`control_media_inventory.py` stores a versioned companion file named
+`<control-file>.mycamino-state.json`. It records normalized media names,
+included/excluded state, first discovery, exact GUI import time when known, an
+estimated filesystem copy/birth time, and the control snapshot identity.
+`discover_control_media_membership(...)` inventories project media without
+running ExifTool or reverse geocoding. On bootstrap, existing media rows
+(including disabled rows) are included and absent project media is
+unclassified. Once established, unknown filenames are new and unchecked absent
+items committed by the review become excluded. A control identity mismatch
+caused by external editing turns removed formerly included rows back into
+unclassified items requiring confirmation.
+
+`MediaUpdateItem` carries independent `add_to_control`, `update_metadata`, and
+`reposition` decisions. `analyze_control_file_updates(...)` combines metadata
+candidates with membership candidates and reuses current sidecars. Strong
+recommendations are GUI imports, files new since the inventory, and uniquely
+classified unclassified media for an otherwise empty stage. Commit stages
+sidecars and affected media maps, then the control file and inventory; rollback
+restores both. Editor Save also refreshes the inventory so deliberate row
+deletions are recorded, while disabled rows remain members. Related-file
+Adventure rename/copy operations carry the companion inventory with the control
+file; shared-control mode intentionally shares it.
+
 New media sidecars use one GPS-independent timestamp-selection path. Embedded
 ExifTool fields are authoritative in this order: `DateTimeOriginal`, then the
 camera/container-key `CreationDate`. If those are absent, `GPSDateTime` or
@@ -507,6 +575,14 @@ time. Generic track `MediaCreateDate` and `CreateDate` follow because exports
 can replace them. Only then does processing fall back to Spotlight
 content/filesystem creation dates and finally filesystem birth/modification
 time. Debug processing uses the identical order and records the selected source.
+
+Bulk metadata preparation first identifies media whose sidecars are missing,
+invalid, or explicitly being refreshed. `MediaMetadataBundle` then collects
+the required ExifTool fields in bounded multi-file batches and all Spotlight
+fields in one `mdls` process per candidate. GPS and timestamp selection share
+that payload, so a medium is not reopened for each field. Reverse geocoding is
+a separate serial phase; its randomized request pacing is deliberately not
+part of this optimization.
 
 Inferred sidecars contain `gps_source: track_time_interpolation` and a nested
 `gps_inference` object with the track identity/fingerprint, bounding times,
@@ -1119,6 +1195,12 @@ selection and asks the controller for a freshly validated Track menu. Shared
 helpers handle disjoint-group movement, block duplication, and copy naming.
 Context and header sorting both call `sort_by_column()`; selected-row sorting
 replaces only the selected slots and includes processed moving-average speed.
+`Renumber Tracks` persists the current row order in the private
+`mycamino_gpx_editor` `order_number` attribute. This presentation-only
+attribute is excluded from semantic fingerprints. After an embedded save,
+`track_asset_relink.py` matches numbered map pairs by fingerprint, stages
+filename cycles, patches JSON/overview metadata and control-file references,
+and performs no raster rendering or tile access.
 
 The editor writes:
 
@@ -1238,7 +1320,15 @@ sidecars remain source-of-truth inputs.
 - Long operations should run in worker threads and update the GUI through
   `performSelectorOnMainThread...`.
 - Use progress bars only while long operations are active.
-- Keep table preview thumbnails optional and cached.
+- Control-table previews are generated by `control_preview_cache.py`. ImageIO
+  downsamples originals to a Retina-ready 144-pixel PNG on one of two workers;
+  AppKit only loads that compact result on the main thread. Requests are
+  limited to the visible table neighborhood, deduplicated, and cancelled when
+  they move out of range.
+- The disposable preview cache lives in
+  `~/Library/Caches/myCamino/control-previews/`, uses source path/size/mtime in
+  its versioned key, retains 256 AppKit images in memory, and prunes disk use
+  from 256 MB to 192 MB. A completed thumbnail reloads only its preview cell.
 - Maintain compatibility between sorted-list parsing in `GPSTrackShowGUI.py`
   and sorted-list writing/merging in `GetGeoLocations.py`.
 - Avoid changing the default GPX path after the user manually edits the GPX

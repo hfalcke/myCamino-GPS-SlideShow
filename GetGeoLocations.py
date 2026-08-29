@@ -12,6 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import json
 import math
 import os
+import plistlib
 import random
 import re
 import shutil
@@ -32,14 +33,27 @@ from plot_metadata_utils import (
     build_photo_metadata_payload,
     legacy_media_sidecar_path,
     media_sidecar_matches_media,
+    media_file_identity,
     media_file_signature,
     media_sidecar_freshness,
     media_sidecar_path,
+    patch_media_sidecar_signature,
     parse_photo_datetime,
     read_json_data,
     read_photo_metadata,
     validate_media_sidecar,
+    valid_media_file_identity,
     write_photo_metadata,
+)
+from adventure_parameters import map_render_signature_matches
+from control_media_inventory import (
+    ControlMediaInventory,
+    MediaMembership,
+    build_control_media_inventory_payload,
+    classify_project_media,
+    control_media_inventory_path,
+    load_control_media_inventory,
+    write_control_media_inventory,
 )
 from gpx_tracks_table import (
     media_coordinates_fingerprint,
@@ -53,6 +67,7 @@ from track_map_layout_utils import (
     time_lapse_track_map_name,
     track_map_variant_names,
 )
+from slideshow_control_format import split_disabled_control_line
 
 
 IMAGE_EXTENSIONS = {
@@ -104,6 +119,7 @@ GEOCODE_ROUND_DIGITS = 6
 # exiftool can recover GPS/date metadata that mdls does not expose.
 EXIFTOOL_WARNING_SHOWN = False
 RUNTIME_CANCEL_EVENT: Optional[threading.Event] = None
+EXIFTOOL_BATCH_SIZE = 96
 
 
 class ProcessingCancelled(Exception):
@@ -232,6 +248,16 @@ class PhotoRecord:
     datetime_source: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class MediaMetadataBundle:
+    """Metadata collected once and shared by all field selectors."""
+
+    exiftool: Optional[dict[str, Any]]
+    spotlight: dict[str, Any]
+    exiftool_available: bool
+    file_stat: os.stat_result
+
+
 @dataclass
 class MediaSidecarMigrationReport:
     """Result of a media-sidecar migration for one project directory."""
@@ -284,6 +310,13 @@ class MediaUpdateItem:
     control_conflict: Optional[str] = None
     control_update_pending: bool = False
     apply_update: bool = True
+    add_to_control: bool = False
+    update_metadata: bool = False
+    membership_status: str = "included"
+    membership_reason: str = "Already included"
+    first_seen_at: str = ""
+    imported_at: str = ""
+    folder_added_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -293,6 +326,19 @@ class MediaUpdateCandidate:
     media_path: Path
     action: str
     reason: str
+
+
+@dataclass
+class MediaIdentityIndexReport:
+    """Counts from one incremental content-identity indexing pass."""
+
+    indexed: int = 0
+    already_indexed: int = 0
+    signature_repaired: int = 0
+    missing: int = 0
+    invalid: int = 0
+    deferred: int = 0
+    failed: int = 0
 
 
 @dataclass
@@ -307,6 +353,7 @@ class MediaUpdatePlan:
     sort_date_sections_by_tracks: bool
     control_signature: Optional[tuple[int, int]] = None
     warnings: list[str] = field(default_factory=list)
+    media_inventory: Optional[ControlMediaInventory] = None
 
 
 @dataclass
@@ -357,6 +404,8 @@ class MediaUpdateResult:
     places_updated: int = 0
     gps_inferred: int = 0
     gps_refreshed: int = 0
+    inventory_included: int = 0
+    inventory_excluded: int = 0
 
 
 @dataclass
@@ -425,7 +474,22 @@ def discover_media_update_candidates(
             raise ProcessingCancelled("Aborted.")
         check_cancelled()
         status, payload, _reason = validate_media_sidecar(media_path)
-        freshness = media_sidecar_freshness(media_path, payload) if status == "available" else status
+        freshness = (
+            media_sidecar_freshness(
+                media_path,
+                payload,
+                cancel_callback=check_cancelled,
+            )
+            if status == "available"
+            else status
+        )
+        if freshness == "content-current" and isinstance(payload, dict):
+            payload = patch_media_sidecar_signature(media_path, payload)
+            freshness = "current"
+            if detail_callback is not None:
+                detail_callback(
+                    f"Reused {media_path.name}: content is unchanged; updated its copied-file signature."
+                )
         if media_path in imported:
             action = "repair" if status != "available" else (
                 "refresh" if freshness in {"changed", "unknown"} else "use_sidecar"
@@ -456,6 +520,143 @@ def discover_media_update_candidates(
         if progress_callback is not None:
             progress_callback(index, total, media_path.name)
     return candidates
+
+
+def discover_control_media_membership(
+    project_dir: Path | str,
+    control_file: Path | str,
+    *,
+    imported_paths: Optional[list[Path | str] | tuple[Path | str, ...] | set[Path | str]] = None,
+) -> tuple[ControlMediaInventory, list[MediaMembership]]:
+    """Classify project media independently of metadata freshness."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    control = Path(control_file).expanduser().resolve(strict=False)
+    entries = (
+        parse_control_file_entries(control.read_text(encoding="utf-8").splitlines())
+        if control.is_file()
+        else []
+    )
+    included_names = [
+        str(entry.get("name", ""))
+        for entry in entries
+        if entry.get("type") == "media"
+    ]
+    media_paths = sorted(
+        (
+            path.resolve(strict=False)
+            for path in project.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    inventory = load_control_media_inventory(control)
+    return inventory, classify_project_media(
+        inventory,
+        media_paths,
+        included_names,
+        imported_paths or (),
+    )
+
+
+def index_media_file_identities(
+    project_dir: Path | str,
+    *,
+    legacy_source_project: Path | str | None = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    detail_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> MediaIdentityIndexReport:
+    """Backfill SHA-256 identities without extracting or geocoding metadata."""
+    project = Path(project_dir).expanduser().resolve(strict=False)
+    legacy_source = (
+        Path(legacy_source_project).expanduser().resolve(strict=False)
+        if legacy_source_project
+        else None
+    )
+    media_paths = sorted(
+        (
+            path.resolve(strict=False)
+            for path in project.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    report = MediaIdentityIndexReport()
+    total = len(media_paths)
+    if progress_callback is not None:
+        progress_callback(0, total, "")
+    for index, media_path in enumerate(media_paths, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        check_cancelled()
+        status, payload, reason = validate_media_sidecar(media_path)
+        if status != "available" or not isinstance(payload, dict):
+            if status == "missing":
+                report.missing += 1
+            else:
+                report.invalid += 1
+            if detail_callback is not None:
+                detail_callback(f"Skipping {media_path.name}: {reason or status}.")
+        elif valid_media_file_identity(payload.get("source_file_identity")):
+            report.already_indexed += 1
+        else:
+            try:
+                stored_signature = payload.get("source_file_signature")
+                current_signature = media_file_signature(media_path)
+                if stored_signature != current_signature:
+                    source_path = legacy_source / media_path.name if legacy_source else None
+                    source_identity = None
+                    destination_identity = None
+                    if source_path is not None and source_path.is_file():
+                        try:
+                            if source_path.stat().st_size == media_path.stat().st_size:
+                                source_identity = media_file_identity(
+                                    source_path,
+                                    cancel_callback=check_cancelled,
+                                )
+                                destination_identity = media_file_identity(
+                                    media_path,
+                                    cancel_callback=check_cancelled,
+                                )
+                        except OSError:
+                            source_identity = None
+                            destination_identity = None
+                    if (
+                        source_identity is None
+                        or destination_identity is None
+                        or source_identity["sha256"] != destination_identity["sha256"]
+                    ):
+                        report.deferred += 1
+                        if detail_callback is not None:
+                            detail_callback(
+                                f"Deferring identity for changed file: {media_path.name}."
+                            )
+                        if progress_callback is not None:
+                            progress_callback(index, total, media_path.name)
+                        continue
+                    identity = destination_identity
+                else:
+                    identity = media_file_identity(
+                        media_path,
+                        cancel_callback=check_cancelled,
+                    )
+                updated = dict(payload)
+                updated["source_file_identity"] = identity
+                if updated.get("source_file_signature") != current_signature:
+                    report.signature_repaired += 1
+                updated["source_file_signature"] = current_signature
+                patch_media_sidecar_signature(media_path, updated)
+                report.indexed += 1
+                if detail_callback is not None:
+                    detail_callback(f"Indexed media identity: {media_path.name}.")
+            except OSError as exc:
+                report.failed += 1
+                if detail_callback is not None:
+                    detail_callback(f"Could not index {media_path.name}: {exc}.")
+        if progress_callback is not None:
+            progress_callback(index, total, media_path.name)
+    return report
 
 
 @dataclass(frozen=True)
@@ -863,6 +1064,71 @@ def read_mdls_raw(file_path: Path, metadata_key: str) -> Optional[str]:
     return value
 
 
+def read_mdls_metadata(file_path: Path) -> dict[str, Any]:
+    """Read all Spotlight fields in one process for batched metadata work."""
+    command = ["mdls", "-plist", "-", str(file_path)]
+    try:
+        result = subprocess.run(command, capture_output=True, check=False)
+    except (FileNotFoundError, OSError):
+        return {}
+    if result.returncode != 0 or not result.stdout:
+        return {}
+    try:
+        payload = plistlib.loads(result.stdout)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _parse_mdls_float_value(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    normalized = str(value).strip().strip("\"'")
+    if "," in normalized and "." not in normalized:
+        normalized = normalized.replace(",", ".")
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def gps_from_spotlight_metadata(
+    metadata: dict[str, Any],
+) -> tuple[Optional[float], Optional[float], dict[str, Any]]:
+    """Select GPS coordinates from one complete Spotlight payload."""
+    latitude_raw = metadata.get("kMDItemLatitude")
+    longitude_raw = metadata.get("kMDItemLongitude")
+    latitude = _parse_mdls_float_value(latitude_raw)
+    longitude = _parse_mdls_float_value(longitude_raw)
+    debug_info: dict[str, Any] = {
+        "latitude_raw": latitude_raw,
+        "longitude_raw": longitude_raw,
+        "gps_coordinates_raw": metadata.get("kMDItemGPSCoordinates"),
+        "source": None,
+    }
+    if latitude is not None and longitude is not None:
+        debug_info["source"] = "kMDItemLatitude/kMDItemLongitude"
+        return latitude, longitude, debug_info
+
+    raw_coordinates = metadata.get("kMDItemGPSCoordinates")
+    if raw_coordinates is None:
+        debug_info["source"] = "missing"
+        return latitude, longitude, debug_info
+    tokens = re.findall(r"[-+]?\d+(?:[.,]\d+)?", str(raw_coordinates))
+    debug_info["gps_coordinate_tokens"] = tokens
+    if len(tokens) < 2:
+        debug_info["source"] = "unparseable kMDItemGPSCoordinates"
+        return latitude, longitude, debug_info
+    try:
+        latitude = float(tokens[0].replace(",", "."))
+        longitude = float(tokens[1].replace(",", "."))
+    except ValueError:
+        debug_info["source"] = "invalid numeric GPSCoordinates"
+        return None, None, debug_info
+    debug_info["source"] = "kMDItemGPSCoordinates"
+    return latitude, longitude, debug_info
+
+
 def normalize_datetime_timezone(value: datetime) -> datetime:
     """Return a timezone-aware datetime normalized to the local timezone."""
     if LOCAL_TIMEZONE is None:
@@ -1011,27 +1277,131 @@ def parse_exiftool_float(value: object) -> Optional[float]:
         return None
 
 
+EXIFTOOL_METADATA_FIELDS = (
+    "GPSLatitude",
+    "GPSLongitude",
+    "GPSPosition",
+    "DateTimeOriginal",
+    "CreationDate",
+    "GPSDateTime",
+    "GPSDateStamp",
+    "GPSTimeStamp",
+    "MediaCreateDate",
+    "CreateDate",
+)
+
+
+def _exiftool_metadata_command(file_paths: list[Path]) -> list[str]:
+    return [
+        "exiftool",
+        "-j",
+        "-n",
+        *(f"-{field}" for field in EXIFTOOL_METADATA_FIELDS),
+        *(str(path) for path in file_paths),
+    ]
+
+
+def read_exiftool_json_many(
+    file_paths: list[Path] | tuple[Path, ...],
+    *,
+    batch_size: int = EXIFTOOL_BATCH_SIZE,
+    exiftool_available: Optional[bool] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> dict[Path, Optional[dict[str, Any]]]:
+    """Read selected ExifTool fields with one process per bounded batch."""
+    paths = [Path(path).expanduser().resolve(strict=False) for path in file_paths]
+    results: dict[Path, Optional[dict[str, Any]]] = {path: None for path in paths}
+    available = is_exiftool_available() if exiftool_available is None else bool(exiftool_available)
+    if not paths or not available:
+        return results
+    batch_size = max(1, int(batch_size))
+    for offset in range(0, len(paths), batch_size):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        check_cancelled()
+        batch = paths[offset : offset + batch_size]
+        try:
+            completed = subprocess.run(
+                _exiftool_metadata_command(batch),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        check_cancelled()
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        try:
+            payload = json.loads(completed.stdout)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        by_source: dict[Path, dict[str, Any]] = {}
+        ordered_payloads: list[dict[str, Any]] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            ordered_payloads.append(entry)
+            source = entry.get("SourceFile")
+            if source:
+                by_source[Path(str(source)).expanduser().resolve(strict=False)] = entry
+        for index, path in enumerate(batch):
+            entry = by_source.get(path)
+            if (
+                entry is None
+                and not by_source
+                and len(ordered_payloads) == len(batch)
+            ):
+                entry = ordered_payloads[index]
+            results[path] = entry
+    return results
+
+
+def prefetch_media_metadata(
+    file_paths: list[Path] | tuple[Path, ...],
+    *,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> dict[Path, MediaMetadataBundle]:
+    """Collect local metadata once for each media file that needs extraction."""
+    paths = [Path(path).expanduser().resolve(strict=False) for path in file_paths]
+    available = is_exiftool_available()
+    exiftool_payloads = read_exiftool_json_many(
+        paths,
+        exiftool_available=available,
+        cancel_event=cancel_event,
+    )
+    bundles: dict[Path, MediaMetadataBundle] = {}
+    total = len(paths)
+    for index, path in enumerate(paths, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessingCancelled("Aborted.")
+        check_cancelled()
+        if progress_callback is not None:
+            progress_callback(index - 1, total, path.name)
+        try:
+            file_stat = path.stat()
+        except OSError:
+            continue
+        bundles[path] = MediaMetadataBundle(
+            exiftool=exiftool_payloads.get(path),
+            spotlight=read_mdls_metadata(path),
+            exiftool_available=available,
+            file_stat=file_stat,
+        )
+    if progress_callback is not None:
+        progress_callback(total, total, "")
+    return bundles
+
+
 def read_exiftool_json(file_path: Path) -> Optional[dict[str, Any]]:
     """Read metadata from exiftool JSON output when available."""
     if not is_exiftool_available():
         return None
 
-    command = [
-        "exiftool",
-        "-j",
-        "-n",
-        "-GPSLatitude",
-        "-GPSLongitude",
-        "-GPSPosition",
-        "-DateTimeOriginal",
-        "-CreationDate",
-        "-GPSDateTime",
-        "-GPSDateStamp",
-        "-GPSTimeStamp",
-        "-MediaCreateDate",
-        "-CreateDate",
-        str(file_path),
-    ]
+    command = _exiftool_metadata_command([file_path])
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except OSError:
@@ -1053,45 +1423,28 @@ def read_exiftool_json(file_path: Path) -> Optional[dict[str, Any]]:
 def read_exiftool_gps_pair(file_path: Path) -> tuple[Optional[float], Optional[float]]:
     """Read latitude and longitude from exiftool metadata."""
     metadata = read_exiftool_json(file_path)
+    latitude, longitude, _debug = gps_from_exiftool_metadata(metadata)
+    return latitude, longitude
+
+
+def gps_from_exiftool_metadata(
+    metadata: Optional[dict[str, Any]],
+) -> tuple[Optional[float], Optional[float], dict[str, Any]]:
+    """Select GPS coordinates from an already collected ExifTool payload."""
+    debug_info: dict[str, Any] = {"metadata_found": metadata is not None}
     if not metadata:
-        return None, None
+        debug_info["source"] = "missing"
+        return None, None, debug_info
 
     latitude = parse_exiftool_float(metadata.get("GPSLatitude"))
     longitude = parse_exiftool_float(metadata.get("GPSLongitude"))
-    if latitude is not None and longitude is not None:
-        return latitude, longitude
-
-    gps_position = metadata.get("GPSPosition")
-    if gps_position is None:
-        return latitude, longitude
-
-    tokens = re.findall(r"[-+]?\d+(?:[.,]\d+)?", str(gps_position))
-    if len(tokens) < 2:
-        return latitude, longitude
-
-    try:
-        return float(tokens[0].replace(",", ".")), float(tokens[1].replace(",", "."))
-    except ValueError:
-        return latitude, longitude
-
-
-def read_exiftool_gps_pair_with_debug(file_path: Path) -> tuple[Optional[float], Optional[float], dict[str, Any]]:
-    """Read GPS values via exiftool and return debug details."""
-    debug_info: dict[str, Any] = {"available": is_exiftool_available()}
-    if not debug_info["available"]:
-        return None, None, debug_info
-
-    metadata = read_exiftool_json(file_path)
-    debug_info["metadata_found"] = metadata is not None
-    if not metadata:
-        return None, None, debug_info
-
-    debug_info["GPSLatitude"] = metadata.get("GPSLatitude")
-    debug_info["GPSLongitude"] = metadata.get("GPSLongitude")
-    debug_info["GPSPosition"] = metadata.get("GPSPosition")
-
-    latitude = parse_exiftool_float(metadata.get("GPSLatitude"))
-    longitude = parse_exiftool_float(metadata.get("GPSLongitude"))
+    debug_info.update(
+        {
+            "GPSLatitude": metadata.get("GPSLatitude"),
+            "GPSLongitude": metadata.get("GPSLongitude"),
+            "GPSPosition": metadata.get("GPSPosition"),
+        }
+    )
     if latitude is not None and longitude is not None:
         debug_info["source"] = "exiftool GPSLatitude/GPSLongitude"
         return latitude, longitude, debug_info
@@ -1108,13 +1461,24 @@ def read_exiftool_gps_pair_with_debug(file_path: Path) -> tuple[Optional[float],
         return latitude, longitude, debug_info
 
     try:
-        parsed_latitude = float(tokens[0].replace(",", "."))
-        parsed_longitude = float(tokens[1].replace(",", "."))
-        debug_info["source"] = "exiftool GPSPosition"
-        return parsed_latitude, parsed_longitude, debug_info
+        latitude = float(tokens[0].replace(",", "."))
+        longitude = float(tokens[1].replace(",", "."))
     except ValueError:
         debug_info["source"] = "invalid numeric GPSPosition"
         return latitude, longitude, debug_info
+    debug_info["source"] = "exiftool GPSPosition"
+    return latitude, longitude, debug_info
+
+
+def read_exiftool_gps_pair_with_debug(file_path: Path) -> tuple[Optional[float], Optional[float], dict[str, Any]]:
+    """Read GPS values via exiftool and return debug details."""
+    debug_info: dict[str, Any] = {"available": is_exiftool_available()}
+    if not debug_info["available"]:
+        return None, None, debug_info
+
+    latitude, longitude, metadata_debug = gps_from_exiftool_metadata(read_exiftool_json(file_path))
+    debug_info.update(metadata_debug)
+    return latitude, longitude, debug_info
 
 
 def parse_mdls_datetime(raw_value: str) -> Optional[datetime]:
@@ -1208,6 +1572,51 @@ def get_photo_datetime_with_debug(file_path: Path) -> tuple[datetime, dict[str, 
     return selected, debug_info
 
 
+def datetime_from_metadata_bundle(
+    bundle: MediaMetadataBundle,
+) -> tuple[datetime, dict[str, Any]]:
+    """Select a timestamp without starting another metadata process."""
+    debug_info: dict[str, Any] = {"candidates": []}
+    selected, exif_debug = datetime_from_exiftool_metadata(
+        bundle.exiftool,
+        available=bundle.exiftool_available,
+    )
+    debug_info["exiftool"] = exif_debug
+    if selected is not None:
+        debug_info["selected_source"] = f"exiftool:{exif_debug.get('selected_source')}"
+        return selected, debug_info
+
+    for metadata_key in ("kMDItemContentCreationDate", "kMDItemFSCreationDate"):
+        value = bundle.spotlight.get(metadata_key)
+        if isinstance(value, datetime):
+            parsed = normalize_datetime_timezone(value)
+            raw_value: object = value.isoformat()
+        else:
+            raw_value = value
+            parsed = parse_mdls_datetime(str(value)) if value is not None else None
+        debug_info["candidates"].append(
+            {
+                "source": metadata_key,
+                "raw": raw_value,
+                "parsed": parsed.isoformat() if parsed is not None else None,
+            }
+        )
+        if parsed is not None:
+            debug_info["selected_source"] = metadata_key
+            return parsed, debug_info
+
+    birthtime = getattr(bundle.file_stat, "st_birthtime", None)
+    if birthtime is not None:
+        selected = datetime.fromtimestamp(birthtime, tz=LOCAL_TIMEZONE)
+        debug_info["selected_source"] = "st_birthtime"
+        debug_info["st_birthtime"] = birthtime
+        return selected, debug_info
+    selected = datetime.fromtimestamp(bundle.file_stat.st_mtime, tz=LOCAL_TIMEZONE)
+    debug_info["selected_source"] = "st_mtime"
+    debug_info["st_mtime"] = bundle.file_stat.st_mtime
+    return selected, debug_info
+
+
 def parse_exiftool_datetime(raw_value: object) -> Optional[datetime]:
     """Parse a datetime string emitted by exiftool."""
     if raw_value is None:
@@ -1278,32 +1687,23 @@ def read_gps_datetime_from_exiftool_metadata(
 def read_exiftool_datetime(file_path: Path) -> Optional[datetime]:
     """Read the preferred datetime from exiftool metadata."""
     metadata = read_exiftool_json(file_path)
-    if not metadata:
-        return None
-
-    for key in ("DateTimeOriginal", "CreationDate"):
-        parsed = parse_exiftool_datetime(metadata.get(key))
-        if parsed is not None:
-            return parsed
-    parsed, _source, _raw = read_gps_datetime_from_exiftool_metadata(metadata)
-    if parsed is not None:
-        return parsed
-    for key in ("MediaCreateDate", "CreateDate"):
-        parsed = parse_exiftool_datetime(metadata.get(key))
-        if parsed is not None:
-            return parsed
-    return None
+    selected, _debug = datetime_from_exiftool_metadata(metadata, available=is_exiftool_available())
+    return selected
 
 
-def read_exiftool_datetime_with_debug(file_path: Path) -> tuple[Optional[datetime], dict[str, Any]]:
-    """Read datetime via exiftool and return debug details."""
-    debug_info: dict[str, Any] = {"available": is_exiftool_available(), "candidates": []}
-    if not debug_info["available"]:
-        return None, debug_info
-
-    metadata = read_exiftool_json(file_path)
-    debug_info["metadata_found"] = metadata is not None
-    if not metadata:
+def datetime_from_exiftool_metadata(
+    metadata: Optional[dict[str, Any]],
+    *,
+    available: bool,
+) -> tuple[Optional[datetime], dict[str, Any]]:
+    """Select the preferred timestamp from one ExifTool payload."""
+    debug_info: dict[str, Any] = {
+        "available": bool(available),
+        "candidates": [],
+        "metadata_found": metadata is not None,
+    }
+    if not available or not metadata:
+        debug_info["selected_source"] = "missing"
         return None, debug_info
 
     for key in ("DateTimeOriginal", "CreationDate"):
@@ -1345,9 +1745,15 @@ def read_exiftool_datetime_with_debug(file_path: Path) -> tuple[Optional[datetim
         if parsed is not None:
             debug_info["selected_source"] = key
             return parsed, debug_info
-
     debug_info["selected_source"] = "missing"
     return None, debug_info
+
+
+def read_exiftool_datetime_with_debug(file_path: Path) -> tuple[Optional[datetime], dict[str, Any]]:
+    """Read datetime via exiftool and return debug details."""
+    available = is_exiftool_available()
+    metadata = read_exiftool_json(file_path) if available else None
+    return datetime_from_exiftool_metadata(metadata, available=available)
 
 
 def placemark_place_details(placemark: object) -> dict[str, Any]:
@@ -2313,6 +2719,15 @@ def migrate_media_sidecars(
     geocode_cache: dict[tuple[float, float], tuple[Optional[str], Optional[dict[str, Any]]]] = {}
     known_places: list[KnownPlace] = []
     total_media = len(media_files)
+    extraction_paths = [
+        media_path
+        for media_path in media_files
+        if not media_sidecar_path(media_path).exists()
+    ]
+    metadata_bundles = prefetch_media_metadata(
+        extraction_paths,
+        progress_callback=progress_callback,
+    )
     for index, media_path in enumerate(media_files, start=1):
         canonical_path = media_sidecar_path(media_path)
         if not canonical_path.exists():
@@ -2323,6 +2738,10 @@ def migrate_media_sidecars(
                 known_places,
                 distance,
                 debug,
+                10.0,
+                GEOCODE_PACING_MIN_SECONDS,
+                GEOCODE_PACING_MAX_SECONDS,
+                metadata_bundles.get(media_path.resolve(strict=False)),
             )
             write_record_json(record, set())
             report.regenerated.append(canonical_path)
@@ -2494,12 +2913,30 @@ def build_record_from_photo(
     geocode_timeout_seconds: float = 10.0,
     geocode_pacing_min_seconds: float = GEOCODE_PACING_MIN_SECONDS,
     geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
+    metadata_bundle: Optional[MediaMetadataBundle] = None,
 ) -> PhotoRecord:
     """Extract metadata from a photo and create a normalized record."""
     check_cancelled()
     debug_info: dict[str, Any] = {}
 
-    if debug:
+    if metadata_bundle is not None:
+        latitude, longitude, gps_debug = gps_from_spotlight_metadata(metadata_bundle.spotlight)
+        if latitude is None or longitude is None:
+            exif_latitude, exif_longitude, exif_gps_debug = gps_from_exiftool_metadata(
+                metadata_bundle.exiftool
+            )
+            exif_gps_debug["available"] = metadata_bundle.exiftool_available
+            gps_debug["exiftool"] = exif_gps_debug
+            if exif_latitude is not None and exif_longitude is not None:
+                latitude, longitude = exif_latitude, exif_longitude
+                gps_debug["source"] = f"fallback:{exif_gps_debug.get('source')}"
+            elif not metadata_bundle.exiftool_available:
+                warn_exiftool_missing_once()
+        photo_datetime, datetime_debug = datetime_from_metadata_bundle(metadata_bundle)
+        debug_info["datetime"] = datetime_debug
+        if debug:
+            debug_info["gps"] = gps_debug
+    elif debug:
         latitude, longitude, gps_debug = read_mdls_gps_pair_with_debug(photo_path)
         if latitude is None or longitude is None:
             exif_latitude, exif_longitude, exif_gps_debug = read_exiftool_gps_pair_with_debug(photo_path)
@@ -2522,8 +2959,8 @@ def build_record_from_photo(
             elif not is_exiftool_available():
                 warn_exiftool_missing_once()
 
-        # Keep timestamp provenance in normal sidecars too. This uses the same
-        # extraction calls as get_photo_datetime(), not a second metadata pass.
+        # The compatibility path retains the legacy helpers. Bulk callers pass
+        # a MediaMetadataBundle so GPS and time reuse the same ExifTool result.
         photo_datetime, datetime_debug = get_photo_datetime_with_debug(photo_path)
         debug_info["datetime"] = datetime_debug
 
@@ -2718,14 +3155,16 @@ def build_record_sidecar_payload(record: PhotoRecord) -> dict[str, Any]:
     for key in {
         "source_filename", "photo_path", "datetime_iso", "date_german", "time",
         "latitude", "longitude", "place", "has_gps", "place_details",
-        "gps_source", "gps_inference", "source_file_signature", "datetime_source",
+        "gps_source", "gps_inference", "source_file_signature", "source_file_identity", "datetime_source",
         "metadata_updated_at", "place_coordinate", *PLACE_DETAIL_KEYS,
     }:
         payload.pop(key, None)
     try:
         signature = media_file_signature(record.photo_path)
+        identity = media_file_identity(record.photo_path, cancel_callback=check_cancelled)
     except OSError:
         signature = None
+        identity = None
     canonical = build_photo_metadata_payload(
         source_filename=record.source_filename,
         photo_path=record.photo_path,
@@ -2735,6 +3174,7 @@ def build_record_sidecar_payload(record: PhotoRecord) -> dict[str, Any]:
         place=record.place,
         place_details=record.place_details,
         source_file_signature=signature,
+        source_file_identity=identity,
         datetime_source=record.datetime_source,
         metadata_updated_at=datetime.now().astimezone().isoformat(),
         place_coordinate=place_coordinate_for_record(record),
@@ -3350,7 +3790,7 @@ def media_map_variant_is_current(
     if str(metadata.get("map_layout", "standard")) != str(map_layout):
         return False
     if isinstance(expected_parameters, dict):
-        return metadata.get("adventure_render_parameters") == expected_parameters
+        return map_render_signature_matches(metadata, expected_parameters)
     return True
 
 
@@ -3468,10 +3908,12 @@ def create_media_overview_for_records(
         background_color=str(options.get("background_color", "black")),
         title_color=str(options.get("title_color", "white")),
         map_provider=str(options.get("map_provider", "osm")),
+        map_credential_id=str(options.get("map_credential_id", "default")),
         custom_map_url=str(options.get("custom_map_url", "")),
         custom_map_attribution=str(options.get("custom_map_attribution", "")),
         maximum_map_zoom=int(options.get("maximum_map_zoom", 19)),
         map_request_timeout_seconds=float(options.get("map_request_timeout_seconds", 12.0)),
+        map_cache_only=bool(options.get("map_cache_only", False)),
         adventure_render_parameters=options.get("adventure_overview_render_parameters", options.get("adventure_render_parameters")),
     )
     return output_name
@@ -3497,7 +3939,7 @@ def media_overview_is_current(
     if str(metadata.get("media_fingerprint", "")) != expected_fingerprint:
         return False
     if isinstance(expected_parameters, dict):
-        return metadata.get("adventure_render_parameters") == expected_parameters
+        return map_render_signature_matches(metadata, expected_parameters)
     return True
 
 
@@ -3841,12 +4283,14 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
         stripped = line.strip()
         if not stripped:
             continue
-        content = stripped
+        disabled, content = split_disabled_control_line(stripped)
+        content = content.strip()
         entry: dict[str, Any] = {
             "line": stripped,
             "type": "other",
             "date": current_date,
             "name": control_line_name(stripped),
+            "disabled": disabled,
         }
         if content.startswith("#"):
             keyword, _separator, value = content[1:].partition(":")
@@ -4723,6 +5167,8 @@ def analyze_media_updates(
     tracks_summary: Optional[TracksSummary] = None,
     control_signature: Optional[tuple[int, int]] = None,
     place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+    media_memberships: Optional[dict[str, MediaMembership]] = None,
+    media_inventory: Optional[ControlMediaInventory] = None,
 ) -> MediaUpdatePlan:
     """Analyze selected media without changing sidecars or the control file."""
     project = Path(project_dir).expanduser().resolve(strict=False)
@@ -4754,10 +5200,55 @@ def analyze_media_updates(
             reference_record = _control_media_record(entry, reference_path)
             if reference_record is not None:
                 gps_resolver._remember_reference_record(reference_record)
+    section_media_counts: dict[str, int] = {}
+    available_stage_sections: set[str] = set()
+    for entry_index, entry in enumerate(entries):
+        if entry.get("type") == "media":
+            section = _control_section_description(entries, entry_index)
+            section_media_counts[section] = section_media_counts.get(section, 0) + 1
+        elif entry.get("type") in {"map", "map_before", "map_after", "media_map"}:
+            available_stage_sections.add(_control_section_description(entries, entry_index))
+    memberships = {
+        normalize_filename_for_match(name): membership
+        for name, membership in (media_memberships or {}).items()
+    }
     selected_actions = {normalize_filename_for_match(key): str(value) for key, value in (actions or {}).items()}
     results: list[MediaUpdateItem] = []
     warnings: list[str] = []
+    for normalized_name, indexes in media_entry_indexes.items():
+        entry_name = str(entries[indexes[0]].get("name", ""))
+        referenced_path = project / Path(entry_name).name
+        if referenced_path.is_file():
+            continue
+        warning = (
+            f"Control row references missing media and was retained: {entry_name}"
+        )
+        warnings.append(warning)
+        if detail_callback is not None:
+            detail_callback(warning)
     paths = [Path(path).expanduser().resolve(strict=False) for path in media_paths]
+    extraction_paths: list[Path] = []
+    for media_path in paths:
+        if media_path.parent != project or not media_path.is_file():
+            continue
+        status, payload, _reason = validate_media_sidecar(media_path)
+        freshness = media_sidecar_freshness(media_path, payload) if status == "available" else status
+        normalized_name = normalize_filename_for_match(media_path.name)
+        action = selected_actions.get(normalized_name)
+        if action not in {"use_sidecar", "refresh", "repair", "skip"}:
+            if status != "available":
+                action = "repair"
+            elif freshness == "changed" or media_entry_indexes.get(normalized_name):
+                action = "refresh"
+            else:
+                action = "use_sidecar"
+        if action in {"refresh", "repair"} or (action == "use_sidecar" and status != "available"):
+            extraction_paths.append(media_path)
+    metadata_bundles = prefetch_media_metadata(
+        extraction_paths,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    )
     for index, media_path in enumerate(paths, start=1):
         if cancel_event is not None and cancel_event.is_set():
             raise ProcessingCancelled("Aborted.")
@@ -4807,7 +5298,18 @@ def analyze_media_updates(
 
         sidecar_write_required = action in {"refresh", "repair"}
         if action in {"refresh", "repair"}:
-            new_record = build_record_from_photo(media_path, False, {}, [], 0.0, True)
+            new_record = build_record_from_photo(
+                media_path,
+                False,
+                {},
+                [],
+                0.0,
+                True,
+                10.0,
+                GEOCODE_PACING_MIN_SECONDS,
+                GEOCODE_PACING_MAX_SECONDS,
+                metadata_bundles.get(media_path),
+            )
             new_record.raw_metadata = dict(old_payload or {})
         else:
             new_record = old_record
@@ -4886,6 +5388,28 @@ def analyze_media_updates(
         staged_payload = build_record_sidecar_payload(new_record) if sidecar_write_required else dict(old_payload or {})
         current_section = _control_section_description(entries, occurrences[0]) if occurrences else "Not included"
         proposed_section = _proposed_media_section(new_record, tracks_summary, sort_date_sections_by_tracks)
+        membership = memberships.get(normalized_name)
+        membership_status = membership.state if membership is not None else (
+            "included" if occurrences else "explicit"
+        )
+        membership_reason = membership.reason if membership is not None else (
+            "Already included" if occurrences else "Explicitly selected"
+        )
+        strong_stage_match = bool(
+            membership_status == "unclassified"
+            and proposed_section in available_stage_sections
+            and section_media_counts.get(proposed_section, 0) == 0
+        )
+        if strong_stage_match:
+            membership_reason = "Strong match to a stage that currently has no media"
+        add_to_control = bool(
+            not occurrences
+            and (
+                membership is None
+                or membership_status == "new"
+                or strong_stage_match
+            )
+        )
         conflict = None
         if len(occurrences) > 1:
             conflict = f"{media_path.name} occurs {len(occurrences)} times in the control file"
@@ -4926,7 +5450,21 @@ def analyze_media_updates(
                 analyzed_sidecar_signature=analyzed_sidecar_signature,
                 sidecar_write_required=sidecar_write_required,
                 control_conflict=conflict or (reason if status == "invalid" else None),
+                add_to_control=add_to_control,
+                update_metadata=bool(
+                    sidecar_write_required and membership_status != "excluded"
+                ),
+                membership_status=("recommended" if strong_stage_match else membership_status),
+                membership_reason=membership_reason,
+                first_seen_at=membership.first_seen_at if membership is not None else "",
+                imported_at=membership.imported_at if membership is not None else "",
+                folder_added_at=membership.folder_added_at if membership is not None else "",
             )
+        )
+        results[-1].apply_update = bool(
+            results[-1].add_to_control
+            or results[-1].update_metadata
+            or results[-1].reposition
         )
     if progress_callback is not None:
         progress_callback(len(paths), len(paths), "")
@@ -4941,6 +5479,7 @@ def analyze_media_updates(
         sort_date_sections_by_tracks=sort_date_sections_by_tracks,
         control_signature=control_signature,
         warnings=warnings,
+        media_inventory=media_inventory,
     )
 
 
@@ -4958,6 +5497,8 @@ def analyze_control_file_updates(
     detail_callback: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
+    media_memberships: Optional[dict[str, MediaMembership]] = None,
+    media_inventory: Optional[ControlMediaInventory] = None,
 ) -> ControlFileUpdatePlan:
     """Analyze Track Map references and selected media from one control snapshot."""
     project = Path(project_dir).expanduser().resolve(strict=False)
@@ -5008,12 +5549,37 @@ def analyze_control_file_updates(
         tracks_summary=usable_tracks_summary,
         control_signature=control_signature,
         place_equivalence_m=place_equivalence_m,
+        media_memberships=media_memberships,
+        media_inventory=media_inventory,
     )
+    if tracks_summary is not None and track_plan.missing_tracks:
+        missing_names = {
+            normalize_track_plot_filename_for_match(name)
+            for name in track_plan.missing_tracks
+        }
+        new_stage_dates = {
+            track.start_time.date()
+            for track in tracks_summary.tracks
+            if track.start_time is not None
+            and normalize_track_plot_filename_for_match(
+                track.track_plot_image_filename
+            ) in missing_names
+        }
+        for item in media_plan.items:
+            if (
+                item.membership_status == "unclassified"
+                and item.new_record.photo_datetime.date() in new_stage_dates
+                and item.proposed_section.endswith(" - Track")
+            ):
+                item.membership_status = "recommended"
+                item.membership_reason = "Strong match to a newly added stage"
+                item.add_to_control = True
+                item.apply_update = True
     if not media_only and not summary_current:
         warning = "Maps must be generated or updated before media can be added or repositioned."
         media_plan.warnings.append(warning)
         for item in media_plan.items:
-            if item.included_count == 0 or item.reposition:
+            if (item.included_count == 0 and item.add_to_control) or item.reposition:
                 item.reposition = False
                 item.control_update_pending = True
                 item.control_conflict = warning
@@ -5154,14 +5720,25 @@ def commit_media_update_plan(
 ) -> MediaUpdateResult:
     """Commit an approved selective update, with the control file replaced last."""
     result = MediaUpdateResult()
-    selected_items = [item for item in plan.items if item.apply_update]
+    selected_items = [
+        item
+        for item in plan.items
+        if item.apply_update
+        and (
+            item.add_to_control
+            or item.update_metadata
+            or (item.included_count > 0 and item.reposition)
+        )
+    ]
     control_entries = []
+    original_control_text = None
     if plan.control_file is not None and plan.control_file.is_file():
         current_stat = plan.control_file.stat()
         current_signature = (int(current_stat.st_size), int(current_stat.st_mtime_ns))
         if plan.control_signature is not None and current_signature != plan.control_signature:
             raise RuntimeError("The control file changed after analysis; analyze the selected media again.")
-        control_entries = parse_control_file_entries(plan.control_file.read_text(encoding="utf-8").splitlines())
+        original_control_text = plan.control_file.read_text(encoding="utf-8")
+        control_entries = parse_control_file_entries(original_control_text.splitlines())
     if _track_map_plan is not None and plan.control_file is not None:
         added, replaced_count, removed, reordered = _apply_track_map_reference_updates(
             control_entries,
@@ -5207,7 +5784,9 @@ def commit_media_update_plan(
                     result.gps_refreshed += 1
             else:
                 result.gps_inferred += 1
-        if item.place_update_recommended and update_place_names:
+        if item.place_update_recommended and update_place_names and (
+            item.add_to_control or item.update_metadata
+        ):
             resolve_place_for_record(
                 record, geocode_cache, known_places, place_distance_m, False,
                 geocode_timeout_seconds, geocode_pacing_min_seconds, geocode_pacing_max_seconds,
@@ -5217,10 +5796,12 @@ def commit_media_update_plan(
                 result.places_updated += 1
         elif item.old_record is not None and is_resolved_place_name(record.place):
             result.places_preserved += 1
-        if item.sidecar_write_required:
+        if item.sidecar_write_required and (
+            item.update_metadata or item.add_to_control
+        ):
             item.staged_payload = build_record_sidecar_payload(record)
 
-        if item.control_update_pending:
+        if item.control_update_pending and (item.add_to_control or item.reposition):
             result.control_rows_pending += 1
             continue
         if not control_entries or item.control_conflict and item.included_count > 1:
@@ -5236,7 +5817,7 @@ def commit_media_update_plan(
             and normalize_filename_for_match(str(entry.get("name", ""))) == normalized_name
         ]
         old_day = control_entries[occurrences[0]].get("date") if len(occurrences) == 1 else None
-        if not occurrences:
+        if not occurrences and item.add_to_control:
             insert_classified_media_entry(
                 control_entries, record, plan.tracks_summary, plan.sort_date_sections_by_tracks,
             )
@@ -5251,7 +5832,11 @@ def commit_media_update_plan(
                 affected_dates.add(old_day)
             affected_dates.add(record.photo_datetime.date())
             result.rows_moved += 1
-        elif len(occurrences) == 1 and old_day == record.photo_datetime.date():
+        elif (
+            len(occurrences) == 1
+            and item.update_metadata
+            and old_day == record.photo_datetime.date()
+        ):
             control_entries[occurrences[0]].update(
                 line=sorted_media_output_line(record),
                 datetime=record.photo_datetime,
@@ -5265,6 +5850,9 @@ def commit_media_update_plan(
             result.control_rows_pending += 1
 
     staged_control_text = None
+    control_text_for_inventory = original_control_text
+    staged_inventory_payload = None
+    staged_inventory_path = None
     staged_map_options = None
     map_temp_dir = None
     if control_entries and plan.control_file is not None:
@@ -5280,7 +5868,41 @@ def commit_media_update_plan(
             result.media_maps_regenerated = len(
                 media_map_specs_from_control_entries(control_entries, affected_dates=affected_dates)
             )
-        staged_control_text = "\n".join(entry["line"] for entry in control_entries) + "\n"
+        candidate_control_text = "\n".join(entry["line"] for entry in control_entries) + "\n"
+        control_text_for_inventory = candidate_control_text
+        if candidate_control_text != original_control_text:
+            staged_control_text = candidate_control_text
+        if plan.media_inventory is not None:
+            included_names = [
+                str(entry.get("name", ""))
+                for entry in control_entries
+                if entry.get("type") == "media"
+            ]
+            project_media = [
+                path
+                for path in plan.project_dir.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            ]
+            staged_inventory_payload = build_control_media_inventory_payload(
+                plan.media_inventory,
+                project_media,
+                included_names,
+                control_text=control_text_for_inventory,
+            )
+            staged_inventory_path = control_media_inventory_path(plan.control_file)
+            inventory_entries = staged_inventory_payload.get("media", {})
+            if isinstance(inventory_entries, dict):
+                result.inventory_included = sum(
+                    1
+                    for entry in inventory_entries.values()
+                    if isinstance(entry, dict) and entry.get("state") == "included"
+                )
+                result.inventory_excluded = sum(
+                    1
+                    for entry in inventory_entries.values()
+                    if isinstance(entry, dict) and entry.get("state") == "excluded"
+                )
 
     if cancel_event is not None and cancel_event.is_set():
         if map_temp_dir is not None:
@@ -5294,7 +5916,9 @@ def commit_media_update_plan(
     replaced: list[tuple[Path, Optional[Path]]] = []
     try:
         for item in selected_items:
-            if not item.sidecar_write_required:
+            if not item.sidecar_write_required or not (
+                item.update_metadata or item.add_to_control
+            ):
                 continue
             destination = media_sidecar_path(item.media_path)
             backup = None
@@ -5328,6 +5952,16 @@ def commit_media_update_plan(
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_control, plan.control_file)
+        if staged_inventory_payload is not None and staged_inventory_path is not None:
+            backup = None
+            if staged_inventory_path.exists():
+                backup = backup_dir / staged_inventory_path.name
+                shutil.copy2(staged_inventory_path, backup)
+            replaced.append((staged_inventory_path, backup))
+            write_control_media_inventory(
+                staged_inventory_payload,
+                staged_inventory_path,
+            )
     except Exception:
         for destination, backup in reversed(replaced):
             if backup is None:
@@ -5362,6 +5996,7 @@ def record_for_merge_media(
     params: Params,
     media_path: Path,
     gps_resolver: Optional[LazyTrackGpsResolver] = None,
+    metadata_bundle: Optional[MediaMetadataBundle] = None,
 ) -> PhotoRecord:
     """Build or load metadata for one media file being merged."""
     json_path = get_json_path_for_photo(media_path)
@@ -5377,6 +6012,10 @@ def record_for_merge_media(
         [],
         params.distance,
         params.debug,
+        10.0,
+        GEOCODE_PACING_MIN_SECONDS,
+        GEOCODE_PACING_MAX_SECONDS,
+        metadata_bundle,
     )
     if gps_resolver is not None:
         gps_resolver.apply(record)
@@ -5456,8 +6095,23 @@ def merge_sorted_control_file(params: Params) -> Path:
             existing_map_names.add(normalized_map_name)
             inserted_maps += 1
 
+    merge_extraction_paths = [
+        media_path
+        for media_path in params.merge_media
+        if params.ignorejson
+        or load_record_from_json(get_json_path_for_photo(media_path), media_path) is None
+    ]
+    merge_metadata_bundles = prefetch_media_metadata(
+        merge_extraction_paths,
+        progress_callback=params.progress_callback,
+    )
     media_records = [
-        record_for_merge_media(params, media_path, gps_resolver)
+        record_for_merge_media(
+            params,
+            media_path,
+            gps_resolver,
+            merge_metadata_bundles.get(media_path.expanduser().resolve(strict=False)),
+        )
         for media_path in params.merge_media
     ]
     for record in sort_records_for_output(media_records, tracks_summary, params.sort_date_sections_by_tracks):
@@ -5882,6 +6536,23 @@ def collect_photo_location_and_dates(
         except OSError:
             protected_json_paths.add(params.tracks)
 
+    preloaded_records: dict[Path, Optional[PhotoRecord]] = {}
+    extraction_paths: list[Path] = []
+    for photo_path in photo_files:
+        resolved_photo_path = photo_path.expanduser().resolve(strict=False)
+        record = (
+            None
+            if params.ignorejson
+            else load_record_from_json(get_json_path_for_photo(photo_path), photo_path)
+        )
+        preloaded_records[resolved_photo_path] = record
+        if record is None:
+            extraction_paths.append(resolved_photo_path)
+    metadata_bundles = prefetch_media_metadata(
+        extraction_paths,
+        progress_callback=params.progress_callback,
+    )
+
     params.photolist.parent.mkdir(parents=True, exist_ok=True)
     total_photos = len(photo_files)
     if params.progress_callback is not None:
@@ -5890,7 +6561,8 @@ def collect_photo_location_and_dates(
         for photo_index, photo_path in enumerate(photo_files, start=1):
             check_cancelled()
             json_path = get_json_path_for_photo(photo_path)
-            record = None if params.ignorejson else load_record_from_json(json_path, photo_path)
+            resolved_photo_path = photo_path.expanduser().resolve(strict=False)
+            record = preloaded_records.get(resolved_photo_path)
             record_was_loaded = record is not None
             if record_was_loaded:
                 record.geocode_requested = params.getclearnames
@@ -5908,6 +6580,7 @@ def collect_photo_location_and_dates(
                     params.geocode_timeout_seconds,
                     params.geocode_pacing_min_seconds,
                     params.geocode_pacing_max_seconds,
+                    metadata_bundles.get(resolved_photo_path),
                 )
             if gps_resolver is not None:
                 gps_resolver.apply(record)

@@ -219,7 +219,7 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertEqual([value for _selector, value, _wait in calls], ["first", "second"])
         self.assertTrue(all(wait is False for _selector, _value, wait in calls))
 
-    def test_media_update_review_is_required_only_for_existing_row_moves(self):
+    def test_media_update_review_is_required_for_additions_and_existing_moves(self):
         def plan(*items):
             return SimpleNamespace(media=SimpleNamespace(items=list(items)))
 
@@ -239,7 +239,7 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             reposition=True,
         )
         self.assertFalse(control_file_update_requires_review(plan(metadata_only)))
-        self.assertFalse(control_file_update_requires_review(plan(new_media)))
+        self.assertTrue(control_file_update_requires_review(plan(new_media)))
         self.assertTrue(control_file_update_requires_review(plan(existing_move)))
 
     def test_summary_path_is_derived_without_preparing_the_gpx(self):

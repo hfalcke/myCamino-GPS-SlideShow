@@ -16,11 +16,58 @@ from GPSTrackShowGUI import (
     normalize_slideshow_resume_history,
     resolve_gui_startup_paths,
     slideshow_settings_command_payload,
+    style_control_table_cell,
     validated_slideshow_resume_position,
 )
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_control_table_does_not_apply_text_style_to_preview_image_cell(self):
+        class ImageCell:
+            def respondsToSelector_(self, selector):
+                return False
+
+            def setFont_(self, _font):
+                self.fail("Image preview cell must not receive text font styling")
+
+            def setTextColor_(self, _color):
+                self.fail("Image preview cell must not receive text color styling")
+
+            def fail(self, message):
+                raise AssertionError(message)
+
+        self.assertFalse(style_control_table_cell(ImageCell(), "IMG", False))
+
+    def test_view_map_index_uses_saved_references_without_gpx_processing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            output = project / "trackimages"
+            output.mkdir()
+            overview = output / "Trip.png"
+            standard = output / "0001_Stage_Trip.png"
+            time_lapse = output / "0001_Stage_Trip-timelapse.png"
+            for path in (overview, standard, time_lapse):
+                path.write_bytes(b"png")
+            control = project / "Trip-sorted.lst"
+            control.write_text(
+                "#Overviewmap: Trip.png\n#Map: 0001_Stage_Trip.png\n",
+                encoding="utf-8",
+            )
+            controller = SimpleNamespace(
+                track_map_base="Trip",
+                _track_images_dir=lambda: output,
+                _current_project_name=lambda: "Trip",
+                _control_file_path=lambda: control,
+                _tracks_summary_json_path=lambda: output / "Trip-summary.json",
+            )
+
+            paths = GPXTrackerController._existing_project_map_paths(controller)
+
+        self.assertEqual(
+            paths,
+            [path.resolve(strict=False) for path in (overview, standard, time_lapse)],
+        )
+
     def test_speed_sidecar_upgrade_does_not_pass_output_directory_twice(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
