@@ -112,6 +112,67 @@ class MediaUpdateReviewWindowTests(unittest.TestCase):
         self.assertIn('== "\\x1b"', source)
         self.assertIn("controller.closeMediaBrowser_", source)
 
+    def test_automatic_map_review_waits_for_fresh_project_status(self):
+        source = inspect.getsource(
+            GPXTrackerController.geoLocationsRunFinished_.callable
+        )
+        automatic_branch = source[source.index('if mode == "automatic_maps":'):]
+        pending = automatic_branch.index(
+            "self.pending_control_update_offer_after_status = list("
+        )
+        refresh = automatic_branch.index(
+            'self.start_async_project_status_refresh("automatic map generation")'
+        )
+        self.assertLess(pending, refresh)
+        self.assertIn(
+            "applyAsyncProjectStatus_ opens the confirmation",
+            automatic_branch,
+        )
+
+    def test_fresh_status_opens_deferred_control_update_confirmation(self):
+        label = Mock()
+        button = Mock()
+        controller = SimpleNamespace(
+            status_refresh_generation=7,
+            project_status_pending=True,
+            media_counts_cache=None,
+            control_ready_cache=False,
+            track_maps_status_cache=None,
+            track_endpoint_place_missing_cache=0,
+            gpx_ready_cache=False,
+            gpx_summary_label=label,
+            track_maps_summary_label=label,
+            media_summary_label=label,
+            media_metadata_button=button,
+            control_file_summary_label=label,
+            parameters={},
+            pending_control_update_after_status=None,
+            pending_control_update_offer_after_status=["new.mov"],
+            _format_track_maps_summary_from_status=Mock(return_value="Current"),
+            refresh_section_status_indicators=Mock(),
+            set_status=Mock(),
+            performSelector_withObject_afterDelay_=Mock(),
+        )
+        result = {
+            "generation": 7,
+            "media_counts": (1, 2),
+            "control_ready": True,
+            "track_maps_status": {"summary_exists": True},
+            "endpoint_place_missing_count": 0,
+            "gpx_ready": True,
+            "gpx_summary": "Tracks",
+            "media_summary": "Media",
+            "control_summary": "Control file up to date",
+        }
+
+        GPXTrackerController.applyAsyncProjectStatus_.callable(controller, result)
+
+        self.assertEqual(controller.pending_control_update_after_status, ["new.mov"])
+        self.assertIsNone(controller.pending_control_update_offer_after_status)
+        controller.performSelector_withObject_afterDelay_.assert_called_once_with(
+            "offerControlUpdateAfterMaps:", None, 0.0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

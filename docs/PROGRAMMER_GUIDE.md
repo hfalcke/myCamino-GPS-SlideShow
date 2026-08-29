@@ -255,7 +255,7 @@ each completed track, so cancelling or terminating a long tour resumes from the
 next unfinished endpoint rather than discarding the complete pass.
 Project status compares both current map variants against the active track
 fingerprint and `locations.reuse_radius_m`. Missing start/end entries are
-reported in both metadata and map status, mark **Update Metadata Extraction**
+reported in both metadata and map status, mark **Update Metadata**
 with an asterisk, and make the Assistant metadata stage incomplete without
 marking otherwise valid map pixels stale.
 
@@ -593,7 +593,7 @@ changed coordinate clears its old reverse-geocoded place so metadata
 maintenance can resolve it again. Place-name writes must preserve this
 provenance.
 
-The place-name phase of Update Metadata Extraction is a dedicated sidecar-only
+The place-name phase of Update Metadata is a dedicated sidecar-only
 pass. It validates the
 extension-aware sidecar, reverse-geocodes only coordinates already stored
 there, and patches only place-related fields. It does not create a temporary
@@ -1335,6 +1335,16 @@ sidecars remain source-of-truth inputs.
   and sorted-list writing/merging in `GetGeoLocations.py`.
 - Avoid changing the default GPX path after the user manually edits the GPX
   field.
+
+## Historical weather enrichment
+
+`historical_weather.py` is a sidecar-only Open-Meteo client. It groups media
+within 100 m and 10 minutes, batches representative coordinates by UTC date,
+uses mixed hourly interpolation, and atomically patches only the `weather`
+object. Sidecars are the persistent cache; playback performs no weather network
+access. The request function is injectable so automated tests use deterministic
+responses. Time-Lapse retains the latest reached snapshot for at most one hour
+of reconstructed media/track time.
 
 ## Packaging
 

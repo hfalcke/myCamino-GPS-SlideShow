@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 20
+PARAMETER_SCHEMA_VERSION = 21
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -90,6 +90,11 @@ PARAMETER_SPECS = (
     ParameterSpec("timelapse.marker_style", "Slide Show", "Moving marker", "pilgrim", "choice", "Choose the moving symbol shown at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("bike", "Bicycle"), ("car", "Car"), ("plane", "Airplane"), ("arrow", "Arrow")), subsection="Time-Lapse"),
     ParameterSpec("slideshow.speedometer", "Slide Show", "Show speedometer", True, "bool", "Show distance-smoothed moving speed in Time-Lapse when recorded timing is available.", subsection="Time-Lapse"),
 
+    ParameterSpec("slideshow.weather", "Slide Show", "Show historical weather", True, "bool", "Show stored historical weather beside the speedometer while media timing is available.", subsection="Header"),
+    ParameterSpec("slideshow.weather_condition_icon", "Slide Show", "Weather condition icon", True, "bool", "Show a compact condition icon derived from the stored WMO weather code.", subsection="Header"),
+    ParameterSpec("slideshow.weather_primary", "Slide Show", "Primary weather value", "temperature", "choice", "Primary historical-weather value shown in the header.", choices=_choice(("temperature", "Temperature"), ("wind", "Wind"), ("precipitation", "Precipitation"), ("humidity", "Humidity"), ("pressure", "Pressure"), ("cloud_cover", "Cloud cover"), ("none", "None")), subsection="Header"),
+    ParameterSpec("slideshow.weather_secondary", "Slide Show", "Secondary weather value", "none", "choice", "Optional second historical-weather value shown when space permits.", choices=_choice(("none", "None"), ("temperature", "Temperature"), ("wind", "Wind"), ("precipitation", "Precipitation"), ("humidity", "Humidity"), ("pressure", "Pressure"), ("cloud_cover", "Cloud cover")), subsection="Header"),
+
     ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
     ParameterSpec("trackmaps.route_source", "Map Generation", "Journey source", "automatic", "choice", "Use GPX tracks when available, require GPX tracks, or build date stages from media locations.", choices=_choice(("automatic", "Automatic"), ("gpx", "GPX tracks"), ("media", "Media locations"))),
     ParameterSpec("trackmaps.gpx_overlay", "Map Generation", "GPX route display", "line", "choice", "Draw the measured GPX route dynamically or hide it.", choices=_choice(("line", "Line"), ("hidden", "Hidden"))),
@@ -138,6 +143,11 @@ PARAMETER_SPECS = (
     ParameterSpec("locations.timeout_seconds", "Locations", "Request timeout", 10.0, "float", "Maximum wait for one Apple reverse-geocoding request.", 1.0, 300.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_min_seconds", "Locations", "Minimum request spacing", 1.0, "float", "Minimum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_max_seconds", "Locations", "Maximum request spacing", 5.0, "float", "Maximum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
+
+    ParameterSpec("weather.enabled", "Weather", "Add historical weather", False, "bool", "Send media coordinates and exposure times to Open-Meteo and store historical weather in media sidecars."),
+    ParameterSpec("weather.access", "Weather", "Open-Meteo access", "free", "choice", "Use the non-commercial free endpoint or a paid customer historical endpoint.", choices=_choice(("free", "Free non-commercial"), ("customer", "Customer API"))),
+    ParameterSpec("weather.credential_id", "Weather", "Credential name", "default", "text", "macOS Keychain account name for an Open-Meteo customer API key; the key is never stored in the Adventure."),
+    ParameterSpec("weather.timeout_seconds", "Weather", "Request timeout", 20.0, "float", "Maximum wait for one historical-weather request.", 1.0, 300.0, advanced=True, unit="s"),
 
     ParameterSpec("maps.interactive_provider", "Map Service", "Interactive provider", "osm", "choice", "Provider used for interactive GPX Editor maps. Public OpenStreetMap is suitable for this use.", choices=_choice(("osm", "OpenStreetMap (public)"), ("geoapify", "Geoapify"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
     ParameterSpec("maps.output_provider", "Map Service", "Map-generation provider", "osm", "choice", "Provider used for generated PNG and PDF maps. Public OpenStreetMap is restricted to manually selected individual maps.", choices=_choice(("osm", "OpenStreetMap (manual only)"), ("geoapify", "Geoapify (recommended)"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),

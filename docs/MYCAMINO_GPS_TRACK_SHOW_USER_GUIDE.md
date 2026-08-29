@@ -436,12 +436,12 @@ Controls:
 - Import: choose images and videos to import into the project directory.
 - View: open the project media browser.
 - Folder icon: open project media in Finder.
-- Update Metadata Extraction: refresh only missing, invalid, or changed
+- Update Metadata: refresh only missing, invalid, or changed
   companion metadata. The button is separated at the right of the section
   because it is a maintenance action rather than an import/view action.
 - If current Track Map sidecars are missing start or destination place names,
   the Photos and Map Generation status lines report the number missing and
-  **Update Metadata Extraction** receives an `*`. Run it again to continue the
+  **Update Metadata** receives an `*`. Run it again to continue the
   place-name pass. Completed endpoints are retained and each completed track is
   saved immediately.
 - Add place names: selected by default; after metadata preparation, obtain
@@ -453,7 +453,7 @@ Controls:
 Existing valid place names are retained. If GPS changes sufficiently, its old
 place name is invalidated automatically and can be looked up again. For a
 deliberate complete metadata rebuild, remove that media file's companion
-metadata file in Finder and run **Update Metadata Extraction**.
+metadata file in Finder and run **Update Metadata**.
 
 Files created:
 
@@ -462,7 +462,7 @@ Files created:
   **Skipping existing** and is not copied or counted as newly imported.
 - Existing files are skipped so duplicates are not imported.
 - Companion metadata files are prepared when media is added and can be refreshed
-  with **Update Metadata Extraction**, **Create**, or **Update Control File**.
+  with **Update Metadata**, **Create**, or **Update Control File**.
   Opening the media browser never scans the media or creates metadata.
 - When companion metadata is created, the embedded exposure timestamp is
   preferred: the original photo time first, then the camera-supplied creation
@@ -706,9 +706,10 @@ Update Control File:
 - Keeps **Add**, **Update Metadata**, and **Move** independent. Repairing a
   sidecar never inserts an intentionally excluded medium into the show.
 - Provides Recommended, New, Unclassified, Excluded, Included Updates, and All
-  filters with visible-row selection controls. Unchecked absent media is
-  remembered as excluded after Apply and is hidden from the normal review, but
-  remains available through the Excluded filter.
+  filters with visible-row selection controls and a count beside every filter.
+  Unchecked absent media is remembered as excluded after Apply and is hidden
+  from the normal review, but remains available through the Excluded filter;
+  select **Add** there to restore it to the control file.
 - Treats disabled photo/video rows as included. If the control file was edited
   outside myCamino, removed media is shown as unclassified for confirmation
   rather than silently treated as a deliberate exclusion.
@@ -725,7 +726,7 @@ Update Control File:
 - Preserves an existing place when GPS remains within the configured
   **Place-name search radius** (150 m by default). A larger GPS change proposes
   a targeted place lookup; if declined, stale place fields are cleared so
-  Update Metadata Extraction can fill them later.
+  Update Metadata can fill them later.
 - Applies required Track Map corrections and selected media changes to one
   staged model. It writes sidecars and affected media maps first, backs up the
   active control file, and replaces that file last.
@@ -1127,6 +1128,23 @@ and contain the route or ordered media positions used for dynamic drawing.
 For a media-only Adventure, the same folder contains one date map per
 `#MediaMap:` section; a GPX summary file is not required.
 
+## Historical weather
+
+Select **Add historical weather** in Media to enrich valid media sidecars from
+Open-Meteo. This is optional because the request sends the media coordinate and
+exposure time to an external service. The free endpoint is limited to
+non-commercial use; customer access uses an API key stored in macOS Keychain.
+
+Weather retrieval is a separate Adventure Processing phase. Current weather is
+reused, nearby media are grouped, and missing weather does not cause EXIF
+metadata or place names to be recalculated. The slideshow can show a condition
+icon and up to two selected values beside the speedometer. During Time-Lapse,
+the latest reached weather remains visible for up to one hour of track/media
+time. Weather data is an historical model estimate, not a camera measurement.
+
+Weather data: [Open-Meteo](https://open-meteo.com/), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
 ## Troubleshooting
 
 - If the GPX section says no GPX file is available, choose or create a GPX file
@@ -1139,10 +1157,10 @@ For a media-only Adventure, the same folder contains one date map per
   **Generate and Update Maps** first and then Update Control File.
 - If the control file cannot be created with tracks, check that
   `trackimages/<projectname>-summary.json` exists.
-- If media have GPS metadata but no place names, use Update Metadata Extraction
+- If media have GPS metadata but no place names, use Update Metadata
   with Add place names selected.
 - If the media browser reports **Missing** or **Invalid** metadata, select the
-  files in Update Control File or use Update Metadata Extraction; place-name
+  files in Update Control File or use Update Metadata; place-name
   extraction does not repair missing media metadata by itself.
 - If the slide show does not start, check that the control file and
   `trackimages/` directory both exist.

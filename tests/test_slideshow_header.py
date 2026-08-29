@@ -22,10 +22,20 @@ from GPSTrackShow import (
     runtime_header_text_shadow_color,
     selected_stage_header_lines,
     time_lapse_header_title_font_size,
+    weather_badge_layout,
 )
 
 
 class SlideshowHeaderTests(unittest.TestCase):
+    def test_weather_badge_uses_one_compact_vertical_column(self):
+        frame = weather_badge_layout(
+            (0.0, 0.0, 1920.0, 1080.0),
+            None,
+            False,
+            True,
+        )
+        self.assertAlmostEqual(frame[2], frame[3] * 1.12)
+
     def test_right_header_statistics_use_a_readable_three_row_font(self):
         self.assertAlmostEqual(
             runtime_header_metrics_font_size(30.0, 1.0, 210.0),

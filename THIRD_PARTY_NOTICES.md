@@ -6,6 +6,13 @@ Those components are not relicensed as original myCamino project content.
 Complete license texts and build-specific package versions are included in the
 `licenses/third-party` directory of each application and in the DMG.
 
+## Open-Meteo Weather Data
+
+Optional historical weather is supplied by [Open-Meteo](https://open-meteo.com/).
+API data is licensed under the Creative Commons Attribution 4.0 International
+licence: https://creativecommons.org/licenses/by/4.0/. Weather is downloaded
+only after the user enables this feature; Open-Meteo's service terms apply.
+
 ## Python Runtime
 
 The applications include Python, distributed under the Python Software

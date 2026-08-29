@@ -509,6 +509,10 @@ class Config:
     window_swap: bool
     clock: bool
     speedometer: bool
+    weather: bool
+    weather_condition_icon: bool
+    weather_primary: str
+    weather_secondary: str
     header_stage_name: bool
     header_track_details: bool
     header_place_name: bool
@@ -605,6 +609,7 @@ class WindowTarget:
     clock_date_text: Optional[str] = None
     running_speed_kmh: Optional[float] = None
     speedometer_maximum_kmh: Optional[float] = None
+    weather: Optional[dict] = None
     place_text: Optional[str] = None
     info_text: Optional[str] = None
     photo_identity: Optional[str] = None
@@ -896,6 +901,10 @@ def parse_args(argv: list[str]) -> Config:
     )
     parser.add_argument("--time-lapse-duration", type=float, default=30.0, help="Seconds of active arrow motion per time-lapse stage (default: 30).")
     parser.add_argument("--speedometer", choices=("on", "off"), default="on", help="Show recorded running speed in Time-Lapse (default: on).")
+    parser.add_argument("--weather", choices=("on", "off"), default="on", help="Show historical weather stored in media sidecars (default: on).")
+    parser.add_argument("--weather-condition-icon", choices=("on", "off"), default="on", help="Show a WMO condition icon with historical weather (default: on).")
+    parser.add_argument("--weather-primary", choices=("none", "temperature", "wind", "precipitation", "humidity", "pressure", "cloud_cover"), default="temperature")
+    parser.add_argument("--weather-secondary", choices=("none", "temperature", "wind", "precipitation", "humidity", "pressure", "cloud_cover"), default="none")
     parser.add_argument(
         "--time-lapse-media-min-fraction",
         "--time-lapse-media-max-fraction",
@@ -1163,6 +1172,10 @@ def parse_args(argv: list[str]) -> Config:
         window_swap=bool(args.window_swap),
         clock=args.clock == "on",
         speedometer=args.speedometer == "on",
+        weather=args.weather == "on",
+        weather_condition_icon=args.weather_condition_icon == "on",
+        weather_primary=str(args.weather_primary),
+        weather_secondary=str(args.weather_secondary),
         header_stage_name=args.header_stage_name == "on",
         header_track_details=args.header_track_details == "on",
         header_place_name=args.header_place_name == "on",
@@ -1343,6 +1356,10 @@ def config_from_options(
     window_swap: bool = False,
     clock: bool = True,
     speedometer: bool = True,
+    weather: bool = True,
+    weather_condition_icon: bool = True,
+    weather_primary: str = "temperature",
+    weather_secondary: str = "none",
     header_stage_name: bool = True,
     header_track_details: bool = True,
     header_place_name: bool = True,
@@ -1546,6 +1563,10 @@ def config_from_options(
         window_swap=bool(window_swap),
         clock=bool(clock),
         speedometer=bool(speedometer),
+        weather=bool(weather),
+        weather_condition_icon=bool(weather_condition_icon),
+        weather_primary=str(weather_primary),
+        weather_secondary=str(weather_secondary),
         header_stage_name=bool(header_stage_name),
         header_track_details=bool(header_track_details),
         header_place_name=bool(header_place_name),
@@ -1848,6 +1869,97 @@ def speedometer_layout(
     image_x, _image_y, image_width, _image_height = image_rect
     frame_x = min(frame_x, image_x + image_width - margin - frame_width)
     return (frame_x, frame_y, frame_width, frame_height), dial_size
+
+
+def weather_badge_layout(
+    image_rect: tuple[float, float, float, float],
+    metadata: Optional[dict],
+    has_date: bool,
+    speedometer_visible: bool,
+) -> tuple[float, float, float, float]:
+    """Place a compact weather badge after the clock/speedometer cluster."""
+    speed_frame, dial_size = speedometer_layout(image_rect, metadata, has_date)
+    margin = max(3.0, dial_size * 0.06)
+    x = speed_frame[0] + (speed_frame[2] + margin if speedometer_visible else 0.0)
+    image_x, _image_y, image_width, _image_height = image_rect
+    maximum_width = max(dial_size, image_x + image_width - margin - x)
+    width = min(dial_size * 1.12, maximum_width)
+    return x, speed_frame[1], max(dial_size, width), speed_frame[3]
+
+
+def weather_snapshot_from_metadata(metadata: object) -> Optional[dict]:
+    """Return one validated, display-ready sidecar weather snapshot."""
+    if not isinstance(metadata, dict):
+        return None
+    weather = metadata.get("weather")
+    if not isinstance(weather, dict) or int(weather.get("schema_version", 0) or 0) != 1:
+        return None
+    values = weather.get("values")
+    source = weather.get("media_source")
+    if not isinstance(values, dict) or not isinstance(source, dict):
+        return None
+    timestamp = parse_iso_datetime(source.get("datetime_iso"))
+    if timestamp is None:
+        return None
+    return {"values": dict(values), "timestamp": timestamp, "weather_code": values.get("weather_code")}
+
+
+def retained_weather_at_time(
+    weather: Optional[dict],
+    current_time: Optional[datetime],
+    maximum_age_seconds: float = 3600.0,
+) -> Optional[dict]:
+    """Retain only preceding weather no more than the configured media-time age."""
+    if not isinstance(weather, dict) or not isinstance(current_time, datetime):
+        return None
+    source_time = weather.get("timestamp")
+    if not isinstance(source_time, datetime):
+        return None
+    aligned = align_datetime_timezone(current_time, source_time)
+    age = (aligned - source_time).total_seconds()
+    return weather if 0.0 <= age <= float(maximum_age_seconds) else None
+
+
+def weather_condition_symbol(weather_code: object) -> str:
+    """Map WMO weather codes to compact offline symbols."""
+    try:
+        code = int(float(weather_code))
+    except (TypeError, ValueError):
+        return "\u2601\ufe0e"
+    if code == 0:
+        return "\u2600\ufe0e"
+    if code in {1, 2, 3, 45, 48}:
+        return "\u2601\ufe0e"
+    if code in {71, 73, 75, 77, 85, 86}:
+        return "\u2744\ufe0e"
+    if code in {95, 96, 99}:
+        return "\u26a1\ufe0e"
+    return "\u2614\ufe0e"
+
+
+def format_weather_value(weather: Optional[dict], field_name: str) -> str:
+    """Format one configured weather field with compact stable units."""
+    values = weather.get("values", {}) if isinstance(weather, dict) else {}
+    mapping = {
+        "temperature": ("temperature_2m", lambda value: f"{value:.1f} \u00b0C"),
+        "wind": ("wind_speed_10m", lambda value: f"{value:.0f} km/h"),
+        "precipitation": ("precipitation", lambda value: f"{value:.1f} mm"),
+        "humidity": ("relative_humidity_2m", lambda value: f"{value:.0f}%"),
+        "pressure": ("pressure_msl", lambda value: f"{value:.0f} hPa"),
+        "cloud_cover": ("cloud_cover", lambda value: f"{value:.0f}% cloud"),
+    }
+    item = mapping.get(str(field_name or "none"))
+    if item is None:
+        return ""
+    value = safe_float(values.get(item[0]))
+    return "" if value is None else item[1](value)
+
+
+def weather_cloud_cover_text(weather: Optional[dict]) -> str:
+    """Return the compact cloud-cover percentage shown beside the condition icon."""
+    values = weather.get("values", {}) if isinstance(weather, dict) else {}
+    value = safe_float(values.get("cloud_cover"))
+    return "" if value is None else f"{value:.0f}%"
 
 
 def runtime_header_band(
@@ -2757,6 +2869,105 @@ if APPKIT_AVAILABLE:
             )
 
 
+    class WeatherBadgeView(NSView):
+        """Retained compact Open-Meteo badge drawn without external icon assets."""
+
+        def initWithFrame_(self, frame):
+            self = objc.super(WeatherBadgeView, self).initWithFrame_(frame)
+            if self is None:
+                return None
+            self.weather = None
+            self.primary = "temperature"
+            self.secondary = "none"
+            self.show_icon = True
+            return self
+
+        def setWeather_primary_secondary_icon_(self, weather, primary, secondary, show_icon):
+            self.weather = weather if isinstance(weather, dict) else None
+            self.primary = str(primary or "temperature")
+            self.secondary = str(secondary or "none")
+            self.show_icon = bool(show_icon)
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, _dirty_rect):
+            if self.weather is None:
+                return
+            bounds = self.bounds()
+            width, height = float(bounds.size.width), float(bounds.size.height)
+            if width < 20.0 or height < 20.0:
+                return
+            ns_color((0.0, 0.0, 0.0, 0.52)).setFill()
+            background = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(0.0, 0.0, width, height),
+                max(4.0, height * 0.08),
+                max(4.0, height * 0.08),
+            )
+            background.fill()
+            padding = max(3.0, height * 0.05)
+            color = ns_color(COLOR_NAMES["white"])
+
+            def draw_centered(text, y, font):
+                if not text:
+                    return
+                value = NSString.stringWithString_(text)
+                size = value.sizeWithAttributes_({NSFontAttributeName: font})
+                value.drawAtPoint_withAttributes_(
+                    ((width - size.width) / 2.0, y),
+                    {
+                        NSFontAttributeName: font,
+                        NSForegroundColorAttributeName: color,
+                    },
+                )
+
+            primary = format_weather_value(self.weather, self.primary)
+            secondary = format_weather_value(self.weather, self.secondary)
+            font = NSFont.boldSystemFontOfSize_(max(10.0, height * 0.19))
+            small_font = NSFont.systemFontOfSize_(max(8.0, height * 0.15))
+            if self.show_icon:
+                icon = weather_condition_symbol(self.weather.get("weather_code"))
+                cloud_cover = weather_cloud_cover_text(self.weather)
+                icon_font = NSFont.systemFontOfSize_(max(12.0, height * 0.32))
+                icon_value = NSString.stringWithString_(icon)
+                icon_size = icon_value.sizeWithAttributes_(
+                    {NSFontAttributeName: icon_font}
+                )
+                cloud_value = NSString.stringWithString_(cloud_cover)
+                cloud_size = cloud_value.sizeWithAttributes_(
+                    {NSFontAttributeName: small_font}
+                )
+                gap = height * 0.035 if cloud_cover else 0.0
+                group_x = (
+                    width - icon_size.width - gap - cloud_size.width
+                ) / 2.0
+                icon_y = height * 0.62
+                icon_value.drawAtPoint_withAttributes_(
+                    (group_x, icon_y),
+                    {
+                        NSFontAttributeName: icon_font,
+                        NSForegroundColorAttributeName: color,
+                    },
+                )
+                if cloud_cover:
+                    cloud_value.drawAtPoint_withAttributes_(
+                        (
+                            group_x + icon_size.width + gap,
+                            icon_y + (icon_size.height - cloud_size.height) / 2.0,
+                        ),
+                        {
+                            NSFontAttributeName: small_font,
+                            NSForegroundColorAttributeName: color,
+                        },
+                    )
+            draw_centered(
+                primary,
+                height * (0.35 if self.show_icon else 0.50),
+                font,
+            )
+            draw_centered(secondary, height * 0.18, small_font)
+            credit_font = NSFont.systemFontOfSize_(max(7.0, height * 0.075))
+            draw_centered("Open-Meteo", padding * 0.45, credit_font)
+
+
     class ElevationProfileOverlayView(NSView):
         """Retained route-free profile inset with lightweight position markers."""
 
@@ -2977,6 +3188,9 @@ if APPKIT_AVAILABLE:
             self.overlay_shadow_color = COLOR_NAMES["black"]
             self.map_header_font_factor = 2.2
             self.header_row_count = 3
+            self.weather_primary = "temperature"
+            self.weather_secondary = "none"
+            self.weather_condition_icon = True
             self.clock_overlay_key = None
             self.clock_overlay_image = None
             self.clock_view = NSImageView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
@@ -2987,6 +3201,9 @@ if APPKIT_AVAILABLE:
             self.speedometer_view = SpeedometerView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
             self.speedometer_view.setHidden_(True)
             self.addSubview_(self.speedometer_view)
+            self.weather_view = WeatherBadgeView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
+            self.weather_view.setHidden_(True)
+            self.addSubview_(self.weather_view)
             self.elevation_profile_view = ElevationProfileOverlayView.alloc().initWithFrame_(self.bounds())
             self.addSubview_(self.elevation_profile_view)
             self.caption_view = NSImageView.alloc().initWithFrame_(self.bounds())
@@ -3090,6 +3307,8 @@ if APPKIT_AVAILABLE:
             self.addSubview_(self.clock_view)
             self.speedometer_view.removeFromSuperview()
             self.addSubview_(self.speedometer_view)
+            self.weather_view.removeFromSuperview()
+            self.addSubview_(self.weather_view)
             self.caption_view.removeFromSuperview()
             self.addSubview_(self.caption_view)
 
@@ -3127,10 +3346,31 @@ if APPKIT_AVAILABLE:
             self.speedometer_view.setSpeed_maximum_(speed, maximum)
             self.speedometer_view.setHidden_(False)
 
+        def _update_weather(self, weather, enabled, speedometer_visible):
+            if not enabled or not isinstance(weather, dict):
+                self.weather_view.setHidden_(True)
+                return
+            image_rect = self.headerReferenceRect()
+            frame = weather_badge_layout(
+                (float(image_rect.origin.x), float(image_rect.origin.y), float(image_rect.size.width), float(image_rect.size.height)),
+                self.map_metadata,
+                bool(self.clock_overlay_key and self.clock_overlay_key[2]),
+                bool(speedometer_visible),
+            )
+            self.weather_view.setFrame_(NSMakeRect(*frame))
+            self.weather_view.setWeather_primary_secondary_icon_(
+                weather,
+                self.weather_primary,
+                self.weather_secondary,
+                self.weather_condition_icon,
+            )
+            self.weather_view.setHidden_(False)
+
         def _retire_content(self):
             """Drop heavyweight content while a closed Cocoa window stays retained."""
             self._update_clock_overlay(None, None, False)
             self._update_speedometer(None, None, False)
+            self._update_weather(None, False, False)
             self.elevation_profile_view.clear()
             self.map_image = None
             self.map_metadata = None
@@ -6453,6 +6693,11 @@ class CocoaImagePresenter:
         self.running_speed_kmh: Optional[float] = None
         self.speedometer_maximum_kmh: Optional[float] = None
         self.speedometer_visible = False
+        self.weather_snapshot: Optional[dict] = None
+        self.weather_visible = False
+        self.weather_primary = "temperature"
+        self.weather_secondary = "none"
+        self.weather_condition_icon = True
         self.header_metadata: Optional[dict] = None
         self.header_lines: tuple[str, ...] = ()
         self.header_metrics: tuple[str, ...] = ()
@@ -6496,6 +6741,8 @@ class CocoaImagePresenter:
         self.clock_view = self._make_image_view(host_view.bounds())
         self.speedometer_view = SpeedometerView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
         self.speedometer_view.setHidden_(True)
+        self.weather_view = WeatherBadgeView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 1.0, 1.0))
+        self.weather_view.setHidden_(True)
         self.elevation_profile_view = ElevationProfileOverlayView.alloc().initWithFrame_(host_view.bounds())
         self.place_view = self._make_image_view(host_view.bounds())
         self.caption_view = self._make_image_view(host_view.bounds())
@@ -6516,6 +6763,7 @@ class CocoaImagePresenter:
         host_view.addSubview_(self.header_view)
         host_view.addSubview_(self.clock_view)
         host_view.addSubview_(self.speedometer_view)
+        host_view.addSubview_(self.weather_view)
         host_view.addSubview_(self.elevation_profile_view)
         host_view.addSubview_(self.place_view)
         host_view.addSubview_(self.caption_view)
@@ -6565,6 +6813,9 @@ class CocoaImagePresenter:
         self.speedometer_view.setHidden_(
             hidden or not self.speedometer_visible or self.running_speed_kmh is None
         )
+        self.weather_view.setHidden_(
+            hidden or not self.weather_visible or self.weather_snapshot is None
+        )
         if self.video_view is not None:
             self.video_view.setHidden_(hidden)
 
@@ -6577,6 +6828,7 @@ class CocoaImagePresenter:
             "header_view",
             "clock_view",
             "speedometer_view",
+            "weather_view",
             "elevation_profile_view",
             "place_view",
             "caption_view",
@@ -6629,6 +6881,7 @@ class CocoaImagePresenter:
             self.header_view,
             self.clock_view,
             self.speedometer_view,
+            self.weather_view,
             self.place_view,
             self.caption_view,
             self.info_view,
@@ -6931,6 +7184,45 @@ class CocoaImagePresenter:
         self.speedometer_view.setSpeed_maximum_(speed, maximum)
         self.speedometer_view.setHidden_(False)
 
+    def set_weather(
+        self,
+        weather: Optional[dict],
+        visible: bool,
+        *,
+        primary: str = "temperature",
+        secondary: str = "none",
+        condition_icon: bool = True,
+    ) -> None:
+        """Show or hide one retained historical-weather badge."""
+        self.weather_snapshot = weather if isinstance(weather, dict) else None
+        self.weather_visible = bool(visible)
+        self.weather_primary = str(primary)
+        self.weather_secondary = str(secondary)
+        self.weather_condition_icon = bool(condition_icon)
+        if not self.weather_visible or self.weather_snapshot is None:
+            self.weather_view.setHidden_(True)
+            return
+        reference = self._header_reference_rect()
+        frame = weather_badge_layout(
+            (
+                float(reference.origin.x),
+                float(reference.origin.y),
+                float(reference.size.width),
+                float(reference.size.height),
+            ),
+            self.header_metadata,
+            bool(self.clock_time is not None and self.clock_date_text),
+            bool(self.speedometer_visible and self.running_speed_kmh is not None),
+        )
+        self.weather_view.setFrame_(NSMakeRect(*frame))
+        self.weather_view.setWeather_primary_secondary_icon_(
+            self.weather_snapshot,
+            self.weather_primary,
+            self.weather_secondary,
+            self.weather_condition_icon,
+        )
+        self.weather_view.setHidden_(False)
+
     def set_header_reference_image(self, image, fills_frame: bool = False) -> None:
         """Select the image whose fitted top edge anchors overlay headers."""
         self.header_reference_image = image
@@ -7030,6 +7322,13 @@ class CocoaImagePresenter:
             self.running_speed_kmh,
             self.speedometer_maximum_kmh,
             self.speedometer_visible,
+        )
+        self.set_weather(
+            self.weather_snapshot,
+            self.weather_visible,
+            primary=self.weather_primary,
+            secondary=self.weather_secondary,
+            condition_icon=self.weather_condition_icon,
         )
         if self.caption_directive is not None and self.caption_font_state is not None:
             self.set_caption(self.caption_directive, self.caption_font_state, self.current_image)
@@ -8387,6 +8686,7 @@ class GPSTrackShowApp:
         self.time_lapse_clock_time: Optional[tuple[int, int]] = None
         self.time_lapse_clock_date_text: Optional[str] = None
         self.time_lapse_place_text: Optional[str] = None
+        self.latest_time_lapse_weather: Optional[dict] = None
         self.time_lapse_stage_start_distance_km = 0.0
         self.time_lapse_media_deadline: Optional[float] = None
         self.time_lapse_media_remaining: Optional[float] = None
@@ -9742,13 +10042,26 @@ class GPSTrackShowApp:
                     and photo_target.running_speed_kmh is not None
                 ),
             )
+            active_presenter.set_weather(
+                photo_target.weather,
+                bool(
+                    self.header_visible
+                    and self.config.weather
+                    and photo_target.weather is not None
+                ),
+                primary=self.config.weather_primary,
+                secondary=self.config.weather_secondary,
+                condition_icon=self.config.weather_condition_icon,
+            )
         if self.photo_presenter is not None and self.photo_presenter is not active_presenter:
             self.photo_presenter.set_clock_time(None)
             self.photo_presenter.set_speedometer(None, None, False)
+            self.photo_presenter.set_weather(None, False)
             self.photo_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
         if self.map_presenter is not None and self.map_presenter is not active_presenter:
             self.map_presenter.set_clock_time(None)
             self.map_presenter.set_speedometer(None, None, False)
+            self.map_presenter.set_weather(None, False)
             self.map_presenter.set_header((), (), None, False, self.config.font_size, self.config.font_color, self.config.map_header_font_factor, "off", self.config.header_shadow_color)
 
     def _continue_time_lapse_after_navigation(self) -> None:
@@ -11629,6 +11942,31 @@ class GPSTrackShowApp:
         total = (end - start).total_seconds()
         return 0.0 if total <= 0 else max(0.0, min(1.0, (photo_time - start).total_seconds() / total))
 
+    def _time_lapse_weather_at(self, display_time: Optional[datetime]) -> Optional[dict]:
+        """Return the latest reached media weather while it is at most one hour old."""
+        return retained_weather_at_time(
+            self.latest_time_lapse_weather,
+            display_time,
+            3600.0,
+        )
+
+    def _preceding_stage_weather(self, row_index: int, display_time: Optional[datetime]) -> Optional[dict]:
+        """Find the nearest preceding weather in the active stage for backward jumps."""
+        if self.time_lapse_stage is None:
+            return None
+        rows = list(zip(self.time_lapse_stage.media_indexes, self.time_lapse_stage.media_entries))
+        for candidate_row, entry in reversed(rows):
+            if candidate_row > row_index:
+                continue
+            path = resolve_path(self.config.photodir, entry.source_name)
+            metadata = try_read_photo_metadata(media_sidecar_path(path), path) or {}
+            weather = weather_snapshot_from_metadata(metadata)
+            if weather is None:
+                continue
+            if display_time is None or retained_weather_at_time(weather, display_time) is not None:
+                return weather
+        return None
+
     def _set_time_lapse_views(self):
         special_stage = self.time_lapse_stage is not None and self.time_lapse_stage.relation is not None
         media_map_stage = (
@@ -11670,6 +12008,7 @@ class GPSTrackShowApp:
         if self.time_lapse_current_media is not None:
             media_time = self.time_lapse_media_datetimes.get(self.time_lapse_current_media[0])
         display_time = time_lapse_clock_datetime(marker_time, self.time_lapse_progress, media_time)
+        display_weather = self._time_lapse_weather_at(display_time)
         uses_late_media_time = isinstance(display_time, datetime) and display_time != marker_time
         if isinstance(display_time, datetime) and (
             uses_late_media_time
@@ -11740,6 +12079,9 @@ class GPSTrackShowApp:
             stage_view.overlay_shadow_color = self.config.header_shadow_color
             stage_view.map_header_font_factor = self.config.map_header_font_factor
             stage_view.header_row_count = 3
+            stage_view.weather_primary = self.config.weather_primary
+            stage_view.weather_secondary = self.config.weather_secondary
+            stage_view.weather_condition_icon = self.config.weather_condition_icon
             stage_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(self.current_track_image, self.current_track_metadata, self.time_lapse_points, arrow, self.time_lapse_media_image, False)
             stage_view._update_clock_overlay(
                 self.time_lapse_clock_time,
@@ -11750,6 +12092,11 @@ class GPSTrackShowApp:
                 running_speed_kmh,
                 speedometer_maximum,
                 bool(self.header_visible and self.config.speedometer),
+            )
+            stage_view._update_weather(
+                display_weather,
+                bool(self.header_visible and self.config.weather and display_weather is not None),
+                bool(self.config.speedometer and running_speed_kmh is not None),
             )
             if self.time_lapse_video_view is not None and self.time_lapse_media_image is not None:
                 old_superview = self.time_lapse_video_view.superview()
@@ -11812,6 +12159,9 @@ class GPSTrackShowApp:
             overview_view.overlay_shadow_color = self.config.header_shadow_color
             overview_view.map_header_font_factor = self.config.map_header_font_factor
             overview_view.header_row_count = 3
+            overview_view.weather_primary = self.config.weather_primary
+            overview_view.weather_secondary = self.config.weather_secondary
+            overview_view.weather_condition_icon = self.config.weather_condition_icon
             overview_map_image = self.current_stage_overview_image or self.current_overview_image
             overview_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(
                 overview_map_image,
@@ -11848,6 +12198,11 @@ class GPSTrackShowApp:
                 speedometer_maximum,
                 bool(self.header_visible and self.config.speedometer),
             )
+            overview_view._update_weather(
+                display_weather,
+                bool(self.header_visible and self.config.weather and display_weather is not None),
+                bool(self.config.speedometer and running_speed_kmh is not None),
+            )
             overview_view._raise_clock_overlay()
         self._publish_live_state()
 
@@ -11857,6 +12212,7 @@ class GPSTrackShowApp:
             if view is not None:
                 view._update_clock_overlay(None, None, False)
                 view._update_speedometer(None, None, False)
+                view._update_weather(None, False, False)
                 view.setHidden_(True)
         for presenter in (self.photo_presenter, self.map_presenter):
             if presenter is not None:
@@ -12488,6 +12844,13 @@ class GPSTrackShowApp:
         self.time_lapse_caption_font = caption_data[1] if caption_data else None
         self.time_lapse_media_draw_frame = True
         metadata = try_read_photo_metadata(media_sidecar_path(path), path) or {}
+        media_weather = weather_snapshot_from_metadata(metadata)
+        media_datetime = self.time_lapse_media_datetimes.get(row_index)
+        self.latest_time_lapse_weather = (
+            media_weather
+            if media_weather is not None
+            else self._preceding_stage_weather(row_index, media_datetime)
+        )
         raw_place = metadata.get("place")
         if not isinstance(raw_place, str) or not raw_place.strip():
             raw_place = entry.place
@@ -13248,6 +13611,7 @@ class GPSTrackShowApp:
         # Retain available statistics even when currently hidden so a live
         # Settings Apply can reveal them without advancing to another medium.
         media_datetime = parse_iso_datetime(photo_metadata.get("datetime_iso"))
+        media_weather = weather_snapshot_from_metadata(photo_metadata)
         profile_media_state = photo_track_state(
             self.current_track_metadata,
             latitude,
@@ -13277,6 +13641,7 @@ class GPSTrackShowApp:
                 clock_date_text=clock_date_text,
                 running_speed_kmh=running_speed_kmh,
                 speedometer_maximum_kmh=speedometer_maximum_kmh,
+                weather=media_weather,
                 place_text=place_text,
                 info_text=info_text,
                 photo_identity=photo_identity,
@@ -13504,6 +13869,19 @@ class GPSTrackShowApp:
                     and target.running_speed_kmh is not None
                 ),
             )
+            if hasattr(presenter, "set_weather"):
+                presenter.set_weather(
+                    target.weather,
+                    bool(
+                        full_window_header
+                        and self.header_visible
+                        and self.config.weather
+                        and target.weather is not None
+                    ),
+                    primary=self.config.weather_primary,
+                    secondary=self.config.weather_secondary,
+                    condition_icon=self.config.weather_condition_icon,
+                )
             if hasattr(presenter, "set_elevation_profile"):
                 presenter.set_elevation_profile(
                     target.image,
@@ -13872,6 +14250,10 @@ class GPSTrackShowApp:
         simple_values = {
             "slideshow.clock": ("clock", bool),
             "slideshow.speedometer": ("speedometer", bool),
+            "slideshow.weather": ("weather", bool),
+            "slideshow.weather_condition_icon": ("weather_condition_icon", bool),
+            "slideshow.weather_primary": ("weather_primary", str),
+            "slideshow.weather_secondary": ("weather_secondary", str),
             "slideshow.header_stage_name": ("header_stage_name", bool),
             "slideshow.header_track_details": ("header_track_details", bool),
             "slideshow.header_place_name": ("header_place_name", bool),

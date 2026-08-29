@@ -35,7 +35,9 @@ class TileCacheMissError(TileProviderAccessError):
 
 
 def provider_requires_credential(provider: str) -> bool:
-    return str(provider or "").strip().lower() in {"geoapify", "thunderforest", "stadia"}
+    return str(provider or "").strip().lower() in {
+        "geoapify", "thunderforest", "stadia", "open-meteo"
+    }
 
 
 def provider_credential_service(provider: str) -> str:
@@ -45,7 +47,7 @@ def provider_credential_service(provider: str) -> str:
 def read_provider_credential(provider: str, credential_id: str = "default") -> str:
     """Read a provider API key from the macOS Keychain or a process environment override."""
     normalized = str(provider or "").strip().lower()
-    environment_key = f"MYCAMINO_{normalized.upper()}_API_KEY"
+    environment_key = f"MYCAMINO_{normalized.upper().replace('-', '_')}_API_KEY"
     if os.environ.get(environment_key):
         return str(os.environ[environment_key]).strip()
     if not provider_requires_credential(normalized):
@@ -157,6 +159,7 @@ def provider_display_name(provider: str) -> str:
         "stadia": "Stadia Alidade Smooth",
         "esri": "Esri.WorldStreetMap",
         "custom": "Custom",
+        "open-meteo": "Open-Meteo",
     }.get(provider, "OpenStreetMap.Mapnik")
 
 

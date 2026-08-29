@@ -129,7 +129,7 @@ class ControlFileTrackSyncTests(unittest.TestCase):
             status,
         )
         self.assertIn("2 track endpoint place names missing", summary)
-        self.assertIn("Update Metadata Extraction", summary)
+        self.assertIn("Update Metadata", summary)
 
     def test_music_help_explains_control_rows_playlists_and_albums(self):
         controller = SimpleNamespace(music_source=None)

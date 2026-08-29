@@ -255,6 +255,10 @@ class AdventureParameterTests(unittest.TestCase):
                 "slideshow.header_track_stats",
                 "slideshow.header_background",
                 "slideshow.header_shadow_color",
+                "slideshow.weather",
+                "slideshow.weather_condition_icon",
+                "slideshow.weather_primary",
+                "slideshow.weather_secondary",
                 "trackmaps.track_title",
             },
         )

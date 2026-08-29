@@ -61,6 +61,7 @@ from AppKit import (
     NSShadow,
     NSSavePanel,
     NSSearchField,
+    NSSecureTextField,
     NSScreen,
     NSSortDescriptor,
     NSStepper,
@@ -266,7 +267,13 @@ from map_provider_utils import (
     contextily_provider,
     provider_requires_credential,
     read_provider_credential,
+    store_provider_credential,
     provider_tile_url,
+)
+from historical_weather import (
+    WeatherCancelled,
+    WeatherOptions,
+    enrich_media_weather,
 )
 from map_provider_setup import (
     load_map_provider_preference,
@@ -750,6 +757,47 @@ def request_provider_api_key(provider: str, credential_id: str) -> bool:
         initial_key=read_provider_credential(provider, credential_id),
     )
     return bool(result and result.get("action") == "configured")
+
+
+def request_open_meteo_api_key(credential_id: str) -> bool:
+    """Collect an Open-Meteo customer key without storing it in the Adventure."""
+    existing = read_provider_credential("open-meteo", credential_id)
+    accessory = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 430.0, 54.0))
+    label = NSTextField.labelWithString_("Open-Meteo customer API key")
+    label.setFrame_(NSMakeRect(0.0, 31.0, 430.0, 18.0))
+    field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 430.0, 26.0))
+    field.setStringValue_(existing)
+    accessory.addSubview_(label)
+    accessory.addSubview_(field)
+    alert = NSAlert.alloc().init()
+    alert.setMessageText_("Configure Open-Meteo customer access")
+    alert.setInformativeText_(
+        "Historical customer access currently requires a suitable paid Open-Meteo plan. "
+        "The key is stored only in macOS Keychain."
+    )
+    alert.setAccessoryView_(accessory)
+    alert.addButtonWithTitle_("Store Key")
+    alert.addButtonWithTitle_("Open Pricing")
+    alert.addButtonWithTitle_("Cancel")
+    while True:
+        response = int(alert.runModal())
+        if response == 1001:
+            NSWorkspace.sharedWorkspace().openURL_(
+                NSURL.URLWithString_("https://open-meteo.com/en/pricing")
+            )
+            continue
+        if response != 1000:
+            return False
+        value = str(field.stringValue()).strip()
+        if not value:
+            show_alert("Enter an Open-Meteo customer API key.")
+            continue
+        try:
+            store_provider_credential("open-meteo", value, credential_id)
+        except (OSError, ValueError) as exc:
+            show_alert("Could not store the Open-Meteo key.", str(exc))
+            return False
+        return True
 
 
 def control_table_backup_directory(control_path: Path) -> Path:
@@ -2332,6 +2380,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_temp_paths = []
         self.geolocations_places_overwrite = False
         self.geolocations_skip_place_names = False
+        self.geolocations_skip_weather = False
         self.processing_phase_title = None
         self.preserve_processing_output_next = False
         self.assistant_control_skip_maps = False
@@ -2344,6 +2393,8 @@ class GPXTrackerController(NSObject):
         self.track_endpoint_place_missing_cache = 0
         self.gpx_ready_cache = None
         self.project_status_pending = False
+        self.pending_control_update_after_status = None
+        self.pending_control_update_offer_after_status = None
         self.workflow_assistant_state = normalize_assistant_state(None, existing_adventure=False)
         self.workflow_assistant_stage = None
         self.assistant_place_names_pending_save = False
@@ -2448,6 +2499,7 @@ class GPXTrackerController(NSObject):
         self.media_update_preview_apply_button = None
         self.media_update_preview_track_text = None
         self.media_update_preview_filter_popup = None
+        self.media_update_preview_hint = None
         self.media_update_preview_filter = "review"
         self.media_update_preview_visible_items = []
         self.media_update_preview_sort_column = "new_time"
@@ -2711,11 +2763,15 @@ class GPXTrackerController(NSObject):
         self.media_view_button = self._make_button("View", "viewMediaFiles:")
         self.media_edit_button = self._make_file_icon_button("editMediaFiles:")
         self.media_metadata_button = self._make_button(
-            "Update Metadata Extraction",
+            "Update Metadata",
             "updateMediaMetadata:",
         )
         self.media_place_names_checkbox = self._make_checkbox(
             "Add place names",
+            "fieldChanged:",
+        )
+        self.media_weather_checkbox = self._make_checkbox(
+            "Add historical weather",
             "fieldChanged:",
         )
         self.root_view.addSubview_(self.media_import_button)
@@ -2723,6 +2779,7 @@ class GPXTrackerController(NSObject):
         self.root_view.addSubview_(self.media_edit_button)
         self.root_view.addSubview_(self.media_metadata_button)
         self.root_view.addSubview_(self.media_place_names_checkbox)
+        self.root_view.addSubview_(self.media_weather_checkbox)
         self.media_summary_label = self._make_label("No project directory selected.", size=12.0)
         self.root_view.addSubview_(self.media_summary_label)
 
@@ -3175,6 +3232,9 @@ class GPXTrackerController(NSObject):
         self.media_place_names_checkbox.setToolTip_(
             "Add readable place names from GPS coordinates while metadata is prepared or updated."
         )
+        self.media_weather_checkbox.setToolTip_(
+            "Send media coordinates and exposure times to Open-Meteo and add missing historical weather to sidecars."
+        )
         self.media_summary_label.setToolTip_("Current count of imported photos and video clips.")
 
         self.control_box.setToolTip_("Create and edit the slide-show control file used to merge media, dates, maps, and geolocations.")
@@ -3264,7 +3324,8 @@ class GPXTrackerController(NSObject):
         self.media_import_button.setNextKeyView_(self.media_view_button)
         self.media_view_button.setNextKeyView_(self.media_edit_button)
         self.media_edit_button.setNextKeyView_(self.media_place_names_checkbox)
-        self.media_place_names_checkbox.setNextKeyView_(self.media_metadata_button)
+        self.media_place_names_checkbox.setNextKeyView_(self.media_weather_checkbox)
+        self.media_weather_checkbox.setNextKeyView_(self.media_metadata_button)
         self.media_metadata_button.setNextKeyView_(self.gpx_make_plots_button)
         self.gpx_make_plots_button.setNextKeyView_(self.gpx_view_plots_button)
         self.gpx_view_plots_button.setNextKeyView_(self.gpx_edit_plots_button)
@@ -3554,7 +3615,11 @@ class GPXTrackerController(NSObject):
         )
         x += FILE_BUTTON_WIDTH + 2.0 * INNER_GAP
         self.media_place_names_checkbox.setFrame_(
-            NSMakeRect(x, header_y, 160.0, FIELD_HEIGHT)
+            NSMakeRect(x, header_y, 132.0, FIELD_HEIGHT)
+        )
+        x += 132.0 + INNER_GAP
+        self.media_weather_checkbox.setFrame_(
+            NSMakeRect(x, header_y, 166.0, FIELD_HEIGHT)
         )
         metadata_width = 180.0
         self.media_metadata_button.setFrame_(
@@ -4947,7 +5012,7 @@ class GPXTrackerController(NSObject):
             freshness_parts.append(
                 f"{missing_endpoints} track endpoint place name"
                 f"{'s' if missing_endpoints != 1 else ''} missing; "
-                "run Update Metadata Extraction"
+                "run Update Metadata"
             )
         freshness_text = f" | {', '.join(freshness_parts)}" if freshness_parts else ""
         if status.get("media_only"):
@@ -4976,9 +5041,9 @@ class GPXTrackerController(NSObject):
         )
         self.track_maps_summary_label.setStringValue_(self._format_track_maps_summary_from_status(status))
         self.media_metadata_button.setTitle_(
-            "Update Metadata Extraction *"
+            "Update Metadata *"
             if self.track_endpoint_place_missing_cache
-            else "Update Metadata Extraction"
+            else "Update Metadata"
         )
         self.refresh_media_summary()
         self.refresh_section_status_indicators()
@@ -5146,7 +5211,7 @@ class GPXTrackerController(NSObject):
             summary += (
                 f" | {missing_endpoints} track endpoint place name"
                 f"{'s' if missing_endpoints != 1 else ''} missing; "
-                "run Update Metadata Extraction"
+                "run Update Metadata"
             )
         self.media_summary_label.setStringValue_(summary)
         self.refresh_section_status_indicators()
@@ -6100,6 +6165,8 @@ class GPXTrackerController(NSObject):
             self.adventure_autosave_suspended = max(0, self.adventure_autosave_suspended - 1)
 
     def _update_loaded_project_fields_without_autosave(self, data):
+        self.pending_control_update_after_status = None
+        self.pending_control_update_offer_after_status = None
         project_directory = str(data.get("project_directory", "") or "")
         self.project_dir_field.setStringValue_(project_directory)
         self.current_project_dir = Path(project_directory).expanduser().resolve(strict=False) if project_directory else None
@@ -6402,7 +6469,7 @@ class GPXTrackerController(NSObject):
             result["media_summary"] += (
                 f" | {missing_endpoints} track endpoint place name"
                 f"{'s' if missing_endpoints != 1 else ''} missing; "
-                "run Update Metadata Extraction"
+                "run Update Metadata"
             )
         if control_lines is not None:
             track_status = result.get("track_maps_status")
@@ -6490,9 +6557,9 @@ class GPXTrackerController(NSObject):
         self.track_maps_summary_label.setStringValue_(self._format_track_maps_summary_from_status(self.track_maps_status_cache))
         self.media_summary_label.setStringValue_(str(result.get("media_summary", "No project directory selected.")))
         self.media_metadata_button.setTitle_(
-            "Update Metadata Extraction *"
+            "Update Metadata *"
             if self.track_endpoint_place_missing_cache
-            else "Update Metadata Extraction"
+            else "Update Metadata"
         )
         if self.track_endpoint_place_missing_cache:
             self.media_metadata_button.setToolTip_(
@@ -6509,12 +6576,24 @@ class GPXTrackerController(NSObject):
         if self.track_endpoint_place_missing_cache:
             self.set_status(
                 f"Project status updated: {self.track_endpoint_place_missing_cache} "
-                "track endpoint place name(s) need Update Metadata Extraction."
+                "track endpoint place name(s) need Update Metadata."
             )
         else:
             self.set_status("Project status updated.")
         pending_value = getattr(self, "pending_control_update_after_status", None)
         self.pending_control_update_after_status = None
+        pending_offer = getattr(
+            self, "pending_control_update_offer_after_status", None
+        )
+        self.pending_control_update_offer_after_status = None
+        if pending_offer is not None:
+            self.pending_control_update_after_status = list(pending_offer)
+            self.performSelector_withObject_afterDelay_(
+                "offerControlUpdateAfterMaps:",
+                None,
+                0.0,
+            )
+            return
         if pending_value is not None:
             self.performSelector_withObject_afterDelay_(
                 "startPendingImportedMediaUpdate:",
@@ -6652,6 +6731,23 @@ class GPXTrackerController(NSObject):
             provider = str(new_parameters.get(key, "osm"))
             if provider_requires_credential(provider) and not request_provider_api_key(
                 provider, credential_id
+            ):
+                return False
+        if (
+            bool(new_parameters.get("weather.enabled", False))
+            and not bool(old_parameters.get("weather.enabled", False))
+        ):
+            weather_access = str(new_parameters.get("weather.access", "free"))
+            if weather_access == "customer":
+                weather_credential = str(new_parameters.get("weather.credential_id", "default"))
+                if not request_open_meteo_api_key(weather_credential):
+                    return False
+            elif not confirm_alert(
+                "Enable historical weather?",
+                "myCamino will send media coordinates and exposure times to Open-Meteo. "
+                "The free endpoint is for non-commercial use, has usage limits, and requires attribution.",
+                "Enable",
+                "Cancel",
             ):
                 return False
         self.parameters = new_parameters
@@ -6905,14 +7001,14 @@ class GPXTrackerController(NSObject):
             "   If a complete project folder was copied in Finder, choose a copied Adventure marked Needs adaptation. The GUI creates a valid Adventure for the new folder while sharing its already copied GPX, control, map, music, and narration files.\n"
             "3. Use the gear beside the myCamino logo to adjust project settings. During a slide show, press s to open Settings directly at Slide Show. Header controls and Time-Lapse options are grouped in their own subsections below thin dividers. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Apply updates an active slide show immediately and auto-saves the settings with the Adventure.\n"
             "4. For a new Adventure, confirm a detected GPX file, choose other GPX files, or select No GPX file - use only photos. One detected file is used directly; several detected or selected files are joined in the GPX Editor. Cancelling a chooser leaves the source unconfirmed. The same media-only choice remains visible in the GPX Files section and is saved with the Adventure.\n"
-            "5. Accept photos and videos already in the Adventure folder or import more. Existing files are skipped rather than copied again. One retained Adventure Processing window then shows metadata extraction, optional place-name lookup, map generation, and control-file work with phase headings and progress in its title. Add place names is selected by default; Skip omits only that slower phase.\n"
+            "5. Accept photos and videos already in the Adventure folder or import more. Existing files are skipped rather than copied again. One retained Adventure Processing window then shows metadata extraction, optional place-name and historical-weather lookup, map generation, and control-file work with phase headings and progress in its title. Historical weather is an explicit opt-in because media coordinates and times are sent to Open-Meteo; Skip omits only the active optional phase.\n"
             "6. Maps automatically creates only missing or outdated maps and always creates Standard and Time-Lapse variants consecutively for each affected stage. Before the first automatic download, choose a hosted provider and store your own API key in macOS Keychain, use Esri or Custom XYZ through Map Service Settings, or defer setup and retain limited public OSM use. Manage Map Provider in Settings reopens this setup. The manual Generate and Update Maps button is mainly for repairs, changed settings, or retried downloads. Completed metadata and maps remain available if a later phase fails or is cancelled.\n"
             "7. If no control file exists, Adventure Processing creates it after successful map generation. If an edited control file already exists, the program asks before opening Update Control File and never replaces it automatically. GPX journeys combine media with measured stages; media-only journeys group located media by date. Missing media GPS can be inferred when its exposure time falls inside exactly one timed GPX track.\n"
             "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. For later additions or corrections, press Update Control File instead of recreating the complete list. It checks map references, inventories all project media, and finds imported, newly discovered, missing, invalid, legacy, and changed items. The review keeps Add, Metadata, and Move as separate choices. Recommended additions start selected, other unclassified files remain unchecked, and unchecked absent files are remembered as deliberately excluded. Use the filters to reveal excluded files and add them later. Map images themselves are rendered in Map Generation. Choose Other Media deliberately rechecks otherwise current files; changed GPS can trigger a targeted place-name update.\n"
             "11. Audio is optional and new Adventures start with No Audio selected, which disables both music and narration. Use the +/− button to expand or collapse the remembered Audio details. Music uses the fixed audio folder; narration uses the fixed narration folder. Both playlist rows provide Choose, Create, Update, Edit, and folder controls. MUS rows control persistent music transport, PLY rows play a finite music selection and then resume the interrupted title, and NAR rows play finite narration sequences while the visuals continue. Narration can leave music unchanged, reduce it, or fade and pause it through Settings > Audio. Insert CTL rows for slide-show flow and timing. The a key toggles all audio. Normalize Video Audio remains available independently.\n"
             "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
-            "13. Update Metadata Extraction in the Media section can also add readable place names. For GPX Adventures it resolves each track's start and destination first and stores them with both map variants for the default PLACE1 - PLACE2 stage title, then processes GPS already stored with each photo or video. Skip in the output window omits that slow phase for the current run without clearing the saved option.\n"
+            "13. Update Metadata can add readable place names and, when selected, historical Open-Meteo weather. Weather is stored in sidecars and reused without repeating EXIF extraction or place lookup. During Time-Lapse the latest reached weather remains visible for up to one media-time hour.\n"
             "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
             "15. In the control-file editor, use the row-type filter or Reset Filter. The Previews popup offers Off, Small, Medium, and Large; thumbnails load progressively without blocking scrolling. Right-click photos or videos to Hide/Unhide them. CAPTION rows label the immediately following medium; FONT rows change following caption and header fonts. Press Choose in Start Slide Show to open this editor, then use Start Slide Show Here at the bottom or in the context menu to launch from an exact row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
             "15. Window mode is Automatic by default: one screen uses one slide-show window, while two screens use a separate overview window. Time-Lapse shows the overview by default as a framed image over the track map before each stage, including with a second display, and advances automatically in Auto mode. Settings can disable the extra dual-display inset or make the overview full-screen. Press w during either show to add or remove the separate overview window. Closing only that window continues the show.\n"
@@ -7143,6 +7239,7 @@ class GPXTrackerController(NSObject):
         self.appendGeoLocationsOutputLine_(f"=== {title} ===")
         self.geolocations_running = True
         self.geolocations_skip_place_names = False
+        self.geolocations_skip_weather = False
         self.refresh_workflow_assistant()
         self.geolocations_cancel_button.setEnabled_(True)
         if self.geolocations_skip_button is not None:
@@ -7163,6 +7260,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_cancel_event = None
         self.geolocations_mode = None
         self.geolocations_skip_place_names = False
+        self.geolocations_skip_weather = False
         self.preserve_processing_output_next = True
 
     def appendGeoLocationsOutputLine_(self, line):
@@ -7191,6 +7289,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_running = False
         self.geolocations_mode = None
         self.geolocations_skip_place_names = False
+        self.geolocations_skip_weather = False
         self.processing_phase_title = None
         self.refresh_workflow_assistant()
 
@@ -7200,6 +7299,33 @@ class GPXTrackerController(NSObject):
         enabled = bool(available)
         self.geolocations_skip_button.setHidden_(not enabled)
         self.geolocations_skip_button.setEnabled_(enabled)
+        self.geolocations_skip_button.setToolTip_(
+            "Skip place-name extraction for this run without changing the Add place names option."
+        )
+
+    def setWeatherSkipAvailable_(self, available):
+        if self.geolocations_skip_button is None:
+            return
+        enabled = bool(available)
+        self.geolocations_skip_button.setHidden_(not enabled)
+        self.geolocations_skip_button.setEnabled_(enabled)
+        self.geolocations_skip_button.setToolTip_(
+            "Skip historical-weather retrieval for this run without changing the saved option."
+        )
+
+    def _historical_weather_options(self):
+        access = str(self.parameters.get("weather.access", "free")).strip().casefold()
+        credential_id = str(self.parameters.get("weather.credential_id", "default"))
+        return WeatherOptions(
+            access="customer" if access == "customer" else "free",
+            api_key=(
+                read_provider_credential("open-meteo", credential_id)
+                if access == "customer"
+                else ""
+            ),
+            timeout_seconds=float(self.parameters.get("weather.timeout_seconds", 20.0)),
+            minimum_request_interval_seconds=0.2 if access == "customer" else 1.0,
+        )
 
     def _cleanup_geolocations_temp_paths(self):
         for temp_path in list(self.geolocations_temp_paths):
@@ -7231,6 +7357,7 @@ class GPXTrackerController(NSObject):
             elif mode == "automatic_maps":
                 self.automatic_map_pending_imported_paths = []
                 self.automatic_map_review_control = False
+                self.pending_control_update_offer_after_status = None
                 self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run("Aborted.", "Map generation cancelled.")
             elif mode in {"media_update_analysis", "media_update_commit"}:
@@ -7262,6 +7389,7 @@ class GPXTrackerController(NSObject):
             elif mode == "automatic_maps":
                 self.automatic_map_pending_imported_paths = []
                 self.automatic_map_review_control = False
+                self.pending_control_update_offer_after_status = None
                 self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run(status, "Map generation failed.")
             elif mode in {"media_update_analysis", "media_update_commit"}:
@@ -7387,6 +7515,19 @@ class GPXTrackerController(NSObject):
                 getattr(self, "automatic_map_review_control", False)
             )
             self.automatic_map_review_control = False
+            self.pending_control_update_offer_after_status = None
+            if (
+                not failures
+                and control_path is not None
+                and control_path.is_file()
+                and review_existing
+            ):
+                # The map job has changed files that the cached project status
+                # describes. Defer the review until the fresh status has been
+                # installed, otherwise a current summary is reported as stale.
+                self.pending_control_update_offer_after_status = list(
+                    pending_imported_paths
+                )
             self.start_async_project_status_refresh("automatic map generation")
             if not failures and control_path is not None:
                 if not control_path.is_file():
@@ -7397,12 +7538,9 @@ class GPXTrackerController(NSObject):
                         0.0,
                     )
                 elif review_existing:
-                    self.pending_control_update_after_status = pending_imported_paths
-                    self.performSelector_withObject_afterDelay_(
-                        "offerControlUpdateAfterMaps:",
-                        None,
-                        0.0,
-                    )
+                    # applyAsyncProjectStatus_ opens the confirmation after the
+                    # newly generated maps and summary have been rechecked.
+                    pass
                 else:
                     self._finish_geolocations_run(summary, summary)
             else:
@@ -7600,11 +7738,18 @@ class GPXTrackerController(NSObject):
     def skipPlaceNameExtraction_(self, _sender):
         if not self.geolocations_running or self.geolocations_cancel_event is None:
             return
-        self.geolocations_skip_place_names = True
+        if self.geolocations_mode in {"assistant_weather", "control_assets_weather"}:
+            self.geolocations_skip_weather = True
+        else:
+            self.geolocations_skip_place_names = True
         self.geolocations_cancel_event.set()
         if self.geolocations_skip_button is not None:
             self.geolocations_skip_button.setEnabled_(False)
-        self.set_status("Skipping place-name extraction...")
+        self.set_status(
+            "Skipping historical weather..."
+            if self.geolocations_skip_weather
+            else "Skipping place-name extraction..."
+        )
 
     @objc.IBAction
     def closeGeoLocationsWindow_(self, _sender):
@@ -8088,6 +8233,11 @@ class GPXTrackerController(NSObject):
             add_places = bool(self.parameters.get("locations.add_place_names", True))
             self.media_place_names_checkbox.setState_(
                 NSControlStateValueOn if add_places else NSControlStateValueOff
+            )
+        if hasattr(self, "media_weather_checkbox"):
+            add_weather = bool(self.parameters.get("weather.enabled", False))
+            self.media_weather_checkbox.setState_(
+                NSControlStateValueOn if add_weather else NSControlStateValueOff
             )
         self._sync_gpx_source_controls()
         self._sync_music_controls()
@@ -12297,6 +12447,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_mode = "assistant_metadata"
         self.geolocations_temp_paths = []
         self.assistant_metadata_place_names = bool(include_place_names)
+        include_weather = bool(self.parameters.get("weather.enabled", False))
         self.assistant_metadata_places_skipped = False
         self.assistant_metadata_place_report = None
         self.assistant_metadata_candidate_paths = []
@@ -12367,6 +12518,42 @@ class GPXTrackerController(NSObject):
                     "candidates": len(candidates),
                     "result": result.media,
                 }
+                if include_weather:
+                    output_writer.write("\n=== Historical Weather ===\n")
+                    self.geolocations_mode = "assistant_weather"
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "setWeatherSkipAvailable:", True, True
+                    )
+                    try:
+                        weather_report = enrich_media_weather(
+                            media_paths,
+                            options=self._historical_weather_options(),
+                            progress_callback=lambda current, total, filename: progress_callback(
+                                current,
+                                total,
+                                f"Weather: {filename}" if filename else "Historical weather",
+                            ),
+                            detail_callback=detail_callback,
+                            cancel_event=cancel_event,
+                        )
+                        output_writer.write(
+                            "Historical weather: "
+                            f"{weather_report.updated} downloaded, "
+                            f"{weather_report.reused} reused, "
+                            f"{weather_report.current} already current, "
+                            f"{weather_report.missing_gps} without GPS, "
+                            f"{weather_report.failed + weather_report.unavailable} unavailable.\n"
+                        )
+                    except WeatherCancelled:
+                        if not self.geolocations_skip_weather:
+                            raise GeoLocationsCancelled("Aborted.")
+                        cancel_event.clear()
+                        output_writer.write("Historical weather skipped for this run.\n")
+                    finally:
+                        self.geolocations_mode = "assistant_metadata"
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            "setWeatherSkipAvailable:", False, True
+                        )
                 if include_place_names:
                     self.performSelectorOnMainThread_withObject_waitUntilDone_(
                         "setPlaceNameSkipAvailable:", True, True
@@ -12477,6 +12664,8 @@ class GPXTrackerController(NSObject):
             media_map_options["skip_rendering"] = True
         geolocation_options = self._geolocation_options()
         requested_places = bool(self.parameters.get("locations.add_place_names", True))
+        requested_weather = bool(self.parameters.get("weather.enabled", False))
+        weather_media_paths = [Path(item["path"]) for item in self.project_media_items()]
         overwrite_requested_places = False
         self.workflow_assistant_state["place_names_requested"] = requested_places
         self.assistant_control_places_skipped = False
@@ -12540,6 +12729,36 @@ class GPXTrackerController(NSObject):
                     cancel_event=cancel_event,
                     **geolocation_options,
                 )
+                if requested_weather:
+                    output_writer.write("\n=== Historical Weather ===\n")
+                    self.geolocations_mode = "control_assets_weather"
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "setWeatherSkipAvailable:", True, True
+                    )
+                    try:
+                        weather_report = enrich_media_weather(
+                            weather_media_paths,
+                            options=self._historical_weather_options(),
+                            progress_callback=media_progress,
+                            detail_callback=lambda line: output_writer.write(f"{line}\n"),
+                            cancel_event=cancel_event,
+                        )
+                        output_writer.write(
+                            "Historical weather: "
+                            f"{weather_report.updated} downloaded, "
+                            f"{weather_report.reused} reused, "
+                            f"{weather_report.current} already current.\n"
+                        )
+                    except WeatherCancelled:
+                        if not self.geolocations_skip_weather:
+                            raise GeoLocationsCancelled("Aborted.")
+                        cancel_event.clear()
+                        output_writer.write("Historical weather skipped for this run.\n")
+                    finally:
+                        self.geolocations_mode = "assistant_control_assets"
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            "setWeatherSkipAvailable:", False, True
+                        )
                 if cancel_event.is_set():
                     raise GeoLocationsCancelled("Aborted.")
                 os.replace(staged_control, control_path)
@@ -13328,6 +13547,7 @@ class GPXTrackerController(NSObject):
     def _reload_media_update_preview(self):
         if self.media_update_preview_data_source is None or self.media_update_preview_table is None:
             return
+        self._update_media_update_filter_labels()
         rows = self._media_update_preview_rows()
         columns = [
             "add_to_control", "update_metadata", "reposition", "membership", "reason",
@@ -13336,6 +13556,59 @@ class GPXTrackerController(NSObject):
         ]
         self.media_update_preview_data_source.setRows_columns_(rows, columns)
         self.media_update_preview_table.reloadData()
+
+    def _update_media_update_filter_labels(self):
+        popup = self.media_update_preview_filter_popup
+        plan = self.media_update_plan
+        if popup is None or plan is None:
+            return
+        counts = {
+            "review": sum(item.membership_status != "excluded" for item in plan.items),
+            "recommended": sum(
+                bool(item.add_to_control or item.update_metadata or item.reposition)
+                for item in plan.items
+            ),
+            "new": sum(item.membership_status == "new" for item in plan.items),
+            "unclassified": sum(
+                item.membership_status == "unclassified" for item in plan.items
+            ),
+            "excluded": sum(item.membership_status == "excluded" for item in plan.items),
+            "included_updates": sum(
+                item.included_count > 0 and bool(item.update_metadata or item.reposition)
+                for item in plan.items
+            ),
+            "all": len(plan.items),
+        }
+        titles = {
+            "review": "Review",
+            "recommended": "Recommended",
+            "new": "New",
+            "unclassified": "Unclassified",
+            "excluded": "Excluded",
+            "included_updates": "Included Updates",
+            "all": "All",
+        }
+        selected_item = None
+        for index in range(int(popup.numberOfItems())):
+            item = popup.itemAtIndex_(index)
+            key = str(item.representedObject() or "")
+            if key in titles:
+                item.setTitle_(f"{titles[key]} ({counts[key]})")
+            if key == self.media_update_preview_filter:
+                selected_item = item
+        if selected_item is not None:
+            popup.selectItem_(selected_item)
+        if self.media_update_preview_hint is not None:
+            excluded = counts["excluded"]
+            if excluded:
+                self.media_update_preview_hint.setStringValue_(
+                    f"{excluded} previously excluded media file(s) are hidden from Review. "
+                    "Choose Excluded to inspect or restore them."
+                )
+            else:
+                self.media_update_preview_hint.setStringValue_(
+                    "Track Map references are applied together. Add, Metadata, and Move are independent."
+                )
 
     def sortMediaUpdatePreviewByColumn_ascending_(self, column, ascending):
         self.media_update_preview_sort_column = str(column)
@@ -13538,6 +13811,7 @@ class GPXTrackerController(NSObject):
             self.media_update_preview_apply_button = apply_button
             self.media_update_preview_track_text = map_text
             self.media_update_preview_filter_popup = filter_popup
+            self.media_update_preview_hint = hint
         self._reload_media_update_preview()
         self.media_update_preview_place_checkbox.setState_(
             NSControlStateValueOn
@@ -14654,6 +14928,14 @@ class GPXTrackerController(NSObject):
             "on" if settings["slideshow.clock"] else "off",
             "--speedometer",
             "on" if settings["slideshow.speedometer"] else "off",
+            "--weather",
+            "on" if settings["slideshow.weather"] else "off",
+            "--weather-condition-icon",
+            "on" if settings["slideshow.weather_condition_icon"] else "off",
+            "--weather-primary",
+            str(settings["slideshow.weather_primary"]),
+            "--weather-secondary",
+            str(settings["slideshow.weather_secondary"]),
             "--header-stage-name",
             "on" if settings["slideshow.header_stage_name"] else "off",
             "--header-track-details",
@@ -17236,6 +17518,25 @@ class GPXTrackerController(NSObject):
             enabled = self.media_place_names_checkbox.state() == NSControlStateValueOn
             self.parameters["locations.add_place_names"] = enabled
             self.workflow_assistant_state["place_names_requested"] = enabled
+        if _sender is self.media_weather_checkbox:
+            enabled = self.media_weather_checkbox.state() == NSControlStateValueOn
+            if enabled and not bool(self.parameters.get("weather.enabled", False)):
+                access = str(self.parameters.get("weather.access", "free"))
+                if access == "customer":
+                    credential_id = str(self.parameters.get("weather.credential_id", "default"))
+                    if not request_open_meteo_api_key(credential_id):
+                        self.media_weather_checkbox.setState_(NSControlStateValueOff)
+                        return
+                elif not confirm_alert(
+                    "Enable historical weather?",
+                    "myCamino will send media coordinates and exposure times to Open-Meteo. "
+                    "The free endpoint is for non-commercial use, has usage limits, and requires attribution.",
+                    "Enable",
+                    "Cancel",
+                ):
+                    self.media_weather_checkbox.setState_(NSControlStateValueOff)
+                    return
+            self.parameters["weather.enabled"] = enabled
         self.mark_dirty()
 
     def textDidChange_(self, _notification):
@@ -17298,6 +17599,7 @@ class GPXTrackerController(NSObject):
             self.media_update_preview_table = None
             self.media_update_preview_data_source = None
             self.media_update_preview_filter_popup = None
+            self.media_update_preview_hint = None
             self.media_update_preview_visible_items = []
         if self.media_viewer_window is not None:
             try:
