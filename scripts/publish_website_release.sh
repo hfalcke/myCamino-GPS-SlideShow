@@ -58,7 +58,10 @@ if [[ -e /var/lib/mycamino/releases/latest.dmg ]]; then
   previous_dmg="$(readlink -f /var/lib/mycamino/releases/latest.dmg)"
 fi
 echo "Registering release metadata and computing the server-side checksum ..."
-register_output="$(docker compose exec -T web python manage.py register_release "/releases/$name" --label "$label" --date "$release_date")"
+# The SSH script itself arrives on standard input. docker compose exec also
+# attaches standard input unless redirected, which would consume every line
+# below this command and silently skip activation while returning success.
+register_output="$(docker compose exec -T web python manage.py register_release "/releases/$name" --label "$label" --date "$release_date" </dev/null)"
 metadata_activated=1
 ln -sfn "$name" /var/lib/mycamino/releases/.latest.dmg.next
 mv -Tf /var/lib/mycamino/releases/.latest.dmg.next /var/lib/mycamino/releases/latest.dmg
@@ -67,4 +70,10 @@ printf '%s\n' "$register_output"
 bash "$pruner" /var/lib/mycamino/releases "$final" "$previous_dmg"
 echo "Release activation complete: $name"
 REMOTE
+ACTIVE_SHA="$(ssh -i "$SSH_KEY" "$REMOTE_HOST" "sha256sum /var/lib/mycamino/releases/latest.dmg | awk '{print \\$1}'")"
+[[ "$ACTIVE_SHA" == "$SHA256" ]] || {
+  echo "Release publication failed: latest.dmg has SHA-256 ${ACTIVE_SHA:-unavailable}, expected $SHA256." >&2
+  exit 1
+}
+echo "Verified active website DMG: ${ACTIVE_SHA}"
 echo "Published https://mycamino.heinofalcke.de/downloads/myCamino-GPS-Track-Show.dmg"

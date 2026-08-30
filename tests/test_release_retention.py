@@ -7,9 +7,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PRUNER = ROOT / "scripts" / "prune_website_releases.sh"
+PUBLISHER = ROOT / "scripts" / "publish_website_release.sh"
 
 
 class ReleaseRetentionTests(unittest.TestCase):
+    def test_publisher_does_not_let_compose_consume_the_ssh_script(self):
+        source = PUBLISHER.read_text(encoding="utf-8")
+        registration = next(
+            line
+            for line in source.splitlines()
+            if "manage.py register_release" in line
+        )
+        self.assertIn("</dev/null", registration)
+        self.assertIn("ACTIVE_SHA=", source)
+        self.assertIn('[[ "$ACTIVE_SHA" == "$SHA256" ]]', source)
+        self.assertLess(
+            source.index("ACTIVE_SHA="),
+            source.index('echo "Published https://mycamino.heinofalcke.de/'),
+        )
+
     def test_keeps_active_and_actual_previously_active_release(self):
         names = [
             "myCamino-GPS-Track-Show-20260718T100000Z.dmg",
