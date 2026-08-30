@@ -38,5 +38,7 @@ never pruned.
 
 Application version and release-date metadata live in
 `application_metadata.py`. Update that file for a new program version before
-running `release.sh`; the values appear in the GUI, macOS bundle, and website
-release record.
+running `release.sh`. The release script reads those values, verifies the
+built macOS bundle version, and explicitly supplies the release label and date
+to the website publisher. The values therefore appear consistently in the
+GUI, macOS bundle, and website release record.

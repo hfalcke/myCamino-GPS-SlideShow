@@ -69,6 +69,10 @@ done
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Error: not inside a Git worktree." >&2; exit 1; }
 git remote get-url "$REMOTE" >/dev/null 2>&1 || { echo "Error: Git remote '$REMOTE' does not exist." >&2; exit 1; }
 
+RELEASE_LABEL="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import full_version_label; print(full_version_label())')"
+RELEASE_DATE="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import APP_RELEASE_DATE; print(APP_RELEASE_DATE)')"
+BUNDLE_VERSION="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import APP_BUNDLE_VERSION; print(APP_BUNDLE_VERSION)')"
+
 BRANCH="$(git branch --show-current)"
 [[ -n "$BRANCH" ]] || { echo "Error: cannot release from a detached HEAD." >&2; exit 1; }
 
@@ -84,6 +88,7 @@ echo "  Repository: $ROOT_DIR"
 echo "  Branch:     $BRANCH"
 echo "  Remote:     $REMOTE ($(git remote get-url "$REMOTE"))"
 echo "  Commit:     $COMMIT_MESSAGE"
+echo "  Version:    $RELEASE_LABEL"
 echo "  Artifact:   $DMG_PATH"
 echo
 git status --short
@@ -125,6 +130,14 @@ fi
 echo "==> Building and verifying DMG from $(git rev-parse --short HEAD)"
 ./build_dmg.sh
 [[ -f "$DMG_PATH" ]] || { echo "Error: expected DMG was not created: $DMG_PATH" >&2; exit 1; }
+BUNDLE_INFO="dist/myCamino GPS Track Show.app/Contents/Info.plist"
+[[ -f "$BUNDLE_INFO" ]] || { echo "Error: built application metadata is missing: $BUNDLE_INFO" >&2; exit 1; }
+BUILT_BUNDLE_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$BUNDLE_INFO")"
+[[ "$BUILT_BUNDLE_VERSION" == "$BUNDLE_VERSION" ]] || {
+  echo "Error: built app version is $BUILT_BUNDLE_VERSION, expected $BUNDLE_VERSION." >&2
+  exit 1
+}
+echo "==> Verified built application version $BUILT_BUNDLE_VERSION"
 
 echo "==> Pushing $BRANCH to $REMOTE"
 if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
@@ -140,7 +153,7 @@ else
 fi
 
 echo "==> Publishing verified DMG to mycamino.heinofalcke.de"
-./scripts/publish_website_release.sh "$DMG_PATH"
+./scripts/publish_website_release.sh "$DMG_PATH" "$RELEASE_LABEL" "$RELEASE_DATE"
 
 echo "==> Release complete"
 echo "Commit: $(git rev-parse --short HEAD)"

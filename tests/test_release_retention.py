@@ -8,9 +8,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PRUNER = ROOT / "scripts" / "prune_website_releases.sh"
 PUBLISHER = ROOT / "scripts" / "publish_website_release.sh"
+RELEASE_SCRIPT = ROOT / "release.sh"
 
 
 class ReleaseRetentionTests(unittest.TestCase):
+    def test_release_script_passes_authoritative_metadata_to_website(self):
+        source = RELEASE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("from application_metadata import full_version_label", source)
+        self.assertIn("from application_metadata import APP_RELEASE_DATE", source)
+        self.assertIn("from application_metadata import APP_BUNDLE_VERSION", source)
+        self.assertIn('[[ "$BUILT_BUNDLE_VERSION" == "$BUNDLE_VERSION" ]]', source)
+        self.assertIn(
+            './scripts/publish_website_release.sh "$DMG_PATH" "$RELEASE_LABEL" "$RELEASE_DATE"',
+            source,
+        )
+
     def test_publisher_does_not_let_compose_consume_the_ssh_script(self):
         source = PUBLISHER.read_text(encoding="utf-8")
         registration = next(
