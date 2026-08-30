@@ -32,6 +32,8 @@ class ReleaseRetentionTests(unittest.TestCase):
         )
         self.assertIn("</dev/null", registration)
         self.assertIn("ACTIVE_SHA=", source)
+        self.assertIn('ACTIVE_SHA="${ACTIVE_SHA_LINE%% *}"', source)
+        self.assertNotIn("awk '{print \\\\$1}'", source)
         self.assertIn('[[ "$ACTIVE_SHA" == "$SHA256" ]]', source)
         self.assertLess(
             source.index("ACTIVE_SHA="),

@@ -70,7 +70,8 @@ printf '%s\n' "$register_output"
 bash "$pruner" /var/lib/mycamino/releases "$final" "$previous_dmg"
 echo "Release activation complete: $name"
 REMOTE
-ACTIVE_SHA="$(ssh -i "$SSH_KEY" "$REMOTE_HOST" "sha256sum /var/lib/mycamino/releases/latest.dmg | awk '{print \\$1}'")"
+ACTIVE_SHA_LINE="$(ssh -i "$SSH_KEY" "$REMOTE_HOST" "sha256sum /var/lib/mycamino/releases/latest.dmg")"
+ACTIVE_SHA="${ACTIVE_SHA_LINE%% *}"
 [[ "$ACTIVE_SHA" == "$SHA256" ]] || {
   echo "Release publication failed: latest.dmg has SHA-256 ${ACTIVE_SHA:-unavailable}, expected $SHA256." >&2
   exit 1
