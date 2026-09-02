@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from GPSTrackShow import (
     GPSTrackShowApp,
+    PLAYBACK_STYLE_VALUES,
     PlaybackPhase,
     PilgrimWalkState,
     advance_time_lapse_progress,
@@ -61,6 +62,50 @@ from track_map_layout_utils import best_unframed_media_layout
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_dual_screen_route_tracking_is_not_a_transition_style(self):
+        self.assertNotIn("TRACKING", PLAYBACK_STYLE_VALUES)
+
+    def test_standard_route_tracking_requires_an_independent_map_display(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.dual_screen_route_tracking_enabled = True
+        app.time_lapse_active = False
+        app.map_presenter = object()
+        app.map_window = object()
+        app.config = SimpleNamespace(join_windows=False)
+        self.assertTrue(app._standard_route_tracking_requested())
+        app.map_window = None
+        self.assertFalse(app._standard_route_tracking_requested())
+        app.map_window = object()
+        app.config.join_windows = True
+        self.assertFalse(app._standard_route_tracking_requested())
+
+    def test_video_holds_standard_route_tracking_progress(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.running = True
+        app.time_lapse_active = False
+        app.standard_route_tracking_active = True
+        app.paused = False
+        app.manual_mode = False
+        app.time_lapse_handle = None
+        app.time_lapse_navigation_generation = 0
+        app.time_lapse_navigation_hold_until = 0.0
+        app.time_lapse_current_media = (4, object())
+        app.time_lapse_current_media_is_video = True
+        app.time_lapse_media_deadline = float("inf")
+        app.time_lapse_last_tick = 0.0
+        app.time_lapse_progress = 0.35
+        calls = []
+        app._set_time_lapse_views = lambda: calls.append("view")
+        app._schedule_time_lapse_tick = lambda delay, generation=None: calls.append(
+            (delay, generation)
+        )
+
+        app._time_lapse_tick()
+
+        self.assertEqual(app.time_lapse_progress, 0.35)
+        self.assertEqual(calls[0], "view")
+        self.assertEqual(calls[1], (0.020, 0))
+
     def test_first_stage_overview_gets_window_startup_grace(self):
         self.assertEqual(time_lapse_overview_display_seconds(3.0, True), 4.0)
         self.assertEqual(time_lapse_overview_display_seconds(3.0, False), 3.0)
@@ -754,6 +799,34 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         app._toggle_window_mode()
         self.assertEqual(actions[-2:], ["remove", "Single window"])
 
+    def test_adding_map_window_preserves_windowed_photo_frame(self):
+        class WindowStub:
+            def __init__(self):
+                self.front_count = 0
+
+            def orderFrontRegardless(self):
+                self.front_count += 1
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.config = SimpleNamespace(join_windows=False, mapwindow=True)
+        app.fullscreen_active = False
+        app.photo_window = WindowStub()
+        app.map_window = WindowStub()
+        screens = [object(), object()]
+        placements = []
+        app._available_screens = lambda: screens
+        app._configure_map_window_for_screens = lambda _screens: None
+        app._current_map_aspect_ratio = lambda: 1.6
+        app._apply_window_to_screen = lambda window, screen, floating, **kwargs: placements.append(
+            (window, screen, floating, kwargs)
+        )
+
+        app._apply_screen_layout(preserve_photo_frame=True)
+
+        self.assertEqual(len(placements), 1)
+        self.assertIs(placements[0][0], app.map_window)
+        self.assertEqual(app.photo_window.front_count, 1)
+
     def test_restored_standard_map_window_shows_marked_overview(self):
         class ViewStub:
             def __init__(self):
@@ -766,12 +839,16 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             def __init__(self):
                 self.visible = None
                 self.images = []
+                self.headers = []
 
             def set_content_visible(self, visible):
                 self.visible = visible
 
             def transition_to(self, image, transition):
                 self.images.append((image, transition))
+
+            def apply_header_state(self, state, *, enabled, mode):
+                self.headers.append((state, enabled, mode))
 
         class ContentStub:
             def __init__(self):
@@ -798,11 +875,18 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         app.time_lapse_active = False
         app.time_lapse_stage = None
         app.current_stage_overview_image = "marked overview"
+        app.current_header_state = "shared header"
+        app._header_mode_for_target = lambda target: "full"
+        app._raise_global_overlay_layers = lambda: None
 
         app._refresh_separate_map_window_content()
 
         self.assertTrue(app.map_presenter.visible)
         self.assertEqual(app.map_presenter.images[0][0], "marked overview")
+        self.assertEqual(
+            app.map_presenter.headers,
+            [("shared header", True, "full")],
+        )
         self.assertTrue(app.time_map_view.hidden)
         self.assertTrue(app.map_window.content.needs_display)
         self.assertTrue(app.map_window.displayed)
@@ -904,8 +988,12 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             def set_content_visible(self, visible):
                 events.append(("presenter", self.role, visible))
 
+            def raise_global_overlays(self):
+                events.append(("global", self.role))
+
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.active_callback = None
+        app.config = SimpleNamespace(debug=False)
         app.time_photo_view = ViewStub("photo")
         app.time_map_view = ViewStub("map")
         app.photo_presenter = PresenterStub("photo")
@@ -920,8 +1008,31 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         )
         self.assertIn(("raise", "photo"), events[:first_hide])
         self.assertIn(("raise", "map"), events[:first_hide])
+        self.assertIn(("global", "photo"), events[:first_hide])
         self.assertIn(("presenter", "photo", False), events)
         self.assertIn(("presenter", "map", False), events)
+
+    def test_help_overlay_uses_presenters_as_single_source(self):
+        class HelpTargetStub:
+            def __init__(self):
+                self.visibility = []
+
+            def set_help_visible(self, visible):
+                self.visibility.append(visible)
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.help_overlay_hide_handle = None
+        app.photo_presenter = HelpTargetStub()
+        app.map_presenter = None
+        app.time_photo_view = HelpTargetStub()
+        app.time_map_view = HelpTargetStub()
+
+        app._set_help_overlay_visible(True)
+        app._set_help_overlay_visible(False)
+
+        self.assertEqual(app.photo_presenter.visibility, [True, False])
+        self.assertEqual(app.time_photo_view.visibility, [])
+        self.assertEqual(app.time_map_view.visibility, [])
 
     def test_time_lapse_preparation_cancels_callbacks_without_hiding_current_slide(self):
         class PresenterStub:
@@ -1345,12 +1456,20 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             self.assertEqual(config.video_volume_percent, 100.0)
             self.assertTrue(config.use_normalized_videos)
             self.assertTrue(config.elevation_profile)
+            self.assertTrue(config.dual_screen_route_tracking)
             self.assertFalse(
                 config_from_options(
                     project_dir,
                     inputlist=control_file,
                     elevation_profile=False,
                 ).elevation_profile
+            )
+            self.assertFalse(
+                config_from_options(
+                    project_dir,
+                    inputlist=control_file,
+                    dual_screen_route_tracking=False,
+                ).dual_screen_route_tracking
             )
             self.assertEqual(
                 config_from_options(project_dir, inputlist=control_file, transition="blend").transition.value,

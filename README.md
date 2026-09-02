@@ -22,6 +22,8 @@ The repository contains two applications:
   elevation, place, date and time information.
 - Use standard full-window photo transitions, overview maps, stage maps and
   elevation profiles within the same presentation.
+- Animate the timed route independently on a second display while Standard
+  photos and videos retain their selected transition.
 - Add optional background music and retain video sound.
 - Prepare the presentation automatically while keeping its control file,
   media order, tracks, music and playback settings editable.

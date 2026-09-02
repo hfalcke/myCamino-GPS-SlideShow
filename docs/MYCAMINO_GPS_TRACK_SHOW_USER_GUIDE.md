@@ -219,6 +219,14 @@ zero. The first use creates a PNG under `trackimages/elevation-profiles`; later
 shows reuse it until the track or its GPX processing settings change. Press
 `e` during a show to toggle all elevation-profile displays for the session.
 
+**GPS route tracking** is also enabled by default. During Standard
+playback with a separate map window, photos and videos retain the selected
+Blend, Fade, Switch, or other transition while the second display uses the
+roomier Time-Lapse map and moves the route marker according to recorded track
+times. Photos have the configured minimum duration; videos hold the route until
+they finish. Press `g` to toggle GPS route tracking for the running show. It has no
+effect when only one slideshow window is available.
+
 The Locations radius groups nearby GPS positions under an already determined
 place name. A larger radius reduces the number of lookups and can speed up
 place-name extraction, while a smaller radius gives more locally specific names.
@@ -888,12 +896,15 @@ The Start Slide Show section contains:
   its window or stationary threshold updates small sidecar metadata files and
   does not regenerate or download maps.
   throughout the stage rather than showing a fixed media time; the separate
-  date subtitle is then omitted. The upper-right map header shows total
-  travelled distance, distance within the current stage, and current height.
+  date subtitle is then omitted. The upper-right map header shows Total,
+  Stage, and Height values.
   Fade, Blend, Collage, Quad, and every other media style use this same clock,
   three-line title area, sizing, and track-statistics layout. Settings have
-  separate checkboxes for the clock, stage name, track length and duration,
-  place name, and statistics. Enabled title fields are packed from the top with
+  separate controls for the initial Full, Simple, or Off presentation header,
+  the persistent logical map header, clock, stage name, track length and
+  duration, place name, and statistics. Press `c` to cycle the presentation
+  header for the current session; the map header follows its content if the
+  physical displays are swapped. Enabled title fields are packed from the top with
   no empty rows, and the first displayed line is larger. One Header layout
   setting controls photos, Time-Lapse maps, and overview maps. No box and
   Semi-transparent overlay leave pictures and maps full-frame, with the header
@@ -928,6 +939,11 @@ black title panel; the Intro uses the same full-tile overview without a
 duplicated baked-in title. A computer with two or more displays starts
 with a separate overview window. Settings can force either Single window or
 Separate overview window regardless of display count.
+
+In Standard two-window playback, GPS route tracking is independent of `t` and
+`Shift-t`: changing the photo transition does not stop the moving map. The
+`t`/`Shift-t` cycle therefore remains Time-Lapse, Blend, Fade, Switch, Expand,
+Collage, Quad, and Random; GPS route tracking is controlled separately with `g`.
 
 In single-window automatic Time-Lapse playback, the temporary overview advances
 to the elevation profile and then to the moving stage after the configured media
@@ -987,7 +1003,9 @@ Common slide-show keys:
   during backward navigation.
 - Command-Left or Command-Right: jump to the previous or next map-backed stage,
   including media-only stages without a GPX track. Command-Left at the first
-  stage returns to the Intro title page.
+  stage returns to the Intro title page. Repeated presses browse lightweight
+  stage previews immediately; full media, audio, profile, and timing setup runs
+  only for the stage where you stop.
 - `+` or `-`: change media duration. In Time-Lapse this is a minimum; the
   current image remains visible longer whenever no newer image is due.
 - Command-`+` or Command-`-`: change the active stage time-lapse duration by
@@ -998,8 +1016,10 @@ Common slide-show keys:
   Closing the overview window also returns to one-window playback without
   stopping the show.
 - `i`: show photo metadata overlay.
-- `c`, `f`, `d`, and `D`: toggle the complete header, fullscreen,
-  display-swap, and memory-debug functions.
+- `c`: cycle the logical presentation header through Full, Off, and Simple.
+  A separate logical map display keeps the configured map header.
+- `f`: toggle fullscreen.
+- `d` and `D`: move or swap the configured displays.
 - `e`: switch the Stage Map elevation-profile introduction on or off. The
   Adventure setting is on by default; the key changes only the running show.
 - `n`: switch subsequent videos between valid normalized copies and originals.

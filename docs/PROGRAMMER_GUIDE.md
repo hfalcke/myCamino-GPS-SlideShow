@@ -238,6 +238,12 @@ and two or more screens create the separate overview window. Legacy
 the former enabled default becomes `auto`, while disabled becomes `single`.
 `slideshow.track_map_before_media` defaults to false and controls the optional
 single-window Standard preview of a marked track map before every medium.
+`slideshow.dual_screen_route_tracking` defaults to true. In Standard playback
+with independent photo and map presenters, it reuses the Time-Lapse timeline,
+event queue, retained map view, and Time-Lapse map asset while media continue
+through the selected Standard transition. It is deliberately not another
+`slideshow.transition` value. The session-only `g` key toggles the runtime
+state; video events suspend timeline progress until playback completes.
 
 The main GUI reuses one retained Adventure Processing window across
 `assistant_metadata`, `automatic_maps`, manual map generation, control
@@ -260,6 +266,12 @@ with an asterisk, and make the Assistant metadata stage incomplete without
 marking otherwise valid map pixels stale.
 
 `GPSTrackShow.py` preparses map blocks with `parse_stage_descriptors(...)`.
+Command-arrow stage navigation keeps a pending descriptor index and uses a
+300 ms settling timer. During rapid browsing, retained canvases show the raw
+stage map and a lightweight overview-route overlay; generation tokens reject
+obsolete asynchronous geometry loads. Only the settled stage reconstructs
+CONTROL/audio state and prepares media timing and profiles. A five-stage LRU
+retains validated map assets, rendered overlays, profiles, and media queues.
 `PlaybackPhase` records Intro information, clean Intro overview, Stage Map,
 marked Stage Overview, Media, and Time-Lapse states. Resume files version 2
 store the stage, phase, medium position, style, and Time-Lapse progress rather
@@ -1007,10 +1019,10 @@ this prevents an older translucent caption from appearing underneath it.
 retains the former full-window presentation. A resumed stage starts at its
 saved progress without replaying that overview. Standard single-window
 playback uses Stage Map, marked Tour Overview, and media. The overview PNG is a
-full-tile basemap; `_handle_overview(...)` suppresses its generic header, while
-`draw_overview_overlay(...)` adds the active stage header with a black runtime
-background. Time-Lapse overview media uses the same renderer without that
-background. The
+full-tile basemap; `_handle_overview(...)` and `draw_overview_overlay(...)`
+suppress legacy bitmap captions during playback. Standard and Time-Lapse then
+apply the same shared runtime header state without modifying or stretching the
+map image. The
 shared transition-completion guard explicitly permits the temporary Time-Lapse
 overview callback while rejecting stale Standard callbacks.
 
@@ -1063,7 +1075,12 @@ AVPlayer child. Clock content is rebuilt only when time, date, or view height
 changes, not on each 20 ms tick. `draw_runtime_header(...)` is shared with the
 full-window media presenter, keeping its compact three-line title area, clock
 geometry, and three track-statistics rows identical across every playback
-style.
+style. `SlideshowHeaderState` always retains the complete content snapshot;
+renderers receive a separate Full, Simple, or Off mode based on the target's
+logical role. The `c` key changes only the media/presentation role. The map
+role follows `slideshow.map_header_enabled`, so swapping physical displays
+does not swap header policy. Simple mode keeps text, statistics, and the clock
+while suppressing weather and the speedometer.
 Generated Time-Lapse basemaps continue beneath the runtime header. Off and
 Semi-transparent retain the full presentation frame and anchor overlays to the
 fitted image edge. Header area creates a real band in the configured slideshow

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from collections import OrderedDict
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,9 @@ from GPSTrackShow import (
     GPSTrackShowApp,
     SLIDESHOW_CHECKPOINT_VERSION,
     PhotoListEntry,
+    StagePresentationCacheEntry,
     TimeLapseStage,
+    adjacent_stage_descriptor_index,
     adjacent_stage_map_index,
     align_datetime_timezone,
     build_time_lapse_media_queue,
@@ -25,6 +28,7 @@ from GPSTrackShow import (
     interpolate_timeline_state,
     nice_speedometer_maximum,
     parse_map_directive,
+    parse_stage_descriptors,
     parse_photo_entry,
     parse_control_datetime,
     parse_iso_datetime,
@@ -41,6 +45,119 @@ from track_timing_utils import haversine_km, repair_timed_points, timed_points_p
 
 
 class TrackTimingTests(unittest.TestCase):
+    def test_preparsed_stage_navigation_does_not_rescan_control_lines(self):
+        stages = parse_stage_descriptors(
+            ["#Map: one.png", "one.jpg", "#Map: two.png", "two.jpg"]
+        )
+        self.assertEqual(adjacent_stage_descriptor_index(stages, 0, True), 1)
+        self.assertEqual(adjacent_stage_descriptor_index(stages, 1, False), 0)
+        self.assertIsNone(adjacent_stage_descriptor_index(stages, 1, True))
+
+    def test_rapid_stage_navigation_supersedes_intermediate_commit(self):
+        class Handle:
+            def __init__(self, delay, callback):
+                self.delay = delay
+                self.callback = callback
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.stages = parse_stage_descriptors(
+            [
+                "#Map: one.png",
+                "one.jpg",
+                "#Map: two.png",
+                "two.jpg",
+                "#Map: three.png",
+            ]
+        )
+        app.current_stage_index = 0
+        app.pending_stage_index = None
+        app.stage_navigation_generation = 0
+        app.stage_navigation_preview_handle = None
+        app.stage_navigation_commit_handle = None
+        app.stage_navigation_browsing = False
+        app.time_lapse_stage = None
+        app.current_display_index = 0
+        app.intro_was_shown = False
+        app.config = SimpleNamespace(debug=False)
+        scheduled = []
+        committed = []
+        previews = []
+        app._begin_stage_navigation_browsing = lambda: setattr(
+            app, "stage_navigation_browsing", True
+        )
+        app._show_stage_navigation_header = previews.append
+        app._show_stage_navigation_endpoints = lambda _index: None
+        app._commit_pending_stage_navigation = committed.append
+
+        def schedule(delay, callback):
+            handle = Handle(delay, callback)
+            scheduled.append(handle)
+            return handle
+
+        app.schedule_callback = schedule
+        app._jump_to_date_section(True)
+        first_commit = scheduled[-1]
+        app._jump_to_date_section(True)
+        second_commit = scheduled[-1]
+
+        self.assertEqual(previews, [1, 2])
+        self.assertTrue(first_commit.cancelled)
+        self.assertFalse(second_commit.cancelled)
+        second_commit.callback()
+        self.assertEqual(committed, [2])
+
+    def test_stage_presentation_cache_retains_five_stages_not_five_variants(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.stage_presentation_cache = OrderedDict()
+        for stage_index in range(6):
+            for time_lapse in (False, True):
+                app._store_stage_entry(
+                    stage_index,
+                    time_lapse,
+                    StagePresentationCacheEntry(
+                        signature=(),
+                        map_path=Path(f"stage-{stage_index}.png"),
+                        image=object(),
+                        metadata=None,
+                    ),
+                )
+        self.assertEqual(
+            {key[0] for key in app.stage_presentation_cache},
+            {1, 2, 3, 4, 5},
+        )
+        self.assertEqual(len(app.stage_presentation_cache), 10)
+
+    def test_settled_navigation_rebinds_full_header_for_active_mode(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.running = True
+        app.stage_navigation_generation = 4
+        app.stage_navigation_header_restore_handle = object()
+        app.pending_stage_index = None
+        app.current_stage_index = 2
+        app.time_lapse_stage = object()
+        app.time_lapse_active = True
+        app.standard_route_tracking_active = False
+        calls = []
+        app._set_time_lapse_views = lambda: calls.append("retained")
+        app._refresh_photo_overlays = lambda: calls.append("standard")
+
+        app._restore_committed_stage_header(2, 4)
+        self.assertEqual(calls, ["retained"])
+        self.assertIsNone(app.stage_navigation_header_restore_handle)
+
+        app.time_lapse_stage = None
+        app.time_lapse_active = False
+        app._restore_committed_stage_header(2, 4)
+        self.assertEqual(calls, ["retained", "standard"])
+
+        app._restore_committed_stage_header(1, 4)
+        app._restore_committed_stage_header(2, 3)
+        self.assertEqual(calls, ["retained", "standard"])
+
     def test_summary_references_map_independent_derived_track_data(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -208,7 +325,7 @@ class TrackTimingTests(unittest.TestCase):
     def test_time_lapse_metric_and_place_rows_are_compact(self):
         self.assertEqual(
             format_time_lapse_metrics(1234.4, 12.34, 456.7),
-            ("Total traveled: 1234 km", "Stage traveled: 12,3 km", "Height: 457 m"),
+            ("Total: 1234 km", "Stage: 12,3 km", "Height: 457 m"),
         )
         self.assertEqual(
             format_place_for_time_lapse("Köln-Innenstadt (Nordrhein-Westfalen), Dom"),

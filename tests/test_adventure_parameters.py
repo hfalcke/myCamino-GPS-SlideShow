@@ -44,7 +44,10 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["audio.narration_video_reduction_percent"], 25.0)
         self.assertTrue(defaults["audio.use_normalized_videos"])
         self.assertTrue(defaults["slideshow.elevation_profile"])
+        self.assertTrue(defaults["slideshow.dual_screen_route_tracking"])
         self.assertTrue(defaults["slideshow.clock"])
+        self.assertEqual(defaults["slideshow.header_mode"], "full")
+        self.assertTrue(defaults["slideshow.map_header_enabled"])
         self.assertTrue(defaults["slideshow.header_stage_name"])
         self.assertTrue(defaults["slideshow.header_track_details"])
         self.assertTrue(defaults["slideshow.header_place_name"])
@@ -245,6 +248,8 @@ class AdventureParameterTests(unittest.TestCase):
             header_keys,
             {
                 "slideshow.clock",
+                "slideshow.header_mode",
+                "slideshow.map_header_enabled",
                 "slideshow.font_color",
                 "slideshow.font_size",
                 "slideshow.font_family",
