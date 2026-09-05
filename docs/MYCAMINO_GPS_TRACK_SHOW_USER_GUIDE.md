@@ -1,5 +1,24 @@
 # myCamino GPS Track Show User Guide
 
+## Quick Start and guided demo
+
+Choose **Help > Quick Start** for the short basic workflow. Packaged builds also
+offer a guided demo on first launch. Choose **Start Demo** to build a disposable
+St-Jean-Pied-de-Port to Roncesvalles Adventure from supplied inputs, **Not Now**
+to defer it, or **Never Show Again** to suppress the startup offer. The demo can
+always be started later with **Help > Start Guided Demo**.
+
+The demo opens numbered Finder folders and asks you to drag the GPX track first,
+then all photographs onto the Adventure Map. It deliberately uses the normal
+drop, metadata, and control-file workflow. It does not open the Track Table;
+the instructions only explain that tracks can be edited both on the map and in
+the Track and Waypoint tables. Weather and place-name network enrichment are
+disabled so the demo remains quick and private. Its temporary Adventure is not
+added to Recent Adventures or crash recovery and is removed when myCamino exits.
+
+The bundled photographs are reduced-quality copies licensed under CC BY 4.0;
+the demo directory contains the attribution and exact asset manifest.
+
 ## Photo-Derived GPX Tracks
 
 Use **Create Tracks from Photos** to open GPX Editor's **Add Media Points**
@@ -16,6 +35,12 @@ Choose **Help**, then **License**, **Third-Party Notices**, or **Source Code** t
 read the documents installed with the application. Release DMGs also contain
 the exact source archive used for that build. Donations may be invited in the
 future, but are voluntary and do not change available features or GPL rights.
+
+The **myCamino** application menu provides the complete GPL, the limited Apple
+App Store distribution exception, the draft App Store EULA, the Contributor
+Agreement, and the third-party notices. Direct beta and DMG releases remain
+governed by GPL-3.0-or-later. The App Store EULA is not active while it is
+marked as a draft.
 
 `myCamino GPS Track Show` helps you assemble one adventure from GPX tracks,
 photos, videos, map images, geolocation metadata, and a final slide-show
@@ -83,6 +108,11 @@ request sends the application version but no installation identifier, Adventure
 name, media, location, or usage information. Use **Automatically Check for
 News** in the myCamino menu to disable or re-enable background checks; manual
 checking remains available.
+Checks run in the background with a short connection timeout. If there is no
+Internet connection or the project website is unavailable, startup and all
+other functions continue without an alert. The News window retains downloaded
+items and shows a small line with the last successful server connection; a
+temporary unavailable indication appears there after a failed manual check.
 
 The map itself has no permanent button strip. Its transparent startup message
 also reminds you that `h` opens help. Keyboard shortcuts are `Cmd-G`, `Cmd-E`,
@@ -845,11 +875,25 @@ commas.
 - `#DURATION NN` changes how long following slides and map insets remain visible.
 - `#TRANSITION STYLE` selects `TIME_LAPSE`, `BLEND`, `FADE`, `SWITCH`, `EXPAND`, `COLLAGE`, `QUAD`, or `RANDOM`, like pressing `t` or `Shift-t`.
 - `#PAUSE NN` holds the current picture for the requested seconds while music continues.
+- `#SET_TIME HH:MM[:SS]` replaces the next medium's time for walker motion only.
+- `#SET_DATE YYYY-MM-DD` replaces its date for walker motion only.
+- `#IGNORE_TIME` shows the next medium without advancing the walker.
 - `#END` applies the Adventure's configured black, loop-once, or loop-forever ending.
 
 Duration and transition settings remain active until another command changes
 them or the show restarts from its title page. Use the editor's CTL filter to
 find these rows quickly.
+
+Time-Lapse always retains control-file media order. A future timestamp advances
+the walker; a missing or earlier timestamp shows the medium at the current
+walker position. Times outside the track are clamped to its beginning or end.
+SET_TIME, SET_DATE, and IGNORE_TIME never change the media clock or metadata.
+
+Append `#REPEAT_UNTIL $LABEL` as the final comma-separated item to repeat a
+CONTROL, MUSIC, PLAY, NARRATOR, CAPTION, or FONT directive at every following
+visible display before that forward label. Repeated audio selections restart.
+CAPTION repeats only on photos and videos. Flow transfers such as LABEL,
+GOTO/JUMP, and END cannot be repeated.
 
 ## Hidden Media, Captions, and Fonts
 
