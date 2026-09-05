@@ -1,21 +1,72 @@
 import hashlib
+import io
+import json
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 from django.contrib.messages import get_messages
+from django.core.management.base import CommandError
 from django.core import mail
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from siteapp.models import BetaRegistration, ContactMessage, DownloadEvent, Release
+from siteapp.models import ApplicationNews, BetaRegistration, ContactMessage, DownloadEvent, Release
 from siteapp.services import digest_token
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend", PUBLIC_BASE_URL="https://test.example", VERIFY_RESEND_SECONDS=600)
 class PublicSiteTests(TestCase):
+    def test_application_news_feed_returns_only_published_current_items(self):
+        now = timezone.now()
+        ApplicationNews.objects.create(
+            slug="welcome", title="Welcome", summary="Welcome to myCamino",
+            published_at=now, is_published=True,
+            link="https://mycamino.heinofalcke.de/", kind="news",
+        )
+        ApplicationNews.objects.create(
+            slug="future", title="Future", summary="Not yet",
+            published_at=now + timezone.timedelta(days=1), is_published=True,
+        )
+        ApplicationNews.objects.create(
+            slug="draft", title="Draft", summary="Not published",
+            published_at=now, is_published=False,
+        )
+
+        response = self.client.get(reverse("application-news"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["format_version"], 1)
+        self.assertEqual([item["id"] for item in response.json()["items"]], ["welcome"])
+        self.assertEqual(response.headers["Cache-Control"], "public, max-age=900")
+
+    def test_application_news_management_command_lifecycle(self):
+        output = io.StringIO()
+        call_command(
+            "app_news", "put", "version-1-0",
+            title="Version 1.0", summary="A new release is ready.",
+            kind="update", app_version="1.0", stdout=output,
+        )
+        item = ApplicationNews.objects.get(slug="version-1-0")
+        self.assertFalse(item.is_published)
+        call_command("app_news", "publish", item.slug, stdout=output)
+        item.refresh_from_db()
+        self.assertTrue(item.is_published)
+
+        listing = io.StringIO()
+        call_command("app_news", "list", all=True, json=True, stdout=listing)
+        self.assertEqual(json.loads(listing.getvalue())[0]["slug"], item.slug)
+
+        call_command("app_news", "withdraw", item.slug, stdout=output)
+        item.refresh_from_db()
+        self.assertFalse(item.is_published)
+        with self.assertRaises(CommandError):
+            call_command("app_news", "delete", item.slug, stdout=output)
+        call_command("app_news", "delete", item.slug, confirm=item.slug, stdout=output)
+        self.assertFalse(ApplicationNews.objects.filter(slug=item.slug).exists())
+
     def test_public_pages_render(self):
         for name in ("home", "documentation", "faq", "contact", "privacy", "imprint", "beta-download", "health"):
             self.assertEqual(self.client.get(reverse(name)).status_code, 200, name)

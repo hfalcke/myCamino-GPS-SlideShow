@@ -1,6 +1,6 @@
 from django.contrib import admin, messages
 
-from .models import BetaRegistration, ContactMessage, DownloadEvent, Release
+from .models import ApplicationNews, BetaRegistration, ContactMessage, DownloadEvent, Release
 from .services import deliver_contact
 
 
@@ -41,6 +41,14 @@ class ReleaseAdmin(admin.ModelAdmin):
         if obj.is_active:
             Release.objects.exclude(pk=obj.pk).update(is_active=False)
         super().save_model(request, obj, form, change)
+
+
+@admin.register(ApplicationNews)
+class ApplicationNewsAdmin(admin.ModelAdmin):
+    list_display = ("title", "kind", "app_version", "published_at", "is_published")
+    list_filter = ("kind", "is_published", "published_at")
+    search_fields = ("slug", "title", "summary", "app_version")
+    prepopulated_fields = {"slug": ("title",)}
 
 
 @admin.register(DownloadEvent)

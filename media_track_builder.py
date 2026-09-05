@@ -7,6 +7,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
 import copy
+import mimetypes
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -15,11 +16,6 @@ from pathlib import Path
 from typing import Iterable
 
 from gpx_processing import GPX_NAMESPACE, haversine_km
-from plot_metadata_utils import (
-    media_sidecar_freshness,
-    media_sidecar_path,
-    validate_media_sidecar,
-)
 
 
 MYCAMINO_NAMESPACE = "https://mycamino.org/gpx/extensions/1"
@@ -59,57 +55,25 @@ class MediaTrackBuildResult:
     merged_points: int = 0
 
 
-def _media_record(path: Path, refresh_metadata: bool):
-    """Return a sidecar-backed PhotoRecord, refreshing only when requested."""
-    from GetGeoLocations import (
-        build_record_from_photo,
-        record_from_sidecar_payload,
-        write_record_json,
-    )
-
-    sidecar = media_sidecar_path(path)
-    status, payload, _reason = validate_media_sidecar(path, sidecar)
-    freshness = (
-        media_sidecar_freshness(path, payload)
-        if status == "available" and isinstance(payload, dict)
-        else "unknown"
-    )
-    if status == "available" and isinstance(payload, dict) and (
-        freshness == "current" or not refresh_metadata
-    ):
-        return record_from_sidecar_payload(payload, sidecar, path), False
-
-    record = build_record_from_photo(
-        path,
-        getclearnames=False,
-        geocode_cache={},
-        known_places=[],
-        place_distance_m=0.0,
-        debug=False,
-    )
-    write_record_json(record, set())
-    return record, True
-
-
 def load_media_track_points(
     media_paths: Iterable[Path],
     *,
     refresh_metadata: bool = True,
 ) -> tuple[list[MediaTrackPoint], int, int, list[str]]:
     """Load selected media through canonical sidecars and return located points."""
+    from media_metadata_service import prepare_media_records
+
     points: list[MediaTrackPoint] = []
     refreshed = reused = 0
     skipped: list[str] = []
-    for raw_path in media_paths:
-        path = Path(raw_path).expanduser().resolve(strict=False)
-        if not path.is_file():
-            skipped.append(f"{path.name}: file is missing")
+    prepared = prepare_media_records(media_paths, refresh_changed=refresh_metadata)
+    for item in prepared:
+        path = item.path
+        record = item.record
+        if record is None:
+            skipped.append(f"{path.name}: {item.error or item.sidecar_status}")
             continue
-        try:
-            record, was_refreshed = _media_record(path, refresh_metadata)
-        except Exception as exc:
-            skipped.append(f"{path.name}: {exc}")
-            continue
+        was_refreshed = item.action == "extracted"
         refreshed += int(was_refreshed)
         reused += int(not was_refreshed)
         if record.latitude is None or record.longitude is None:
@@ -239,6 +203,11 @@ def media_stage_to_track(stage: MediaTrackStage) -> ET.Element:
         if item.timestamp is not None:
             ET.SubElement(point, qname("time")).text = item.timestamp.isoformat()
         ET.SubElement(point, qname("name")).text = item.media_path.name
+        link = ET.SubElement(point, qname("link"), href=item.media_path.resolve(strict=False).as_uri())
+        ET.SubElement(link, qname("text")).text = item.media_path.name
+        media_type, _encoding = mimetypes.guess_type(item.media_path.name)
+        if media_type:
+            ET.SubElement(link, qname("type")).text = media_type
     return track
 
 

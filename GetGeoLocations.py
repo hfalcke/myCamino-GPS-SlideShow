@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from typing import Any, Callable, Optional, TextIO
+from typing import Any, Callable, Iterable, Optional, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from plot_metadata_utils import (
@@ -68,6 +68,7 @@ from track_map_layout_utils import (
     track_map_variant_names,
 )
 from slideshow_control_format import split_disabled_control_line
+from project_media_watcher import discover_project_media
 
 
 IMAGE_EXTENSIONS = {
@@ -97,6 +98,14 @@ VIDEO_EXTENSIONS = {
 }
 DEFAULT_PLACE_GPS_EQUIVALENCE_M = 150.0
 FILE_FILTERS = {"IMAGE", "VIDEO", "ALL"}
+
+
+def discover_media_files(project: Path | str) -> list[Path]:
+    """Return supported project media recursively, excluding generated assets."""
+    return sorted(
+        discover_project_media(project, IMAGE_EXTENSIONS | VIDEO_EXTENSIONS),
+        key=lambda path: str(path).casefold(),
+    )
 
 GERMAN_WEEKDAYS = [
     "Montag",
@@ -450,21 +459,21 @@ def discover_media_update_candidates(
         media_paths = sorted(
             (
                 path for path in imported
-                if path.parent == project
+                if path.is_relative_to(project)
                 and path.is_file()
                 and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+                and not any(
+                    part.casefold() in {
+                        "audio", "narration", "trackimages", "normalized-videos",
+                        ".mycamino", "cache", "caches", "tmp", "temp",
+                    }
+                    for part in path.relative_to(project).parts[:-1]
+                )
             ),
-            key=lambda path: path.name.casefold(),
+            key=lambda path: str(path).casefold(),
         )
     else:
-        media_paths = sorted(
-            (
-                path.resolve(strict=False)
-                for path in project.iterdir()
-                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-            ),
-            key=lambda path: path.name.casefold(),
-        )
+        media_paths = discover_media_files(project)
     candidates: list[MediaUpdateCandidate] = []
     total = len(media_paths)
     if progress_callback is not None:
@@ -541,15 +550,7 @@ def discover_control_media_membership(
         for entry in entries
         if entry.get("type") == "media"
     ]
-    media_paths = sorted(
-        (
-            path.resolve(strict=False)
-            for path in project.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-        ),
-        key=lambda path: path.name.casefold(),
-    )
+    media_paths = discover_media_files(project)
     inventory = load_control_media_inventory(control)
     return inventory, classify_project_media(
         inventory,
@@ -562,6 +563,7 @@ def discover_control_media_membership(
 def index_media_file_identities(
     project_dir: Path | str,
     *,
+    media_paths: Optional[Iterable[Path | str]] = None,
     legacy_source_project: Path | str | None = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     detail_callback: Optional[Callable[[str], None]] = None,
@@ -574,19 +576,24 @@ def index_media_file_identities(
         if legacy_source_project
         else None
     )
-    media_paths = sorted(
-        (
-            path.resolve(strict=False)
-            for path in project.iterdir()
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-        ),
-        key=lambda path: path.name.casefold(),
-    )
+    if media_paths is None:
+        selected_media_paths = discover_media_files(project)
+    else:
+        selected_media_paths = sorted(
+            {
+                Path(path).expanduser().resolve(strict=False)
+                for path in media_paths
+                if Path(path).expanduser().resolve(strict=False).is_relative_to(project)
+                and Path(path).expanduser().resolve(strict=False).is_file()
+                and Path(path).suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            },
+            key=lambda path: str(path).casefold(),
+        )
     report = MediaIdentityIndexReport()
-    total = len(media_paths)
+    total = len(selected_media_paths)
     if progress_callback is not None:
         progress_callback(0, total, "")
-    for index, media_path in enumerate(media_paths, start=1):
+    for index, media_path in enumerate(selected_media_paths, start=1):
         if cancel_event is not None and cancel_event.is_set():
             raise ProcessingCancelled("Aborted.")
         check_cancelled()
@@ -2646,8 +2653,8 @@ def list_photo_files(photodir: Path, file_filter: str = "ALL") -> list[Path]:
     """Return supported media files in the input directory."""
     allowed_extensions = allowed_extensions_for_filter(file_filter)
     return sorted(
-        [path for path in photodir.iterdir() if path.is_file() and path.suffix.lower() in allowed_extensions],
-        key=lambda item: item.name.lower(),
+        discover_project_media(photodir, allowed_extensions),
+        key=lambda item: str(item).casefold(),
     )
 
 
@@ -4063,6 +4070,10 @@ def project_map_plan_from_sidecars(
         record = load_record_from_json(get_json_path_for_photo(media_path), media_path)
         if record is None:
             continue
+        try:
+            record.control_filename = str(media_path.relative_to(project))
+        except ValueError:
+            record.control_filename = media_path.name
         if resolver is not None and resolver.apply(record):
             write_record_json(record, set())
         records.append(record)
@@ -4217,7 +4228,6 @@ def write_sorted_output(
         sort_date_sections_by_tracks,
         media_map_options,
     )
-    media_overview = plan.overview_name
     try:
         render_project_map_plan(plan, sorted_output_path, media_map_options)
     except Exception as exc:
@@ -4228,30 +4238,31 @@ def write_sorted_output(
         )
         print(f"Could not create project maps: {exc}", flush=True)
     sorted_output_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_output_path.write_text(project_control_plan_text(plan), encoding="utf-8")
 
-    with sorted_output_path.open("w", encoding="utf-8") as output_file:
-        if tracks_summary and tracks_summary.overview_image:
-            output_file.write(f"#Overviewmap: {tracks_summary.overview_image}\n")
-        elif media_overview:
-            output_file.write(f"#Overviewmap: {media_overview}\n")
 
-        active_date = None
-        for section in plan.sections:
-            if section.get("date") is not None:
-                date_datetime = datetime.combine(
-                    section["date"],
-                    datetime.min.time(),
-                ).replace(tzinfo=LOCAL_TIMEZONE)
-                output_file.write(f"#Datum: {format_german_date(date_datetime)}\n")
-                active_date = section["date"]
-            elif active_date is not None:
-                # Clear inherited date context without inventing one.
-                output_file.write("#Datum:\n")
-                active_date = None
-            for keyword, filename in section["maps"]:
-                output_file.write(f"#{keyword}: {filename}\n")
-            for record in section["records"]:
-                output_file.write(sorted_media_output_line(record) + "\n")
+def project_control_plan_text(plan: ProjectMapPlan) -> str:
+    """Serialize a prepared project plan without rendering any map images."""
+    lines = []
+    if plan.tracks_summary and plan.tracks_summary.overview_image:
+        lines.append(f"#Overviewmap: {plan.tracks_summary.overview_image}")
+    elif plan.overview_name:
+        lines.append(f"#Overviewmap: {plan.overview_name}")
+
+    active_date = None
+    for section in plan.sections:
+        if section.get("date") is not None:
+            date_datetime = datetime.combine(
+                section["date"], datetime.min.time()
+            ).replace(tzinfo=LOCAL_TIMEZONE)
+            lines.append(f"#Datum: {format_german_date(date_datetime)}")
+            active_date = section["date"]
+        elif active_date is not None:
+            lines.append("#Datum:")
+            active_date = None
+        lines.extend(f"#{keyword}: {filename}" for keyword, filename in section["maps"])
+        lines.extend(sorted_media_output_line(record) for record in section["records"])
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def parse_german_date_label(value: str) -> Optional[date]:
@@ -4265,12 +4276,17 @@ def parse_german_date_label(value: str) -> Optional[date]:
         return None
 
 
+def control_record_filename(record: PhotoRecord) -> str:
+    """Return a project-relative control name without changing sidecar identity."""
+    return str(getattr(record, "control_filename", record.source_filename))
+
+
 def sorted_media_output_line(record: PhotoRecord) -> str:
     """Return one media line in sorted-list format."""
     time_text = record.photo_datetime.strftime("%H:%M")
     gps_text = format_gps_text(record.latitude, record.longitude)
     place_text = format_place_text(record.latitude, record.longitude, record.place, record.geocode_requested)
-    return f"{record.source_filename} | {time_text} | {gps_text} | {place_text}"
+    return f"{control_record_filename(record)} | {time_text} | {gps_text} | {place_text}"
 
 
 def control_line_name(line: str) -> str:
@@ -4645,7 +4661,7 @@ def insert_media_entry(
             "type": "media",
             "date": day,
             "datetime": record.photo_datetime,
-            "name": record.source_filename,
+            "name": control_record_filename(record),
         },
     )
 
@@ -4696,7 +4712,7 @@ def _insert_media_in_section(
             "type": "media",
             "date": record.photo_datetime.date(),
             "datetime": record.photo_datetime,
-            "name": record.source_filename,
+            "name": control_record_filename(record),
         },
     )
 
@@ -5244,7 +5260,7 @@ def analyze_media_updates(
         normalized_entry_name = normalize_filename_for_match(str(entry.get("name", "")))
         media_entry_indexes.setdefault(normalized_entry_name, []).append(entry_index)
         if gps_resolver is not None:
-            reference_path = project / Path(str(entry.get("name", ""))).name
+            reference_path = project / str(entry.get("name", ""))
             reference_record = _control_media_record(entry, reference_path)
             if reference_record is not None:
                 gps_resolver._remember_reference_record(reference_record)
@@ -5265,7 +5281,7 @@ def analyze_media_updates(
     warnings: list[str] = []
     for normalized_name, indexes in media_entry_indexes.items():
         entry_name = str(entries[indexes[0]].get("name", ""))
-        referenced_path = project / Path(entry_name).name
+        referenced_path = project / entry_name
         if referenced_path.is_file():
             continue
         warning = (
@@ -5277,7 +5293,7 @@ def analyze_media_updates(
     paths = [Path(path).expanduser().resolve(strict=False) for path in media_paths]
     extraction_paths: list[Path] = []
     for media_path in paths:
-        if media_path.parent != project or not media_path.is_file():
+        if not media_path.is_relative_to(project) or not media_path.is_file():
             continue
         status, payload, _reason = validate_media_sidecar(media_path)
         freshness = media_sidecar_freshness(media_path, payload) if status == "available" else status
@@ -5303,7 +5319,7 @@ def analyze_media_updates(
         check_cancelled()
         if progress_callback is not None:
             progress_callback(index - 1, len(paths), media_path.name)
-        if media_path.parent != project or not media_path.is_file():
+        if not media_path.is_relative_to(project) or not media_path.is_file():
             warning = f"Skipped {media_path}: not an existing project media file."
             warnings.append(warning)
             if detail_callback is not None:
@@ -5362,6 +5378,11 @@ def analyze_media_updates(
         else:
             new_record = old_record
             assert new_record is not None
+
+        try:
+            new_record.control_filename = str(media_path.relative_to(project))
+        except ValueError:
+            new_record.control_filename = media_path.name
 
         if gps_resolver is not None and gps_resolver.apply(new_record):
             sidecar_write_required = True
@@ -5889,7 +5910,7 @@ def commit_media_update_plan(
             control_entries[occurrences[0]].update(
                 line=sorted_media_output_line(record),
                 datetime=record.photo_datetime,
-                name=record.source_filename,
+                name=control_record_filename(record),
             )
             if item.gps_changed:
                 affected_dates.add(record.photo_datetime.date())
@@ -6679,6 +6700,10 @@ def collect_photo_location_and_dates(
                     )
                 )
 
+            try:
+                record.control_filename = str(photo_path.relative_to(params.photodir))
+            except ValueError:
+                record.control_filename = photo_path.name
             screen_line = build_unsorted_output_line(record, include_update_marker=True)
             file_line = build_unsorted_output_line(record, include_update_marker=False)
             emit_output_line(screen_line, file_line, output_file)

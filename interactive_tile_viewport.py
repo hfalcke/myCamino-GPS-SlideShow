@@ -27,6 +27,47 @@ class TileCoordinate:
     y: int
 
 
+def aspect_preserving_rect(
+    viewport_width: float,
+    viewport_height: float,
+    extent: dict[str, float],
+) -> tuple[float, float, float, float]:
+    """Return a centered viewport rectangle that does not stretch map units."""
+    view_width = max(float(viewport_width), 1.0)
+    view_height = max(float(viewport_height), 1.0)
+    span_x = max(float(extent["max_x"]) - float(extent["min_x"]), 1.0)
+    span_y = max(float(extent["max_y"]) - float(extent["min_y"]), 1.0)
+    map_ratio = span_x / span_y
+    view_ratio = view_width / view_height
+    if view_ratio > map_ratio:
+        height = view_height
+        width = height * map_ratio
+    else:
+        width = view_width
+        height = width / map_ratio
+    return (view_width - width) / 2.0, (view_height - height) / 2.0, width, height
+
+
+def clamp_extent_to_web_mercator(extent: dict[str, float]) -> dict[str, float]:
+    """Keep a viewport inside the finite XYZ Web Mercator world."""
+    min_x = float(extent["min_x"])
+    max_x = float(extent["max_x"])
+    min_y = float(extent["min_y"])
+    max_y = float(extent["max_y"])
+
+    def clamp_axis(low: float, high: float) -> tuple[float, float]:
+        span = min(max(high - low, 1.0), WEB_MERCATOR_WORLD_M)
+        center = (low + high) / 2.0
+        minimum_center = -WEB_MERCATOR_HALF_WORLD_M + span / 2.0
+        maximum_center = WEB_MERCATOR_HALF_WORLD_M - span / 2.0
+        center = max(minimum_center, min(maximum_center, center))
+        return center - span / 2.0, center + span / 2.0
+
+    min_x, max_x = clamp_axis(min_x, max_x)
+    min_y, max_y = clamp_axis(min_y, max_y)
+    return {"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y}
+
+
 def tile_bounds_mercator(tile: TileCoordinate) -> dict[str, float]:
     """Return an XYZ tile's Web Mercator bounds."""
     count = 1 << int(tile.zoom)
@@ -70,6 +111,14 @@ def visible_tiles(extent: dict[str, float], zoom: int) -> list[TileCoordinate]:
     )
 
 
+def tile_coverage_complete(
+    expected_keys: set[tuple[int, int, int]],
+    loaded_keys,
+) -> bool:
+    """Return whether every tile in the current viewport has been loaded."""
+    return expected_keys.issubset(set(loaded_keys))
+
+
 def shifted_extent(
     extent: dict[str, float],
     delta_x_points: float,
@@ -92,6 +141,42 @@ def shifted_extent(
         "min_y": float(extent["min_y"]) + shift_y,
         "max_y": float(extent["max_y"]) + shift_y,
     }
+
+
+def scroll_pan_deltas(
+    delta_x_points: float,
+    delta_y_points: float,
+    *,
+    reverse_vertical: bool = False,
+) -> tuple[float, float]:
+    """Return view-space pan deltas without changing drag-pan semantics."""
+    delta_y = -float(delta_y_points) if reverse_vertical else float(delta_y_points)
+    return float(delta_x_points), delta_y
+
+
+def mouse_wheel_zoom_factor(delta_y: float, *, units_per_level: float = 4.0) -> float:
+    """Convert wheel units to a bounded continuous scale, not a level per event."""
+    units = max(-4.0, min(4.0, float(delta_y)))
+    return 2.0 ** (units / max(float(units_per_level), 1.0))
+
+
+def tile_zoom_for_viewport(
+    extent: dict[str, float],
+    viewport_width: float,
+    viewport_height: float,
+    *,
+    maximum_zoom: int = 19,
+    tile_pixels: int = 256,
+) -> int:
+    """Choose an XYZ level whose native pixels cover the fitted viewport."""
+    span_x = max(float(extent["max_x"]) - float(extent["min_x"]), 1.0)
+    span_y = max(float(extent["max_y"]) - float(extent["min_y"]), 1.0)
+    width = max(float(viewport_width), 1.0)
+    height = max(float(viewport_height), 1.0)
+    pixel_size = max(int(tile_pixels), 1)
+    zoom_x = math.log2(WEB_MERCATOR_WORLD_M * width / (span_x * pixel_size))
+    zoom_y = math.log2(WEB_MERCATOR_WORLD_M * height / (span_y * pixel_size))
+    return max(0, min(int(maximum_zoom), int(math.ceil(max(zoom_x, zoom_y)))))
 
 
 def zoomed_extent(
@@ -152,7 +237,14 @@ def load_tile_png(
     )
     url = provider_tile_url(source, tile.x, tile.y, tile.zoom)
     cached_fetch = cx.tile.memory.cache(cx.tile._fetch_tile)
-    with contextily_request_timeout(cx, timeout_seconds, provider):
+    # Interactive viewports request only visible tiles. Two workers may fetch
+    # them concurrently; generated maps retain the conservative provider pace.
+    with contextily_request_timeout(
+        cx,
+        timeout_seconds,
+        provider,
+        minimum_interval_seconds=0.0,
+    ):
         array = cached_fetch(url, 0, 1, {})
     output = io.BytesIO()
     Image.fromarray(array).save(output, format="PNG")

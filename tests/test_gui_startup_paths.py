@@ -3,8 +3,10 @@ import unittest
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from GPXEditor import GPXEditorController
+from cocoa_adventure_map import AdventureMapAppDelegate, AdventureMapController
 from GPSTrackShowGUI import (
     GPXTrackerController,
     SLIDESHOW_CHECKPOINT_VERSION,
@@ -22,6 +24,91 @@ from GPSTrackShowGUI import (
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_adventure_map_waits_for_weather_decision_before_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            media = Path(temporary_directory) / "photo.jpg"
+            media.write_bytes(b"photo")
+            controller = SimpleNamespace(
+                pending_media=set(),
+                processing_active=False,
+                _metadata_creation_requires_weather_choice=Mock(return_value=True),
+                _request_initial_weather_choice=Mock(return_value=False),
+                _start_next_media_batch=Mock(),
+            )
+
+            AdventureMapController.queue_media_processing(controller, [media])
+
+            self.assertEqual(controller.pending_media, set())
+            controller._start_next_media_batch.assert_not_called()
+
+    def test_media_index_and_watcher_wait_for_staged_track_loading(self):
+        controller = SimpleNamespace(
+            startup_track_loading=True,
+            startup_media_scan_deferred=False,
+            startup_watcher_deferred=False,
+            _stop_media_watcher=Mock(),
+        )
+
+        AdventureMapController._scan_project_media(controller)
+        AdventureMapController._start_media_watcher(controller)
+
+        self.assertTrue(controller.startup_media_scan_deferred)
+        self.assertTrue(controller.startup_watcher_deferred)
+        controller._stop_media_watcher.assert_not_called()
+
+    def test_lower_priority_startup_work_begins_after_media_index(self):
+        media = Path("new-photo.jpg")
+        controller = SimpleNamespace(
+            startup_pending_media_paths={media},
+            startup_watcher_deferred=True,
+            pending_control_media=set(),
+            processing_active=False,
+            _queue_derived_track_data=Mock(),
+            queue_media_processing=Mock(),
+            _start_media_watcher=Mock(),
+        )
+
+        AdventureMapController._finish_prioritized_startup_work(controller)
+
+        controller._queue_derived_track_data.assert_called_once_with()
+        controller.queue_media_processing.assert_called_once_with([media])
+        controller._start_media_watcher.assert_called_once_with()
+        self.assertFalse(controller.startup_watcher_deferred)
+
+    def test_adventure_map_does_not_terminate_while_recovery_prompt_closes(self):
+        delegate = AdventureMapAppDelegate.alloc().initWithProjectDirectory_projectFile_(
+            None,
+            None,
+        )
+        delegate.controller = SimpleNamespace(startup_in_progress=True)
+        self.assertFalse(delegate.applicationShouldTerminateAfterLastWindowClosed_(None))
+
+        delegate.controller.startup_in_progress = False
+        self.assertTrue(delegate.applicationShouldTerminateAfterLastWindowClosed_(None))
+
+    def test_workspace_track_inspection_bypasses_legacy_map_window(self):
+        expected_inspector = object()
+        workspace = SimpleNamespace(
+            inspect_workspace_track=Mock(return_value=expected_inspector)
+        )
+        source_view = SimpleNamespace(adventure_workspace_delegate=workspace)
+        controller = SimpleNamespace()
+        track = object()
+
+        result = GPXEditorController.open_track_workflow_at_point(
+            controller,
+            track,
+            17,
+            source_view=source_view,
+        )
+
+        self.assertIs(result, expected_inspector)
+        workspace.inspect_workspace_track.assert_called_once_with(track, 17)
+
+    def test_full_gui_flag_is_explicit_opt_out_of_map_first_startup(self):
+        args = build_argument_parser().parse_args(["--full-gui"])
+        self.assertTrue(args.full_gui)
+
     def test_control_table_does_not_apply_text_style_to_preview_image_cell(self):
         class ImageCell:
             def respondsToSelector_(self, selector):

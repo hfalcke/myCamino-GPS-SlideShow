@@ -2,13 +2,12 @@
 
 ## Photo-Derived GPX Tracks
 
-Use **Create Tracks from Photos** in the GPX Files section to turn project photo
-and video GPS positions into editable, estimated GPX stage tracks. Existing
-valid media sidecars are reused. If a control file exists, its stages and media
-order define the generated tracks; otherwise media are grouped by local date.
-The generated tracks open in GPX Editor alongside the current GPX when one is
-already selected. A newly generated file becomes the Adventure's active GPX
-only after you save and confirm that choice.
+Use **Create Tracks from Photos** to open GPX Editor's **Add Media Points**
+workflow. For a new media-only journey, the editor supplies an empty destination
+track. With an existing GPX, select the destination track before adding media.
+Only selected photos and videos are processed, current sidecars are reused, and
+each accepted medium remains a raw linked waypoint. Save the edited GPX before
+making it the Adventure's journey source.
 
 ## License and source code
 
@@ -24,6 +23,73 @@ control file.
 
 An adventure is one project directory. The project directory contains all files
 created or imported by the workflow.
+
+## Adventure Map
+
+The normal starting screen is the Adventure Map. Drop an `.adv` file or an
+Adventure directory to load it. Existing tracks appear as a lightweight
+overview and media are grouped into numbered location markers. Click a track
+to select it and double-click it to open the Track Table. From there,
+double-click its row to open the Waypoint Table; the map context menu can open
+either table directly. Nearby tracks remain visible but subdued. Double-click empty map space or press
+`Cmd-0` to return to the complete overview. The map preserves geographic
+proportions while resizing; black margins are used instead of stretching map
+tiles when the window and map have different shapes.
+
+Click a numbered media group to select all media in it. Command-click adds or
+removes another group. Command-drag from empty map space to draw a black selection
+rectangle and add the enclosed groups or thumbnails; a simple empty-map click
+clears the selection. Selected media have a red outline. Right-click a media
+group to fit all selected media to the map or create a new track from their
+GPS positions. Ordinary dragging and two-finger scrolling pan the map.
+
+You may also drop GPX tracks, photos, videos, audio, a control file, or a media
+folder. Fast media metadata preparation runs in the background and never
+regenerates map images. The small activity indicator shows the current phase;
+click it for the complete processing journal. Work that has not yet
+been saved is regularly placed in temporary crash-recovery snapshots.
+
+myCamino also checks the active Adventure at startup and while it remains open.
+After a newly copied photo or video has stopped changing, metadata is prepared
+once. An existing edited control file is never changed silently: new media is
+shown in **Review Control File Updates** first. If there is no control file,
+myCamino creates an initial one from the available media and opens the editor.
+Previously excluded media is remembered and is not proposed repeatedly.
+
+Choose **myCamino > Settings** or press `Cmd-,` at any time, including before
+creating an Adventure. Pre-Adventure changes remain in memory and are written
+as the initial Adventure settings when it is created. The first genuinely new
+medium that needs metadata also asks once whether historical weather should be
+included. Free non-commercial retrieval needs no Open-Meteo account or API key.
+Customer access requires an Open-Meteo account, a suitable paid plan, and an API
+key, which myCamino stores in macOS Keychain. The answer is remembered and can
+be changed later in Settings.
+
+The native **Track**, **Media**, **Maps**, **Control File**, **Audio**, and
+**Slide Show** menus expose the normal workflow directly, without showing the
+Advanced Interface. **Adventure > Adventure Properties** edits the protected
+name, project directory, description, and Intro title image. Contextual Settings
+entries open the one shared Settings window at the appropriate section; the
+canonical command remains **myCamino > Settings** (`Cmd-,`). The **Window** menu
+lists visible, hidden, minimized, processing, and unsaved windows and restores a
+selected one. **Adventure > Advanced Interface** remains available for detailed
+status and uncommon operations.
+
+myCamino checks its project website at most once per day for published news and
+update notices. A newly received item is announced once; unread items remain
+visible as a count under **myCamino > News and Updates** and on the application
+Dock icon. Opening the News window marks the downloaded items as read. The
+request sends the application version but no installation identifier, Adventure
+name, media, location, or usage information. Use **Automatically Check for
+News** in the myCamino menu to disable or re-enable background checks; manual
+checking remains available.
+
+The map itself has no permanent button strip. Its transparent startup message
+also reminds you that `h` opens help. Keyboard shortcuts are `Cmd-G`, `Cmd-E`,
+`Cmd-L`, `Cmd-S`, Space, and `h`; `Cmd-Q` quits. Two-finger scrolling moves the
+map in the same direction as your fingers, while dragging continues to grab
+and move the map directly. Experts who prefer the former control-first startup
+can pass `--full-gui`.
 
 After installation, start the application by clicking the
 **myCamino GPS Track Show** icon in Applications. Because the beta is unsigned,
@@ -48,6 +114,7 @@ Experts can also preload a project:
 ./.venv/bin/python GPSTrackShowGUI.py --project-directory /path/to/project
 ./.venv/bin/python GPSTrackShowGUI.py /path/to/project
 ./.venv/bin/python GPSTrackShowGUI.py /path/to/project/adventure.adv
+./.venv/bin/python GPSTrackShowGUI.py --full-gui /path/to/project
 ```
 
 When a project directory is supplied, the GUI loads its most recently modified
@@ -1153,7 +1220,9 @@ For a media-only Adventure, the same folder contains one date map per
 Select **Add historical weather** in Media to enrich valid media sidecars from
 Open-Meteo. This is optional because the request sends the media coordinate and
 exposure time to an external service. The free endpoint is limited to
-non-commercial use; customer access uses an API key stored in macOS Keychain.
+non-commercial use and needs no account or API key. Customer access requires an
+Open-Meteo account and suitable paid plan; its API key is stored in macOS
+Keychain rather than in the Adventure.
 
 Weather retrieval is a separate Adventure Processing phase. Current weather is
 reused, nearby media are grouped, and missing weather does not cause EXIF

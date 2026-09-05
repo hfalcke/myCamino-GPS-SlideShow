@@ -7,13 +7,18 @@ from __future__ import annotations
 
 import copy
 import math
+import mimetypes
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 
 from gpx_processing import parse_time
 
 
 EARTH_RADIUS_M = 6378137.0
+MYCAMINO_NAMESPACE = "https://mycamino.org/gpx/extensions/1"
+ET.register_namespace("mycamino", MYCAMINO_NAMESPACE)
 
 
 def local_name(tag: str) -> str:
@@ -149,6 +154,111 @@ def synthesized_point(
 
 def duplicate_point(point: ET.Element) -> ET.Element:
     return copy.deepcopy(point)
+
+
+def point_from_values(
+    track: ET.Element,
+    latitude: float,
+    longitude: float,
+    *,
+    elevation_m: float | None = None,
+    timestamp: datetime | None = None,
+    name: str | None = None,
+    media_path: Path | None = None,
+) -> ET.Element:
+    """Create a GPX point compatible with the destination track namespace."""
+    latitude = float(latitude)
+    longitude = float(longitude)
+    if not -90.0 <= latitude <= 90.0 or not -180.0 <= longitude <= 180.0:
+        raise ValueError("Waypoint coordinates are outside the valid range.")
+    point = ET.Element(
+        qualified_like(track, "trkpt"),
+        {"lat": f"{latitude:.8f}", "lon": f"{longitude:.8f}"},
+    )
+    if elevation_m is not None:
+        ET.SubElement(point, qualified_like(track, "ele")).text = f"{float(elevation_m):.3f}"
+    if timestamp is not None:
+        ET.SubElement(point, qualified_like(track, "time")).text = _format_time(timestamp)
+    if name:
+        ET.SubElement(point, qualified_like(track, "name")).text = str(name)
+    if media_path is not None:
+        path = Path(media_path).expanduser().resolve(strict=False)
+        link = ET.SubElement(point, qualified_like(track, "link"), {"href": path.as_uri()})
+        ET.SubElement(link, qualified_like(track, "text")).text = path.name
+        media_type, _encoding = mimetypes.guess_type(path.name)
+        if media_type:
+            ET.SubElement(link, qualified_like(track, "type")).text = media_type
+    return point
+
+
+def mark_track_media_derived(track: ET.Element) -> None:
+    """Record that an editable track contains media-derived route anchors."""
+    extensions = next(
+        (child for child in list(track) if local_name(child.tag) == "extensions"),
+        None,
+    )
+    if extensions is None:
+        extensions = ET.SubElement(track, qualified_like(track, "extensions"))
+    tag = f"{{{MYCAMINO_NAMESPACE}}}trackOrigin"
+    origin = next((child for child in list(extensions) if child.tag == tag), None)
+    if origin is None:
+        origin = ET.SubElement(extensions, tag)
+    origin.set("kind", "media-derived")
+    origin.set("estimated", "true")
+
+
+def media_paths_for_point(point: ET.Element, source_directory: Path | None = None) -> list[Path]:
+    """Resolve local media links attached to one standard GPX waypoint."""
+    result = []
+    for child in list(point):
+        if local_name(child.tag) != "link":
+            continue
+        href = str(child.attrib.get("href", "")).strip()
+        if not href:
+            continue
+        parsed = urlparse(href)
+        if parsed.scheme == "file":
+            candidate = Path(unquote(parsed.path))
+        elif parsed.scheme:
+            continue
+        else:
+            candidate = Path(unquote(href))
+            if not candidate.is_absolute() and source_directory is not None:
+                candidate = Path(source_directory) / candidate
+        result.append(candidate.expanduser().resolve(strict=False))
+    return result
+
+
+def rewrite_local_media_links(
+    track: ET.Element,
+    *,
+    source_directory: Path | None,
+    output_directory: Path,
+) -> None:
+    """Make local GPX media links portable when possible during Save/Save As."""
+    output_directory = Path(output_directory).resolve(strict=False)
+    for point in (item for segment in track_segments(track) for item in segment_points(segment)):
+        for link in (child for child in list(point) if local_name(child.tag) == "link"):
+            href = str(link.attrib.get("href", "")).strip()
+            if not href:
+                continue
+            parsed = urlparse(href)
+            if parsed.scheme == "file":
+                media_path = Path(unquote(parsed.path)).resolve(strict=False)
+            elif parsed.scheme:
+                continue
+            else:
+                media_path = Path(unquote(href))
+                if not media_path.is_absolute():
+                    if source_directory is None:
+                        continue
+                    media_path = (Path(source_directory) / media_path).resolve(strict=False)
+            try:
+                relative = media_path.relative_to(output_directory)
+            except ValueError:
+                link.set("href", media_path.as_uri())
+            else:
+                link.set("href", quote(relative.as_posix()))
 
 
 def insertion_for_row(
@@ -294,7 +404,12 @@ def insert_points_after_row(
 ) -> list[int]:
     locations = point_locations(track)
     if not locations:
-        raise ValueError("The track has no insertion segment.")
+        segments = track_segments(track)
+        segment = segments[0] if segments else ET.SubElement(track, qualified_like(track, "trkseg"))
+        inserted = [copy.deepcopy(point) for point in points]
+        for point in inserted:
+            segment.append(point)
+        return list(range(len(inserted)))
     row = max(0, min(int(row), len(locations) - 1))
     _selected, segment, local_index = locations[row]
     inserted = [copy.deepcopy(point) for point in points]
@@ -306,6 +421,126 @@ def insert_points_after_row(
         for index, (point, _segment, _local_index) in enumerate(point_locations(track))
         if id(point) in identities
     ]
+
+
+def insert_points_chronologically(track: ET.Element, points: list[ET.Element]) -> list[int]:
+    """Merge timed points in timestamp order without crossing GPX segment boundaries."""
+    inserted = []
+    def time_key(point):
+        value = _time_child(point)
+        try:
+            return (value is None, value.timestamp() if value is not None else float("inf"))
+        except (OSError, OverflowError, ValueError):
+            return (True, float("inf"))
+    incoming = sorted(
+        [copy.deepcopy(point) for point in points],
+        key=time_key,
+    )
+    for point in incoming:
+        point_time = _time_child(point)
+        locations = point_locations(track)
+        if not locations:
+            segment = track_segments(track)[0] if track_segments(track) else ET.SubElement(track, qualified_like(track, "trkseg"))
+            segment.append(point)
+            inserted.append(point)
+            continue
+        target = None
+        if point_time is not None:
+            point_value = time_key(point)[1]
+            target = next(
+                ((candidate, segment, index) for candidate, segment, index in locations
+                 if _time_child(candidate) is None or time_key(candidate)[1] > point_value),
+                None,
+            )
+        if target is None:
+            segment = locations[-1][1]
+            segment.append(point)
+        else:
+            _candidate, segment, index = target
+            segment.insert(index, point)
+        inserted.append(point)
+    identities = {id(point) for point in inserted}
+    return [
+        index for index, (point, _segment, _local_index) in enumerate(point_locations(track))
+        if id(point) in identities
+    ]
+
+
+def monotonic_route_matches(
+    track: ET.Element,
+    points: list[ET.Element],
+) -> list[tuple[int, float]]:
+    """Match ordered media points to non-decreasing raw route rows."""
+    route = point_locations(track)
+    if not route:
+        return []
+    previous = 0
+    matches = []
+    for point in points:
+        latitude = float(point.attrib["lat"])
+        longitude = float(point.attrib["lon"])
+        candidates = range(previous, len(route))
+        anchor = min(
+            candidates,
+            key=lambda index: _distance_m(
+                latitude,
+                longitude,
+                float(route[index][0].attrib["lat"]),
+                float(route[index][0].attrib["lon"]),
+            ),
+        )
+        distance = _distance_m(
+            latitude,
+            longitude,
+            float(route[anchor][0].attrib["lat"]),
+            float(route[anchor][0].attrib["lon"]),
+        )
+        matches.append((anchor, distance))
+        previous = anchor
+    return matches
+
+
+def insert_points_at_route_matches(
+    track: ET.Element,
+    points: list[ET.Element],
+    matches: list[tuple[int, float]],
+) -> list[int]:
+    """Insert ordered points after their monotonic closest route anchors."""
+    if len(points) != len(matches):
+        raise ValueError("Media points and route matches do not have the same size.")
+    original_locations = point_locations(track)
+    inserted = []
+    grouped = {}
+    for point, (anchor, _distance) in zip(points, matches):
+        if not 0 <= int(anchor) < len(original_locations):
+            raise ValueError("A route match points outside the destination track.")
+        grouped.setdefault(int(anchor), []).append(copy.deepcopy(point))
+    for anchor in sorted(grouped, reverse=True):
+        _source, segment, local_index = original_locations[anchor]
+        members = grouped[anchor]
+        for offset, point in enumerate(members, start=1):
+            segment.insert(local_index + offset, point)
+            inserted.append(point)
+    identities = {id(point) for point in inserted}
+    return [
+        index
+        for index, (point, _segment, _local_index) in enumerate(point_locations(track))
+        if id(point) in identities
+    ]
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    first_latitude = math.radians(lat1)
+    second_latitude = math.radians(lat2)
+    delta_latitude = second_latitude - first_latitude
+    delta_longitude = math.radians(lon2 - lon1)
+    value = (
+        math.sin(delta_latitude / 2.0) ** 2
+        + math.cos(first_latitude)
+        * math.cos(second_latitude)
+        * math.sin(delta_longitude / 2.0) ** 2
+    )
+    return 2.0 * 6371008.8 * math.asin(min(1.0, math.sqrt(value)))
 
 
 def remove_rows(track: ET.Element, rows: list[int]) -> int:

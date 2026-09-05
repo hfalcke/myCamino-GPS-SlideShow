@@ -58,6 +58,28 @@ class Release(models.Model):
         return self.label
 
 
+class ApplicationNews(models.Model):
+    KIND_CHOICES = (("news", "News"), ("update", "Update"))
+
+    slug = models.SlugField(max_length=120, unique=True)
+    title = models.CharField(max_length=240)
+    summary = models.TextField(max_length=4000)
+    kind = models.CharField(max_length=12, choices=KIND_CHOICES, default="news")
+    app_version = models.CharField(max_length=40, blank=True)
+    link = models.URLField(blank=True)
+    published_at = models.DateTimeField()
+    is_published = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-published_at", "-created_at")
+        verbose_name_plural = "application news"
+
+    def __str__(self):
+        return self.title
+
+
 class DownloadEvent(models.Model):
     registration = models.ForeignKey(BetaRegistration, on_delete=models.CASCADE, related_name="download_events")
     release = models.ForeignKey(Release, on_delete=models.SET_NULL, null=True, blank=True, related_name="download_events")

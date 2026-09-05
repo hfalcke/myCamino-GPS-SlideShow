@@ -12,3 +12,4 @@ website/staticfiles/
 website/.pytest_cache/
 website/exports/
 .DS_Store
+**/.mycamino/logs/

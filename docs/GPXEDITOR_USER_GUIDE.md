@@ -1,26 +1,43 @@
 # myCamino GPX Editor User Guide
 
-## Creating Tracks from Photos
+## Creating a Track
 
-**Tracks from Photos** creates editable estimated tracks from the GPS positions
-stored with selected photos and videos. Select individual media files or
-folders. The editor reuses valid extension-aware media sidecars and extracts
-metadata only for missing, invalid, or changed selected media.
+Starting GPX Editor without an input file creates an untitled document with one
+empty track and immediately opens its progressively loaded world map for
+editing. **New Track** adds another empty track. Right-click anywhere and choose
+**Create Waypoint Here** to create the first point; the map then centers at the
+normal track-editing zoom. Further points can be added on a segment, after the
+selected point, or at the track end.
 
-When a slide-show control file is available in the selected folder, one track is
-created for each control-file stage and media order is preserved. Otherwise,
-one track is created per local calendar date. Nearby consecutive positions are
-reduced using the GPX **Minimum point spacing** setting (10 m by default), while
-the first and last position of every stage are retained. Generated GPX tracks
-are marked as estimated and media-derived.
+`Cmd-I` opens coordinate entry when the track is empty. **Add Points From
+Clipboard** and `Cmd-V` recognize decimal coordinates, hemisphere and DMS
+notation, `geo:` links, expanded Google Maps/Earth URLs, KML coordinates, and
+GPX point fragments. A preview is shown before insertion. Shortened map links
+are not followed; paste their expanded URL or the coordinates instead.
 
-The main myCamino GUI provides **Create Tracks from Photos** too. It uses all
-project media and the active control file, opens the result in GPX Editor, and
-asks before a newly saved GPX becomes the Adventure's active journey source.
+**Add Media Points** accepts photos, videos, and folders. It reuses current
+extension-aware sidecars and uses the canonical batched metadata extractor only
+for selected media whose sidecar is missing, invalid, or changed. Reverse
+geocoding, weather retrieval, map generation, and slideshow generation are not
+run. Every located selected medium becomes a raw GPX point linked to its
+original file. A sortable review table confirms inclusion before extraction;
+you can also drop files, folders, or a slide-show control file onto a
+destination track row or directly onto its open Track Map. Media listed in a
+dropped control file are collected for the same review. Timed media are
+inserted chronologically. If the destination
+contains untimed points, the editor asks before estimating their times by route
+distance; known timestamps are never replaced.
+
+Media links are ordinary GPX `<link>` elements. They are relative when the
+media is below the saved GPX directory and file URLs otherwise. Map pins mark
+linked media. Press `p` to switch between selected-photo and all-photo
+thumbnails; double-click a linked point or use **View Media** to open it. Press
+`s` to save a map or elevation profile as PNG.
 
 ## Planning and Editing Points
 
-- `Cmd-I` inserts a point after the selected waypoint rows.
+- `Cmd-I` inserts a point after the selected waypoint rows, or opens coordinate
+  entry for an empty track.
 - `Shift-Cmd-I` inserts a point before the selected waypoint rows.
 - Interior points are inserted halfway between their neighbors. At a track end,
   the first or last two points are extrapolated.
@@ -181,8 +198,14 @@ Important behavior:
 - If multiple rows are selected, sorting reorders only the selected rows.
 - Drag selected rows to reorder tracks manually.
 - Backspace/Delete deletes selected tracks after confirmation.
-- Double-click a track row to open the waypoint inspector and raise the track
-  plot plus the associated elevation profile.
+- Double-click a track row to open its waypoint table. In the map-first
+  Adventure Map, double-click a track to open this Track Table first; its
+  context menu can open either table directly.
+- **Save Selected Tracks As…** in the Track menu or row context menu writes the
+  selected tracks, in current table order, to a separate GPX file. Exported
+  copies are numbered from 1 while the source Adventure and its track numbers
+  remain unchanged. Media links are rewritten relative to the new file when
+  possible.
 
 The processing summary above the table always shows the active XY smoothing,
 spacing, elevation smoothing, error, and DOP limits. At the right end of the
@@ -281,10 +304,12 @@ Press Plot Overview to open an OpenStreetMap overview.
 Behavior:
 
 - Shows all visible tracks.
-- If tracks are selected, the overview zooms to them and highlights them.
+- Selected tracks are dark blue, unselected tracks are gray, and marked
+  waypoint ranges remain red.
 - Selecting tracks in the table updates the highlight.
 - Click a track on the map to select it in the table.
-- Double-click a point to open that track and waypoint in the inspector.
+- In the Adventure Map, double-click a track to open the Track Table, then
+  double-click its row to open the waypoint table.
 
 Common keys:
 
@@ -296,7 +321,8 @@ Common keys:
 - `c`: center on cursor.
 - `z`: zoom to current selection.
 - Shift-`Z`: reset to full map extent.
-- `p`: save current plot as PNG.
+- `p`: toggle linked-photo thumbnail display on a track map.
+- `s`: save the current map or profile as PNG.
 - `u`: clear plot selection.
 - `e`: open or focus elevation profile.
 - Cmd-Z / Shift-Cmd-Z: undo or redo the last track edit.

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,6 +70,38 @@ class ProjectParameterPropagationTests(unittest.TestCase):
             requests.get("https://example.invalid/tile")
         self.assertEqual(calls[0]["timeout"], 7.5)
         self.assertEqual(calls[0]["headers"]["user-agent"], MYCAMINO_USER_AGENT)
+        self.assertIs(requests.get, original_get)
+
+    def test_zero_interval_allows_two_interactive_requests_concurrently(self):
+        barrier = threading.Barrier(2)
+        active = 0
+        maximum_active = 0
+        counter_lock = threading.Lock()
+
+        def original_get(*_args, **_kwargs):
+            nonlocal active, maximum_active
+            with counter_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                barrier.wait(timeout=1.0)
+                return SimpleNamespace(status_code=200, headers={"Content-Type": "image/png"})
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        requests = SimpleNamespace(get=original_get)
+        contextily = SimpleNamespace(tile=SimpleNamespace(requests=requests))
+
+        def fetch(tile_number):
+            with contextily_request_timeout(contextily, 1, "osm", 0):
+                return requests.get(f"https://tile.openstreetmap.org/2/{tile_number}/0.png")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(fetch, range(2)))
+
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(maximum_active, 2)
         self.assertIs(requests.get, original_get)
 
     def test_public_osm_cache_is_retained_for_at_least_seven_days(self):

@@ -1,5 +1,7 @@
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
+import tempfile
 import unittest
 
 from gpx_point_editing import (
@@ -7,10 +9,16 @@ from gpx_point_editing import (
     deserialize_points,
     insert_point_for_rows,
     insert_points_after_row,
+    insert_points_at_route_matches,
+    insert_points_chronologically,
     join_segments_at_row,
     joinable_segment_boundary,
     move_rows,
     point_locations,
+    point_from_values,
+    media_paths_for_point,
+    monotonic_route_matches,
+    rewrite_local_media_links,
     serialized_points,
     translate_points_web_mercator,
 )
@@ -49,6 +57,64 @@ def coordinates(track):
 
 
 class PointEditingTests(unittest.TestCase):
+    def test_insert_first_point_into_empty_track(self):
+        track = track_with_points([])
+        point = point_from_values(track, 50.0, 7.0, name="Start")
+        self.assertEqual(insert_points_after_row(track, -1, [point]), [0])
+        self.assertEqual(coordinates(track), [(50.0, 7.0)])
+
+    def test_chronological_insert_preserves_existing_points(self):
+        track = track_with_points(
+            [
+                (50.0, 7.0, None, "2026-01-01T10:00:00Z"),
+                (50.0, 7.2, None, "2026-01-01T12:00:00Z"),
+            ]
+        )
+        point = point_from_values(
+            track,
+            50.0,
+            7.1,
+            timestamp=datetime.fromisoformat("2026-01-01T11:00:00+00:00"),
+        )
+        self.assertEqual(insert_points_chronologically(track, [point]), [1])
+        self.assertEqual([value[1] for value in coordinates(track)], [7.0, 7.1, 7.2])
+
+    def test_media_points_match_an_untimed_route_monotonically(self):
+        track = track_with_points(
+            [
+                (50.0, 7.0, None, None),
+                (50.0, 7.1, None, None),
+                (50.0, 7.2, None, None),
+            ]
+        )
+        media_points = [
+            point_from_values(track, 50.0, 7.19, name="late"),
+            point_from_values(track, 50.0, 7.01, name="later but behind"),
+        ]
+        matches = monotonic_route_matches(track, media_points)
+        self.assertEqual([row for row, _distance in matches], [2, 2])
+        rows = insert_points_at_route_matches(track, media_points, matches)
+        self.assertEqual(rows, [3, 4])
+
+    def test_media_links_become_relative_below_save_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "media" / "photo.jpg"
+            media.parent.mkdir()
+            media.write_bytes(b"image")
+            track = track_with_points([])
+            point = point_from_values(track, 50.0, 7.0, media_path=media)
+            insert_points_after_row(track, -1, [point])
+            rewrite_local_media_links(
+                track,
+                source_directory=None,
+                output_directory=root,
+            )
+            inserted_point = point_locations(track)[0][0]
+            link = next(child for child in inserted_point if child.tag.endswith("link"))
+            self.assertEqual(link.attrib["href"], "media/photo.jpg")
+            self.assertEqual(media_paths_for_point(inserted_point, root), [media.resolve()])
+
     def test_cut_segment_breaks_connection_without_splitting_track(self):
         track = track_with_points(
             [

@@ -2,18 +2,31 @@
 
 ## Media-Derived Tracks and Planning
 
-`media_track_builder.py` is the shared non-GUI pipeline for creating estimated
-GPX tracks from media. It validates extension-aware sidecars, selectively calls
-the existing metadata extractor, groups media by control-file stage or local
-date, applies endpoint-preserving point spacing, and writes canonical GPX 1.1.
-Generated tracks carry a `mycamino:trackOrigin` extension with
-`kind="media-derived"` and `estimated="true"`. `gpx_tracks_table.py` reports
-their `source_structure` as `media`.
+`media_metadata_service.py` is the shared sidecar-backed preparation boundary
+used by GPX Editor and `media_track_builder.py`. It validates extension-aware
+sidecars, reuses current records, batches embedded metadata extraction for only
+missing/invalid/changed files, and deliberately performs no place, weather,
+track-inference, map, or control-file work. `gpx_coordinate_input.py` parses the
+clipboard and link formats accepted by the editor.
+
+`media_track_builder.py` retains its non-GUI grouping and GPX-writing APIs for
+automation and compatibility. Interactive creation inserts every selected
+medium directly into the chosen editable track instead of creating a temporary
+reduced GPX file.
+
+Track-table and Track Map file drops share the same Cocoa review and
+`media_metadata_service.py` preparation path. Drops may contain media, folders,
+or a `.lst` control file; control rows are resolved relative to that file and
+deduplicated before review. The open Track Map's track is made the destination
+before the deferred review starts, avoiding modal work inside AppKit's drag
+session.
 
 `gpx_point_editing.py` contains segment-aware XML operations used by the point
 table and Track Map: Web Mercator interpolation/extrapolation, insertion,
-clipboard serialization, deletion, and same-segment movement. UI code should
-use these helpers rather than duplicating GPX child-order or boundary logic.
+chronological media merging, standard GPX media links, clipboard serialization,
+deletion, and same-segment movement. `cocoa_media_viewer.py` provides the small
+reusable linked-media viewer. UI code should use these helpers rather than
+duplicating GPX child-order or boundary logic.
 
 `gpx_routing.py` defines the deliberately small future routing-provider
 boundary. A future Valhalla, OSRM, or openrouteservice implementation returns
@@ -49,6 +62,24 @@ with currently implemented behavior.
 The active source files are:
 
 - `GPSTrackShowGUI.py`: main Cocoa GUI for creating and managing an adventure.
+- `cocoa_adventure_map.py`: default map-first application controller. It wraps
+  the existing editable GPX controller and exposes asset drops, native macOS
+  project menus, one retained overview/focused-track canvas, transparent map
+  guidance, background media preparation, and the processing journal.
+  Startup deliberately finishes staged track plotting before indexing or drawing
+  media. After the media-marker redraw has reached AppKit, derived-track work,
+  metadata preparation, and the directory watcher start in the background.
+- `cocoa_native_menus.py`: shared myCamino process branding, native-menu helpers,
+  and the dynamic Window menu used by map-first, full-GUI, and standalone GPX
+  launches.
+- `adventure_map_workspace.py`: AppKit-independent clustering, temporary
+  control-model, rotating-journal, geometry simplification, and versioned
+  unsaved-recovery services.
+- `project_media_watcher.py`: recursive, generated-directory-aware media
+  inventory with macOS directory events, one-second file-settling, event
+  coalescing, and a 60-second reconciliation fallback. Both map-first and
+  direct Advanced Interface launches use it; a map-hosted Advanced Interface
+  leaves ownership with the map controller.
 - `GPSTrackShow.py`: standalone Cocoa slide-show player.
 - `GPXEditor.py`: native GPX track editor, usable standalone or embedded from
   the GUI.
@@ -77,7 +108,22 @@ The active source files are:
 
 All GUI code uses PyObjC/Cocoa/AppKit. Tkinter is intentionally not used.
 
-`GPSTrackShowGUI.py` is the main process. It imports and calls:
+Media discovery is deliberately separate from map freshness. A discovered
+batch receives a path-scoped identity and metadata pass, then either enters the
+existing control-file review or creates an initial control list from sidecars.
+It does not call map rendering. `control_media_inventory.py` remains the source
+of truth for included, excluded, pending, and genuinely new membership, while
+`ProjectMediaWatcher` only reports stable filesystem changes.
+
+`GPSTrackShowGUI.py` remains the executable entry point. By default it installs
+`AdventureMapAppDelegate`; `--full-gui` installs the traditional
+`GPSTrackShowGUIAppDelegate`. The map shell retains one `GPXEditorController`,
+so revealing Track Editor does not parse the GPX again. The shell uses small
+delegate hooks on `PlotView` for workspace drops, selection, overlay drawing,
+and keyboard commands; standalone GPX Editor behavior is unchanged when those
+hooks are absent.
+
+The full GUI imports and calls:
 
 - `GetGeoLocations.run_with_options(...)`
 - `gpx_tracks_table.prepare_with_options(...)`
@@ -1202,12 +1248,16 @@ Core classes:
 - `GPXEditorController`: main editor controller.
 - `EditorTableDataSource` and `EditorTableView`: main track table.
 - `PlotView`: overview/track map display with cursor, zoom, selection, delete,
-  cut, and anchor handling.
+  cut, anchor handling, and media/control-file drops.
 - `ElevationProfileView`: elevation profile window linked to a plot view. It
   shares selection and edit commands with `PlotView`, supports independent
   distance and visible-elevation scaling, and retains its own temporary help
   window and close timer.
 - `TrackInspectorController`: waypoint-level editor for one track.
+
+An input-free launch creates one empty track and immediately opens its world
+viewport without an elevation-profile companion. The ordinary `New Track`
+command remains nonintrusive and does not force another map window open.
 
 `EditorTableView.menuForEvent_()` applies standard macOS context-click
 selection and asks the controller for a freshly validated Track menu. Shared
@@ -1220,6 +1270,9 @@ attribute is excluded from semantic fingerprints. After an embedded save,
 `track_asset_relink.py` matches numbered map pairs by fingerprint, stages
 filename cycles, patches JSON/overview metadata and control-file references,
 and performs no raster rendering or tile access.
+`Save Selected Tracks As…` deep-copies only the selected records, assigns the
+copies order numbers from one, rewrites local media links for the destination,
+and installs the new GPX atomically without touching source records.
 
 The editor writes:
 
@@ -1392,3 +1445,33 @@ Relevant specs:
 - `GPSTrackShow.spec`: bundled slide-show player executable.
 - `myCamino GPX Editor.spec`: standalone GPX editor app.
 - `myCamino GPS Track Show.spec`: main GUI app with bundled player resources.
+## Application news channel
+
+`application_news.py` validates and retrieves the public version-1 feed at
+`https://mycamino.heinofalcke.de/api/app-news/v1/`. It sends the application
+version in a generic User-Agent but no persistent client identifier or Adventure
+data. `cocoa_application_news.py` owns the process-wide asynchronous checker,
+local `NSUserDefaults` read state, first-arrival alert, Dock badge, retained News
+window, and native-menu entries. Automatic checks run at most once per 24 hours
+and can be disabled without disabling manual checks.
+
+The Django `ApplicationNews` model supplies the feed. Its stable slug is the
+client-visible identity; unpublished and future-dated rows are excluded. The
+endpoint is deliberately read-only and publicly cacheable for 15 minutes.
+
+Operators create and publish messages through the guarded Django management
+command rather than editing the database directly:
+
+```bash
+python website/manage.py app_news list --all
+python website/manage.py app_news put release-1-0 --title "myCamino 1.0" \
+  --summary "The new release is available."
+python website/manage.py app_news publish release-1-0
+```
+
+The FediOps **myCamino Website > Application News** page invokes this same
+command on the deployed website. Its companion
+`scripts/ops/mycamino_app_news.sh` wrapper provides list, draft, publish,
+withdraw, and confirmation-protected delete operations from an administrator's
+terminal. This separation keeps validation in the website application and
+prevents the control panel from depending on the database schema directly.

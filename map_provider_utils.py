@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import time
-from threading import RLock
+from threading import RLock, local
 
 from application_metadata import APP_VERSION
 
@@ -16,6 +16,10 @@ from application_metadata import APP_VERSION
 _REQUEST_PATCH_LOCK = RLock()
 _REQUEST_CLOCK_LOCK = RLock()
 _LAST_REQUEST_BY_HOST: dict[str, float] = {}
+_REQUEST_CONTEXT = local()
+_PATCHED_REQUEST_MODULE = None
+_ORIGINAL_REQUEST_GET = None
+_REQUEST_PATCH_USERS = 0
 
 MYCAMINO_CONTACT_URL = "https://mycamino.heinofalcke.de/contact/"
 MYCAMINO_REPOSITORY_URL = "https://github.com/hfalcke/myCamino-GPS-SlideShow"
@@ -233,6 +237,8 @@ def contextily_request_timeout(
     cache_only: bool = False,
 ):
     """Apply identification, pacing, timeout, and terminal provider errors."""
+    global _PATCHED_REQUEST_MODULE, _ORIGINAL_REQUEST_GET, _REQUEST_PATCH_USERS
+
     tile_module = getattr(contextily_module, "tile", None)
     request_module = getattr(tile_module, "requests", None) if tile_module is not None else None
     original_get = getattr(request_module, "get", None) if request_module is not None else None
@@ -245,29 +251,38 @@ def contextily_request_timeout(
         0.25 if normalized_provider == "osm" else 0.0
     ) if minimum_interval_seconds is None else max(0.0, float(minimum_interval_seconds))
 
-    def get_with_timeout(*args, **kwargs):
-        if cache_only:
+    def policy_get(*args, **kwargs):
+        configuration = getattr(_REQUEST_CONTEXT, "configuration", None) or {}
+        active_cache_only = bool(configuration.get("cache_only", False))
+        active_timeout = float(configuration.get("timeout", timeout_seconds))
+        active_provider = str(configuration.get("provider", normalized_provider))
+        active_interval = float(configuration.get("interval", interval))
+        if active_cache_only:
             url = str(args[0] if args else kwargs.get("url", ""))
             raise TileCacheMissError(
                 "Cached OSM tiles are incomplete. No network request was sent"
                 + (f" for {url}." if url else ".")
             )
-        kwargs.setdefault("timeout", float(timeout_seconds))
+        kwargs.setdefault("timeout", active_timeout)
         headers = dict(kwargs.get("headers") or {})
         headers["user-agent"] = MYCAMINO_USER_AGENT
         kwargs["headers"] = headers
         url = str(args[0] if args else kwargs.get("url", ""))
-        host = url.split("/", 3)[2].lower() if "://" in url else normalized_provider
-        with _REQUEST_CLOCK_LOCK:
-            elapsed = time.monotonic() - _LAST_REQUEST_BY_HOST.get(host, 0.0)
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
-            response = original_get(*args, **kwargs)
-            _LAST_REQUEST_BY_HOST[host] = time.monotonic()
+        host = url.split("/", 3)[2].lower() if "://" in url else active_provider
+        if active_interval > 0.0:
+            with _REQUEST_CLOCK_LOCK:
+                elapsed = time.monotonic() - _LAST_REQUEST_BY_HOST.get(host, 0.0)
+                if elapsed < active_interval:
+                    time.sleep(active_interval - elapsed)
+                _LAST_REQUEST_BY_HOST[host] = time.monotonic()
+        response = _ORIGINAL_REQUEST_GET(*args, **kwargs)
+        if active_interval <= 0.0:
+            with _REQUEST_CLOCK_LOCK:
+                _LAST_REQUEST_BY_HOST[host] = time.monotonic()
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 403:
             raise TileProviderAccessError(
-                f"{provider_display_name(normalized_provider)} blocked tile access (HTTP 403). "
+                f"{provider_display_name(active_provider)} blocked tile access (HTTP 403). "
                 "Further downloads were stopped. Check the provider policy and credentials."
             )
         if status == 429:
@@ -278,28 +293,53 @@ def contextily_request_timeout(
                 retry_seconds = 0.0
             if retry_seconds > 0.0:
                 time.sleep(retry_seconds)
-                response = original_get(*args, **kwargs)
+                response = _ORIGINAL_REQUEST_GET(*args, **kwargs)
                 status = int(getattr(response, "status_code", 0) or 0)
             if status == 429:
                 raise TileProviderAccessError(
-                    f"{provider_display_name(normalized_provider)} rate-limited tile access (HTTP 429"
+                    f"{provider_display_name(active_provider)} rate-limited tile access (HTTP 429"
                     f"{', retry after ' + retry_after + ' seconds' if retry_after else ''})."
                 )
         if status == 403:
             raise TileProviderAccessError(
-                f"{provider_display_name(normalized_provider)} blocked tile access (HTTP 403). "
+                f"{provider_display_name(active_provider)} blocked tile access (HTTP 403). "
                 "Further downloads were stopped. Check the provider policy and credentials."
             )
         content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
         if status < 400 and "text/html" in content_type:
             raise TileProviderAccessError(
-                f"{provider_display_name(normalized_provider)} returned an HTML page instead of a map tile."
+                f"{provider_display_name(active_provider)} returned an HTML page instead of a map tile."
             )
         return response
 
+    previous_configuration = getattr(_REQUEST_CONTEXT, "configuration", None)
     with _REQUEST_PATCH_LOCK:
-        request_module.get = get_with_timeout
-        try:
-            yield
-        finally:
-            request_module.get = original_get
+        if _REQUEST_PATCH_USERS == 0:
+            _PATCHED_REQUEST_MODULE = request_module
+            _ORIGINAL_REQUEST_GET = original_get
+            request_module.get = policy_get
+        elif request_module is not _PATCHED_REQUEST_MODULE:
+            raise RuntimeError("Concurrent tile requests used different request modules.")
+        _REQUEST_PATCH_USERS += 1
+    _REQUEST_CONTEXT.configuration = {
+        "cache_only": cache_only,
+        "timeout": float(timeout_seconds),
+        "provider": normalized_provider,
+        "interval": interval,
+    }
+    try:
+        yield
+    finally:
+        if previous_configuration is None:
+            try:
+                del _REQUEST_CONTEXT.configuration
+            except AttributeError:
+                pass
+        else:
+            _REQUEST_CONTEXT.configuration = previous_configuration
+        with _REQUEST_PATCH_LOCK:
+            _REQUEST_PATCH_USERS -= 1
+            if _REQUEST_PATCH_USERS == 0:
+                _PATCHED_REQUEST_MODULE.get = _ORIGINAL_REQUEST_GET
+                _PATCHED_REQUEST_MODULE = None
+                _ORIGINAL_REQUEST_GET = None

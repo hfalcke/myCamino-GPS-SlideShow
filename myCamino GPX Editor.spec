@@ -78,7 +78,12 @@ app = BUNDLE(
     coll,
     name='myCamino GPX Editor.app',
     icon='build/MyCaminoLogo-ohneText.icns',
-    bundle_identifier=None,
+    bundle_identifier='org.mycamino.gpx-editor',
     version=APP_BUNDLE_VERSION,
-    info_plist={'CFBundleVersion': bundle_build_number()},
+    info_plist={
+        'CFBundleVersion': bundle_build_number(),
+        'CFBundleDisplayName': 'myCamino GPX Editor',
+        'CFBundleName': 'myCamino GPX Editor',
+        'NSHighResolutionCapable': True,
+    },
 )

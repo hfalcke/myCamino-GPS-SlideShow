@@ -414,6 +414,23 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         payload = json.loads(media_sidecar_path(media).read_text(encoding="utf-8"))
         self.assertEqual(payload["source_file_identity"]["algorithm"], "sha256")
 
+    def test_identity_indexing_can_be_limited_to_a_discovered_batch(self):
+        first = self._media("first.jpeg")
+        second = self._media("second.jpeg")
+        self._sidecar(first, datetime(2024, 7, 15, 12, 0))
+        self._sidecar(second, datetime(2024, 7, 15, 12, 1))
+
+        report = geo.index_media_file_identities(
+            self.project,
+            media_paths=[second],
+        )
+
+        self.assertEqual(report.indexed, 1)
+        first_payload = json.loads(media_sidecar_path(first).read_text(encoding="utf-8"))
+        second_payload = json.loads(media_sidecar_path(second).read_text(encoding="utf-8"))
+        self.assertNotIn("source_file_identity", first_payload)
+        self.assertIn("source_file_identity", second_payload)
+
     def test_identity_indexing_explains_missing_sidecar_is_prepared_next(self):
         media = self._media("new.jpeg")
         details = []
@@ -495,6 +512,40 @@ class SelectiveMediaUpdateTests(unittest.TestCase):
         self.assertEqual(actions[changed.name], "refresh")
         self.assertNotIn(current.name, actions)
         self.assertEqual(actions[unknown.name], "refresh")
+
+    def test_imported_only_discovery_accepts_nested_project_media(self):
+        nested = self.project / "camera" / "day-one" / "nested.jpeg"
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b"nested")
+
+        candidates = geo.discover_media_update_candidates(
+            self.project,
+            imported_paths=[nested],
+            only_imported=True,
+        )
+
+        self.assertEqual([item.media_path for item in candidates], [nested.resolve()])
+
+    def test_nested_media_keeps_sidecar_identity_and_uses_relative_control_name(self):
+        nested = self.project / "camera" / "day-one" / "nested.jpeg"
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b"nested")
+        self._sidecar(nested, datetime(2024, 7, 15, 12, 0))
+
+        plan = geo.analyze_media_updates(
+            self.project,
+            [nested],
+            actions={nested.name: "use_sidecar"},
+        )
+
+        record = plan.items[0].new_record
+        self.assertEqual(record.source_filename, nested.name)
+        self.assertEqual(record.control_filename, "camera/day-one/nested.jpeg")
+        self.assertTrue(
+            geo.sorted_media_output_line(record).startswith(
+                "camera/day-one/nested.jpeg |"
+            )
+        )
 
     def test_discovery_reports_current_sidecars_as_skipped(self):
         current = self._media("current.jpeg")

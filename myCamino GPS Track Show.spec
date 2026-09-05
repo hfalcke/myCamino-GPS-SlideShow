@@ -85,7 +85,12 @@ app = BUNDLE(
     coll,
     name='myCamino GPS Track Show.app',
     icon='build/MyCaminoLogo-ohneText.icns',
-    bundle_identifier=None,
+    bundle_identifier='org.mycamino',
     version=APP_BUNDLE_VERSION,
-    info_plist={'CFBundleVersion': bundle_build_number()},
+    info_plist={
+        'CFBundleVersion': bundle_build_number(),
+        'CFBundleDisplayName': 'myCamino',
+        'CFBundleName': 'myCamino',
+        'NSHighResolutionCapable': True,
+    },
 )

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from PIL import Image
 
@@ -117,6 +119,35 @@ class ControlPreviewCacheTests(unittest.TestCase):
         self.assertIn("_request_control_preview_neighborhood", source)
         module_source = Path(gui.__file__).read_text(encoding="utf-8")
         self.assertIn("reloadDataForRowIndexes_columnIndexes_", module_source)
+
+    def test_map_media_selection_reveals_anchor_and_selects_all_matches(self):
+        window = Mock()
+        controller = SimpleNamespace(
+            control_table_window=window,
+            control_table_path=Path("control.lst"),
+            control_table_rows=[
+                {"type": "IMG", "name": "one.jpg"},
+                {"type": "DAT", "name": "2026-01-01"},
+                {"type": "VID", "name": "two.mov"},
+            ],
+            control_table_filter_key="media",
+            resolve_control_row_path=lambda row: Path(row["name"]),
+            _sync_control_table_filter_popup=Mock(),
+            _reload_control_table=Mock(),
+            _select_control_table_indexes=Mock(),
+            _scroll_control_table_model_row_to_visible=Mock(),
+            set_status=Mock(),
+        )
+        result = gui.GPXTrackerController.show_control_file_media_selection(
+            controller,
+            [Path("one.jpg"), Path("two.mov")],
+            Path("two.mov"),
+        )
+        self.assertTrue(result)
+        self.assertEqual(controller.control_table_filter_key, "all")
+        controller._select_control_table_indexes.assert_called_once_with([0, 2])
+        controller._scroll_control_table_model_row_to_visible.assert_called_once_with(2)
+        window.makeKeyAndOrderFront_.assert_called_once_with(None)
 
 
 if __name__ == "__main__":

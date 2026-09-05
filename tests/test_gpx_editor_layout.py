@@ -1,8 +1,10 @@
 import unittest
 import xml.etree.ElementTree as ET
+import tempfile
+from pathlib import Path
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from interactive_tile_viewport import visible_tiles, zoomed_extent
 
@@ -12,12 +14,14 @@ from GPXEditor import (
     TRACK_SORT_CRITERIA,
     TrackRecord,
     TrackInspectorController,
+    command_modifier_requests_media_selection,
     apply_untimed_prompt_response,
     compact_elevation_status,
     compact_xy_status,
     context_track_row_selection,
     duplicate_track_records,
     elevation_distance_range_for_map_extent,
+    elevation_rows_for_selected_tracks,
     elevation_profile_visible_range,
     format_inspector_elevation,
     format_inspector_timestamp,
@@ -29,11 +33,14 @@ from GPXEditor import (
     remember_untimed_track_identities,
     renumber_track_records,
     reordered_selected_items,
+    sampled_polyline_points,
     suppressed_untimed_track_identities,
     untimed_tracks_requiring_prompt,
     unique_track_copy_name,
     visible_track_count,
     visible_simplified_polyline_runs,
+    write_selected_tracks_gpx,
+    stored_track_order_number,
 )
 
 
@@ -53,6 +60,181 @@ class FakeDefaults:
 
 
 class InspectorPointSelectionTests(unittest.TestCase):
+    def test_selected_track_export_is_atomic_renumbered_and_preserves_segments(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            media = directory / "source" / "photo one.jpg"
+            media.parent.mkdir()
+            media.write_bytes(b"photo")
+            tracks = []
+            for number, name in ((7, "First"), (12, "Second")):
+                element = ET.Element(qname("trk"))
+                ET.SubElement(element, qname("name")).text = name
+                for offset in (0, 1):
+                    segment = ET.SubElement(element, qname("trkseg"))
+                    point = ET.SubElement(
+                        segment,
+                        qname("trkpt"),
+                        {"lat": str(50 + offset), "lon": str(7 + offset)},
+                    )
+                    link = ET.SubElement(point, qname("link"), {"href": str(media)})
+                    ET.SubElement(link, qname("text")).text = media.name
+                track = TrackRecord(number, element, str(directory / "source.gpx"))
+                track.set_order_number(number)
+                tracks.append(track)
+            destination = directory / "selected.gpx"
+
+            count = write_selected_tracks_gpx(
+                tracks,
+                destination,
+                project_name="Selection",
+            )
+
+            self.assertEqual(count, 2)
+            root = ET.parse(destination).getroot()
+            exported = root.findall("gpx:trk", {"gpx": "http://www.topografix.com/GPX/1/1"})
+            self.assertEqual([stored_track_order_number(track) for track in exported], [1, 2])
+            self.assertEqual([len(track.findall("gpx:trkseg", {"gpx": "http://www.topografix.com/GPX/1/1"})) for track in exported], [2, 2])
+            href = exported[0].find(".//gpx:link", {"gpx": "http://www.topografix.com/GPX/1/1"}).get("href")
+            self.assertFalse(Path(href).is_absolute())
+            self.assertEqual([track.nr for track in tracks], [7, 12])
+            self.assertEqual([track.stored_order_number for track in tracks], [7, 12])
+            self.assertEqual(
+                tracks[0].element.find(".//gpx:link", {"gpx": "http://www.topografix.com/GPX/1/1"}).get("href"),
+                str(media),
+            )
+
+    def test_media_rubber_band_requires_command_modifier(self):
+        self.assertFalse(command_modifier_requests_media_selection(0))
+        self.assertTrue(command_modifier_requests_media_selection(1 << 20))
+
+    def test_workspace_requires_track_selection_before_point_editing(self):
+        track = SimpleNamespace(nr=7)
+        selected = []
+        controller = SimpleNamespace(
+            select_track_in_table=Mock(side_effect=lambda nr: selected.append(nr)),
+            selected_tracks=Mock(side_effect=lambda: [track] if selected else []),
+        )
+        workspace = SimpleNamespace(workspaceTrackSelectedForEditing_=Mock())
+        target = ("point", track, 3, None)
+        plot = SimpleNamespace(
+            adventure_workspace_delegate=workspace,
+            mode="overview",
+            controller=controller,
+            cursor=(1, object(), object()),
+            workspace_track_selection_consumed=False,
+            waypoint_editing_enabled=lambda: bool(selected),
+            nearest_edit_target=Mock(side_effect=lambda _location: target if selected else None),
+            nearest_track_for_location=Mock(return_value=(4.0, track, 3)),
+        )
+
+        first_result = PlotView.edit_target_for_mouse_down(plot, object())
+
+        self.assertIsNone(first_result)
+        self.assertIsNone(plot.cursor)
+        self.assertTrue(plot.workspace_track_selection_consumed)
+        controller.select_track_in_table.assert_called_once_with(7)
+        workspace.workspaceTrackSelectedForEditing_.assert_called_once_with(track)
+
+        plot.workspace_track_selection_consumed = False
+        second_result = PlotView.edit_target_for_mouse_down(plot, object())
+        self.assertEqual(second_result, target)
+        controller.select_track_in_table.assert_called_once_with(7)
+
+    def test_long_press_timer_runs_in_common_tracking_modes(self):
+        timer = Mock()
+        run_loop = Mock()
+        plot = SimpleNamespace(long_press_timer=None)
+        with (
+            patch("GPXEditor.NSTimer") as timer_class,
+            patch("GPXEditor.NSRunLoop") as run_loop_class,
+        ):
+            timer_class.timerWithTimeInterval_target_selector_userInfo_repeats_.return_value = timer
+            run_loop_class.currentRunLoop.return_value = run_loop
+
+            PlotView.schedule_point_editing_long_press(plot)
+
+        run_loop.addTimer_forMode_.assert_called_once()
+        self.assertIs(plot.long_press_timer, timer)
+
+    def test_drag_ready_feedback_matches_active_cursor_point(self):
+        track = object()
+        plot = SimpleNamespace(
+            cursor=(4, object(), track),
+            dragged_point_track=track,
+            dragged_point_index=4,
+        )
+        self.assertTrue(PlotView.cursor_is_ready_for_drag(plot))
+
+        plot.dragged_point_index = 5
+        self.assertFalse(PlotView.cursor_is_ready_for_drag(plot))
+
+    def test_map_context_can_open_track_table_without_changing_viewport(self):
+        track = SimpleNamespace(nr=7)
+        controller = SimpleNamespace(select_track_in_table=Mock(), show=Mock())
+        workspace = SimpleNamespace(openTrackEditor_=Mock())
+        plot = PlotView.alloc().init()
+        plot.context_track_target = (track, 12)
+        plot.controller = controller
+        plot.adventure_workspace_delegate = workspace
+
+        PlotView.showContextTrackTable_(plot, None)
+
+        controller.select_track_in_table.assert_called_once_with(7)
+        workspace.openTrackEditor_.assert_called_once_with(None)
+        controller.show.assert_not_called()
+
+    def test_map_context_opens_profile_for_the_same_plot_view(self):
+        controller = SimpleNamespace(open_elevation_profile_for_plot_view=Mock())
+        plot = PlotView.alloc().init()
+        plot.controller = controller
+
+        PlotView.showElevationProfile_(plot, None)
+
+        controller.open_elevation_profile_for_plot_view.assert_called_once_with(plot)
+
+    def test_track_table_hides_instead_of_closing_map_first_workspace(self):
+        table_window = Mock()
+        map_window = Mock()
+        map_window.isVisible.return_value = True
+        controller = SimpleNamespace(
+            adventure_workspace_delegate=SimpleNamespace(window=map_window),
+            window=table_window,
+        )
+
+        hidden = GPXEditorController.hide_main_editor_for_workspace(controller)
+
+        self.assertTrue(hidden)
+        table_window.orderOut_.assert_called_once_with(None)
+
+    def test_selected_track_is_editable_in_adventure_overview(self):
+        controller = SimpleNamespace(selected_tracks=Mock(return_value=[object()]))
+        plot = SimpleNamespace(
+            mode="overview",
+            adventure_workspace_delegate=object(),
+            controller=controller,
+        )
+        self.assertTrue(PlotView.waypoint_editing_enabled(plot))
+
+    def test_unselected_adventure_overview_is_not_waypoint_editable(self):
+        controller = SimpleNamespace(selected_tracks=Mock(return_value=[]))
+        plot = SimpleNamespace(
+            mode="overview",
+            adventure_workspace_delegate=object(),
+            controller=controller,
+        )
+        self.assertFalse(PlotView.waypoint_editing_enabled(plot))
+
+    def test_adventure_overview_targets_the_single_selected_track(self):
+        selected_track = object()
+        controller = SimpleNamespace(selected_tracks=Mock(return_value=[selected_track]))
+        plot = SimpleNamespace(
+            mode="overview",
+            adventure_workspace_delegate=object(),
+            controller=controller,
+        )
+        self.assertIs(PlotView.current_track_for_title(plot), selected_track)
+
     def test_segment_break_rows_follow_segment_indexes(self):
         rows = [
             {"segment_index": 0},
@@ -83,7 +265,7 @@ class InspectorPointSelectionTests(unittest.TestCase):
             else:
                 parent.close_plot_windows_for_inspector.assert_not_called()
 
-    def test_track_table_double_click_plots_without_opening_inspector(self):
+    def test_track_table_double_click_opens_waypoint_table(self):
         track = SimpleNamespace(nr=7)
         controller = GPXEditorController.alloc().init()
         controller.track_table = SimpleNamespace(clickedRow=Mock(return_value=0), selectedRow=Mock(return_value=0))
@@ -91,15 +273,31 @@ class InspectorPointSelectionTests(unittest.TestCase):
         controller.selected_nrs = []
         controller.update_selection_field = Mock()
         controller.highlight_selected_rows = Mock()
-        controller.plotSelected_ = Mock()
-        controller.open_inspector_for_track = Mock()
+        controller.open_inspector_for_track = Mock(return_value=Mock())
         controller.set_status = Mock()
 
         controller.trackDoubleClicked_(None)
 
         self.assertEqual(controller.selected_nrs, [7])
-        controller.plotSelected_.assert_called_once_with(None)
-        controller.open_inspector_for_track.assert_not_called()
+        controller.open_inspector_for_track.assert_called_once_with(track)
+
+    def test_plot_selected_reuses_adventure_workspace_map(self):
+        track = SimpleNamespace(nr=7)
+        workspace = SimpleNamespace(plot_view=object(), focus_workspace_tracks=Mock())
+        controller = GPXEditorController.alloc().init()
+        controller.tracks = [track]
+        controller.selected_nrs = [7]
+        controller.adventure_workspace_delegate = workspace
+        controller.open_plot_window = Mock()
+
+        controller.plotSelected_(None)
+
+        workspace.focus_workspace_tracks.assert_called_once_with(
+            [track],
+            mode="track",
+            reset_viewport=True,
+        )
+        controller.open_plot_window.assert_not_called()
 
     def make_controller(self, rows, *, suppressed=False, marker=4):
         track = object()
@@ -580,6 +778,55 @@ class TrackBatchOrderTests(unittest.TestCase):
 
         self.assertEqual(controller.tracks[0].source_file, "source.gpx")
 
+    def test_dropped_distance_sort_sets_anchor_from_first_dropped_track(self):
+        first = self.make_track(4, "First", "first.gpx")
+        second = self.make_track(5, "Second", "second.gpx")
+        controller = SimpleNamespace(
+            tracks=[first, second],
+            anchor=(1.0, 2.0),  # The automatic table calculation may have set this.
+            selected_nrs=[],
+            update_selection_field=Mock(),
+            highlight_selected_rows=Mock(),
+            sort_by_column=Mock(),
+        )
+
+        GPXEditorController.apply_dropped_track_sort(
+            controller,
+            [first, second],
+            "distance",
+            anchor_was_set=False,
+        )
+
+        self.assertEqual(controller.anchor, (50.0, 7.0))
+        self.assertEqual(controller.selected_nrs, [4, 5])
+        controller.sort_by_column.assert_called_once_with(
+            "distance",
+            ascending=True,
+            source="dropped tracks",
+            push_undo_step=False,
+        )
+
+    def test_dropped_distance_sort_preserves_existing_anchor(self):
+        first = self.make_track(4, "First", "first.gpx")
+        second = self.make_track(5, "Second", "second.gpx")
+        controller = SimpleNamespace(
+            tracks=[first, second],
+            anchor=(48.0, 11.0),
+            selected_nrs=[],
+            update_selection_field=Mock(),
+            highlight_selected_rows=Mock(),
+            sort_by_column=Mock(),
+        )
+
+        GPXEditorController.apply_dropped_track_sort(
+            controller,
+            [first, second],
+            "distance",
+            anchor_was_set=True,
+        )
+
+        self.assertEqual(controller.anchor, (48.0, 11.0))
+
 
 class InspectorTableDocumentSizeTests(unittest.TestCase):
     def test_document_fills_larger_viewport(self):
@@ -595,6 +842,19 @@ class InspectorTableDocumentSizeTests(unittest.TestCase):
 
 
 class ElevationProfileVisibleRangeTests(unittest.TestCase):
+    def test_axis_rows_prefer_the_selected_track(self):
+        first = SimpleNamespace(nr=1)
+        second = SimpleNamespace(nr=2)
+        rows = [
+            {"track": first, "elevation": 120.0},
+            {"track": second, "elevation": 1800.0},
+        ]
+        self.assertEqual(
+            elevation_rows_for_selected_tracks(rows, [1]),
+            [rows[0]],
+        )
+        self.assertEqual(elevation_rows_for_selected_tracks(rows, []), rows)
+
     def test_uses_only_points_in_visible_distance_range(self):
         rows = [
             {"distance": 0.0, "elevation": 900.0},
@@ -683,6 +943,13 @@ class InitialLoadCallbackTests(unittest.TestCase):
 
 
 class PlotPolylinePreparationTests(unittest.TestCase):
+    def test_coarse_overview_sampling_preserves_endpoints_and_budget(self):
+        points = [(float(index), float(index % 7)) for index in range(1000)]
+        sampled = sampled_polyline_points(points, 80)
+        self.assertLessEqual(len(sampled), 80)
+        self.assertEqual(sampled[0], points[0])
+        self.assertEqual(sampled[-1], points[-1])
+
     def test_clips_to_visible_extent_and_removes_subpixel_points(self):
         points = [
             (-20.0, 50.0),

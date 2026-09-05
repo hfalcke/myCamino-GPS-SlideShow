@@ -11,6 +11,29 @@ The repository contains two applications:
 - **myCamino GPX Editor** inspects, corrects, joins, splits and exports GPX
   tracks.
 
+The main application now opens on the **Adventure Map**. Drop an Adventure,
+project folder, GPX file, media, or audio onto this map to begin. The detailed
+Adventure controls are available directly from the native **Adventure**,
+**Track**, **Media**, **Maps**, **Control File**, **Audio**, and **Slide Show**
+menus; the Advanced Interface remains available for detailed status and uncommon
+operations. Press `h` on the map for a
+concise guide to its controls. Track selection and focus remain in this one map
+window; `Cmd-0` returns to the complete Adventure overview.
+Media markers stay grouped while thumbnails would overlap and expand as the
+selected track gains enough screen space. Click a group to select it,
+Command-click to add groups, or Command-drag a selection rectangle from empty
+map space. Ordinary dragging pans the map. Right-click selected media to fit them to the view or create a track
+from their GPS positions. Double-click a thumbnail or group to open the media
+viewer. Previous and Next move through the complete Adventure media sequence.
+The active Adventure is monitored for newly copied photos and videos. Stable
+new files are prepared in the background and offered in the control-file
+review; if no control file exists yet, myCamino creates the initial list and
+opens its editor. Settings are available with `Cmd-,` even before an Adventure
+is created and become that Adventure's initial settings when it is saved.
+Contextual Settings entries in the workflow menus open this same Settings window
+at the relevant section. The **Window** menu lists and restores all open myCamino
+windows.
+
 ## Main functions
 
 - Import GPX tracks, photographs and videos from a multi-day journey.

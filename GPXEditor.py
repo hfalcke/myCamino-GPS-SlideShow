@@ -96,6 +96,7 @@ from Foundation import (
     NSData,
     NSObject,
     NSRunLoop,
+    NSRunLoopCommonModes,
     NSString,
     NSTimer,
     NSURL,
@@ -120,6 +121,14 @@ from adventure_parameters import (
 )
 from cocoa_parameter_editor import CocoaParameterEditor
 from cocoa_map_provider_setup import configure_hosted_provider, run_map_provider_setup
+from cocoa_media_viewer import CocoaMediaViewer
+from cocoa_native_menus import (
+    WindowMenuCoordinator,
+    add_menu,
+    configure_mycamino_branding,
+    menu_item,
+)
+from cocoa_application_news import install_application_news
 from gpx_processing import (
     ProcessedTrack,
     ProcessingOptions,
@@ -142,14 +151,22 @@ from gpx_point_editing import (
     deserialize_points,
     duplicate_point,
     insert_point_for_rows,
+    insert_points_at_route_matches,
+    insert_points_chronologically,
     insert_points_after_row,
     join_segments_at_row,
     joinable_segment_boundary,
+    media_paths_for_point,
+    mark_track_media_derived,
+    monotonic_route_matches,
     move_rows as move_point_rows,
+    point_from_values,
+    rewrite_local_media_links,
     remove_rows,
     serialized_points,
     translate_points_web_mercator,
 )
+from gpx_coordinate_input import CoordinateParseError, ParsedCoordinate, parse_coordinate_text
 from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
 from map_provider_utils import (
     DEFAULT_TILE_CACHE_DIR,
@@ -165,12 +182,18 @@ from map_provider_utils import (
 )
 from map_provider_setup import load_map_provider_preference, save_map_provider_preference
 from map_overlay import MapOverlayScene, normalize_overlay_segments
+from control_preview_cache import ThumbnailMemoryCache, create_or_reuse_thumbnail
 from interactive_tile_viewport import (
     TileCoordinate,
+    aspect_preserving_rect,
+    clamp_extent_to_web_mercator,
     load_tile_png,
+    mouse_wheel_zoom_factor,
     shifted_extent as shifted_interactive_extent,
+    scroll_pan_deltas,
     tile_bounds_mercator,
-    tile_zoom_after_scale,
+    tile_coverage_complete,
+    tile_zoom_for_viewport,
     visible_tiles,
     zoomed_extent as zoomed_interactive_extent,
 )
@@ -245,12 +268,18 @@ STATUS_HEIGHT = 24.0
 ROW_HEIGHT = 24.0
 DRAG_TYPE = "myCaminoGPXEditorRows"
 POINT_DRAG_TYPE = "myCaminoGPXEditorPointRows"
+FILE_DRAG_TYPE = "NSFilenamesPboardType"
 POINT_PASTEBOARD_TYPE = "org.mycamino.gpx-track-points"
 UNTIMED_PROMPT_SUPPRESSION_KEY = "org.mycamino.gpx-editor.untimed-prompt-suppressed.v1"
 UNTIMED_PROMPT_SUPPRESSION_LIMIT = 2000
 APP_CACHE_DIR = Path.home() / "Library" / "Caches" / "myCamino-GPXEditor"
 TILE_CACHE_DIR = DEFAULT_TILE_CACHE_DIR
 MPL_CACHE_DIR = APP_CACHE_DIR / "matplotlib"
+
+
+def command_modifier_requests_media_selection(modifier_flags: int) -> bool:
+    """Keep ordinary map drags available for panning."""
+    return bool(int(modifier_flags) & NSEventModifierFlagCommand)
 
 
 def suppressed_untimed_track_identities(defaults) -> set[str]:
@@ -281,6 +310,8 @@ def untimed_tracks_requiring_prompt(tracks, suppressed: set[str]):
     """Return row, track, and stable identity for unsuppressed untimed tracks."""
     pending = []
     for row, track in enumerate(tracks):
+        if not track.points():
+            continue
         if timing_status_for_track(track.element) != "untimed":
             continue
         identity = raw_track_geometry_fingerprint(track.element)
@@ -422,6 +453,19 @@ def visible_simplified_polyline_runs(
     return [run for run in simplified_runs if len(run) >= 2]
 
 
+def sampled_polyline_points(points, maximum_points: int):
+    """Retain endpoints while bounding coarse overview drawing work."""
+    sequence = list(points)
+    limit = max(2, int(maximum_points))
+    if len(sequence) <= limit:
+        return sequence
+    indexes = {
+        round(index * (len(sequence) - 1) / (limit - 1))
+        for index in range(limit)
+    }
+    return [sequence[index] for index in sorted(indexes)]
+
+
 def nsstring(value: str) -> NSString:
     return NSString.stringWithString_(value)
 
@@ -472,6 +516,18 @@ def elevation_distance_range_for_map_extent(
     if not distances:
         return None
     return min(distances), max(distances)
+
+
+def elevation_rows_for_selected_tracks(rows: Iterable[dict], selected_track_numbers) -> list[dict]:
+    """Use selected-track heights when available, otherwise retain all rows."""
+    values = list(rows)
+    selected = {int(number) for number in selected_track_numbers}
+    matching = [
+        row
+        for row in values
+        if getattr(row.get("track"), "nr", None) in selected
+    ]
+    return matching or values
 
 
 def qname(local_name: str) -> str:
@@ -1037,9 +1093,37 @@ class EditorTableDataSource(NSObject):
         return True
 
     def tableView_validateDrop_proposedRow_proposedDropOperation_(self, _table_view, _info, row, _operation):
+        if _info.draggingPasteboard().propertyListForType_(FILE_DRAG_TYPE):
+            return 1 if 0 <= row < len(self.controller.tracks) else 0
         return 1 if 0 <= row <= len(self.controller.tracks) else 0
 
     def tableView_acceptDrop_row_dropOperation_(self, _table_view, info, row, _operation):
+        file_paths = info.draggingPasteboard().propertyListForType_(FILE_DRAG_TYPE)
+        if file_paths:
+            resolved_paths = [
+                Path(str(path)).expanduser().resolve(strict=False)
+                for path in file_paths
+            ]
+            gpx_paths = [
+                path for path in resolved_paths if path.suffix.casefold() == ".gpx"
+            ]
+            if gpx_paths:
+                self.controller.load_gpx_paths(
+                    gpx_paths,
+                    mark_dirty=True,
+                    offer_sort_after_drop=True,
+                )
+                return True
+            if not 0 <= row < len(self.controller.tracks):
+                return False
+            self.controller.selected_nrs = [self.controller.tracks[row].nr]
+            self.controller.highlight_selected_rows()
+            self.controller.update_selection_field()
+            self.controller.media_context["_pending_media_paths"] = [
+                str(path) for path in resolved_paths
+            ]
+            self.controller.addTracksFromPhotos_(None)
+            return True
         text = str(info.draggingPasteboard().stringForType_(DRAG_TYPE) or "")
         indexes = [int(part) for part in text.split(",") if part.isdigit()]
         if not indexes:
@@ -1143,6 +1227,75 @@ def visible_track_count(tracks: Iterable[TrackRecord]) -> int:
     return sum(1 for track in tracks if not track.hidden)
 
 
+def build_selected_tracks_root(
+    tracks: Iterable[TrackRecord],
+    output_path: Path,
+    *,
+    project_name: str = "",
+    anchor: tuple[float, float] | None = None,
+) -> ET.Element:
+    """Build an independent GPX document from selected tracks in display order."""
+    selected = list(tracks)
+    root = ET.Element(qname("gpx"), {"version": "1.1", "creator": "myCamino GPX Editor"})
+    if project_name:
+        metadata = ET.SubElement(root, qname("metadata"))
+        ET.SubElement(metadata, qname("name")).text = project_name
+    if anchor is not None:
+        extensions = ET.SubElement(root, qname("extensions"))
+        anchor_node = ET.SubElement(extensions, "mycamino_anchor")
+        anchor_node.set("lat", f"{anchor[0]:.8f}")
+        anchor_node.set("lon", f"{anchor[1]:.8f}")
+    for number, track in enumerate(selected, start=1):
+        output_track = copy.deepcopy(track.element)
+        get_or_create_mycamino_track_extension(output_track).set(
+            MYCAMINO_ORDER_NUMBER_ATTR, str(number)
+        )
+        rewrite_local_media_links(
+            output_track,
+            source_directory=Path(track.source_file).parent if track.source_file else None,
+            output_directory=Path(output_path).parent,
+        )
+        for child in list(output_track):
+            if child.tag == qname("time"):
+                output_track.remove(child)
+        root.append(output_track)
+    return root
+
+
+def write_selected_tracks_gpx(
+    tracks: Iterable[TrackRecord],
+    output_path: Path,
+    *,
+    project_name: str = "",
+    anchor: tuple[float, float] | None = None,
+) -> int:
+    """Atomically export selected tracks without mutating their source records."""
+    selected = list(tracks)
+    if not selected:
+        raise ValueError("No tracks selected")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    root = build_selected_tracks_root(
+        selected,
+        output_path,
+        project_name=project_name,
+        anchor=anchor,
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            ET.ElementTree(root).write(handle, encoding="utf-8", xml_declaration=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return len(selected)
+
+
 TRACK_SORT_CRITERIA = (
     ("date", "Date & Time"),
     ("nr", "Track Number"),
@@ -1181,6 +1334,15 @@ class EditorTableView(NSTableView):
 
     def keyDown_(self, event):
         key = str(event.charactersIgnoringModifiers() or event.characters() or "")
+        if (
+            key.casefold() == "i"
+            and event.modifierFlags() & NSEventModifierFlagCommand
+            and getattr(self, "controller", None) is not None
+        ):
+            selected = self.controller.selected_tracks()
+            if len(selected) == 1 and not selected[0].points():
+                self.controller.addPointsFromClipboard_(None)
+                return
         if key in {"\x7f", "\uf728"} and getattr(self, "controller", None) is not None:
             self.controller.delete_selected_tracks()
             return
@@ -1202,12 +1364,31 @@ class PlotView(NSView):
         self.show_info = True
         self.info_overlay_dismissed = False
         self.info_overlay_close_rect = None
+        self.info_overlay_rect = None
+        self.info_overlay_origin = None
+        self.info_overlay_dragging = False
+        self.info_overlay_drag_offset = None
         self.context_overlay_coordinate = None
         self.pointer_coordinate = None
         self.pointer_elevation = None
         self.show_help = False
         self.show_track_numbers = False
         self.show_endpoint_markers = True
+        self.show_all_photo_thumbnails = False
+        self.hovered_media_point = None
+        self.active_media_path = None
+        self.photo_thumbnail_hit_targets = []
+        self.clicked_media_target = None
+        self.clicked_workspace_media_target = None
+        self.workspace_media_selection_active = False
+        self.workspace_track_selection_consumed = False
+        self.photo_thumbnail_cache = ThumbnailMemoryCache()
+        self.photo_thumbnail_futures = {}
+        self.photo_thumbnail_generation = 0
+        self.photo_thumbnail_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="mycamino-gpx-photo-preview",
+        )
         self.transient_help_until = time.monotonic() + 5.0
         self.transient_help_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             5.1,
@@ -1240,10 +1421,13 @@ class PlotView(NSView):
         self.last_gesture_location = None
         self.interactive_tiles_active = False
         self.interactive_tiles = {}
+        self.interactive_fallback_tiles = {}
+        self.interactive_tile_target_keys = set()
         self.interactive_tile_generation = 0
         self.interactive_tile_futures = {}
         self.interactive_tile_timer = None
         self.pinch_finish_timer = None
+        self.wheel_finish_timer = None
         self.pinch_start_tile_zoom = None
         self.pinch_accumulated_scale = 1.0
         self.interactive_tile_executor = concurrent.futures.ThreadPoolExecutor(
@@ -1252,9 +1436,14 @@ class PlotView(NSView):
         )
         self.interactive_provider_failed_generation = None
         self.context_target = None
+        self.context_track_target = None
         self.context_location = None
+        self.adventure_workspace_delegate = None
+        self.reparenting_for_adventure_workspace = False
         self.initial_plot_info = self.clone_plot_info(self.plot_info)
         self.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        if self.mode == "track":
+            self.registerForDraggedTypes_([FILE_DRAG_TYPE])
         if self.plot_info.get("image") is None and (self.plot_info.get("metadata") or {}).get("extent_mercator"):
             self.interactive_tiles_active = True
             self.schedule_interactive_tiles()
@@ -1274,7 +1463,15 @@ class PlotView(NSView):
             for track in tracks
         ]
         if not any(processed.points for _track, processed in processed_tracks):
-            self.draw_text("No track points available.", 20, bounds.size.height - 40, 16)
+            workspace = self.adventure_workspace_delegate
+            if workspace is None:
+                self.draw_text("No track points available.", 20, bounds.size.height - 40, 16)
+            if self.interactive_tiles_active:
+                self.draw_interactive_attribution(bounds)
+            if workspace is not None and hasattr(workspace, "drawWorkspaceOverlay_inView_bounds_"):
+                workspace.drawWorkspaceOverlay_inView_bounds_(self, self, bounds)
+            if self.show_help:
+                self.draw_help(bounds)
             return
         transformer = self._metadata_transformer([], bounds)
         if transformer is None:
@@ -1287,7 +1484,21 @@ class PlotView(NSView):
         for _track, processed in processed_tracks:
             for segment in processed.segments:
                 if self.plot_info.get("image") is None or self.interactive_tiles_active:
-                    self.draw_track(segment.points, transformer, NSColor.systemBlueColor(), 3.5)
+                    color = NSColor.systemBlueColor()
+                    workspace = self.adventure_workspace_delegate
+                    if (
+                        workspace is not None
+                        and self.controller.selected_nrs
+                        and _track.nr not in self.controller.selected_nrs
+                    ):
+                        color = NSColor.disabledControlTextColor()
+                    draw_points = segment.points
+                    if workspace is not None and self.mode == "overview":
+                        # The selected track is redrawn precisely below. Keep the
+                        # all-track overview responsive even for very large GPX files.
+                        per_track_limit = max(48, min(320, 16000 // max(len(tracks), 1)))
+                        draw_points = sampled_polyline_points(draw_points, per_track_limit)
+                    self.draw_track(draw_points, transformer, color, 3.5)
                 self.draw_segment_end_caps(segment.points, transformer)
         if self.mode == "overview" and self.show_endpoint_markers:
             self.draw_overview_track_endpoint_dots(transformer)
@@ -1296,19 +1507,26 @@ class PlotView(NSView):
         if self.mode == "overview":
             self.draw_overview_endpoint_markers(transformer)
         if self.mode == "track" and tracks:
-            self.draw_track_start_end_markers(tracks[0], transformer)
+            current_track = self.current_track_for_title() or tracks[0]
+            self.draw_track_start_end_markers(current_track, transformer)
+            self.draw_media_markers(current_track, transformer, bounds)
         if self.mode == "overview" and self.show_track_numbers:
             self.draw_track_number_labels(transformer)
         if self.cursor is not None:
             point = self.cursor[1]
             x, y = transformer(point)
             self.draw_cursor_arrow(transformer, bounds)
+            drag_ready = self.cursor_is_ready_for_drag()
+            if drag_ready:
+                NSColor.systemYellowColor().setFill()
+                halo = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(x - 12, y - 12, 24, 24))
+                halo.fill()
             selected = any(
                 start <= self.cursor[0] <= end
                 for start, end in self.selected_ranges_for_track(self.cursor[2])
             )
-            (NSColor.systemRedColor() if selected else NSColor.whiteColor()).setFill()
-            (NSColor.systemRedColor() if selected else NSColor.systemBlueColor()).setStroke()
+            (NSColor.systemRedColor() if selected or drag_ready else NSColor.whiteColor()).setFill()
+            (NSColor.whiteColor() if drag_ready else NSColor.systemRedColor() if selected else NSColor.systemBlueColor()).setStroke()
             dot = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(x - 7, y - 7, 14, 14))
             dot.setLineWidth_(2.0)
             dot.fill()
@@ -1321,13 +1539,21 @@ class PlotView(NSView):
             self.draw_interactive_attribution(bounds)
         if self.show_help:
             self.draw_help(bounds)
-        elif self.transient_help_until and time.monotonic() < self.transient_help_until:
+        elif workspace is None and self.transient_help_until and time.monotonic() < self.transient_help_until:
             self.draw_overlay_panel(["Press h for help on keys"], bounds, width=260.0, centered=True)
         elif self.transient_help_until:
             self.transient_help_until = None
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "drawWorkspaceOverlay_inView_bounds_"):
+            workspace.drawWorkspaceOverlay_inView_bounds_(self, self, bounds)
 
     def viewWillMoveToWindow_(self, window):
-        if window is None:
+        if window is None and not self.reparenting_for_adventure_workspace:
+            self.photo_thumbnail_generation += 1
+            for future in self.photo_thumbnail_futures.values():
+                future.cancel()
+            self.photo_thumbnail_futures.clear()
+            self.photo_thumbnail_executor.shutdown(wait=False, cancel_futures=True)
             self.cancel_interactive_tile_requests(shutdown=True)
         elif hasattr(window, "setAcceptsMouseMovedEvents_"):
             window.setAcceptsMouseMovedEvents_(True)
@@ -1336,11 +1562,65 @@ class PlotView(NSView):
     def mouseMoved_(self, event):
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
         self.update_pointer_location(location)
+        target = self.nearest_edit_target(location) if self.waypoint_editing_enabled() else None
+        hovered = None
+        if target is not None and target[0] == "point":
+            track, index = target[1], target[2]
+            if self.controller.media_paths_for_track_point(track, index):
+                hovered = (track.nr, index)
+        if hovered != self.hovered_media_point:
+            self.hovered_media_point = hovered
+            self.setNeedsDisplay_(True)
 
     def mouseExited_(self, _event):
         self.pointer_coordinate = None
         self.pointer_elevation = None
+        self.hovered_media_point = None
         self.update_window_title()
+
+    def draggingEntered_(self, sender):
+        if self.adventure_workspace_delegate is None and self.mode != "track":
+            return 0
+        paths = sender.draggingPasteboard().propertyListForType_(FILE_DRAG_TYPE)
+        return 1 if paths else 0
+
+    def prepareForDragOperation_(self, sender):
+        return bool(sender.draggingPasteboard().propertyListForType_(FILE_DRAG_TYPE))
+
+    def performDragOperation_(self, sender):
+        paths = sender.draggingPasteboard().propertyListForType_(FILE_DRAG_TYPE)
+        if self.adventure_workspace_delegate is not None:
+            self.adventure_workspace_delegate.performWorkspaceDrop_(list(paths or []))
+            return bool(paths)
+        if self.mode != "track":
+            return False
+        resolved_paths = [
+            Path(str(path)).expanduser().resolve(strict=False)
+            for path in paths or []
+        ]
+        gpx_paths = [path for path in resolved_paths if path.suffix.casefold() == ".gpx"]
+        if gpx_paths:
+            self.controller.load_gpx_paths(
+                gpx_paths,
+                mark_dirty=True,
+                offer_sort_after_drop=True,
+            )
+            remaining = [path for path in resolved_paths if path not in gpx_paths]
+            if remaining:
+                self.controller.performSelector_withObject_afterDelay_(
+                    "addDroppedMediaPaths:", [str(path) for path in remaining], 0.0
+                )
+            return True
+        track = self.current_track_for_title()
+        if not paths or track is None:
+            return False
+        self.controller.selected_nrs = [track.nr]
+        self.controller.update_selection_field()
+        self.controller.highlight_selected_rows()
+        self.controller.performSelector_withObject_afterDelay_(
+            "addDroppedMediaPaths:", [str(path) for path in paths], 0.0
+        )
+        return True
 
     def update_pointer_location(self, location):
         coordinate = self.coordinate_for_view_point(location)
@@ -1359,12 +1639,28 @@ class PlotView(NSView):
 
     def display_tracks(self) -> list[TrackRecord]:
         if self.mode == "overview":
+            tracks = self.controller.visible_tracks()
+            if (
+                self.adventure_workspace_delegate is not None
+                and self.controller.track_load_timer is not None
+            ):
+                return [track for track in tracks if track.processed is not None]
+            return tracks
+        if self.adventure_workspace_delegate is not None:
             return self.controller.visible_tracks()
         sequence = self.track_sequence()
         if not sequence:
             return []
         self.track_index = max(0, min(self.track_index, len(sequence) - 1))
         return [sequence[self.track_index]]
+
+    def waypoint_editing_enabled(self) -> bool:
+        if self.mode == "track":
+            return True
+        return bool(
+            self.adventure_workspace_delegate is not None
+            and len(self.controller.selected_tracks()) == 1
+        )
 
     def track_sequence(self) -> list[TrackRecord]:
         if self.mode != "track":
@@ -1395,6 +1691,10 @@ class PlotView(NSView):
 
     def current_track_for_title(self):
         if self.mode != "track":
+            if self.adventure_workspace_delegate is not None:
+                selected = self.controller.selected_tracks()
+                if len(selected) == 1:
+                    return selected[0]
             return None
         current_nr = self.plot_info.get("current_track_nr")
         if current_nr is not None:
@@ -1410,6 +1710,10 @@ class PlotView(NSView):
     def update_window_title(self):
         window = self.window()
         if window is None:
+            return
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "updateWorkspaceWindowTitle_"):
+            workspace.updateWorkspaceWindowTitle_(window)
             return
         cursor_text = self.map_pointer_title_text()
         if self.mode == "overview":
@@ -1547,18 +1851,35 @@ class PlotView(NSView):
             return
         NSColor.blackColor().setFill()
         NSBezierPath.fillRect_(bounds)
+        map_rect = self.interactive_map_rect(bounds)
         tiles = visible_tiles(extent, self.current_tile_zoom())
+        # Placeholders belong behind the transition layer. During a zoom the
+        # previous tiles remain geographically aligned and scale immediately;
+        # target-resolution tiles replace them progressively as they arrive.
         for tile in tiles:
-            rect = self.tile_view_rect(tile, extent, bounds)
-            image = self.interactive_tiles.get((tile.zoom, tile.x, tile.y))
-            if image is None:
+            rect = self.tile_view_rect(tile, extent, map_rect)
+            if (tile.zoom, tile.x, tile.y) not in self.interactive_tiles:
                 NSColor.colorWithSRGBRed_green_blue_alpha_(0.08, 0.08, 0.08, 1.0).setFill()
                 NSBezierPath.fillRect_(rect)
                 NSColor.colorWithSRGBRed_green_blue_alpha_(0.18, 0.18, 0.18, 1.0).setStroke()
                 border = NSBezierPath.bezierPathWithRect_(rect)
                 border.setLineWidth_(0.5)
                 border.stroke()
-            else:
+
+        for key in sorted(self.interactive_fallback_tiles):
+            image = self.interactive_fallback_tiles[key]
+            rect = self.tile_view_rect(TileCoordinate(*key), extent, map_rect)
+            image.drawInRect_fromRect_operation_fraction_(
+                rect,
+                NSZeroRect,
+                NSCompositingOperationSourceOver,
+                1.0,
+            )
+
+        for tile in tiles:
+            image = self.interactive_tiles.get((tile.zoom, tile.x, tile.y))
+            if image is not None:
+                rect = self.tile_view_rect(tile, extent, map_rect)
                 image.drawInRect_fromRect_operation_fraction_(
                     rect,
                     NSZeroRect,
@@ -1581,11 +1902,24 @@ class PlotView(NSView):
         tile_extent = tile_bounds_mercator(tile)
         span_x = max(float(extent["max_x"]) - float(extent["min_x"]), 1.0)
         span_y = max(float(extent["max_y"]) - float(extent["min_y"]), 1.0)
-        left = (tile_extent["min_x"] - float(extent["min_x"])) / span_x * bounds.size.width
-        right = (tile_extent["max_x"] - float(extent["min_x"])) / span_x * bounds.size.width
-        bottom = (tile_extent["min_y"] - float(extent["min_y"])) / span_y * bounds.size.height
-        top = (tile_extent["max_y"] - float(extent["min_y"])) / span_y * bounds.size.height
+        left = bounds.origin.x + (tile_extent["min_x"] - float(extent["min_x"])) / span_x * bounds.size.width
+        right = bounds.origin.x + (tile_extent["max_x"] - float(extent["min_x"])) / span_x * bounds.size.width
+        bottom = bounds.origin.y + (tile_extent["min_y"] - float(extent["min_y"])) / span_y * bounds.size.height
+        top = bounds.origin.y + (tile_extent["max_y"] - float(extent["min_y"])) / span_y * bounds.size.height
         return NSMakeRect(left, bottom, right - left, top - bottom)
+
+    def interactive_map_rect(self, bounds=None):
+        bounds = self.bounds() if bounds is None else bounds
+        extent = (self.plot_info.get("metadata") or {}).get("extent_mercator") or {}
+        required = ("min_x", "max_x", "min_y", "max_y")
+        if any(key not in extent for key in required):
+            return bounds
+        x, y, width, height = aspect_preserving_rect(
+            bounds.size.width,
+            bounds.size.height,
+            extent,
+        )
+        return NSMakeRect(bounds.origin.x + x, bounds.origin.y + y, width, height)
 
     def _metadata_transformer(self, points: list[PointInfo], bounds):
         metadata = self.plot_info.get("metadata") or {}
@@ -1595,7 +1929,7 @@ class PlotView(NSView):
         required = ("min_x", "max_x", "min_y", "max_y")
         if (image is None and not self.interactive_tiles_active) or any(key not in extent for key in required):
             return None
-        image_rect = bounds if self.interactive_tiles_active else self.image_rect(bounds)
+        image_rect = self.interactive_map_rect(bounds) if self.interactive_tiles_active else self.image_rect(bounds)
         return self._metadata_transformer_for_rect(image_rect)
 
     def _metadata_transformer_for_rect(self, image_rect):
@@ -1690,9 +2024,10 @@ class PlotView(NSView):
         if not selected:
             return
         tracks = [track for track in self.controller.tracks if track.nr in selected and not track.hidden]
+        selected_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.22, 0.62, 1.0)
         for track in tracks:
             for segment in self.controller.display_processed_track(track).segments:
-                self.draw_track(segment.points, transformer, NSColor.systemRedColor(), 7.0)
+                self.draw_track(segment.points, transformer, selected_color, 6.0)
 
     def draw_overview_endpoint_markers(self, transformer):
         if self.mode != "overview":
@@ -1723,7 +2058,11 @@ class PlotView(NSView):
             points = self.controller.display_processed_track(track).points
             if not points:
                 continue
-            stroke_color = NSColor.systemRedColor() if track.nr in selected else NSColor.systemBlueColor()
+            stroke_color = (
+                NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.22, 0.62, 1.0)
+                if track.nr in selected
+                else NSColor.systemBlueColor()
+            )
             NSColor.whiteColor().setFill()
             stroke_color.setStroke()
             for point in (points[0], points[-1]):
@@ -1788,13 +2127,107 @@ class PlotView(NSView):
         panel.fill()
         self.draw_text(text, x + 7, y + 4, 12, NSColor.whiteColor())
 
+    def linked_media_for_track(self, track: TrackRecord):
+        source_directory = Path(track.source_file).parent if track.source_file else None
+        result = []
+        for index, point in enumerate(track.points()):
+            for path in media_paths_for_point(point.element, source_directory):
+                if path.is_file():
+                    result.append((index, point, path))
+        return result
+
+    def request_photo_thumbnail(self, path: Path):
+        try:
+            stat = path.stat()
+            cache_key = (str(path), int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            return None
+        image = self.photo_thumbnail_cache.get(cache_key)
+        if image is not None or cache_key in self.photo_thumbnail_futures:
+            return image
+        generation = self.photo_thumbnail_generation
+
+        def load():
+            _identity, thumbnail_path, _created = create_or_reuse_thumbnail(path)
+            return thumbnail_path
+
+        future = self.photo_thumbnail_executor.submit(load)
+        self.photo_thumbnail_futures[cache_key] = future
+
+        def completed(done):
+            try:
+                thumbnail_path = done.result()
+            except Exception:
+                thumbnail_path = None
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "installPhotoThumbnail:", (cache_key, generation, thumbnail_path), False
+            )
+
+        future.add_done_callback(completed)
+        return None
+
+    @objc.IBAction
+    def installPhotoThumbnail_(self, payload):
+        cache_key, generation, thumbnail_path = payload
+        self.photo_thumbnail_futures.pop(cache_key, None)
+        if generation != self.photo_thumbnail_generation or thumbnail_path is None:
+            return
+        image = NSImage.alloc().initWithContentsOfFile_(str(thumbnail_path))
+        if image is not None:
+            self.photo_thumbnail_cache.put(cache_key, image)
+            self.setNeedsDisplay_(True)
+
+    def draw_media_markers(self, track: TrackRecord, transformer, bounds):
+        selected_element = self.cursor[1].element if self.cursor is not None else None
+        self.photo_thumbnail_hit_targets = []
+        linked = self.linked_media_for_track(track)
+        linked.sort(
+            key=lambda value: (
+                value[2].resolve(strict=False) == self.active_media_path,
+                value[1].element is selected_element,
+                self.hovered_media_point == (track.nr, value[0]),
+            )
+        )
+        for _index, point, path in linked:
+            x, y = transformer(point)
+            NSColor.whiteColor().setStroke()
+            NSColor.systemBlueColor().setFill()
+            marker = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(x - 5, y + 5, 10, 10))
+            marker.setLineWidth_(1.5)
+            marker.fill()
+            marker.stroke()
+            hovered = self.hovered_media_point == (track.nr, _index)
+            if not (self.show_all_photo_thumbnails or point.element is selected_element or hovered):
+                continue
+            image = self.request_photo_thumbnail(path)
+            if image is None:
+                continue
+            maximum = 72.0 if self.show_all_photo_thumbnails else 96.0
+            image_size = image.size()
+            scale = min(maximum / max(image_size.width, 1.0), maximum / max(image_size.height, 1.0))
+            width, height = image_size.width * scale, image_size.height * scale
+            left = max(2.0, min(bounds.size.width - width - 2.0, x - width / 2.0))
+            bottom = max(2.0, min(bounds.size.height - height - 2.0, y + 18.0))
+            active = path.resolve(strict=False) == self.active_media_path
+            (NSColor.systemBlueColor() if active else NSColor.whiteColor()).setFill()
+            NSBezierPath.fillRect_(NSMakeRect(left - 3, bottom - 3, width + 6, height + 6))
+            image.drawInRect_fromRect_operation_fraction_(
+                NSMakeRect(left, bottom, width, height), NSZeroRect,
+                NSCompositingOperationSourceOver, 1.0
+            )
+            self.photo_thumbnail_hit_targets.append(
+                (NSMakeRect(left - 3, bottom - 3, width + 6, height + 6), track, _index, path)
+            )
+
     def draw_selection_overlay(self, transformer):
-        if self.mode != "track":
+        if self.mode != "track" and self.adventure_workspace_delegate is None:
             return
-        displayed = self.display_tracks()
-        if not displayed:
+        track = self.cursor[2] if self.cursor is not None else None
+        if track is None:
+            selected = self.controller.selected_tracks()
+            track = selected[0] if len(selected) == 1 else None
+        if track is None:
             return
-        track = displayed[0]
         for start, end in self.selected_ranges_for_track(track):
             self.draw_selected_point_range(track, transformer, start, end)
 
@@ -1939,7 +2372,16 @@ class PlotView(NSView):
         padding = 16.0
         panel_height = padding * 2 + title_height + line_height * len(lines)
         panel_width = min(width, max(260.0, bounds.size.width - 32.0))
-        if centered:
+        if closable and self.info_overlay_origin is not None:
+            maximum_x = max(0.0, bounds.size.width - panel_width)
+            maximum_y = max(0.0, bounds.size.height - panel_height)
+            rect = NSMakeRect(
+                max(0.0, min(maximum_x, self.info_overlay_origin.x)),
+                max(0.0, min(maximum_y, self.info_overlay_origin.y)),
+                panel_width,
+                panel_height,
+            )
+        elif centered:
             rect = NSMakeRect(
                 (bounds.size.width - panel_width) / 2.0,
                 (bounds.size.height - panel_height) / 2.0,
@@ -1952,6 +2394,9 @@ class PlotView(NSView):
         panel = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, 8.0, 8.0)
         panel.fill()
         self.info_overlay_close_rect = None
+        self.info_overlay_rect = rect if closable else None
+        if closable:
+            self.info_overlay_origin = rect.origin
         if closable:
             close_size = 20.0
             close_rect = NSMakeRect(
@@ -2057,6 +2502,9 @@ class PlotView(NSView):
         self.info_overlay_dismissed = True
         self.context_overlay_coordinate = None
         self.info_overlay_close_rect = None
+        self.info_overlay_rect = None
+        self.info_overlay_dragging = False
+        self.info_overlay_drag_offset = None
         self.setNeedsDisplay_(True)
 
     def draw_help(self, bounds):
@@ -2068,16 +2516,17 @@ class PlotView(NSView):
             "c: center map on current cursor point",
             "z / Shift-Z: zoom to selection / reset to the full map extent",
             "q: close this plot window",
-            "p: save current plot as PNG",
+            "p: toggle photo thumbnails on a track map",
+            "s: save current plot as PNG",
             "u: clear current plot selection",
             "e: open elevation profile",
             "d: toggle start/end dots",
             "click: select nearest waypoint; right-click: edit, inspect coordinates, cut, or join",
-            "drag or two-finger scroll: pan; Option-drag pans immediately",
-            "Option-arrows: pan 20%; trackpad pinch: zoom",
+            "drag or two-finger trackpad scroll: pan; Option-drag pans immediately",
+            "mouse wheel, +/-, or trackpad pinch: zoom",
             "hold 1 second: insert or drag a waypoint or marked segment; Escape cancels",
             "m or shift-click: set the selection marker at the current point",
-            "overview double-click: open that track and waypoint inspector",
+            "overview double-click: open the Track Table",
             "double-click track point: open the waypoint inspector",
             "overview: n toggles track numbers",
             "track: arrows/space next track, m marker, delete range, x cut after cursor",
@@ -2085,6 +2534,13 @@ class PlotView(NSView):
             "Cmd-X: cut the track after the current cursor point",
             "point table: Cmd-I / Shift-Cmd-I inserts after / before",
         ]
+        if self.adventure_workspace_delegate is not None:
+            help_lines.extend(
+                [
+                    "media: click selects; Cmd-click adds or removes a group",
+                    "media: Cmd-drag empty map draws a selection rectangle",
+                ]
+            )
         self.draw_overlay_panel(help_lines, bounds, title="myCamino GPX Editor Keys", width=560.0, centered=True)
 
     def clone_plot_info(self, info):
@@ -2094,7 +2550,9 @@ class PlotView(NSView):
             return [self.clone_plot_info(value) for value in info]
         return info
 
-    def replace_plot_info(self, plot_info):
+    def replace_plot_info(self, plot_info, preserve_tiles=False):
+        previous_tiles = dict(self.interactive_tiles)
+        previous_fallback = dict(self.interactive_fallback_tiles)
         self.plot_info = plot_info or {}
         self.initial_plot_info = self.clone_plot_info(self.plot_info)
         self.cursor = None
@@ -2103,16 +2561,57 @@ class PlotView(NSView):
         self.interactive_tiles_active = self.plot_info.get("image") is None
         self.interactive_tile_generation += 1
         self.cancel_interactive_tile_requests(shutdown=False)
+        if preserve_tiles and self.interactive_tiles_active:
+            current_zoom = self.current_tile_zoom()
+            self.interactive_tiles = {
+                key: image for key, image in previous_tiles.items() if key[0] == current_zoom
+            }
+            self.interactive_fallback_tiles = previous_fallback
+            self.interactive_fallback_tiles.update(previous_tiles)
+        else:
+            # Unrelated maps must not inherit each other's tiles. Workspace
+            # startup explicitly opts in while changing from world to overview.
+            self.interactive_tiles.clear()
+            self.interactive_fallback_tiles.clear()
+        self.interactive_tile_target_keys.clear()
         if self.interactive_tiles_active:
-            self.schedule_interactive_tiles()
+            self.schedule_interactive_tiles(immediate=True)
         self.setNeedsDisplay_(True)
 
     def mouseDown_(self, event):
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
-        self.update_pointer_location(location)
+        self.clicked_media_target = None
+        self.clicked_workspace_media_target = None
+        self.workspace_track_selection_consumed = False
         if self.show_info and self.point_inside_rect(location, self.info_overlay_close_rect):
             self.dismiss_info_overlay()
             return
+        if self.show_info and self.point_inside_rect(location, self.info_overlay_rect):
+            self.info_overlay_dragging = True
+            self.info_overlay_drag_offset = NSMakePoint(
+                location.x - self.info_overlay_rect.origin.x,
+                location.y - self.info_overlay_rect.origin.y,
+            )
+            return
+        for rect, track, point_index, path in reversed(self.photo_thumbnail_hit_targets):
+            if (
+                rect.origin.x <= location.x <= rect.origin.x + rect.size.width
+                and rect.origin.y <= location.y <= rect.origin.y + rect.size.height
+            ):
+                self.clicked_media_target = (track, point_index, path)
+                self.active_media_path = path.resolve(strict=False)
+                self.move_cursor_to_track_point(
+                    track,
+                    point_index,
+                    self.inspector,
+                    sync_table=True,
+                    focus_plot=False,
+                )
+                break
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "workspace_media_target_at_location"):
+            self.clicked_workspace_media_target = workspace.workspace_media_target_at_location(location)
+        self.update_pointer_location(location)
         self.mouse_down_started_at = time.monotonic()
         self.mouse_down_click_count = int(event.clickCount())
         self.pan_origin = location
@@ -2121,32 +2620,103 @@ class PlotView(NSView):
         self.pan_active = bool(event.modifierFlags() & NSEventModifierFlagOption)
         self.last_gesture_location = location
         self.context_overlay_coordinate = None
-        target = self.nearest_edit_target(location) if self.mode == "track" else None
+        target = self.edit_target_for_mouse_down(location)
         selected_target = self.selected_range_at_target(target)
+        if (
+            workspace is not None
+            and target is None
+            and not self.workspace_track_selection_consumed
+            and self.clicked_media_target is None
+            and self.clicked_workspace_media_target is None
+            and not self.pan_active
+            and command_modifier_requests_media_selection(event.modifierFlags())
+            and hasattr(workspace, "beginWorkspaceMediaSelectionAt_modifierFlags_")
+        ):
+            workspace.beginWorkspaceMediaSelectionAt_modifierFlags_(
+                location,
+                int(event.modifierFlags()),
+            )
+            self.workspace_media_selection_active = True
+            self.pan_origin = None
+            self.pan_start_extent = None
+            return
         if not self.pan_active:
-            if selected_target is None:
+            if (
+                selected_target is None
+                and not self.workspace_track_selection_consumed
+                and self.clicked_media_target is None
+                and self.clicked_workspace_media_target is None
+                and target is not None
+            ):
                 self.move_cursor_to_event(event)
-                target = self.nearest_edit_target(location) if self.mode == "track" else None
+                target = self.edit_target_for_mouse_down(location)
             self.long_press_target = target
-        if self.mode == "track" and self.cursor is not None:
+        if (
+            self.waypoint_editing_enabled()
+            and target is not None
+        ):
             self.long_press_origin = location
             if self.long_press_timer is not None:
                 self.long_press_timer.invalidate()
             if not self.pan_active:
-                self.long_press_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                    1.0,
-                    self,
-                    "beginPointEditingLongPress:",
-                    None,
-                    False,
-                )
-        if self.mode == "track" and self.cursor is not None and event.modifierFlags() & NSEventModifierFlagShift:
+                self.schedule_point_editing_long_press()
+        if self.waypoint_editing_enabled() and self.cursor is not None and event.modifierFlags() & NSEventModifierFlagShift:
             self.marker = self.cursor[0]
             self.sync_inspector_selection()
             self.controller.refresh_elevation_profile_for_plot_view(self)
             self.controller.set_status(f"Marker set at point {self.marker + 1} of track #{self.cursor[2].nr}.")
+
+    def edit_target_for_mouse_down(self, location):
+        """Resolve an edit target after an Adventure track has been selected."""
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and self.mode == "overview":
+            nearest = self.nearest_track_for_location(location)
+            if nearest is not None and nearest[0] <= 12.0:
+                _distance, track, _point_index = nearest
+                selected = self.controller.selected_tracks()
+                if len(selected) != 1 or selected[0] is not track:
+                    self.controller.select_track_in_table(track.nr)
+                    self.cursor = None
+                    self.workspace_track_selection_consumed = True
+                    if hasattr(workspace, "workspaceTrackSelectedForEditing_"):
+                        workspace.workspaceTrackSelectedForEditing_(track)
+                    return None
+        return self.nearest_edit_target(location) if self.waypoint_editing_enabled() else None
+
+    def schedule_point_editing_long_press(self):
+        """Run the edit timer while AppKit is tracking the held mouse button."""
+        timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0,
+            self,
+            "beginPointEditingLongPress:",
+            None,
+            False,
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+        self.long_press_timer = timer
+
+    def cursor_is_ready_for_drag(self) -> bool:
+        return bool(
+            self.cursor is not None
+            and self.dragged_point_track is self.cursor[2]
+            and self.dragged_point_index == self.cursor[0]
+        )
+
     def mouseDragged_(self, event):
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
+        if self.info_overlay_dragging and self.info_overlay_drag_offset is not None:
+            self.info_overlay_origin = NSMakePoint(
+                location.x - self.info_overlay_drag_offset.x,
+                location.y - self.info_overlay_drag_offset.y,
+            )
+            self.setNeedsDisplay_(True)
+            return
+        if self.workspace_media_selection_active:
+            workspace = self.adventure_workspace_delegate
+            if workspace is not None and hasattr(workspace, "updateWorkspaceMediaSelectionTo_"):
+                workspace.updateWorkspaceMediaSelectionTo_(location)
+            self.last_gesture_location = location
+            return
         if self.dragged_segment_rows and self.dragged_point_track is not None:
             coordinate = self.coordinate_for_view_point(location)
             if coordinate is not None and self.dragged_segment_origin_mercator is not None:
@@ -2199,18 +2769,32 @@ class PlotView(NSView):
                     self.long_press_timer.invalidate()
                     self.long_press_timer = None
             if self.pan_active and self.pan_start_extent is not None:
+                map_rect = self.interactive_map_rect(self.bounds())
                 next_extent = shifted_interactive_extent(
                     self.pan_start_extent,
                     location.x - self.pan_origin.x,
                     location.y - self.pan_origin.y,
-                    self.bounds().size.width,
-                    self.bounds().size.height,
+                    map_rect.size.width,
+                    map_rect.size.height,
                 )
                 self.set_interactive_viewport(next_extent, request_tiles=False)
                 self.last_gesture_location = location
                 return
 
     def mouseUp_(self, event):
+        if self.info_overlay_dragging:
+            self.info_overlay_dragging = False
+            self.info_overlay_drag_offset = None
+            return
+        if self.workspace_media_selection_active:
+            self.workspace_media_selection_active = False
+            workspace = self.adventure_workspace_delegate
+            location = self.convertPoint_fromView_(event.locationInWindow(), None)
+            if workspace is not None and hasattr(workspace, "finishWorkspaceMediaSelectionAt_"):
+                workspace.finishWorkspaceMediaSelectionAt_(location)
+            self.mouse_down_started_at = None
+            self.mouse_down_click_count = 0
+            return
         if self.long_press_timer is not None:
             self.long_press_timer.invalidate()
             self.long_press_timer = None
@@ -2226,6 +2810,24 @@ class PlotView(NSView):
             return
         self.pan_origin = None
         self.pan_start_extent = None
+        workspace = self.adventure_workspace_delegate
+        if (
+            workspace is not None
+            and self.dragged_point_index is None
+            and self.dragged_point_track is None
+            and not self.dragged_segment_rows
+        ):
+            if hasattr(workspace, "workspaceMapClicked_clickCount_modifierFlags_"):
+                workspace.workspaceMapClicked_clickCount_modifierFlags_(
+                    self,
+                    int(event.clickCount()),
+                    int(event.modifierFlags()),
+                )
+            else:
+                workspace.workspaceMapClicked_clickCount_(self, int(event.clickCount()))
+            self.mouse_down_started_at = None
+            self.mouse_down_click_count = 0
+            return
         if self.dragged_segment_rows and self.dragged_point_track is not None:
             track = self.dragged_point_track
             rows = list(self.dragged_segment_rows)
@@ -2255,15 +2857,18 @@ class PlotView(NSView):
             elapsed = time.monotonic() - self.mouse_down_started_at if self.mouse_down_started_at else 0.0
             if self.mouse_down_click_count == 2 and elapsed < 1.0 and self.cursor is not None:
                 if self.mode == "overview":
-                    self.controller.open_track_workflow_at_point(self.cursor[2], self.cursor[0])
+                    self.controller.open_track_workflow_at_point(
+                        self.cursor[2], self.cursor[0], source_view=self
+                    )
                 elif self.mode == "track":
-                    inspector = self.controller.open_inspector_for_track(self.cursor[2])
-                    if inspector is not None:
-                        self.inspector = inspector
-                        inspector.plot_view = self
-                        inspector.select_point_index(self.cursor[0])
-                        inspector.window.makeKeyAndOrderFront_(None)
-                        inspector.window.orderFrontRegardless()
+                    if not self.controller.show_media_for_track_point(self.cursor[2], self.cursor[0]):
+                        inspector = self.controller.open_inspector_for_track(self.cursor[2])
+                        if inspector is not None:
+                            self.inspector = inspector
+                            inspector.plot_view = self
+                            inspector.select_point_index(self.cursor[0])
+                            inspector.window.makeKeyAndOrderFront_(None)
+                            inspector.window.orderFrontRegardless()
             self.mouse_down_started_at = None
             self.mouse_down_click_count = 0
             return
@@ -2293,7 +2898,9 @@ class PlotView(NSView):
         required = ("min_x", "max_x", "min_y", "max_y")
         if any(key not in extent for key in required):
             return None
-        image_rect = self.bounds() if self.interactive_tiles_active else self.image_rect(self.bounds())
+        image_rect = self.interactive_map_rect(self.bounds()) if self.interactive_tiles_active else self.image_rect(self.bounds())
+        if not self.point_inside_rect(location, image_rect):
+            return None
         left = image_rect.origin.x + float(axes.get("left", 0.0)) * image_rect.size.width
         bottom = image_rect.origin.y + float(axes.get("bottom", 0.0)) * image_rect.size.height
         width = max(float(axes.get("width", 1.0)) * image_rect.size.width, 1.0)
@@ -2330,7 +2937,7 @@ class PlotView(NSView):
         displayed = self.display_tracks()
         if not displayed:
             return None
-        track = displayed[0]
+        track = self.current_track_for_title() or displayed[0]
         points = track.points()
         if not points:
             return None
@@ -2374,6 +2981,41 @@ class PlotView(NSView):
             return ("segment", track, best[1], best[2])
         return None
 
+    def nearest_track_for_location(self, location):
+        """Return the nearest visible route and source row for map-level actions."""
+        transformer = self._metadata_transformer([], self.bounds())
+        if transformer is None:
+            return None
+        best = None
+        tracks = self.display_tracks()
+        per_track_limit = max(48, min(320, 16000 // max(len(tracks), 1)))
+        for track in tracks:
+            processed = self.controller.display_processed_track(track)
+            for segment in processed.segments:
+                points = sampled_polyline_points(segment.points, per_track_limit)
+                projected = [transformer(point) for point in points]
+                for point, (point_x, point_y) in zip(points, projected):
+                    distance = math.hypot(location.x - point_x, location.y - point_y)
+                    if best is None or distance < best[0]:
+                        best = (distance, track, point.source_index)
+                for index, ((x1, y1), (x2, y2)) in enumerate(zip(projected, projected[1:])):
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    denominator = dx * dx + dy * dy
+                    if denominator <= 0.0:
+                        continue
+                    fraction = max(
+                        0.0,
+                        min(1.0, ((location.x - x1) * dx + (location.y - y1) * dy) / denominator),
+                    )
+                    nearest_x = x1 + fraction * dx
+                    nearest_y = y1 + fraction * dy
+                    distance = math.hypot(location.x - nearest_x, location.y - nearest_y)
+                    source = points[index if fraction < 0.5 else index + 1].source_index
+                    if best is None or distance < best[0]:
+                        best = (distance, track, source)
+        return best
+
     def _plot_context_item(self, menu, title, action, enabled=True):
         item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
         item.setTarget_(self)
@@ -2383,14 +3025,47 @@ class PlotView(NSView):
 
     def menuForEvent_(self, event):
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
-        target = self.nearest_edit_target(location) if self.mode == "track" else None
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "workspace_media_target_at_location"):
+            media_target = workspace.workspace_media_target_at_location(location)
+            if media_target is not None and hasattr(workspace, "workspaceMediaContextMenuForTarget_"):
+                return workspace.workspaceMediaContextMenuForTarget_(media_target)
+        target = self.nearest_edit_target(location) if self.waypoint_editing_enabled() else None
         self.context_target = target
+        self.context_track_target = None
         self.context_location = location
+        if self.adventure_workspace_delegate is not None and self.mode == "overview":
+            nearest = self.nearest_track_for_location(location)
+            if nearest is not None and nearest[0] <= 18.0:
+                _distance, track, point_index = nearest
+                points = track.points()
+                point_index = max(0, min(int(point_index), max(0, len(points) - 1)))
+                selected = self.controller.selected_tracks()
+                newly_selected = len(selected) != 1 or selected[0] is not track
+                if newly_selected:
+                    self.controller.select_track_in_table(track.nr)
+                    self.cursor = None
+                    target = None
+                    self.context_target = None
+                if target is None:
+                    self.context_track_target = (track, point_index)
         selected_range = self.selected_range_at_target(target)
         self.context_selected_range = selected_range
         menu = NSMenu.alloc().initWithTitle_("GPX Map")
         menu.setAutoenablesItems_(False)
-        if selected_range is not None:
+        if self.context_track_target is not None:
+            self._plot_context_item(menu, "Show Track Table", "showContextTrackTable:")
+            self._plot_context_item(menu, "Show Waypoint Table", "showContextWaypointTable:")
+            self._plot_context_item(menu, "Fit to Track", "focusContextTrack:")
+            menu.addItem_(NSMenuItem.separatorItem())
+            self.add_location_context_items(menu)
+            menu.addItem_(NSMenuItem.separatorItem())
+            self.add_view_context_items(menu)
+        elif selected_range is not None:
+            self.context_track_target = (target[1], target[2])
+            self._plot_context_item(menu, "Show Track Table", "showContextTrackTable:")
+            self._plot_context_item(menu, "Show Waypoint Table", "showContextWaypointTable:")
+            menu.addItem_(NSMenuItem.separatorItem())
             self._plot_context_item(menu, "Copy Marked Segment", "copyContextSegment:")
             self._plot_context_item(menu, "Cut Marked Segment", "cutContextSelectedSegment:")
             self._plot_context_item(menu, "Delete Marked Segment", "deleteContextSelectedSegment:")
@@ -2399,12 +3074,18 @@ class PlotView(NSView):
             menu.addItem_(NSMenuItem.separatorItem())
             self.add_view_context_items(menu)
         elif target is not None and target[0] == "point":
+            self.context_track_target = (target[1], target[2])
             self.prepare_context_point(target[1], target[2], create_inspector=False)
+            linked_media = self.controller.media_paths_for_track_point(target[1], target[2])
             for title, action in [
-                ("Inspect Waypoint", "inspectContextPoint:"),
+                ("Show Track Table", "showContextTrackTable:"),
+                ("Show Waypoint Table", "showContextWaypointTable:"),
+                ("Show Point Information", "inspectContextPoint:"),
+                ("View Media", "viewContextMedia:"),
                 ("Set Selection Marker", "markContextPoint:"),
                 ("Center", "centerOnlyContextPoint:"),
                 ("Center and Zoom", "centerContextPoint:"),
+                ("Fit to Track", "fitContextTrack:"),
                 (None, None),
                 ("Insert Waypoint Before", "insertContextBefore:"),
                 ("Insert Waypoint After", "insertContextAfter:"),
@@ -2428,8 +3109,13 @@ class PlotView(NSView):
                         enabled = joinable_segment_boundary(target[1].element, target[2]) is not None
                     elif action == "pasteContextPointsAfter:":
                         enabled = self.point_clipboard_payload() is not None
+                    elif action == "viewContextMedia:":
+                        enabled = bool(linked_media)
                     self._plot_context_item(menu, title, action, enabled)
         elif target is not None and target[0] == "segment":
+            self.context_track_target = (target[1], target[2])
+            self._plot_context_item(menu, "Show Track Table", "showContextTrackTable:")
+            self._plot_context_item(menu, "Show Waypoint Table", "showContextWaypointTable:")
             self._plot_context_item(menu, "Insert Waypoint Here", "insertContextSegment:")
             self._plot_context_item(menu, "Cut Track Connection Here", "cutContextSegment:")
             menu.addItem_(NSMenuItem.separatorItem())
@@ -2447,21 +3133,47 @@ class PlotView(NSView):
         coordinate_available = self.coordinate_for_view_point(self.context_location) is not None
         self._plot_context_item(menu, "Show Coordinates Here", "showContextCoordinates:", coordinate_available)
         self._plot_context_item(menu, "Copy Coordinates Here", "copyMapContextCoordinates:", coordinate_available)
-        can_insert = coordinate_available and self.cursor is not None and self.mode == "track"
+        self._plot_context_item(
+            menu,
+            "Create Waypoint Here",
+            "createContextWaypointHere:",
+            coordinate_available and self.waypoint_editing_enabled() and bool(self.controller.selected_tracks()),
+        )
+        can_insert = coordinate_available and self.cursor is not None and self.waypoint_editing_enabled()
         self._plot_context_item(menu, "Insert Waypoint Before Selected Here", "insertContextLocationBefore:", can_insert)
         self._plot_context_item(menu, "Insert Waypoint After Selected Here", "insertContextLocationAfter:", can_insert)
         self._plot_context_item(
             menu,
             "Paste Waypoint(s) at Nearest Point",
             "pasteContextPointsNearest:",
-            self.mode == "track" and self.point_clipboard_payload() is not None,
+            self.waypoint_editing_enabled() and self.point_clipboard_payload() is not None,
         )
 
     def add_view_context_items(self, menu):
+        if self.adventure_workspace_delegate is not None and self.waypoint_editing_enabled():
+            self._plot_context_item(menu, "Show Adventure Overview", "showAdventureOverview:")
+        self._plot_context_item(menu, "Show Elevation Profile", "showElevationProfile:")
         self._plot_context_item(menu, "Center on Selected Waypoint", "centerContextPoint:", self.cursor is not None)
         self._plot_context_item(menu, "Zoom In", "zoomContextIn:")
         self._plot_context_item(menu, "Zoom Out", "zoomContextOut:")
-        self._plot_context_item(menu, "Fit Selected Track", "fitContextTrack:")
+        self._plot_context_item(menu, "Fit to Track", "fitContextTrack:")
+        if self.waypoint_editing_enabled():
+            title = "Show Selected Photo Thumbnail" if self.show_all_photo_thumbnails else "Show All Photo Thumbnails"
+            self._plot_context_item(menu, title, "togglePhotoDisplay:")
+
+    @objc.IBAction
+    def showElevationProfile_(self, _sender):
+        self.controller.open_elevation_profile_for_plot_view(self)
+
+    @objc.IBAction
+    def togglePhotoDisplay_(self, _sender):
+        self.show_all_photo_thumbnails = not self.show_all_photo_thumbnails
+        self.controller.set_status(
+            "Showing all visible photo thumbnails."
+            if self.show_all_photo_thumbnails
+            else "Showing a thumbnail only for the selected photo point."
+        )
+        self.setNeedsDisplay_(True)
 
     def prepare_context_point(self, track, index, create_inspector=True):
         inspector = self.controller.existing_inspector_for_track(track)
@@ -2518,7 +3230,7 @@ class PlotView(NSView):
         displayed = self.display_tracks()
         if not displayed or location is None:
             return None
-        track = displayed[0]
+        track = self.current_track_for_title() or displayed[0]
         points = track.points()
         if not points:
             return None
@@ -2603,6 +3315,47 @@ class PlotView(NSView):
             self.paste_context_points(*context)
 
     @objc.IBAction
+    def showContextTrackTable_(self, _sender):
+        context = self.context_track_target
+        if context is None:
+            return
+        track, _point_index = context
+        self.controller.select_track_in_table(track.nr)
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "openTrackEditor_"):
+            workspace.openTrackEditor_(None)
+        else:
+            self.controller.show()
+
+    @objc.IBAction
+    def showContextWaypointTable_(self, _sender):
+        context = self.context_track_target
+        if context is None:
+            return
+        track, point_index = context
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "inspect_workspace_track"):
+            workspace.inspect_workspace_track(track, point_index)
+            return
+        inspector = self.controller.open_inspector_for_track(track)
+        if inspector is not None:
+            self.inspector = inspector
+            inspector.plot_view = self
+            inspector.select_point_index(point_index)
+            inspector.window.makeKeyAndOrderFront_(None)
+
+    @objc.IBAction
+    def inspectContextTrack_(self, sender):
+        self.showContextWaypointTable_(sender)
+
+    @objc.IBAction
+    def focusContextTrack_(self, _sender):
+        context = self.context_track_target
+        workspace = self.adventure_workspace_delegate
+        if context is not None and workspace is not None:
+            workspace.focus_workspace_track(context[0], context[1], reset_viewport=True)
+
+    @objc.IBAction
     def inspectContextPoint_(self, _sender):
         context = self.context_point()
         if context is None:
@@ -2612,6 +3365,12 @@ class PlotView(NSView):
         self.show_info = True
         self.context_overlay_coordinate = None
         self.setNeedsDisplay_(True)
+
+    @objc.IBAction
+    def viewContextMedia_(self, _sender):
+        context = self.context_point()
+        if context is not None:
+            self.controller.show_media_for_track_point(*context)
 
     @objc.IBAction
     def markContextPoint_(self, _sender):
@@ -2637,10 +3396,7 @@ class PlotView(NSView):
                     self.cursor[1].lat,
                 )
                 extent = zoomed_interactive_extent(extent, 2.0, center_x, center_y)
-                self.set_interactive_viewport(
-                    extent,
-                    min(self.controller.maximum_map_zoom, self.current_tile_zoom() + 1),
-                )
+                self.render_extent(extent, status="Centered and zoomed on the selected waypoint.")
 
     @objc.IBAction
     def centerOnlyContextPoint_(self, _sender):
@@ -2730,7 +3486,7 @@ class PlotView(NSView):
         )
 
     def insert_context_location(self, *, before):
-        if self.cursor is None or self.mode != "track":
+        if self.cursor is None or not self.waypoint_editing_enabled():
             return
         coordinate = self.coordinate_for_view_point(self.context_location)
         if coordinate is None:
@@ -2761,6 +3517,47 @@ class PlotView(NSView):
             inspector,
             f"Inserted waypoint at the map location {position} point {row + 1} in track #{track.nr}.",
         )
+
+    @objc.IBAction
+    def createContextWaypointHere_(self, _sender):
+        coordinate = self.coordinate_for_view_point(self.context_location)
+        tracks = self.track_sequence()
+        if coordinate is None or not self.waypoint_editing_enabled() or not tracks:
+            return
+        selected_tracks = self.controller.selected_tracks()
+        track = self.cursor[2] if self.cursor is not None else selected_tracks[0]
+        longitude, latitude = coordinate
+        old_count = len(track.points())
+        inspector = self.controller.existing_inspector_for_track(track)
+        try:
+            self.push_map_edit_undo(track, inspector)
+            point = point_from_values(track.element, latitude, longitude)
+            target = self.context_target
+            if target is not None and target[0] == "segment" and target[1] is track:
+                anchor = int(target[2])
+            elif self.cursor is not None and self.cursor[2] is track:
+                anchor = int(self.cursor[0])
+            else:
+                anchor = max(-1, old_count - 1)
+            inserted_rows = insert_points_after_row(track.element, anchor, [point])
+            inserted_row = inserted_rows[0]
+        except (ValueError, IndexError) as exc:
+            self.discard_map_edit_undo(inspector)
+            show_alert("Cannot create a waypoint.", str(exc))
+            return
+        self.finish_map_structure_edit(
+            track,
+            inserted_row,
+            inspector,
+            f"Created waypoint {inserted_row + 1} at the selected map location.",
+        )
+        if old_count == 0:
+            point_info = track.points()[0]
+            self.render_extent(
+                self.controller.extent_for_track_records([track]),
+                status="Centered the map on the first waypoint.",
+            )
+            self.move_cursor_to_track_point(track, 0, inspector, sync_table=False, focus_plot=False)
 
     @objc.IBAction
     def insertContextLocationBefore_(self, _sender):
@@ -3002,7 +3799,28 @@ class PlotView(NSView):
 
     @objc.IBAction
     def fitContextTrack_(self, _sender):
-        self.zoom_to_selected()
+        context = self.context_track_target
+        track = context[0] if context is not None else None
+        if track is None and self.cursor is not None:
+            track = self.cursor[2]
+        if track is None:
+            selected = self.controller.selected_tracks()
+            track = selected[0] if len(selected) == 1 else None
+        if track is None:
+            self.controller.set_status("Select a track to fit first.")
+            return
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None:
+            workspace.focus_workspace_track(track, reset_viewport=True)
+            return
+        extent = self.controller.extent_for_track_records([track])
+        self.render_extent(extent, status=f"Fitted track #{track.nr} to the map.")
+
+    @objc.IBAction
+    def showAdventureOverview_(self, _sender):
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None:
+            workspace.show_workspace_overview()
 
     @objc.IBAction
     def beginPointEditingLongPress_(self, _timer):
@@ -3015,6 +3833,9 @@ class PlotView(NSView):
                 "Hold closer to a waypoint or track segment to edit it."
             )
             return
+        # A held media pin is an editing gesture, not a delayed media click.
+        self.clicked_media_target = None
+        self.clicked_workspace_media_target = None
         kind, track, index, fraction = target
         inspector = self.controller.existing_inspector_for_track(track)
         if inspector is not None:
@@ -3070,15 +3891,48 @@ class PlotView(NSView):
         self.drag_inserted_point = kind == "segment"
         self.dragged_point_index = index
         self.dragged_point_track = track
+        points = track.points()
+        if 0 <= index < len(points):
+            self.cursor = (index, points[index], track)
         if inspector is not None:
             inspector.reload_rows()
             inspector.select_point_index(index)
         self.controller.set_status(
             f"Drag point {index + 1}; release to keep it or press Escape to cancel."
         )
+        self.update_window_title()
+        self.setNeedsDisplay_(True)
 
     def scrollWheel_(self, event):
-        self.pan_map(float(event.scrollingDeltaX()), float(event.scrollingDeltaY()))
+        if not bool(event.hasPreciseScrollingDeltas()):
+            delta_y = float(event.scrollingDeltaY())
+            factor = mouse_wheel_zoom_factor(delta_y)
+            if factor != 1.0:
+                location = self.convertPoint_fromView_(event.locationInWindow(), None)
+                self.last_gesture_location = location
+                extent = self.zoomed_extent(factor, focus_location=location)
+                if extent is not None:
+                    self.set_interactive_viewport(
+                        extent,
+                        self.current_tile_zoom(),
+                        request_tiles=False,
+                    )
+                    if self.wheel_finish_timer is not None:
+                        self.wheel_finish_timer.invalidate()
+                    self.wheel_finish_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                        0.15,
+                        self,
+                        "finishWheelZoom:",
+                        None,
+                        False,
+                    )
+                return
+        delta_x, delta_y = scroll_pan_deltas(
+            event.scrollingDeltaX(),
+            event.scrollingDeltaY(),
+            reverse_vertical=self.adventure_workspace_delegate is not None,
+        )
+        self.pan_map(delta_x, delta_y)
 
     def pan_map(self, delta_x: float, delta_y: float):
         extent = self.shifted_extent(delta_x, delta_y)
@@ -3102,12 +3956,24 @@ class PlotView(NSView):
     def set_interactive_viewport(self, extent, tile_zoom=None, request_tiles=True):
         if not extent:
             return
-        requested_zoom = self.current_tile_zoom() if tile_zoom is None else int(tile_zoom)
+        extent = clamp_extent_to_web_mercator(extent)
+        previous_zoom = self.current_tile_zoom()
+        requested_zoom = previous_zoom if tile_zoom is None else int(tile_zoom)
         if request_tiles:
             requested_zoom, _diagnostics = self.controller.effective_tile_zoom(
                 extent,
                 requested_zoom,
             )
+            if requested_zoom != previous_zoom:
+                # Preserve references to the old level so it can be transformed
+                # beneath the incoming tiles instead of exposing a black frame.
+                self.interactive_fallback_tiles.update(self.interactive_tiles)
+                self.interactive_tiles = {
+                    key: image
+                    for key, image in self.interactive_tiles.items()
+                    if key[0] == requested_zoom
+                }
+                self.interactive_tile_target_keys.clear()
         metadata = dict(self.plot_info.get("metadata") or {})
         metadata.update(
             {
@@ -3152,12 +4018,24 @@ class PlotView(NSView):
             self.current_tile_zoom(),
         )
         if effective_zoom != self.current_tile_zoom():
+            self.interactive_fallback_tiles.update(self.interactive_tiles)
+            self.interactive_tiles = {
+                key: image
+                for key, image in self.interactive_tiles.items()
+                if key[0] == effective_zoom
+            }
             self.plot_info["tile_zoom_level"] = effective_zoom
             self.plot_info["zoom_level"] = effective_zoom
             self.interactive_tile_generation += 1
             self.cancel_interactive_tile_requests(shutdown=False)
         generation = self.interactive_tile_generation
-        for tile in visible_tiles(extent, self.current_tile_zoom()):
+        target_tiles = visible_tiles(extent, self.current_tile_zoom())
+        self.interactive_tile_target_keys = {
+            (tile.zoom, tile.x, tile.y) for tile in target_tiles
+        }
+        if self.retire_interactive_fallback_if_covered():
+            self.setNeedsDisplayInRect_(self.interactive_map_rect(self.bounds()))
+        for tile in target_tiles:
             key = (tile.zoom, tile.x, tile.y)
             pending_key = (generation, key)
             if key in self.interactive_tiles or pending_key in self.interactive_tile_futures:
@@ -3215,7 +4093,22 @@ class PlotView(NSView):
         tile = TileCoordinate(*key)
         extent = self.current_extent()
         if extent:
-            self.setNeedsDisplayInRect_(self.tile_view_rect(tile, extent, self.bounds()))
+            self.setNeedsDisplayInRect_(
+                self.tile_view_rect(tile, extent, self.interactive_map_rect(self.bounds()))
+            )
+        if self.retire_interactive_fallback_if_covered():
+            self.setNeedsDisplayInRect_(self.interactive_map_rect(self.bounds()))
+
+    def retire_interactive_fallback_if_covered(self):
+        if not self.interactive_fallback_tiles:
+            return False
+        if not tile_coverage_complete(
+            self.interactive_tile_target_keys,
+            self.interactive_tiles.keys(),
+        ):
+            return False
+        self.interactive_fallback_tiles.clear()
+        return True
 
     def cancel_interactive_tile_requests(self, shutdown=False):
         if self.interactive_tile_timer is not None:
@@ -3225,16 +4118,42 @@ class PlotView(NSView):
             future.cancel()
         self.interactive_tile_futures.clear()
         if shutdown and self.interactive_tile_executor is not None:
+            if self.wheel_finish_timer is not None:
+                self.wheel_finish_timer.invalidate()
+                self.wheel_finish_timer = None
             if self.pinch_finish_timer is not None:
                 self.pinch_finish_timer.invalidate()
                 self.pinch_finish_timer = None
             self.interactive_tile_generation += 1
+            self.interactive_fallback_tiles.clear()
+            self.interactive_tile_target_keys.clear()
             self.interactive_tile_executor.shutdown(wait=False, cancel_futures=True)
             self.interactive_tile_executor = None
 
+    def recommended_tile_zoom(self, extent: dict) -> int:
+        bounds = self.bounds()
+        _x, _y, width, height = aspect_preserving_rect(
+            bounds.size.width,
+            bounds.size.height,
+            extent,
+        )
+        requested = tile_zoom_for_viewport(
+            extent,
+            width,
+            height,
+            maximum_zoom=self.controller.maximum_map_zoom,
+        )
+        effective, _diagnostics = self.controller.effective_tile_zoom(extent, requested)
+        return effective
+
     def render_extent(self, extent: dict, requested_tile_zoom: int | None = None, status: str = "Rendered OSM viewport."):
+        bounds = self.bounds()
+        extent = self.controller.fit_extent_to_aspect(
+            extent,
+            (max(bounds.size.width, 1.0), max(bounds.size.height, 1.0)),
+        )
         if requested_tile_zoom is None:
-            requested_tile_zoom = self.current_tile_zoom()
+            requested_tile_zoom = self.recommended_tile_zoom(extent)
         self.set_interactive_viewport(extent, requested_tile_zoom)
         self.update_window_title()
         self.controller.set_status(status)
@@ -3247,7 +4166,9 @@ class PlotView(NSView):
             self.setNeedsDisplay_(True)
             return
         self.interactive_tiles.clear()
-        self.set_interactive_viewport(dict(extent), self.current_tile_zoom())
+        self.interactive_fallback_tiles.clear()
+        self.interactive_tile_target_keys.clear()
+        self.set_interactive_viewport(dict(extent), self.recommended_tile_zoom(extent))
         self.cursor = None
         self.marker = None
 
@@ -3257,8 +4178,9 @@ class PlotView(NSView):
         if not extent:
             return None
         bounds = self.bounds()
-        width = max(bounds.size.width, 1.0)
-        height = max(bounds.size.height, 1.0)
+        map_rect = self.interactive_map_rect(bounds)
+        width = max(map_rect.size.width, 1.0)
+        height = max(map_rect.size.height, 1.0)
         return shifted_interactive_extent(extent, delta_x, delta_y, width, height)
 
     def magnifyWithEvent_(self, event):
@@ -3300,16 +4222,29 @@ class PlotView(NSView):
         self.pinch_finish_timer = None
         if self.pinch_start_tile_zoom is None:
             return
-        requested_zoom = tile_zoom_after_scale(
-            self.pinch_start_tile_zoom,
-            self.pinch_accumulated_scale,
-        )
         self.pinch_start_tile_zoom = None
         self.pinch_accumulated_scale = 1.0
         extent = self.current_extent()
         if extent is not None:
+            requested_zoom = self.recommended_tile_zoom(extent)
             self.set_interactive_viewport(extent, requested_zoom, request_tiles=True)
             self.controller.sync_elevation_profile_to_plot_view(self)
+
+    @objc.IBAction
+    def finishWheelZoom_(self, _timer):
+        self.wheel_finish_timer = None
+        extent = self.current_extent()
+        if extent is None:
+            return
+        self.set_interactive_viewport(
+            extent,
+            self.recommended_tile_zoom(extent),
+            request_tiles=True,
+        )
+        self.controller.sync_elevation_profile_to_plot_view(self)
+        self.controller.set_status(
+            f"Map zoom {self.current_tile_zoom()}; loading visible tiles."
+        )
 
     def centered_extent_on_point(self, point: PointInfo):
         metadata = self.plot_info.get("metadata") or {}
@@ -3359,10 +4294,7 @@ class PlotView(NSView):
                 tracks = self.controller.visible_tracks()
             tracks = [track for track in tracks if not track.hidden]
             extent = self.controller.extent_for_track_records(tracks)
-            requested_zoom = self.controller.overview_zoom_for_tracks(
-                tracks, int(self.plot_info.get("zoom_level", self.controller.overview_zoom))
-            )
-            self.render_extent(extent, requested_zoom, "Zoomed overview to selected tracks.")
+            self.render_extent(extent, status="Zoomed overview to selected tracks.")
             return
         tracks = self.display_tracks()
         if not tracks:
@@ -3384,6 +4316,11 @@ class PlotView(NSView):
 
     def move_cursor_to_event(self, event):
         tracks = self.display_tracks()
+        if self.adventure_workspace_delegate is not None and self.mode == "overview":
+            selected = self.controller.selected_tracks()
+            if len(selected) != 1:
+                return
+            tracks = selected
         points = [(track, index, point) for track in tracks for index, point in enumerate(track.points())]
         if not points:
             return
@@ -3460,6 +4397,14 @@ class PlotView(NSView):
         option_down = bool(event.modifierFlags() & NSEventModifierFlagOption)
         shift_down = bool(event.modifierFlags() & NSEventModifierFlagShift)
         self.transient_help_until = None
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and workspace.handleWorkspaceKeyEvent_(event):
+            return
+        if key == "\x1b" and self.workspace_media_selection_active:
+            self.workspace_media_selection_active = False
+            if hasattr(workspace, "cancelWorkspaceMediaSelection_"):
+                workspace.cancelWorkspaceMediaSelection_(None)
+            return
         if key == "\x1b":
             self.dismiss_info_overlay()
             self.show_help = False
@@ -3534,8 +4479,10 @@ class PlotView(NSView):
             return
         elif key in {"u", "U"}:
             self.unselect_plot_items()
-        elif key in {"p", "P"}:
+        elif key in {"s", "S"}:
             self.controller.save_plot_view_png(self)
+        elif self.mode == "track" and key in {"p", "P"}:
+            self.togglePhotoDisplay_(None)
         elif key in {"e", "E"}:
             self.controller.open_elevation_profile_for_plot_view(self)
         elif self.mode == "overview" and key in {"n", "N"}:
@@ -3582,7 +4529,9 @@ class PlotView(NSView):
         elif self.mode == "track" and (key in {"\uf702", "\uf700"} or key_code in {123, 126}):
             self.switch_track(-1)
             return
-        elif self.mode == "track" and key in {"m", "M"} and self.cursor is not None:
+        elif (
+            self.mode == "track" or self.adventure_workspace_delegate is not None
+        ) and key in {"m", "M"} and self.cursor is not None:
             previous_show_info = self.show_info
             self.marker = self.cursor[0]
             if self.inspector is not None and self.cursor[2] is self.inspector.track:
@@ -3617,14 +4566,13 @@ class PlotView(NSView):
             tracks = self.controller.tracks
             extent = self.controller.extent_for_track_records(tracks)
             if extent is not None:
-                requested_zoom = self.controller.overview_zoom_for_tracks(tracks, self.controller.overview_zoom)
-                self.render_extent(extent, requested_zoom, "Reset overview to all tracks.")
+                self.render_extent(extent, status="Reset overview to all tracks.")
                 return
         else:
             tracks = self.display_tracks()
             extent = self.controller.extent_for_track_records(tracks)
             if extent is not None:
-                self.render_extent(extent, self.controller.track_zoom, "Reset track map to the full track extent.")
+                self.render_extent(extent, status="Reset track map to the full track extent.")
                 if any(track is selected_track for track in tracks) and selected_point_index is not None:
                     self.move_cursor_to_track_point(selected_track, selected_point_index, self.inspector, sync_table=False)
                 return
@@ -3648,12 +4596,7 @@ class PlotView(NSView):
         extent = self.zoomed_extent(factor, focus_location=focus_location)
         if extent is None:
             return
-        current_zoom = int(self.plot_info.get("tile_zoom_level", self.plot_info.get("zoom_level", 14 if self.mode == "track" else 8)))
-        tile_delta = int(round(math.log2(max(float(factor), 1.0e-6))))
-        if tile_delta == 0:
-            tile_delta = 1 if factor > 1.0 else -1
-        new_tile_zoom = max(0, min(self.controller.maximum_map_zoom, current_zoom + tile_delta))
-        self.render_extent(extent, new_tile_zoom, f"Map zoom {new_tile_zoom}; loading visible tiles.")
+        self.render_extent(extent, status="Loading tiles for the new map scale.")
 
     def zoomed_extent(self, factor: float, focus_location=None):
         metadata = self.plot_info.get("metadata") or {}
@@ -3666,12 +4609,12 @@ class PlotView(NSView):
         max_y = float(extent["max_y"])
         center_x = (min_x + max_x) / 2.0
         center_y = (min_y + max_y) / 2.0
-        if self.cursor is not None:
-            center_x, center_y = lonlat_to_web_mercator(self.cursor[1].lon, self.cursor[1].lat)
-        elif focus_location is not None:
+        if focus_location is not None:
             coordinate = self.coordinate_for_view_point(focus_location)
             if coordinate is not None:
                 center_x, center_y = lonlat_to_web_mercator(*coordinate)
+        elif self.cursor is not None:
+            center_x, center_y = lonlat_to_web_mercator(self.cursor[1].lon, self.cursor[1].lat)
         return zoomed_interactive_extent(extent, factor, center_x, center_y)
 
     def clamp_extent_to_base(self, extent, base_extent):
@@ -3755,10 +4698,13 @@ class PlotWindowDelegate(NSObject):
 
     def windowWillClose_(self, _notification):
         window = _notification.object()
+        workspace = getattr(self.view, "adventure_workspace_delegate", None)
         if self.controller is not None:
             self.controller.unregister_auxiliary_window(window)
         if self.controller is not None and not self.controller.closing_auxiliary_windows and self.view is not None:
             self.controller.plot_window_closing(self.view)
+        if workspace is not None and hasattr(workspace, "workspaceMapWindowWillClose_"):
+            workspace.workspaceMapWindowWillClose_(window)
 
 
 class ElevationProfileView(NSView):
@@ -3864,12 +4810,22 @@ class ElevationProfileView(NSView):
         return y_min, max(y_max, y_min + 500.0)
 
     def elevation_range(self, rows, x_min, x_max):
-        elevations = [row["elevation"] for row in rows if row["elevation"] is not None]
+        axis_rows = rows
+        if self.plot_view.mode == "overview":
+            axis_rows = elevation_rows_for_selected_tracks(
+                rows,
+                self.controller.selected_nrs,
+            )
+        elevations = [
+            row["elevation"]
+            for row in axis_rows
+            if row["elevation"] is not None
+        ]
         if not elevations:
             return 0.0, 500.0
         if self.y_axis_mode != "visible":
             return self.fixed_elevation_range(elevations)
-        visible_range = elevation_profile_visible_range(rows, x_min, x_max)
+        visible_range = elevation_profile_visible_range(axis_rows, x_min, x_max)
         return visible_range if visible_range is not None else self.fixed_elevation_range(elevations)
 
     def visible_distance_range(self, total_distance):
@@ -4091,23 +5047,33 @@ class ElevationProfileView(NSView):
         self.draw_text("250 m", x - 12, y + bar_height + 3, 9, NSColor.secondaryLabelColor())
 
     def draw_profiles(self, rows, transform, x_min, x_max):
+        selected_tracks = set(self.controller.selected_nrs)
+
+        def track_color(track):
+            if self.plot_view.mode != "overview" or not selected_tracks:
+                return NSColor.systemBlueColor()
+            if track.nr in selected_tracks:
+                return NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.22, 0.62, 1.0)
+            return NSColor.disabledControlTextColor()
+
+        def stroke(path, track):
+            if path is None or track is None:
+                return
+            track_color(track).setStroke()
+            path.setLineWidth_(3.0 if track.nr in selected_tracks else 2.0)
+            path.stroke()
+
         current_track = None
         path = None
         for row in rows:
             elevation = row["elevation"]
             if elevation is None or row["distance"] < x_min or row["distance"] > x_max:
-                if path is not None:
-                    NSColor.systemBlueColor().setStroke()
-                    path.setLineWidth_(2.0)
-                    path.stroke()
+                stroke(path, current_track)
                 path = None
                 current_track = None
                 continue
             if row["track"] is not current_track or path is None:
-                if path is not None:
-                    NSColor.systemBlueColor().setStroke()
-                    path.setLineWidth_(2.0)
-                    path.stroke()
+                stroke(path, current_track)
                 path = NSBezierPath.bezierPath()
                 x, y = transform(row["distance"], elevation)
                 path.moveToPoint_((x, y))
@@ -4115,53 +5081,42 @@ class ElevationProfileView(NSView):
             else:
                 x, y = transform(row["distance"], elevation)
                 path.lineToPoint_((x, y))
-        if path is not None:
-            NSColor.systemBlueColor().setStroke()
-            path.setLineWidth_(2.0)
-            path.stroke()
+        stroke(path, current_track)
 
     def draw_selected_ranges(self, rows, track_ranges, transform, x_min, x_max):
-        if self.plot_view.marker is not None and self.plot_view.cursor is not None:
-            track = self.plot_view.cursor[2]
-            start = min(self.plot_view.marker, self.plot_view.cursor[0])
-            end = max(self.plot_view.marker, self.plot_view.cursor[0])
-            selected_rows = [
-                row
-                for row in rows
-                if row["track"] is track and start <= row["index"] <= end and row["elevation"] is not None
-            ]
-            self.draw_profile_segment(selected_rows, transform, x_min, x_max, NSColor.systemRedColor(), 4.0)
-        if self.plot_view.mode == "overview":
-            selected = set(self.controller.selected_nrs)
-            if not selected:
-                return
-            NSColor.systemRedColor().setFill()
-            for track_nr in selected:
-                if track_nr not in track_ranges:
-                    continue
-                start, end = track_ranges[track_nr]
-                left = max(start, x_min)
-                right = min(end, x_max)
-                if right <= left:
-                    continue
-                x1, _ = transform(left, self.elevation_baseline(rows))
-                x2, _ = transform(right, self.elevation_baseline(rows))
-                rect = NSMakeRect(x1, 32, max(x2 - x1, 2.0), max(self.bounds().size.height - 58, 10))
-                NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 0.0, 0.0, 0.12).setFill()
-                NSBezierPath.fillRect_(rect)
-            return
-        track = self.current_track()
-        if track is None:
-            return
-        ranges = self.plot_view.selected_ranges_for_track(track)
-        if self.plot_view.marker is not None and self.plot_view.cursor is not None and self.plot_view.cursor[2] is track:
-            self.plot_view.sync_inspector_selection()
-        for start, end in ranges:
+        del track_ranges
+        tracks = (
+            self.profile_tracks()
+            if self.plot_view.mode == "overview"
+            else [self.current_track()]
+        )
+        for track in (item for item in tracks if item is not None):
+            ranges = self.plot_view.selected_ranges_for_track(track)
+            if (
+                self.plot_view.marker is not None
+                and self.plot_view.cursor is not None
+                and self.plot_view.cursor[2] is track
+            ):
+                self.plot_view.sync_inspector_selection()
             points = track.points()
-            if start >= len(points) or end >= len(points):
-                continue
-            selected_rows = [row for row in rows if row["track"] is track and start <= row["index"] <= end and row["elevation"] is not None]
-            self.draw_profile_segment(selected_rows, transform, x_min, x_max, NSColor.systemRedColor(), 4.0)
+            for start, end in ranges:
+                if start >= len(points) or end >= len(points):
+                    continue
+                selected_rows = [
+                    row
+                    for row in rows
+                    if row["track"] is track
+                    and start <= row["index"] <= end
+                    and row["elevation"] is not None
+                ]
+                self.draw_profile_segment(
+                    selected_rows,
+                    transform,
+                    x_min,
+                    x_max,
+                    NSColor.systemRedColor(),
+                    4.0,
+                )
 
     def draw_profile_segment(self, rows, transform, x_min, x_max, color, width):
         path = None
@@ -4265,7 +5220,11 @@ class ElevationProfileView(NSView):
             self.controller.set_status(f"Profile marker set at point {self.plot_view.marker + 1}.")
         if event.clickCount() >= 2 and self.plot_view.cursor is not None:
             if self.plot_view.mode == "overview":
-                self.controller.open_track_workflow_at_point(self.plot_view.cursor[2], self.plot_view.cursor[0])
+                self.controller.open_track_workflow_at_point(
+                    self.plot_view.cursor[2],
+                    self.plot_view.cursor[0],
+                    source_view=self.plot_view,
+                )
             elif self.plot_view.mode == "track":
                 inspector = self.controller.open_inspector_for_track(self.plot_view.cursor[2])
                 if inspector is not None:
@@ -4364,7 +5323,7 @@ class ElevationProfileView(NSView):
                 "Point information shown." if self.plot_view.show_info else "Point information hidden."
             )
             return
-        if key in {"p", "P"}:
+        if key in {"s", "S"}:
             self.controller.save_elevation_profile_png(self)
             return
         if key in {"c", "C"}:
@@ -4439,7 +5398,7 @@ class ElevationProfileView(NSView):
                 "y                 Fit height to the currently visible profile (+5% margins)",
                 "0                 Restore the zero-based default height axis",
                 "u                 Clear the current selection",
-                "p                 Save the elevation profile as a PNG",
+                "s                 Save the elevation profile as a PNG",
                 "q                 Close the elevation profile",
                 "",
                 "Click / drag      Move the cursor to the nearest track point",
@@ -4871,7 +5830,7 @@ class TrackInspectorController(NSObject):
             ("Split Track Above", "splitTrack:", ""),
             ("Readjust Time", "readjustTime:", ""),
             ("Fit Map to Selection", "fitMapToSelection:", ""),
-            ("Fit Map to Track", "fitMapToTrack:", ""),
+            ("Fit to Track", "fitMapToTrack:", ""),
         ]:
             if title is None:
                 menu.addItem_(NSMenuItem.separatorItem())
@@ -5371,6 +6330,11 @@ class TrackInspectorController(NSObject):
 
     def insert_point(self, *, before=False):
         rows = self.selected_row_indexes()
+        if not self.track.points():
+            coordinates = self.parent.prompt_for_coordinate_text()
+            if coordinates:
+                self.insert_parsed_coordinates(coordinates)
+            return
         try:
             self.push_undo()
             _point, new_row = insert_point_for_rows(
@@ -5464,10 +6428,13 @@ class TrackInspectorController(NSObject):
         pasteboard = NSPasteboard.generalPasteboard()
         payload = pasteboard.stringForType_(POINT_PASTEBOARD_TYPE)
         if payload is None:
-            show_alert(
-                "No GPX waypoints on the clipboard.",
-                "Copy or cut waypoint rows in a GPX point table first.",
-            )
+            plain_text = pasteboard.stringForType_("public.utf8-plain-text")
+            try:
+                parsed = parse_coordinate_text(str(plain_text or ""))
+            except CoordinateParseError as exc:
+                show_alert("Cannot paste coordinates.", str(exc))
+                return
+            self.insert_parsed_coordinates(parsed)
             return
         try:
             points = deserialize_points(str(payload))
@@ -5484,6 +6451,54 @@ class TrackInspectorController(NSObject):
             inserted_rows,
             f"Pasted {len(inserted_rows)} point(s) into track #{self.track.nr}.",
         )
+
+    def insert_parsed_coordinates(self, coordinates: list[ParsedCoordinate]):
+        if not coordinates:
+            return
+        rows = self.selected_row_indexes()
+        anchor = rows[-1] if rows else len(self.track.points()) - 1
+        points = [
+            point_from_values(
+                self.track.element,
+                item.latitude,
+                item.longitude,
+                elevation_m=item.elevation_m,
+                timestamp=item.timestamp,
+                name=item.name,
+            )
+            for item in coordinates
+        ]
+        try:
+            self.push_undo()
+            inserted_rows = insert_points_after_row(self.track.element, anchor, points)
+        except ValueError as exc:
+            if self.undo_stack:
+                self.undo_stack.pop()
+            show_alert("Cannot insert coordinates.", str(exc))
+            return
+        self.finish_point_structure_change(
+            inserted_rows,
+            f"Inserted {len(inserted_rows)} coordinate point(s) in track #{self.track.nr}.",
+        )
+        view = self.ensure_plot_view()
+        if view is not None:
+            if len(self.track.points()) == len(inserted_rows) and len(inserted_rows) == 1:
+                view.render_extent(
+                    self.parent.fit_extent_to_aspect(
+                        self.parent.extent_for_track_records([self.track]), (1000, 720)
+                    ),
+                    status="Centered the map on the first waypoint.",
+                )
+            elif len(inserted_rows) > 1:
+                view.render_extent(
+                    self.parent.fit_extent_to_aspect(
+                        self.parent.extent_for_point_infos(
+                            [self.track.points()[row] for row in inserted_rows]
+                        ),
+                        (1000, 720),
+                    ),
+                    status="Fitted the map to the inserted waypoints.",
+                )
 
     def duplicate_selected_points(self):
         rows = self.selected_row_indexes()
@@ -5977,7 +6992,7 @@ class TrackInspectorController(NSObject):
             "Edit a table cell and press Enter to change a waypoint value. Undo restores recent inspector edits. Backspace/Delete removes selected waypoints after confirmation.\n\n"
             "Command-I inserts a waypoint after the selected rows; Shift-Command-I inserts before them. Interior points are placed halfway between their neighbors. At a track end, the last two points are extrapolated. Command-C, Command-X, and Command-V copy, cut, and paste complete GPX waypoint data. Drag selected table rows to reorder them inside the same GPX segment. A thin separator marks every cut connection. The right-click menu can cut a connection or join the adjoining segment endpoints again, and also provides Duplicate, Fit Map, Split Track Above, and Readjust Time.\n\n"
             "Plot Track opens the track map. When this inspector and the map are both open, selecting points in the table highlights them on the map; clicking the map selects the nearest waypoint here. If a map marker is active, the selected range is shown in red. A new manual table selection replaces the active map-marker range.\n\n"
-            "On the track map, right-click a waypoint or segment for editing, centering, coordinate display, insertion, pasting, and connection-cut commands. Cutting a connection creates a GPX segment boundary but keeps one track; short perpendicular marks show segment ends, and selecting either adjoining endpoint allows the segments to be joined again. Press m or Shift-click to start a marked range. Right-click its red line to copy, cut, or delete it, or hold it for one second and drag all selected points together. Hold an unselected waypoint or connecting segment to move or insert one point. A normal drag pans the map, Option-drag pans immediately, Option-arrow pans by part of the window, and a trackpad pinch zooms. Press Escape while dragging to cancel, or otherwise to hide point information. Shift-Z fits the map to the complete current track after points have moved beyond the old map boundary.\n\n"
+            "On the track map, right-click a waypoint or segment for editing, centering, coordinate display, insertion, pasting, and connection-cut commands. Cutting a connection creates a GPX segment boundary but keeps one track; short perpendicular marks show segment ends, and selecting either adjoining endpoint allows the segments to be joined again. Press m or Shift-click to start a marked range. Right-click its red line to copy, cut, or delete it, or hold it for one second and drag all selected points together. Hold an unselected waypoint or connecting segment to move or insert one point. A normal drag or two-finger trackpad scroll pans the map, Option-drag pans immediately, Option-arrow pans by part of the window, and the mouse wheel or a trackpad pinch zooms. Press Escape while dragging to cancel, or otherwise to hide point information. Shift-Z fits the map to the complete current track after points have moved beyond the old map boundary.\n\n"
             "Split Track Above moves the selected waypoint and all following waypoints into a new track. Readjust Time recalculates selected waypoint timestamps from the first selected timestamp and the velocity field. Save keeps inspector edits in memory; Save & Exit keeps them and closes this window. The main editor Save writes everything to disk.",
         )
 
@@ -5998,6 +7013,8 @@ class GPXEditorWindowDelegate(NSObject):
         self.controller.layout_window()
 
     def windowShouldClose_(self, _sender):
+        if self.controller.hide_main_editor_for_workspace():
+            return False
         if not self.controller.quit_confirmed and not self.controller.confirm_quit():
             return False
         try:
@@ -6052,6 +7069,7 @@ class GPXEditorController(NSObject):
         self.last_load_dir: Path | None = None
         self.last_pdf_path: Path | None = None
         self.last_png_dir: Path | None = None
+        self.last_track_export_dir: Path | None = None
         self.pdf_summary_window = None
         self.pdf_summary_path_field = None
         self.pdf_summary_checkboxes = {}
@@ -6065,9 +7083,11 @@ class GPXEditorController(NSObject):
         self.on_close_callback = None
         self.on_save_callback = None
         self.on_settings_change_callback = None
+        self.media_context = {}
         self.settings_controller = None
         self.parameter_load_warnings = []
         self.help_window = None
+        self.media_viewer = None
         self.license_document_windows = {}
         self.did_auto_size_track_columns = False
         self.dirty = False
@@ -6107,6 +7127,8 @@ class GPXEditorController(NSObject):
         self.pending_track_load_path_count = 0
         self.pending_track_load_status = ""
         self.pending_track_load_start_index = 0
+        self.pending_track_load_offer_sort = False
+        self.pending_track_load_anchor_was_set = False
         self.pending_pdf_export_after_load = False
         self.on_initial_load_complete_callback = None
         self.initial_load_completion_notified = False
@@ -6561,7 +7583,7 @@ class GPXEditorController(NSObject):
             "Right-click selected tracks for plotting, sorting, duplicating, moving, "
             "visibility, joining, and deletion actions."
         )
-        self.track_table.registerForDraggedTypes_([DRAG_TYPE])
+        self.track_table.registerForDraggedTypes_([DRAG_TYPE, FILE_DRAG_TYPE])
         table_font = self.table_font(12)
         header_font = self.table_font(11)
         numeric_columns = {"row", "nr", "length", "duration", "sum", "distance", "speed", "ascent", "descent", "npoints"}
@@ -6596,11 +7618,12 @@ class GPXEditorController(NSObject):
         self.root.addSubview_(self.selection_field)
 
         button_specs = [
+            ("New Track", "newTrack:", "Create an empty editable track."),
             ("Add Tracks", "addTracks:", "Load one or more .gpx files and append their tracks."),
             (
-                "Tracks from Photos",
+                "Add Media Points",
                 "addTracksFromPhotos:",
-                "Create editable estimated tracks from photo/video GPS positions and add them to this editor.",
+                "Review photos/videos and add their GPS positions as linked waypoints to the selected track.",
             ),
             (
                 "Renumber Tracks",
@@ -6691,8 +7714,13 @@ class GPXEditorController(NSObject):
 
         menu = NSMenu.alloc().initWithTitle_("Track")
         menu.setAutoenablesItems_(False)
+        self._track_context_item(menu, "New Track", "newTrack:", True)
+        self._track_context_item(menu, "Add Points From Clipboard", "addPointsFromClipboard:", count == 1)
+        self._track_context_item(menu, "Add Media Points…", "addTracksFromPhotos:", count == 1)
+        menu.addItem_(NSMenuItem.separatorItem())
         self._track_context_item(menu, "Inspect Track", "contextInspectTrack:", count == 1)
         self._track_context_item(menu, "Plot Track(s)", "contextPlotTracks:", count > 0)
+        self._track_context_item(menu, "Elevation Profile", "contextElevationProfile:", count > 0)
         self._track_context_item(
             menu,
             "Plot Selected in Overview",
@@ -6714,6 +7742,12 @@ class GPXEditorController(NSObject):
             "Renumber Tracks",
             "renumberTracks:",
             bool(self.tracks),
+        )
+        self._track_context_item(
+            menu,
+            "Save Selected Tracks As…",
+            "saveSelectedTracksAs:",
+            count > 0,
         )
         self._track_context_item(
             menu, "Duplicate Selected Tracks", "duplicateSelectedTracks:", count > 0
@@ -6813,11 +7847,12 @@ class GPXEditorController(NSObject):
         self.header_logo_view.setFrame_(NSMakeRect(logo_x, top - logo_size + 4, logo_size, logo_size))
         top -= 52
         project_y = top - FIELD_HEIGHT
-        self.buttons["Add Tracks"].setFrame_(NSMakeRect(PADDING, project_y, 104, BUTTON_HEIGHT))
-        self.buttons["Tracks from Photos"].setFrame_(
-            NSMakeRect(PADDING + 104 + gap, project_y, 140, BUTTON_HEIGHT)
+        self.buttons["New Track"].setFrame_(NSMakeRect(PADDING, project_y, 96, BUTTON_HEIGHT))
+        self.buttons["Add Tracks"].setFrame_(NSMakeRect(PADDING + 96 + gap, project_y, 104, BUTTON_HEIGHT))
+        self.buttons["Add Media Points"].setFrame_(
+            NSMakeRect(PADDING + 96 + gap + 104 + gap, project_y, 140, BUTTON_HEIGHT)
         )
-        project_x = PADDING + 104 + gap + 140 + gap
+        project_x = PADDING + 96 + gap + 104 + gap + 140 + gap
         self.project_label.setFrame_(NSMakeRect(project_x, project_y + FIELD_HEIGHT + 2, 220, 18))
         self.project_field.setFrame_(NSMakeRect(project_x, project_y, 310, FIELD_HEIGHT))
         self.buttons["Renumber Tracks"].setFrame_(
@@ -6889,8 +7924,9 @@ class GPXEditorController(NSObject):
         order = [
             self.buttons["Help"],
             self.settings_button,
+            self.buttons["New Track"],
             self.buttons["Add Tracks"],
-            self.buttons["Tracks from Photos"],
+            self.buttons["Add Media Points"],
             self.project_field,
             self.buttons["Undo"],
             self.buttons["Redo"],
@@ -7040,7 +8076,9 @@ class GPXEditorController(NSObject):
         if delete_recovery:
             self.delete_recovery_file()
 
-    def close_main_editor_window(self, delete_recovery=True):
+    def close_main_editor_window(self, delete_recovery=True, force=False):
+        if not force and self.hide_main_editor_for_workspace():
+            return
         try:
             self.window.orderOut_(None)
         except Exception:
@@ -7056,6 +8094,18 @@ class GPXEditorController(NSObject):
             pass
         if self.standalone:
             NSApp().terminate_(None)
+
+    def hide_main_editor_for_workspace(self):
+        """Hide the shared Track Table without closing its map-first document."""
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        map_window = getattr(workspace, "window", None) if workspace is not None else None
+        if map_window is None or not map_window.isVisible():
+            return False
+        try:
+            self.window.orderOut_(None)
+        except Exception:
+            return False
+        return True
 
     def notify_save_callback(self, saved_path: Path | None):
         """Report a successful save to an embedding caller."""
@@ -7232,6 +8282,9 @@ class GPXEditorController(NSObject):
         self.dirty = True
         self.recalculate()
         self.set_status(message)
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "workspaceDocumentDidChange_"):
+            workspace.workspaceDocumentDidChange_(message)
 
     def invalidate_track_metrics(self, track: TrackRecord):
         track.metrics_dirty = True
@@ -7328,6 +8381,9 @@ class GPXEditorController(NSObject):
                 windows.append(window)
         if self.help_window is not None and not any(existing == self.help_window for existing in windows):
             windows.append(self.help_window)
+        if self.media_viewer is not None:
+            self.media_viewer.close_(None)
+            self.media_viewer = None
 
         for window in windows:
             try:
@@ -7461,7 +8517,15 @@ class GPXEditorController(NSObject):
         view.update_window_title()
         view.setNeedsDisplay_(True)
 
-    def open_track_workflow_at_point(self, track: TrackRecord, point_index: int):
+    def open_track_workflow_at_point(
+        self,
+        track: TrackRecord,
+        point_index: int,
+        source_view=None,
+    ):
+        workspace = getattr(source_view, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "inspect_workspace_track"):
+            return workspace.inspect_workspace_track(track, point_index)
         if not any(loaded_track is track for loaded_track in self.tracks):
             return None
         self.selected_nrs = [track.nr]
@@ -7524,6 +8588,79 @@ class GPXEditorController(NSObject):
     def selected_tracks(self) -> list[TrackRecord]:
         by_nr = {track.nr: track for track in self.tracks}
         return [by_nr[nr] for nr in self.selected_nrs if nr in by_nr]
+
+    @objc.IBAction
+    def showTrackTable_(self, _sender):
+        self.show()
+
+    def validateMenuItem_(self, item):
+        action = str(item.action() or "")
+        if action in {"inspectTrack:", "plotSelected:", "contextElevationProfile:", "saveSelectedTracksAs:"}:
+            return bool(self.selected_tracks())
+        if action == "renumberTracks:":
+            return bool(self.tracks)
+        if action == "undo:":
+            return bool(self.undo_stack)
+        if action == "redo:":
+            return bool(self.redo_stack)
+        return True
+
+    def media_paths_for_track_point(self, track: TrackRecord, point_index: int) -> list[Path]:
+        points = track.points()
+        if not 0 <= int(point_index) < len(points):
+            return []
+        source_directory = Path(track.source_file).parent if track.source_file else None
+        return [
+            path
+            for path in media_paths_for_point(points[int(point_index)].element, source_directory)
+            if path.is_file()
+        ]
+
+    def show_media_for_track_point(self, track: TrackRecord, point_index: int) -> bool:
+        all_paths = []
+        selected_path = None
+        source_directory = Path(track.source_file).parent if track.source_file else None
+        for index, point in enumerate(track.points()):
+            for path in media_paths_for_point(point.element, source_directory):
+                if not path.is_file() or path in all_paths:
+                    continue
+                if index == point_index and selected_path is None:
+                    selected_path = path
+                all_paths.append(path)
+        if not all_paths or selected_path is None:
+            return False
+        if self.media_viewer is None:
+            self.media_viewer = CocoaMediaViewer.alloc().init()
+        self.media_viewer.show_paths(
+            all_paths,
+            all_paths.index(selected_path),
+            selection_callback=lambda path: self.highlight_media_path(track, path),
+        )
+        return True
+
+    def highlight_media_path(self, track: TrackRecord, path: Path):
+        selected_path = Path(path).resolve(strict=False)
+        source_directory = Path(track.source_file).parent if track.source_file else None
+        selected_index = None
+        for index, point in enumerate(track.points()):
+            if any(
+                candidate.resolve(strict=False) == selected_path
+                for candidate in media_paths_for_point(point.element, source_directory)
+            ):
+                selected_index = index
+                break
+        for _window, _delegate, view in self.plot_windows:
+            if not isinstance(view, PlotView):
+                continue
+            view.active_media_path = selected_path
+            if selected_index is not None and track in view.display_tracks():
+                view.move_cursor_to_track_point(
+                    track,
+                    selected_index,
+                    sync_table=True,
+                    focus_plot=False,
+                )
+            view.setNeedsDisplay_(True)
 
     def visible_tracks(self) -> list[TrackRecord]:
         return [track for track in self.tracks if not track.hidden]
@@ -7964,6 +9101,84 @@ class GPXEditorController(NSObject):
         self.dirty = True
         self.set_status(f"Project name changed to '{new_name}'. It will be written to GPX metadata on save.")
 
+    def create_empty_track(self, *, name: str | None = None, mark_dirty: bool = True) -> TrackRecord:
+        """Append one canonical empty track and make it the active selection."""
+        if mark_dirty:
+            self.push_undo()
+        element = ET.Element(qname("trk"))
+        get_or_create_track_name(element).text = name or f"Track {self.next_nr}"
+        ET.SubElement(element, qname("trkseg"))
+        record = TrackRecord(self.next_nr, element, "")
+        record.set_order_number(record.nr)
+        self.next_nr += 1
+        self.tracks.append(record)
+        self.selected_nrs = [record.nr]
+        if not self.project_name:
+            self.project_name = "Untitled"
+            self.project_field.setStringValue_(self.project_name)
+        self.dirty = bool(mark_dirty) or self.dirty
+        self.recalculate()
+        self.update_selection_field()
+        self.highlight_selected_rows()
+        self.set_status(f"Created empty track #{record.nr}. Add its first waypoint from the table, clipboard, media, or map.")
+        return record
+
+    def prompt_for_coordinate_text(self) -> list[ParsedCoordinate] | None:
+        """Collect and preview one or more common coordinate representations."""
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Add Waypoint Coordinates")
+        alert.setInformativeText_(
+            "Paste decimal, DMS, geo:, full Google Maps/Earth, KML, or GPX coordinates. "
+            "Use one coordinate per line. Optional CSV fields are elevation, ISO time, and name."
+        )
+        alert.addButtonWithTitle_("Preview and Add")
+        alert.addButtonWithTitle_("Cancel")
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 520, 150))
+        scroll.setHasVerticalScroller_(True)
+        editor = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 510, 150))
+        pasteboard_text = NSPasteboard.generalPasteboard().stringForType_("public.utf8-plain-text")
+        if pasteboard_text:
+            editor.setString_(str(pasteboard_text))
+        scroll.setDocumentView_(editor)
+        alert.setAccessoryView_(scroll)
+        if int(alert.runModal()) != 1000:
+            return None
+        try:
+            coordinates = parse_coordinate_text(str(editor.string()))
+        except CoordinateParseError as exc:
+            show_alert("Could not read the coordinates.", str(exc))
+            return None
+        lines = [
+            f"{item.latitude:.8f}, {item.longitude:.8f}"
+            + (f", {item.elevation_m:.1f} m" if item.elevation_m is not None else "")
+            + (f", {item.timestamp.isoformat()}" if item.timestamp is not None else "")
+            for item in coordinates[:10]
+        ]
+        if len(coordinates) > 10:
+            lines.append(f"...and {len(coordinates) - 10} more")
+        preview = NSAlert.alloc().init()
+        preview.setMessageText_(f"Add {len(coordinates)} waypoint(s)?")
+        preview.setInformativeText_("\n".join(lines))
+        preview.addButtonWithTitle_("Add")
+        preview.addButtonWithTitle_("Cancel")
+        return coordinates if int(preview.runModal()) == 1000 else None
+
+    @objc.IBAction
+    def newTrack_(self, _sender):
+        self.create_empty_track()
+
+    @objc.IBAction
+    def addPointsFromClipboard_(self, _sender):
+        selected = self.selected_tracks()
+        if len(selected) != 1:
+            show_alert("Select one destination track.")
+            return
+        coordinates = self.prompt_for_coordinate_text()
+        if not coordinates:
+            return
+        inspector = self.open_inspector_for_track(selected[0])
+        inspector.insert_parsed_coordinates(coordinates)
+
     @objc.IBAction
     def addTracks_(self, _sender):
         panel = NSOpenPanel.openPanel()
@@ -7975,28 +9190,47 @@ class GPXEditorController(NSObject):
             paths = [Path(str(url.path())).resolve() for url in panel.URLs()]
             self.load_gpx_paths(paths)
 
+    def addDroppedMediaPaths_(self, paths):
+        """Review media or a control file dropped onto the active track map."""
+        self.media_context["_pending_media_paths"] = [str(path) for path in paths or []]
+        self.addTracksFromPhotos_(None)
+
     @objc.IBAction
     def addTracksFromPhotos_(self, _sender):
         from GetGeoLocations import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-        from media_track_builder import build_media_tracks, write_media_gpx
+        from media_metadata_service import media_paths_from_control_file, prepare_media_records
+        from track_timing_utils import repair_timed_points
+        from video_audio_normalization import GENERATED_DIRECTORY_NAMES
 
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseFiles_(True)
-        panel.setCanChooseDirectories_(True)
-        panel.setAllowsMultipleSelection_(True)
-        panel.setPrompt_("Create Tracks")
-        if not panel.runModal():
-            return
-        selected = [Path(str(url.path())).expanduser().resolve() for url in panel.URLs()]
+        pending_paths = self.media_context.pop("_pending_media_paths", None)
+        if pending_paths:
+            selected = [Path(path).expanduser().resolve(strict=False) for path in pending_paths]
+        else:
+            panel = NSOpenPanel.openPanel()
+            panel.setCanChooseFiles_(True)
+            panel.setCanChooseDirectories_(True)
+            panel.setAllowsMultipleSelection_(True)
+            panel.setPrompt_("Add Media Points")
+            media_directory = self.media_context.get("project_directory")
+            if media_directory:
+                candidate = Path(media_directory).expanduser().resolve(strict=False)
+                if candidate.is_dir():
+                    panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(candidate)))
+            if not panel.runModal():
+                return
+            selected = [Path(str(url.path())).expanduser().resolve() for url in panel.URLs()]
         media_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-        excluded_names = {
-            "audio",
-            "trackimages",
-            "normalized-videos",
-            "__pycache__",
-        }
+        excluded_names = set(GENERATED_DIRECTORY_NAMES) | {"__pycache__"}
         media_paths = []
         for selected_path in selected:
+            if selected_path.is_file() and selected_path.suffix.casefold() == ".lst":
+                try:
+                    media_paths.extend(
+                        media_paths_from_control_file(selected_path, media_extensions)
+                    )
+                except OSError as exc:
+                    show_alert("Could not read the control file.", str(exc))
+                continue
             candidates = (
                 selected_path.rglob("*")
                 if selected_path.is_dir()
@@ -8013,49 +9247,143 @@ class GPXEditorController(NSObject):
         if not media_paths:
             show_alert("No supported photos or videos were selected.")
             return
-        common_directory = (
-            selected[0] if len(selected) == 1 and selected[0].is_dir() else media_paths[0].parent
-        )
-        control_candidates = sorted(
-            common_directory.glob("*.lst"),
-            key=lambda path: path.stat().st_mtime_ns,
-            reverse=True,
-        )
-        control_path = control_candidates[0] if control_candidates else None
-        spacing = float(self.parameters.get("gpx.minimum_point_spacing_m", 10.0))
-        self.set_status(f"Preparing {len(media_paths)} media file(s) for photo tracks...")
-        result = build_media_tracks(
-            media_paths,
-            control_path=control_path,
-            minimum_spacing_m=spacing,
-            refresh_metadata=True,
-        )
-        if not result.tracks:
-            details = "\n".join(result.skipped_media[:12])
+        skip_selection = bool(self.media_context.pop("_skip_media_selection_once", False))
+        if not skip_selection:
+            from cocoa_media_point_selector import choose_media_points
+
+            media_paths = choose_media_points(media_paths)
+            if media_paths is None:
+                return
+            if not media_paths:
+                show_alert("No media selected.", "Check at least one file before continuing.")
+                return
+        force_new_track = bool(self.media_context.pop("_force_new_media_track_once", False))
+        destination = [self.create_empty_track(name="Track from Media")] if force_new_track else self.selected_tracks()
+        if len(destination) != 1:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Choose a destination track.")
+            alert.setInformativeText_(
+                "Media points require exactly one selected track. You can create a new empty track now, "
+                "or cancel and select an existing track."
+            )
+            alert.addButtonWithTitle_("Create New Track")
+            alert.addButtonWithTitle_("Cancel")
+            if int(alert.runModal()) != 1000:
+                return
+            destination = [self.create_empty_track()]
+        track = destination[0]
+        self.set_status(f"Preparing {len(media_paths)} media file(s) for track #{track.nr}...")
+        prepared = prepare_media_records(media_paths, refresh_changed=True)
+        usable = [item for item in prepared if item.record is not None and item.record.latitude is not None and item.record.longitude is not None]
+        skipped = [f"{item.path.name}: {item.error or 'no GPS coordinates'}" for item in prepared if item not in usable]
+        if not usable:
             show_alert(
-                "No photo track could be created.",
-                details or "The selected media contain no usable GPS coordinates.",
+                "No media points could be added.",
+                "\n".join(skipped[:12]) or "The selected media contain no usable GPS coordinates.",
             )
             return
-        temporary = Path(tempfile.gettempdir()) / (
-            f"myCamino-photo-tracks-{os.getpid()}-{time.time_ns()}.gpx"
+        usable.sort(key=lambda item: (
+            item.record.photo_datetime is None,
+            item.record.photo_datetime.timestamp() if item.record.photo_datetime is not None else float("inf"),
+            item.path.name.casefold(),
+        ))
+        existing_points = track.points()
+        existing_untimed = [point for point in existing_points if point.time is None]
+        estimate_times = False
+        fallback_speed = 3.5
+        route_matches = None
+        if existing_untimed and any(item.record.photo_datetime is not None for item in usable):
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Review Media Point Timing")
+            points_preview = [
+                point_from_values(
+                    track.element,
+                    item.record.latitude,
+                    item.record.longitude,
+                    timestamp=item.record.photo_datetime,
+                )
+                for item in usable
+            ]
+            if existing_points and len(existing_untimed) == len(existing_points):
+                route_matches = monotonic_route_matches(track.element, points_preview)
+            match_text = ""
+            if route_matches:
+                distances = [distance for _row, distance in route_matches]
+                match_text = (
+                    f"\nClosest-route matching: mean {sum(distances) / len(distances):.0f} m, "
+                    f"maximum {max(distances):.0f} m."
+                )
+            alert.setInformativeText_(
+                f"{len(usable)} located media point(s) will be merged by exposure time. "
+                f"The track also has {len(existing_untimed)} untimed waypoint(s).\n\n"
+                "Choose Add and Estimate to fill those timestamps by route distance, preserving every existing timestamp. "
+                "Edit the fallback speed below when the photo anchors do not determine one."
+                f"{match_text}"
+            )
+            speed_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 180, FIELD_HEIGHT))
+            speed_field.setStringValue_("3.5")
+            speed_field.setPlaceholderString_("Fallback speed in km/h")
+            alert.setAccessoryView_(speed_field)
+            alert.addButtonWithTitle_("Add and Estimate")
+            alert.addButtonWithTitle_("Add Without Estimating")
+            alert.addButtonWithTitle_("Cancel")
+            response = int(alert.runModal())
+            if response == 1002:
+                return
+            estimate_times = response == 1000
+            if estimate_times:
+                try:
+                    fallback_speed = float(str(speed_field.stringValue()).replace(",", "."))
+                    if fallback_speed <= 0:
+                        raise ValueError
+                except ValueError:
+                    show_alert("Invalid fallback speed.", "Enter a positive speed in km/h.")
+                    return
+        points = [
+            point_from_values(
+                track.element,
+                item.record.latitude,
+                item.record.longitude,
+                timestamp=item.record.photo_datetime,
+                name=item.path.name,
+                media_path=item.path,
+            )
+            for item in usable
+        ]
+        self.push_undo()
+        if estimate_times and route_matches and len(existing_untimed) == len(existing_points):
+            inserted_rows = insert_points_at_route_matches(track.element, points, route_matches)
+        else:
+            inserted_rows = insert_points_chronologically(track.element, points)
+        mark_track_media_derived(track.element)
+        if estimate_times:
+            timing_input = [
+                {"lat": point.lat, "lon": point.lon, "time": point.time, "segment_index": point.segment_index}
+                for point in track.points()
+            ]
+            repaired = repair_timed_points(timing_input, fallback_speed_kmh=fallback_speed)
+            for point, proposal in zip(track.points(), repaired):
+                if point.time is None and proposal.get("time") is not None:
+                    get_or_create_point_time(point.element).text = format_gpx_time(proposal["time"])
+        self.invalidate_track_metrics(track)
+        self.mark_dirty(
+            f"Added {len(inserted_rows)} media point(s) to track #{track.nr}; "
+            f"reused {sum(item.action == 'reused' for item in usable)}, "
+            f"extracted {sum(item.action == 'extracted' for item in usable)}, skipped {len(skipped)}."
         )
-        write_media_gpx(temporary, result, PROGRAM_TITLE)
-        if not self.project_name:
-            self.project_name = common_directory.name
-            self.project_field.setStringValue_(self.project_name)
-        if self.last_save_path is None and not str(self.output_field.stringValue()).strip():
-            suggested = common_directory / f"{common_directory.name}-photo-tracks.gpx"
-            self.set_output_path(suggested.resolve(strict=False))
-        self.load_gpx_paths([temporary], mark_dirty=True)
-        self.last_load_dir = common_directory
-        suffix = (
-            f" Reused {result.reused_sidecars}, refreshed {result.refreshed_sidecars}; "
-            f"merged {result.merged_points} near-duplicate point(s)."
-        )
-        if result.skipped_media:
-            suffix += f" Skipped {len(result.skipped_media)} media file(s)."
-        self.pending_track_load_status = suffix
+        inspector = self.existing_inspector_for_track(track)
+        if inspector is not None:
+            inspector.reload_rows()
+            inspector.select_point_rows(inserted_rows)
+        view = self.open_or_reload_track_plot_for_track(track)
+        if view is not None:
+            view.render_extent(
+                self.fit_extent_to_aspect(
+                    self.extent_for_point_infos([track.points()[row] for row in inserted_rows]),
+                    (1000, 720),
+                ),
+                status="Fitted the map to the inserted media points.",
+            )
 
     def _append_gpx_track_records(self, paths: list[Path]):
         """Parse GPX files and append unprocessed records, returning load details."""
@@ -8183,7 +9511,12 @@ class GPXEditorController(NSObject):
                     if self.debug:
                         print(f"GPXEditor metrics cache write failed for {source}: {exc}", flush=True)
 
-    def load_gpx_paths(self, paths: list[Path], mark_dirty: bool = True):
+    def load_gpx_paths(
+        self,
+        paths: list[Path],
+        mark_dirty: bool = True,
+        offer_sort_after_drop: bool = False,
+    ):
         """Load files now, then process one new track per AppKit run-loop turn."""
         if not paths:
             return
@@ -8210,6 +9543,8 @@ class GPXEditorController(NSObject):
         self.pending_track_load_path_count = len(paths)
         self.pending_track_load_status = ignored_suffix
         self.pending_track_load_start_index = start_index
+        self.pending_track_load_offer_sort = bool(offer_sort_after_drop)
+        self.pending_track_load_anchor_was_set = self.anchor is not None
         self.show_track_load_progress(0, self.pending_track_load_total)
         self.status_label.setStringValue_(f"Loading track 0 of {self.pending_track_load_total}...")
         self.track_load_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -8233,12 +9568,19 @@ class GPXEditorController(NSObject):
         track = self.pending_track_loads[index]
         try:
             self.compute_metrics(track)
+            workspace = getattr(self, "adventure_workspace_delegate", None)
+            if workspace is not None:
+                # Cached table metrics intentionally omit display geometry.
+                # Build one track per run-loop turn so the overview grows
+                # incrementally instead of processing every track on repaint.
+                self.display_processed_track(track)
         except Exception as exc:
             timer.invalidate()
             self.track_load_timer = None
             del self.tracks[self.pending_track_load_start_index :]
             self.next_nr = max([record.nr for record in self.tracks], default=0) + 1
             self.pending_track_loads = []
+            self.pending_track_load_offer_sort = False
             self.pending_pdf_export_after_load = False
             self.set_track_loading_controls_enabled(True)
             self.hide_track_load_progress()
@@ -8252,6 +9594,9 @@ class GPXEditorController(NSObject):
         self.status_label.setStringValue_(f"Loading track {current} of {total}: {track.name}")
         self.status_label.displayIfNeeded()
         self.load_progress.displayIfNeeded()
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "workspace_track_loading_progress"):
+            workspace.workspace_track_loading_progress(current, total)
         if current >= total:
             self._finish_staged_track_loading()
 
@@ -8264,9 +9609,12 @@ class GPXEditorController(NSObject):
         ignored_suffix = self.pending_track_load_status
         mark_dirty = self.pending_track_load_mark_dirty
         loaded_records = list(self.pending_track_loads)
+        offer_sort = self.pending_track_load_offer_sort
+        anchor_was_set = self.pending_track_load_anchor_was_set
         self.pending_track_loads = []
         self.pending_track_load_index = 0
         self.pending_track_load_total = 0
+        self.pending_track_load_offer_sort = False
         try:
             self.recalculate()
         except Exception as exc:
@@ -8282,11 +9630,70 @@ class GPXEditorController(NSObject):
         self.hide_track_load_progress()
         action = "Added" if mark_dirty else "Loaded"
         self.set_status(f"{action} {added} track(s) from {path_count} GPX file(s).{ignored_suffix}")
+        if offer_sort and len(loaded_records) > 1:
+            self.offer_sort_dropped_tracks(loaded_records, anchor_was_set)
         self.notify_initial_load_complete()
         self.offer_track_time_entry()
         if self.pending_pdf_export_after_load:
             self.pending_pdf_export_after_load = False
             self.exportPdf_(None)
+
+    def offer_sort_dropped_tracks(
+        self,
+        loaded_records: list[TrackRecord],
+        anchor_was_set: bool,
+    ):
+        """Offer a chronological or anchor-distance order for a dropped track block."""
+        loaded_records = [track for track in loaded_records if track in self.tracks]
+        if len(loaded_records) < 2:
+            return
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(f"Sort {len(loaded_records)} Dropped Tracks?")
+        alert.setInformativeText_(
+            "Sort the newly added tracks by their recorded date and time, or by "
+            "their distance from the current anchorpoint. If no anchorpoint was "
+            "set, distance sorting uses the first point of the first dropped track."
+        )
+        alert.addButtonWithTitle_("Sort by Time")
+        alert.addButtonWithTitle_("Sort by Distance")
+        alert.addButtonWithTitle_("Keep Current Order")
+        response = int(alert.runModal())
+        if response not in {1000, 1001}:
+            return
+        self.apply_dropped_track_sort(
+            loaded_records,
+            "date" if response == 1000 else "distance",
+            anchor_was_set,
+        )
+
+    def apply_dropped_track_sort(
+        self,
+        loaded_records: list[TrackRecord],
+        criterion: str,
+        anchor_was_set: bool,
+    ):
+        """Sort newly dropped tracks in their occupied rows without another undo step."""
+        loaded_records = [track for track in loaded_records if track in self.tracks]
+        if len(loaded_records) < 2 or criterion not in {"date", "distance"}:
+            return
+        if criterion == "distance" and not anchor_was_set:
+            points = loaded_records[0].points()
+            if not points:
+                show_alert(
+                    "The dropped tracks cannot be sorted by distance.",
+                    "The first dropped track has no track points from which to set an anchorpoint.",
+                )
+                return
+            self.anchor = (points[0].lat, points[0].lon)
+        self.selected_nrs = [track.nr for track in loaded_records]
+        self.update_selection_field()
+        self.highlight_selected_rows()
+        self.sort_by_column(
+            criterion,
+            ascending=True,
+            source="dropped tracks",
+            push_undo_step=False,
+        )
 
     def offer_track_time_entry(self):
         """Offer, but never require, an absolute anchor for fully untimed tracks."""
@@ -9481,7 +10888,7 @@ class GPXEditorController(NSObject):
                 return True
         return False
 
-    def build_root(self) -> ET.Element:
+    def build_root(self, output_path: Path | None = None) -> ET.Element:
         root = ET.Element(qname("gpx"), {"version": "1.1", "creator": "myCamino GPX Editor"})
         if self.project_name:
             metadata = ET.SubElement(root, qname("metadata"))
@@ -9494,6 +10901,12 @@ class GPXEditorController(NSObject):
         for track in self.tracks:
             track.set_order_number(track.nr)
             output_track = copy.deepcopy(track.element)
+            if output_path is not None:
+                rewrite_local_media_links(
+                    output_track,
+                    source_directory=Path(track.source_file).parent if track.source_file else None,
+                    output_directory=Path(output_path).parent,
+                )
             for child in list(output_track):
                 if child.tag == qname("time"):
                     output_track.remove(child)
@@ -9502,7 +10915,7 @@ class GPXEditorController(NSObject):
 
     def write_gpx_file(self, path: Path) -> ET.Element:
         path.parent.mkdir(parents=True, exist_ok=True)
-        root = self.build_root()
+        root = self.build_root(path)
         ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
         return root
 
@@ -9643,8 +11056,16 @@ class GPXEditorController(NSObject):
         self.selected_nrs = [track.nr]
         self.update_selection_field()
         self.highlight_selected_rows()
-        self.plotSelected_(None)
-        self.set_status(f"Plotted track #{track.nr}.")
+        inspector = self.open_inspector_for_track(track)
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        view = getattr(workspace, "plot_view", None) if workspace is not None else None
+        if inspector is not None and view is not None:
+            inspector.plot_view = view
+            view.inspector = inspector
+            cursor = getattr(view, "cursor", None)
+            point_index = cursor[0] if cursor is not None and cursor[2] is track else 0
+            inspector.select_point_index(point_index)
+        self.set_status(f"Opened waypoint table for track #{track.nr}.")
 
     @objc.IBAction
     def contextInspectTrack_(self, sender):
@@ -9653,6 +11074,19 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def contextPlotTracks_(self, sender):
         self.plotSelected_(sender)
+
+    @objc.IBAction
+    def contextElevationProfile_(self, _sender):
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and getattr(workspace, "plot_view", None) is not None:
+            selected = self.selected_tracks()
+            if selected and hasattr(workspace, "focus_workspace_tracks"):
+                workspace.focus_workspace_tracks(selected, mode="track", reset_viewport=False)
+            self.open_elevation_profile_for_plot_view(workspace.plot_view)
+            return
+        view = self.open_plot_window("track", recreate_existing=False, open_profile=False)
+        if view is not None:
+            self.open_elevation_profile_for_plot_view(view)
 
     @objc.IBAction
     def contextPlotOverview_(self, sender):
@@ -9810,13 +11244,58 @@ class GPXEditorController(NSObject):
         )
         self.redraw_open_plot_views()
 
-    def sort_by_column(self, column: str, ascending: bool | None = None, update_header: bool = True, source: str = "direct"):
+    @objc.IBAction
+    def saveSelectedTracksAs_(self, _sender):
+        selected_numbers = set(self.selected_nrs)
+        selected = [track for track in self.tracks if track.nr in selected_numbers]
+        if not selected:
+            show_alert("Select one or more tracks to export.")
+            return
+        panel = NSSavePanel.savePanel()
+        panel.setAllowedFileTypes_(["gpx"])
+        panel.setNameFieldStringValue_(f"{self.safe_filename(selected[0].name)}.gpx")
+        project_directory = self.media_context.get("project_directory")
+        if self.last_track_export_dir is not None:
+            directory = self.last_track_export_dir
+        elif project_directory:
+            directory = Path(str(project_directory)).expanduser().resolve(strict=False)
+        else:
+            directory = self.default_save_directory()
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(directory)))
+        if not file_panel_ok(panel.runModal()) or panel.URL() is None:
+            return
+        output_path = Path(str(panel.URL().path())).expanduser().resolve(strict=False)
+        if output_path.suffix.lower() != ".gpx":
+            output_path = output_path.with_suffix(".gpx")
+        try:
+            count = write_selected_tracks_gpx(
+                selected,
+                output_path,
+                project_name=selected[0].name,
+                anchor=self.anchor,
+            )
+        except (OSError, ValueError) as exc:
+            show_alert("Could not export the selected tracks.", str(exc))
+            self.set_status("Selected tracks were not exported.")
+            return
+        self.last_track_export_dir = output_path.parent
+        self.set_status(f"Exported {count} selected track(s) to {output_path}.")
+
+    def sort_by_column(
+        self,
+        column: str,
+        ascending: bool | None = None,
+        update_header: bool = True,
+        source: str = "direct",
+        push_undo_step: bool = True,
+    ):
         if not self.tracks:
             return
         if column not in {identifier for identifier, _title, _width, _editable in self.columns}:
             self.set_status(f"Ignored unknown sort column: {column}")
             return
-        self.push_undo()
+        if push_undo_step:
+            self.push_undo()
         before_order = [track.nr for track in self.tracks[:6]]
         self.set_status(f"Sorting by {column} ({source})...")
         if ascending is not None:
@@ -10134,6 +11613,13 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def plotAll_(self, _sender):
         selected = self.selected_tracks()
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and getattr(workspace, "plot_view", None) is not None:
+            if selected and hasattr(workspace, "focus_workspace_tracks"):
+                workspace.focus_workspace_tracks(selected, mode="overview", reset_viewport=True)
+            elif hasattr(workspace, "show_workspace_overview"):
+                workspace.show_workspace_overview()
+            return
         if selected:
             self.open_plot_window("overview", recreate_existing=True, tracks_override=selected)
         else:
@@ -10144,6 +11630,18 @@ class GPXEditorController(NSObject):
         if not self.selected_tracks() and self.tracks:
             self.selected_nrs = [self.tracks[0].nr]
             self.update_selection_field()
+        selected = self.selected_tracks()
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if (
+            workspace is not None
+            and selected
+            and getattr(workspace, "plot_view", None) is not None
+        ):
+            if hasattr(workspace, "focus_workspace_tracks"):
+                workspace.focus_workspace_tracks(selected, mode="track", reset_viewport=True)
+            else:
+                workspace.focus_workspace_track(selected[0], reset_viewport=True)
+            return
         existing = self.existing_plot_view("track")
         if existing is not None:
             _window, existing_view = existing
@@ -10212,7 +11710,10 @@ class GPXEditorController(NSObject):
             extent = self.extent_for_track_records(track_records)
             if extent is None:
                 return None
-            extent = self.fit_extent_to_aspect(extent, (1000, 720))
+            if any(track.points() for track in track_records):
+                extent = self.fit_extent_to_aspect(extent, (1000, 720))
+            else:
+                extent = clamp_extent_to_web_mercator(extent)
             zoom, diagnostics = self.effective_tile_zoom(extent, zoom)
             return {
                 "image": None,
@@ -10341,9 +11842,19 @@ class GPXEditorController(NSObject):
             for point in self.display_processed_track(track).points
         ]
         if not projected:
-            return {"min_x": -1.0, "max_x": 1.0, "min_y": -1.0, "max_y": 1.0}
+            limit = math.pi * 6378137.0
+            return {"min_x": -limit, "max_x": limit, "min_y": -limit, "max_y": limit}
         xs = [point[0] for point in projected]
         ys = [point[1] for point in projected]
+        if len(projected) == 1:
+            # Roughly three tiles across at the configured track zoom.
+            span = (2.0 * math.pi * 6378137.0) / (2 ** max(0, self.track_zoom)) * 3.0
+            return {
+                "min_x": xs[0] - span / 2.0,
+                "max_x": xs[0] + span / 2.0,
+                "min_y": ys[0] - span / 2.0,
+                "max_y": ys[0] + span / 2.0,
+            }
         span_x = max(max(xs) - min(xs), 1.0)
         span_y = max(max(ys) - min(ys), 1.0)
         padding_x = span_x * padding_fraction
@@ -10353,6 +11864,24 @@ class GPXEditorController(NSObject):
             "max_x": max(xs) + padding_x,
             "min_y": min(ys) - padding_y,
             "max_y": max(ys) + padding_y,
+        }
+
+    def extent_for_point_infos(self, points: list[PointInfo], padding_fraction: float | None = None) -> dict:
+        padding_fraction = self.map_padding_fraction if padding_fraction is None else padding_fraction
+        projected = [lonlat_to_web_mercator(point.lon, point.lat) for point in points]
+        if not projected:
+            return self.extent_for_track_records([])
+        if len(projected) == 1:
+            span = (2.0 * math.pi * 6378137.0) / (2 ** max(0, self.track_zoom)) * 3.0
+            x, y = projected[0]
+            return {"min_x": x - span / 2, "max_x": x + span / 2, "min_y": y - span / 2, "max_y": y + span / 2}
+        xs, ys = [item[0] for item in projected], [item[1] for item in projected]
+        span_x, span_y = max(max(xs) - min(xs), 1.0), max(max(ys) - min(ys), 1.0)
+        return {
+            "min_x": min(xs) - span_x * padding_fraction,
+            "max_x": max(xs) + span_x * padding_fraction,
+            "min_y": min(ys) - span_y * padding_fraction,
+            "max_y": max(ys) + span_y * padding_fraction,
         }
 
     def overview_zoom_for_tracks(self, selected_tracks: list[TrackRecord], base_zoom: int | None = None) -> int:
@@ -10563,10 +12092,31 @@ class GPXEditorController(NSObject):
             "status_message": status_message,
         }
 
-    def open_plot_window(self, mode: str, recreate_existing: bool = True, tracks_override: list[TrackRecord] | None = None):
+    def open_plot_window(
+        self,
+        mode: str,
+        recreate_existing: bool = True,
+        tracks_override: list[TrackRecord] | None = None,
+        open_profile: bool = True,
+    ):
         if not self.tracks:
             show_alert("No tracks to plot.")
             return
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and getattr(workspace, "plot_view", None) is not None:
+            selected = list(tracks_override or self.selected_tracks() or self.tracks[:1])
+            if mode == "overview" and tracks_override is None:
+                return workspace.show_workspace_overview()
+            if hasattr(workspace, "focus_workspace_tracks"):
+                return workspace.focus_workspace_tracks(
+                    selected,
+                    mode=mode,
+                    reset_viewport=recreate_existing,
+                )
+            return workspace.focus_workspace_track(
+                selected[0],
+                reset_viewport=recreate_existing,
+            )
         existing = self.existing_plot_view(mode)
         if existing is not None and not recreate_existing:
             window, view = existing
@@ -10575,7 +12125,8 @@ class GPXEditorController(NSObject):
             window.makeFirstResponder_(view)
             view.update_window_title()
             view.setNeedsDisplay_(True)
-            self.open_elevation_profile_for_plot_view(view)
+            if open_profile:
+                self.open_elevation_profile_for_plot_view(view)
             window.makeKeyAndOrderFront_(None)
             window.makeFirstResponder_(view)
             return view
@@ -10590,7 +12141,8 @@ class GPXEditorController(NSObject):
             window.makeFirstResponder_(view)
             view.update_window_title()
             view.setNeedsDisplay_(True)
-            self.open_elevation_profile_for_plot_view(view)
+            if open_profile:
+                self.open_elevation_profile_for_plot_view(view)
             window.makeKeyAndOrderFront_(None)
             window.makeFirstResponder_(view)
             return view
@@ -10614,7 +12166,8 @@ class GPXEditorController(NSObject):
         view.update_window_title()
         self.plot_windows.append((window, delegate, view))
         self.register_auxiliary_window(window)
-        self.open_elevation_profile_for_plot_view(view)
+        if open_profile:
+            self.open_elevation_profile_for_plot_view(view)
         window.makeKeyAndOrderFront_(None)
         window.makeFirstResponder_(view)
         return view
@@ -10792,6 +12345,8 @@ class GPXEditorController(NSObject):
 
     @objc.IBAction
     def quit_(self, _sender):
+        if self.hide_main_editor_for_workspace():
+            return
         if not self.confirm_quit():
             return
         self.quit_confirmed = True
@@ -10804,12 +12359,12 @@ class GPXEditorController(NSObject):
             "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
-            "Add Tracks loads GPX files into the table. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
-            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to perform Plot Track(s); inspect waypoints explicitly when the point table is needed. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row.\n\n"
+            "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
+            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint table. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row.\n\n"
             "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber Tracks records the current row order as persistent track numbers; after another sort, sorting by Track Number restores that order. Hidden rows remain numbered but are gray and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
-            "Plot Overview opens an overview using the configured map service. If tracks are selected, the overview zooms to those tracks and highlights them in red; selecting different tracks in the table updates the red highlight. Click a track in the overview to select it in the table. Double-click a point in the overview to open that track in the inspector and track map at the same point.\n\n"
-            "Plot Track(s) opens a detailed map for the selected track. View File opens the original GPX source file of the selected track in TextEdit and asks whether unsaved edits should be saved first. Click a map to move the cursor dot and direction arrow to the nearest waypoint; drag to pan. Double-click a track point to open its waypoint inspector. Press i to show or hide point information; Escape hides it; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z zooms out to the full map extent; q closes the plot window. In the track map, m or Shift-click starts a marked range. Its red segment can be copied, cut, deleted, or dragged through its context menu and long-click gesture. Right-click elsewhere to paste copied points after the nearest waypoint.\n\n"
+            "Plot Overview opens an overview using the configured map service. Selected tracks are dark blue, other tracks are gray, and marked waypoint ranges remain red. Click a track in the overview to select it in the table. In the Adventure Map, double-click a track to open the Track Table; double-click it there to open the waypoint table. The map context menu can open either table directly.\n\n"
+            "Plot Track(s) opens a detailed map for the selected track; an empty track starts on a world map. Right-click Create Waypoint Here to add its first or a later point. View File opens the original GPX source file in TextEdit. Click a map to move the cursor dot and direction arrow to the nearest waypoint; drag to pan. Double-click a linked media point to view its photo or video, or another point to open its waypoint inspector. Press i to show or hide point information; Escape hides it; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z zooms out to the full map extent; p changes photo-thumbnail display; s saves PNG; q closes the plot window. In the track map, m or Shift-click starts a marked range. Its red segment can be copied, cut, deleted, or dragged through its context menu and long-click gesture. Right-click elsewhere to paste copied points after the nearest waypoint.\n\n"
             "Inspect Track opens all raw waypoints of one track. The read-only XY and Elevation status columns explain quality filtering and interpolation; the header shows retained/raw counts. The processing summary above the main table shows the active XY smoothing, spacing, elevation smoothing, error, and HDOP/VDOP limits. Statistics, maps, PDFs, profiles, and timing use this common segment-aware processed geometry while saved GPX points remain unchanged.\n\n"
             "The gear button edits GPX processing, PDF, and map-service settings. Manage Map Provider opens the shared provider setup, account links, and secure Keychain registration; Esri and Custom XYZ are completed manually in Map Service. Set a smoothing, spacing, or quality limit to zero to disable it. A standalone editor keeps these settings for future sessions; an editor opened from an Adventure stores them with that Adventure. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
         )
@@ -10856,6 +12411,13 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def showProjectLicense_(self, _sender):
         self._show_project_document("license", "myCamino License — GPL-3.0-or-later")
+
+    @objc.IBAction
+    def showAbout_(self, _sender):
+        show_alert(
+            "myCamino GPX Editor",
+            "Create, inspect, edit, combine, and export GPX tracks with myCamino.",
+        )
 
     @objc.IBAction
     def showThirdPartyNotices_(self, _sender):
@@ -11005,6 +12567,52 @@ def startup_options_from_args(args, parser: argparse.ArgumentParser | None = Non
     return startup_paths, output_path, bool(args.debug)
 
 
+def build_gpx_editor_menu(controller, window_menu_coordinator=None):
+    """Build the native menu used by the standalone GPX Editor."""
+    main_menu = NSMenu.alloc().initWithTitle_("Main Menu")
+    app_menu = add_menu(main_menu, "myCamino")
+    app_menu.addItem_(menu_item("About myCamino", "showAbout:", controller))
+    app_menu.addItem_(menu_item("Settings…", "showSettings:", controller, ",", NSEventModifierFlagCommand))
+    app_menu.addItem_(NSMenuItem.separatorItem())
+    app_menu.addItem_(menu_item("License", "showProjectLicense:", controller))
+    app_menu.addItem_(menu_item("Third-Party Notices", "showThirdPartyNotices:", controller))
+    install_application_news(app_menu)
+    app_menu.addItem_(NSMenuItem.separatorItem())
+    app_menu.addItem_(menu_item("Quit myCamino", "terminate:", NSApp(), "q", NSEventModifierFlagCommand))
+
+    file_menu = add_menu(main_menu, "File")
+    file_menu.addItem_(menu_item("Add GPX Files…", "addTracks:", controller, "o", NSEventModifierFlagCommand))
+    file_menu.addItem_(menu_item("Save", "save:", controller, "s", NSEventModifierFlagCommand))
+    file_menu.addItem_(menu_item("Save Selected Tracks As…", "saveSelectedTracksAs:", controller))
+
+    edit_menu = add_menu(main_menu, "Edit")
+    edit_menu.addItem_(menu_item("Undo", "undo:", controller, "z", NSEventModifierFlagCommand))
+    edit_menu.addItem_(menu_item("Redo", "redo:", controller, "Z", NSEventModifierFlagCommand | NSEventModifierFlagShift))
+
+    track_menu = add_menu(main_menu, "Track")
+    for title, action in (
+        ("New Track", "newTrack:"),
+        ("Track Table", "showTrackTable:"),
+        ("Waypoint Table", "inspectTrack:"),
+        ("Plot Track(s)", "plotSelected:"),
+        ("Elevation Profile", "contextElevationProfile:"),
+        ("Renumber Tracks", "renumberTracks:"),
+        ("Save Selected Tracks As…", "saveSelectedTracksAs:"),
+    ):
+        track_menu.addItem_(menu_item(title, action, controller))
+
+    window_menu = add_menu(main_menu, "Window")
+    coordinator = window_menu_coordinator or WindowMenuCoordinator.alloc().init()
+    coordinator.attach(window_menu)
+    controller.native_window_menu_coordinator = coordinator
+
+    help_menu = add_menu(main_menu, "Help")
+    help_menu.addItem_(menu_item("GPX Editor Help", "help:", controller))
+    help_menu.addItem_(menu_item("Report a Bug", "openBugReport:", controller))
+    help_menu.addItem_(menu_item("Request a Feature", "openFeatureRequest:", controller))
+    return main_menu
+
+
 class AppDelegate(NSObject):
     def initWithStartupPaths_outputPath_debug_(self, startup_paths, output_path, debug):
         self = objc.super(AppDelegate, self).init()
@@ -11016,7 +12624,14 @@ class AppDelegate(NSObject):
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
+        configure_mycamino_branding(bundled_resource_path("MyCaminoLogo-ohneText.png"))
         self.controller = GPXEditorController.alloc().initStandalone_(True)
+        self.window_menu_coordinator = WindowMenuCoordinator.alloc().init()
+        self.main_menu = build_gpx_editor_menu(
+            self.controller,
+            self.window_menu_coordinator,
+        )
+        NSApp().setMainMenu_(self.main_menu)
         self.controller.debug = bool(self.debug)
         if self.output_path is not None:
             self.controller.set_output_path(self.output_path)
@@ -11029,6 +12644,13 @@ class AppDelegate(NSObject):
             self.controller.load_gpx_paths(self.startup_paths, mark_dirty=False)
         elif loaded_recovery:
             self.controller.recalculate()
+        else:
+            track = self.controller.create_empty_track(mark_dirty=True)
+            self.controller.open_plot_window(
+                "track",
+                tracks_override=[track],
+                open_profile=False,
+            )
 
 
 def show_gpx_editor(
@@ -11041,6 +12663,7 @@ def show_gpx_editor(
     on_settings_change=None,
     on_initial_load_complete=None,
     settings=None,
+    media_context=None,
 ):
     controller = GPXEditorController.alloc().initStandalone_(standalone)
     if settings is not None:
@@ -11050,6 +12673,7 @@ def show_gpx_editor(
     controller.on_save_callback = on_save
     controller.on_settings_change_callback = on_settings_change
     controller.on_initial_load_complete_callback = on_initial_load_complete
+    controller.media_context = dict(media_context or {})
     if output_file is not None:
         controller.set_output_path(Path(output_file).expanduser().resolve())
     controller.show()
@@ -11060,6 +12684,12 @@ def show_gpx_editor(
         controller.recalculate()
         controller.notify_initial_load_complete()
     else:
+        track = controller.create_empty_track(mark_dirty=True)
+        controller.open_plot_window(
+            "track",
+            tracks_override=[track],
+            open_profile=False,
+        )
         controller.notify_initial_load_complete()
     return controller
 
@@ -11072,6 +12702,7 @@ def show_gpx_editor_from_cli_args(
     on_settings_change=None,
     on_initial_load_complete=None,
     settings=None,
+    media_context=None,
 ):
     """Open the editor from another Python program using CLI-style arguments.
 
@@ -11107,6 +12738,7 @@ def show_gpx_editor_from_cli_args(
         on_settings_change=on_settings_change,
         on_initial_load_complete=on_initial_load_complete,
         settings=settings,
+        media_context=media_context,
     )
 
 
@@ -11153,6 +12785,7 @@ def run_gpx_editor_from_cli_args(cli_args: list[str] | tuple[str, ...] | None = 
     parser = build_argument_parser()
     args = parser.parse_args(list(cli_args or []))
     startup_paths, output_path, debug = startup_options_from_args(args, parser=parser)
+    configure_mycamino_branding()
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
     delegate = AppDelegate.alloc().initWithStartupPaths_outputPath_debug_(startup_paths, output_path, debug)
@@ -11166,6 +12799,7 @@ def main() -> int:
     args = parser.parse_args()
     startup_paths, output_path, debug = startup_options_from_args(args, parser=parser)
 
+    configure_mycamino_branding()
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
     delegate = AppDelegate.alloc().initWithStartupPaths_outputPath_debug_(startup_paths, output_path, debug)

@@ -18,6 +18,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# A directly executed Python file is normally known only as ``__main__``.
+# Register its canonical name before defining any PyObjC classes so map-first
+# code cannot import this file a second time and register those classes twice.
+if __name__ == "__main__":
+    sys.modules.setdefault("GPSTrackShowGUI", sys.modules[__name__])
+
 import objc
 from AppKit import (
     NSApp,
@@ -109,6 +115,13 @@ from beta_notice import (
     beta_notice_should_be_shown,
 )
 from application_metadata import compact_version_label, full_version_label
+from cocoa_native_menus import (
+    WindowMenuCoordinator,
+    add_menu,
+    configure_mycamino_branding,
+    menu_item,
+)
+from cocoa_application_news import install_application_news
 
 try:
     from AVFoundation import AVPlayer
@@ -143,6 +156,7 @@ from GetGeoLocations import (
     control_media_points,
     media_map_output_filename,
     project_map_plan_from_sidecars,
+    project_control_plan_text,
     render_project_map_plan,
     render_media_map_specs,
     run_with_options as run_geolocations_with_options,
@@ -150,6 +164,7 @@ from GetGeoLocations import (
 )
 from control_media_inventory import (
     build_control_media_inventory_payload,
+    classify_project_media,
     control_media_inventory_path,
     load_control_media_inventory,
     mark_imported_media,
@@ -195,6 +210,7 @@ from track_map_layout_utils import (
     resolve_track_map_variant,
     time_lapse_track_map_name,
 )
+from project_media_watcher import ProjectMediaWatcher, discover_project_media
 from adventure_parameters import (
     PARAMETER_SPECS,
     SECTION_ORDER,
@@ -772,12 +788,14 @@ def request_open_meteo_api_key(credential_id: str) -> bool:
     alert = NSAlert.alloc().init()
     alert.setMessageText_("Configure Open-Meteo customer access")
     alert.setInformativeText_(
-        "Historical customer access currently requires a suitable paid Open-Meteo plan. "
-        "The key is stored only in macOS Keychain."
+        "Free non-commercial access does not need an account or API key. "
+        "Customer access requires an Open-Meteo account and a suitable paid historical-"
+        "weather plan. Create or manage the account on Open-Meteo, then enter its API "
+        "key here. The key is stored only in macOS Keychain."
     )
     alert.setAccessoryView_(accessory)
     alert.addButtonWithTitle_("Store Key")
-    alert.addButtonWithTitle_("Open Pricing")
+    alert.addButtonWithTitle_("Open Plans and Account")
     alert.addButtonWithTitle_("Cancel")
     while True:
         response = int(alert.runModal())
@@ -1690,6 +1708,9 @@ class GPSTrackShowGUIWindowDelegate(NSObject):
     def windowShouldClose_(self, _sender):
         if not self.controller.confirm_close():
             return False
+        if getattr(self.controller, "hosted_by_adventure_map", False):
+            _sender.orderOut_(None)
+            return False
         NSApp().terminate_(None)
         return True
 
@@ -2329,6 +2350,14 @@ class GPXTrackerController(NSObject):
         self.narration_playlist = None
         self.audio_section_expanded = False
         self.parameters = default_parameters()
+        self.weather_consent = "unasked"
+        self.hosted_by_adventure_map = False
+        self.adventure_map_host = None
+        self.project_media_watcher = None
+        self.project_media_watch_seen_paths = set()
+        self.pending_discovered_media = set()
+        self.discovered_media_retry_scheduled = False
+        self.discovered_media_generate_maps = True
         self.pending_map_provider_action = None
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
@@ -5586,6 +5615,7 @@ class GPXTrackerController(NSObject):
         elif action == "media_not_yet":
             self.set_status("Existing media was not accepted yet; the assistant will ask again later.")
         elif action == "prepare_metadata":
+            self.discovered_media_generate_maps = True
             self._start_assistant_metadata_preparation(
                 bool(self.parameters.get("locations.add_place_names", True))
             )
@@ -5629,6 +5659,7 @@ class GPXTrackerController(NSObject):
             "track_map_base": self.track_map_base or project_filename_base(self._current_project_name()),
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
             "parameters": parameter_payload(self.parameters),
+            "weather_consent": self.weather_consent,
             "slideshow_resume_history": list(self.slideshow_resume_history),
             "media_identity_source_project": (
                 str(self.media_identity_source_project)
@@ -6151,6 +6182,7 @@ class GPXTrackerController(NSObject):
                         pass
             return loaded
 
+        self._stop_project_media_watcher()
         self._initialize_blank_adventure_fields(resolved, blank_name)
         if blank_name is not None:
             self.adventureNameCommitted_(self.title_field)
@@ -6212,6 +6244,13 @@ class GPXTrackerController(NSObject):
                 "values": migrated_values,
             }
         self.parameters = normalize_parameters(raw_parameters)
+        stored_weather_consent = str(data.get("weather_consent", "")).casefold()
+        if stored_weather_consent in {"unasked", "free", "customer", "disabled"}:
+            self.weather_consent = stored_weather_consent
+        elif bool(self.parameters.get("weather.enabled", False)):
+            self.weather_consent = str(self.parameters.get("weather.access", "free")).casefold()
+        else:
+            self.weather_consent = "unasked"
         self._sync_legacy_parameter_controls()
         loaded_gpx_value = str(data["gpx_file"]).strip()
         loaded_gpx_path = self.current_project_dir / loaded_gpx_value
@@ -6659,6 +6698,7 @@ class GPXTrackerController(NSObject):
             show_alert("Could not load adventure.", str(exc))
             return False
 
+        self._stop_project_media_watcher()
         old_audio_details_visible = bool(
             self.parameters.get("audio.enabled", False)
             and self.audio_section_expanded
@@ -6694,6 +6734,7 @@ class GPXTrackerController(NSObject):
         if music_paths_changed:
             self.saved_project_payload = dict(data)
             self.mark_dirty(immediate=True)
+        self._start_project_media_watcher()
         return True
 
     def confirm_close(self):
@@ -6752,6 +6793,12 @@ class GPXTrackerController(NSObject):
                 return False
         self.parameters = new_parameters
         changed = changed_parameter_keys(old_parameters, self.parameters)
+        if changed & {"weather.enabled", "weather.access"}:
+            self.weather_consent = (
+                str(self.parameters.get("weather.access", "free")).casefold()
+                if bool(self.parameters.get("weather.enabled", False))
+                else "disabled"
+            )
         self._sync_legacy_parameter_controls()
         self._resize_main_window_for_audio_visibility(
             old_audio_details_visible,
@@ -6828,6 +6875,11 @@ class GPXTrackerController(NSObject):
         if self.pending_map_provider_action is not None:
             self.performSelector_withObject_afterDelay_(
                 "resumePendingMapProviderAction:", None, 0.0
+            )
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host.adoptAdvancedInterfaceParameters_weatherConsent_(
+                dict(self.parameters), self.weather_consent
             )
         return True
 
@@ -7072,6 +7124,56 @@ class GPXTrackerController(NSObject):
             content.addSubview_(close_button)
             self.main_help_window = window
         self.main_help_window.makeKeyAndOrderFront_(None)
+
+    @objc.IBAction
+    def showAbout_(self, _sender):
+        show_alert("myCamino", full_version_label())
+
+    @objc.IBAction
+    def chooseControlFileMenu_(self, _sender):
+        project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
+        if project_dir is None:
+            return
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setAllowedFileTypes_(["lst"])
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(project_dir)))
+        if panel.runModal() == NSModalResponseOK and panel.URL() is not None:
+            self.current_control_file = Path(str(panel.URL().path())).resolve(strict=False)
+            self.control_file_field.setStringValue_(self.current_control_file.name)
+            self.mark_dirty(immediate=True)
+            self.refresh_control_file_display()
+
+    @objc.IBAction
+    def addHistoricalWeatherMenu_(self, _sender):
+        self.media_weather_checkbox.setState_(NSControlStateValueOn)
+        self.fieldChanged_(self.media_weather_checkbox)
+        self.updateMediaMetadata_(None)
+
+    @objc.IBAction
+    def toggleAudioMenu_(self, _sender):
+        enabled = not bool(self.parameters.get("audio.enabled", False))
+        self.no_music_checkbox.setState_(NSControlStateValueOff if enabled else NSControlStateValueOn)
+        self.noMusicChanged_(self.no_music_checkbox)
+
+    @objc.IBAction
+    def revealControlFileMenu_(self, _sender):
+        path = self._control_file_path()
+        if path is not None and path.exists():
+            NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([
+                NSURL.fileURLWithPath_(str(path))
+            ])
+
+    @objc.IBAction
+    def saveSelectedTracksMenu_(self, _sender):
+        controller = self.gpx_editor_controller
+        if controller is None:
+            self.addAndEditTracks_(None)
+            controller = self.gpx_editor_controller
+        if controller is not None:
+            controller.saveSelectedTracksAs_(None)
 
     def _show_project_document(self, kind, title):
         window = self.license_document_windows.get(kind)
@@ -7482,11 +7584,18 @@ class GPXTrackerController(NSObject):
             self.set_status(summary)
             self._continue_adventure_processing(summary)
             self.refresh_section_status_indicators()
-            self.performSelector_withObject_afterDelay_(
-                "startAutomaticMapGeneration:",
-                pending_imported_paths,
-                0.0,
-            )
+            if bool(getattr(self, "discovered_media_generate_maps", True)):
+                self.performSelector_withObject_afterDelay_(
+                    "startAutomaticMapGeneration:",
+                    pending_imported_paths,
+                    0.0,
+                )
+            else:
+                self.performSelector_withObject_afterDelay_(
+                    "finishDiscoveredMediaMetadata:",
+                    pending_imported_paths,
+                    0.0,
+                )
             return
         if mode == "automatic_maps":
             result = getattr(self, "automatic_map_generation_result", {}) or {}
@@ -8094,6 +8203,81 @@ class GPXTrackerController(NSObject):
     @objc.IBAction
     def showParameterEditor_(self, _sender):
         self._show_parameter_editor_section()
+
+    @objc.IBAction
+    def showMediaSettingsMenu_(self, _sender):
+        self._show_parameter_editor_section("Locations")
+
+    @objc.IBAction
+    def showMapSettingsMenu_(self, _sender):
+        self._show_parameter_editor_section("Map Generation")
+
+    @objc.IBAction
+    def showAudioSettingsMenu_(self, _sender):
+        self._show_parameter_editor_section("Audio")
+
+    @objc.IBAction
+    def showSlideShowSettingsMenu_(self, _sender):
+        self._show_parameter_editor_section("Slide Show")
+
+    @objc.IBAction
+    def showAdventureProperties_(self, _sender):
+        self.window.makeKeyAndOrderFront_(None)
+        self.description_scroll.scrollRectToVisible_(self.description_scroll.bounds())
+        self.window.makeFirstResponder_(self.description_text)
+
+    def validateMenuItem_(self, item):
+        action = str(item.action() or "")
+        has_project = self.current_project_dir is not None
+        control_path = self._control_file_path() if has_project else None
+        if action == "toggleAudioMenu:":
+            item.setState_(
+                NSControlStateValueOn
+                if bool(self.parameters.get("audio.enabled", False))
+                else NSControlStateValueOff
+            )
+        if action in {
+            "selectGPXFile:", "addAndEditTracks:", "createTracksFromPhotos:",
+            "importMediaFiles:", "viewMediaFiles:", "editMediaFiles:",
+            "getPlaceNames:", "addHistoricalWeatherMenu:", "updateMediaMetadata:",
+            "makePlots:", "viewPlots:", "editPlots:", "chooseControlFileMenu:",
+            "createControlFile:", "toggleAudioMenu:", "chooseMusicPlaylist:",
+            "createMusicPlaylist:", "updateMusicPlaylist:", "editMusicPlaylist:",
+            "openMusicFolder:", "chooseNarrationPlaylist:",
+            "createNarrationPlaylist:", "updateNarrationPlaylist:",
+            "editNarrationPlaylist:", "openNarrationFolder:",
+            "normalizeVideoAudio:", "startSelectedSlideShow:",
+            "continueSelectedSlideShow:", "exportPdfSummary:",
+        }:
+            return has_project
+        if action in {"editControlFile:", "updateControlFile:", "revealControlFileMenu:"}:
+            return bool(control_path is not None and control_path.is_file())
+        if action == "cancelMakePlots:":
+            return bool(not self.gpx_cancel_plots_button.isHidden())
+        if action == "saveSelectedTracksMenu:":
+            return bool(
+                self.gpx_editor_controller is not None
+                and self.gpx_editor_controller.selected_tracks()
+            )
+        return True
+
+    @objc.python_method
+    def window_status_for_window(self, window):
+        if bool(window.isKeyWindow()):
+            states = ["Active"]
+        elif bool(window.isMiniaturized()):
+            states = ["Minimized"]
+        elif not bool(window.isVisible()):
+            states = ["Hidden"]
+        else:
+            states = ["Visible"]
+        if window is self.window and self.project_dirty:
+            states.append("Unsaved")
+        if window is self.window and self._assistant_operation_active():
+            states.append("Processing")
+        if window is self.window and slideshow_process_is_running(self.slideshow_process):
+            states.append("Slide Show Running")
+        return ", ".join(states)
 
     def _show_parameter_editor_section(self, section=None, *, draft_overrides=None, show_advanced=None):
         """Open Adventure Settings, optionally selecting one section."""
@@ -9599,12 +9783,8 @@ class GPXTrackerController(NSObject):
             return []
         items = []
         media_paths = sorted(
-            [
-                path
-                for path in project_dir.iterdir()
-                if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
-            ],
-            key=lambda path: path.name.lower(),
+            discover_project_media(project_dir, MEDIA_EXTENSIONS),
+            key=lambda path: str(path).casefold(),
         )
         for index, path in enumerate(media_paths):
             row_type = "VID" if path.suffix.lower() in VIDEO_EXTENSIONS else "IMG"
@@ -9616,7 +9796,7 @@ class GPXTrackerController(NSObject):
                 "index": index,
                 "row": {
                     "type": row_type,
-                    "name": path.name,
+                    "name": str(path.relative_to(project_dir)),
                     "time": time_text,
                     "gps": gps_text,
                     "place": place_text,
@@ -9624,7 +9804,7 @@ class GPXTrackerController(NSObject):
                 "path": path.resolve(strict=False),
                 "kind": "video" if row_type == "VID" else "image",
                 "image": None,
-                "name": path.name,
+                "name": str(path.relative_to(project_dir)),
                 "metadata": metadata.get("metadata", "Invalid"),
                 "metadata_reason": metadata.get("metadata_reason", ""),
                 "freshness": metadata.get("freshness", "Unknown"),
@@ -9635,6 +9815,217 @@ class GPXTrackerController(NSObject):
                 "sort_datetime": metadata.get("sort_datetime"),
             })
         return items
+
+    def _stop_project_media_watcher(self):
+        watcher = self.project_media_watcher
+        self.project_media_watcher = None
+        if watcher is not None:
+            watcher.stop()
+
+    def _start_project_media_watcher(self):
+        self._stop_project_media_watcher()
+        if (
+            self.hosted_by_adventure_map
+            or self.current_project_dir is None
+            or self.current_project_file is None
+            or not self.current_project_dir.is_dir()
+        ):
+            return
+        self.project_media_watch_seen_paths = set()
+
+        def discovered(paths, initial):
+            payload = {
+                "paths": [str(path) for path in paths],
+                "initial": bool(initial),
+            }
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "handleProjectMediaDiscovery:", payload, False
+            )
+
+        self.project_media_watcher = ProjectMediaWatcher(
+            self.current_project_dir,
+            discovered,
+            extensions=MEDIA_EXTENSIONS,
+            excluded_directories=GENERATED_DIRECTORY_NAMES | {
+                "audio", "narration", "trackimages", ".mycamino", "cache", "caches",
+            },
+            reconciliation_seconds=60.0,
+            stability_seconds=1.0,
+        )
+        self.project_media_watcher.start()
+
+    def _included_control_media_names(self):
+        control_path = self._control_file_path()
+        if control_path is None or not control_path.is_file():
+            return []
+        if self.control_table_path == control_path and self.control_table_rows:
+            rows = self.control_table_rows
+        else:
+            try:
+                rows = [
+                    parse_slideshow_control_line(line)
+                    for line in control_path.read_text(encoding="utf-8").splitlines()
+                ]
+            except OSError:
+                return []
+        return [
+            str(row.get("name", ""))
+            for row in rows
+            if str(row.get("type", "")).upper() in {"IMG", "VID"}
+        ]
+
+    def _new_control_media_candidates(self, paths):
+        control_path = self._control_file_path()
+        if control_path is None or not control_path.is_file():
+            return list(paths)
+        inventory = load_control_media_inventory(control_path)
+        memberships = classify_project_media(
+            inventory,
+            paths,
+            self._included_control_media_names(),
+        )
+        return [
+            item.media_path
+            for item in memberships
+            if item.state in {"new", "unclassified"}
+        ]
+
+    def _new_media_needs_weather_decision(self, paths):
+        if self.weather_consent != "unasked":
+            return False
+        for path in paths:
+            status, _metadata, _reason = validate_media_sidecar(path)
+            if status != "available":
+                return True
+        return False
+
+    def _request_discovered_media_weather_choice(self):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Add historical weather to new media?")
+        alert.setInformativeText_(
+            "Weather lookup sends media coordinates and exposure times to Open-Meteo. "
+            "Free non-commercial access needs no account or API key. Customer access "
+            "requires an Open-Meteo account, a suitable paid plan, and an API key. "
+            "Open-Meteo attribution is required for either choice. "
+            "This choice is remembered and can be changed in Settings."
+        )
+        alert.addButtonWithTitle_("Include Weather (Free)")
+        alert.addButtonWithTitle_("Customer Account")
+        alert.addButtonWithTitle_("No Weather")
+        while True:
+            response = int(alert.runModal())
+            if response == 1000:
+                self.weather_consent = "free"
+                self.parameters["weather.enabled"] = True
+                self.parameters["weather.access"] = "free"
+                break
+            if response == 1001:
+                credential = str(self.parameters.get("weather.credential_id", "default"))
+                if not request_open_meteo_api_key(credential):
+                    continue
+                self.weather_consent = "customer"
+                self.parameters["weather.enabled"] = True
+                self.parameters["weather.access"] = "customer"
+                break
+            self.weather_consent = "disabled"
+            self.parameters["weather.enabled"] = False
+            break
+        self.mark_dirty(immediate=True)
+        return True
+
+    def handleProjectMediaDiscovery_(self, payload):
+        paths = [
+            Path(value).resolve(strict=False)
+            for value in payload.get("paths", [])
+            if Path(value).is_file()
+        ]
+        unseen = [path for path in paths if path not in self.project_media_watch_seen_paths]
+        self.project_media_watch_seen_paths.update(paths)
+        candidates = self._new_control_media_candidates(unseen)
+        if not candidates:
+            return
+        self.pending_discovered_media.update(candidates)
+        self.processPendingDiscoveredMedia_(None)
+
+    def processPendingDiscoveredMedia_(self, _sender):
+        self.discovered_media_retry_scheduled = False
+        if not self.pending_discovered_media:
+            return
+        if self.geolocations_thread is not None and self.geolocations_thread.is_alive():
+            if self.discovered_media_retry_scheduled:
+                return
+            self.discovered_media_retry_scheduled = True
+            self.performSelector_withObject_afterDelay_(
+                "processPendingDiscoveredMedia:", None, 1.0
+            )
+            return
+        candidates = sorted(
+            self.pending_discovered_media, key=lambda path: str(path).casefold()
+        )
+        self.pending_discovered_media.clear()
+        if self._new_media_needs_weather_decision(candidates):
+            if not self._request_discovered_media_weather_choice():
+                self.pending_discovered_media.update(candidates)
+                return
+        self.set_status(f"Preparing {len(candidates)} newly discovered media file(s)...")
+        self._start_automatic_media_metadata(
+            candidates,
+            generate_maps=False,
+            record_as_imported=False,
+        )
+
+    def _create_initial_control_from_project_media(self):
+        project_dir = self.current_project_dir
+        control_path = self._control_file_path()
+        if project_dir is None or control_path is None:
+            return False
+        plan = self._project_map_plan()
+        if plan is None:
+            return False
+        control_text = project_control_plan_text(plan)
+        write_text_atomic(control_path, control_text)
+        self.current_control_file = control_path
+        self.control_file_field.setStringValue_(control_path.name)
+        self.load_slideshow_control_file(control_path, force_reload=True)
+        rows = [
+            parse_slideshow_control_line(line)
+            for line in control_text.splitlines()
+            if line.strip()
+        ]
+        self._sync_control_media_inventory(control_path, rows, control_text=control_text)
+        self.mark_dirty(immediate=True)
+        return True
+
+    def finishDiscoveredMediaMetadata_(self, paths):
+        pending = [Path(value).resolve(strict=False) for value in (paths or [])]
+        control_path = self._control_file_path()
+        if control_path is not None and control_path.is_file():
+            self.reviewDiscoveredMediaPaths_(pending)
+            return
+        try:
+            created = self._create_initial_control_from_project_media()
+        except (OSError, ValueError, TypeError) as exc:
+            show_alert("Could not create the initial control file.", str(exc))
+            return
+        if created:
+            self.editControlFile_(None)
+
+    def reviewDiscoveredMediaPaths_(self, paths):
+        """Open or extend the retained review for one prepared discovery batch."""
+        pending = [Path(value).resolve(strict=False) for value in (paths or [])]
+        review_open = bool(
+            self.media_update_preview_window is not None
+            and self.media_update_preview_window.isVisible()
+            and self.control_file_update_plan is not None
+        )
+        if review_open:
+            self._start_control_file_update_analysis(
+                paths=pending,
+                imported_paths=pending,
+                append=True,
+            )
+        else:
+            self._start_control_file_update_analysis(imported_paths=pending)
 
     def included_control_media_names(self):
         control_file_path = self._control_file_path()
@@ -10980,11 +11371,7 @@ class GPXTrackerController(NSObject):
         if project_dir is None:
             return
         control = Path(control_path).expanduser().resolve(strict=False)
-        media_paths = [
-            path
-            for path in project_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
-        ]
+        media_paths = list(discover_project_media(project_dir, MEDIA_EXTENSIONS))
         included_names = [
             str(row.get("name", ""))
             for row in rows
@@ -11702,6 +12089,7 @@ class GPXTrackerController(NSObject):
                     return
                 self._refresh_project_file_menus()
                 self.start_async_project_status_refresh("new adventure")
+                self._start_project_media_watcher()
                 return
 
             if requested_name == self.committed_adventure_name:
@@ -11852,11 +12240,17 @@ class GPXTrackerController(NSObject):
     @objc.IBAction
     def saveAndExit_(self, _sender):
         if self.confirm_close():
+            if getattr(self, "hosted_by_adventure_map", False):
+                self.window.orderOut_(None)
+                return
             NSApp().terminate_(None)
 
     @objc.IBAction
     def quit_(self, _sender):
         if self.confirm_close():
+            if getattr(self, "hosted_by_adventure_map", False):
+                self.window.orderOut_(None)
+                return
             NSApp().terminate_(None)
 
     @objc.IBAction
@@ -12390,12 +12784,24 @@ class GPXTrackerController(NSObject):
         include_place_names = bool(
             self.media_place_names_checkbox.state() == NSControlStateValueOn
         )
+        self.discovered_media_generate_maps = True
         self._start_assistant_metadata_preparation(include_place_names)
 
-    def _start_automatic_media_metadata(self, imported_paths=None):
+    def _start_automatic_media_metadata(
+        self,
+        imported_paths=None,
+        *,
+        generate_maps=True,
+        record_as_imported=True,
+    ):
         """Prepare sidecars after media acceptance and defer control updates until completion."""
         control_path = self._control_file_path()
-        if imported_paths and control_path is not None and control_path.is_file():
+        if (
+            record_as_imported
+            and imported_paths
+            and control_path is not None
+            and control_path.is_file()
+        ):
             try:
                 mark_imported_media(control_path, imported_paths)
             except OSError as exc:
@@ -12411,8 +12817,10 @@ class GPXTrackerController(NSObject):
             for path in getattr(self, "pending_imported_media_for_control_update", [])
         }
         self.pending_imported_media_for_control_update = sorted(existing | pending)
+        self.discovered_media_generate_maps = bool(generate_maps)
         self._start_assistant_metadata_preparation(
-            bool(self.parameters.get("locations.add_place_names", True))
+            bool(self.parameters.get("locations.add_place_names", True)),
+            requested_paths=sorted(pending) if imported_paths is not None else None,
         )
 
     def startPendingImportedMediaUpdate_(self, paths):
@@ -12423,7 +12831,9 @@ class GPXTrackerController(NSObject):
         ):
             self._start_control_file_update_analysis(imported_paths=pending_paths)
 
-    def _start_assistant_metadata_preparation(self, include_place_names):
+    def _start_assistant_metadata_preparation(
+        self, include_place_names, requested_paths=None
+    ):
         """Prepare only missing, invalid, legacy, or changed sidecars for onboarding."""
         if self.geolocations_thread is not None and self.geolocations_thread.is_alive():
             show_alert("A metadata operation is already running.")
@@ -12431,7 +12841,11 @@ class GPXTrackerController(NSObject):
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
             return
-        media_paths = [Path(item["path"]) for item in self.project_media_items()]
+        media_paths = (
+            [Path(path).resolve(strict=False) for path in requested_paths]
+            if requested_paths is not None
+            else [Path(item["path"]) for item in self.project_media_items()]
+        )
         if not media_paths:
             self.pending_imported_media_for_control_update = []
             show_alert("No photos or videos are available.")
@@ -12471,6 +12885,7 @@ class GPXTrackerController(NSObject):
                 output_writer.write("\n=== Indexing media identity ===\n")
                 identity_report = index_media_file_identities(
                     project_dir,
+                    media_paths=media_paths if requested_paths is not None else None,
                     legacy_source_project=self.media_identity_source_project,
                     progress_callback=progress_callback,
                     detail_callback=detail_callback,
@@ -12485,6 +12900,8 @@ class GPXTrackerController(NSObject):
                 output_writer.write("\n=== Preparing media metadata ===\n")
                 candidates = discover_media_update_candidates(
                     project_dir,
+                    imported_paths=media_paths if requested_paths is not None else None,
+                    only_imported=requested_paths is not None,
                     progress_callback=progress_callback,
                     detail_callback=detail_callback,
                     cancel_event=cancel_event,
@@ -13991,6 +14408,46 @@ class GPXTrackerController(NSObject):
             return
         if self.load_slideshow_control_file(control_file_path):
             self.set_status(f"Loaded slide show control file {control_file_path}")
+
+    def show_control_file_media_selection(self, media_paths, anchor_path=None):
+        """Select matching media rows and reveal the medium used to open the menu."""
+        if self.control_table_window is None or self.control_table_path is None:
+            return False
+        targets = {
+            Path(path).expanduser().resolve(strict=False)
+            for path in media_paths
+        }
+        anchor = (
+            Path(anchor_path).expanduser().resolve(strict=False)
+            if anchor_path is not None
+            else None
+        )
+        indexes = []
+        anchor_index = None
+        for index, row in enumerate(self.control_table_rows):
+            if str(row.get("type", "")).upper() not in {"IMG", "VID"}:
+                continue
+            path = self.resolve_control_row_path(row)
+            if path is None:
+                continue
+            resolved = path.resolve(strict=False)
+            if resolved in targets:
+                indexes.append(index)
+            if anchor_index is None and anchor is not None and resolved == anchor:
+                anchor_index = index
+        if indexes:
+            self.control_table_filter_key = "all"
+            self._sync_control_table_filter_popup()
+            self._reload_control_table()
+            self._select_control_table_indexes(indexes)
+            self._scroll_control_table_model_row_to_visible(
+                anchor_index if anchor_index is not None else indexes[0]
+            )
+        self.control_table_window.makeKeyAndOrderFront_(None)
+        self.control_table_window.orderFrontRegardless()
+        if not indexes:
+            self.set_status("The selected media are not present in the control file.")
+        return bool(indexes)
 
     @objc.IBAction
     def startSelectedSlideShow_(self, _sender):
@@ -17060,6 +17517,7 @@ class GPXTrackerController(NSObject):
         open_pdf_summary=False,
         project_name=None,
         confirm_generated_activation=False,
+        open_media_points=False,
     ):
         from GPXEditor import show_gpx_editor_from_cli_args
 
@@ -17080,6 +17538,8 @@ class GPXTrackerController(NSObject):
                 existing_controller.project_field.setStringValue_(str(project_name))
             if open_pdf_summary:
                 existing_controller.exportPdf_(None)
+            if open_media_points:
+                existing_controller.addTracksFromPhotos_(None)
             self.set_status("GPXEditor is already open.")
             return existing_controller
         if existing_window is not None and not existing_window.isVisible():
@@ -17264,6 +17724,8 @@ class GPXTrackerController(NSObject):
 
         def handle_initial_editor_load_complete():
             self._resume_project_status_after_editor_startup()
+            if open_media_points and self.gpx_editor_controller is not None:
+                self.gpx_editor_controller.addTracksFromPhotos_(None)
 
         try:
             self.gpx_editor_controller = show_gpx_editor_from_cli_args(
@@ -17273,7 +17735,17 @@ class GPXTrackerController(NSObject):
                 on_settings_change=self._apply_embedded_editor_parameters,
                 on_initial_load_complete=handle_initial_editor_load_complete,
                 settings=self.parameters,
+                media_context={
+                    "project_directory": str(self.current_project_dir or ""),
+                    "control_file": str(self._control_file_path() or ""),
+                },
             )
+            if (
+                open_media_points
+                and self.gpx_editor_controller is not None
+                and self.gpx_editor_controller.track_load_timer is None
+            ):
+                self.gpx_editor_controller.addTracksFromPhotos_(None)
         except Exception as exc:
             self._resume_project_status_after_editor_startup()
             show_alert("Could not open GPXEditor.", str(exc))
@@ -17411,8 +17883,6 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def createTracksFromPhotos_(self, _sender):
-        from media_track_builder import build_media_tracks, write_media_gpx
-
         project_dir = self._resolve_project_directory(
             allow_create=False,
             update_gpx_field=False,
@@ -17420,63 +17890,28 @@ class GPXTrackerController(NSObject):
         if project_dir is None:
             show_alert("Please choose a project directory first.")
             return
-        media_paths = [Path(item["path"]) for item in self.project_media_items()]
-        if not media_paths:
+        if not self.project_media_items():
             show_alert(
                 "No project photos or videos are available.",
                 "Import or accept media before creating a photo-derived GPX track.",
             )
             return
         current_gpx = self._current_single_gpx_path()
-        if current_gpx is not None and current_gpx.is_file():
-            if not confirm_alert(
-                "Add photo-derived tracks to the existing GPX?",
-                f"The generated stage tracks will be appended in GPX Editor to:\n"
-                f"{current_gpx.name}\n\nNothing is changed until you save.",
-                "Open Together",
-                "Cancel",
-            ):
-                return
-        spacing = float(self.parameters.get("gpx.minimum_point_spacing_m", 10.0))
-        self.set_status(f"Creating estimated tracks from {len(media_paths)} media file(s)...")
-        try:
-            result = build_media_tracks(
-                media_paths,
-                control_path=self._control_file_path(),
-                minimum_spacing_m=spacing,
-                refresh_metadata=True,
-            )
-        except Exception as exc:
-            show_alert("Could not create photo tracks.", str(exc))
-            self.set_status("Photo-track creation failed.")
-            return
-        if not result.tracks:
-            details = "\n".join(result.skipped_media[:12])
-            show_alert(
-                "No photo track could be created.",
-                details or "The project media contain no usable GPS coordinates.",
-            )
-            return
-        temporary = Path(tempfile.gettempdir()) / (
-            f"myCamino-photo-tracks-{os.getpid()}-{time.time_ns()}.gpx"
-        )
-        write_media_gpx(temporary, result, PROGRAM_TITLE)
         default_output = self._default_gpx_path()
         if default_output is None:
             default_output = project_dir / f"{self._current_project_name() or project_dir.name}.gpx"
-        inputs = ([current_gpx] if current_gpx is not None and current_gpx.is_file() else [])
-        inputs.append(temporary)
         controller = self._open_gpx_editor(
-            input_paths=inputs,
+            input_paths=[current_gpx] if current_gpx is not None and current_gpx.is_file() else [],
             output_path=current_gpx if current_gpx is not None else default_output,
             project_name=self._current_project_name(),
             confirm_generated_activation=current_gpx is None,
+            open_media_points=current_gpx is None,
         )
         if controller is not None:
-            self.set_status(
-                f"Opened {len(result.tracks)} estimated photo track(s) in GPX Editor; "
-                f"reused {result.reused_sidecars}, refreshed {result.refreshed_sidecars} sidecar(s)."
-            )
+            if current_gpx is not None:
+                self.set_status(
+                    "GPX Editor opened. Select one destination track, then use Add Media Points."
+                )
 
     def controlTextDidEndEditing_(self, notification):
         field = notification.object()
@@ -17543,12 +17978,23 @@ class GPXTrackerController(NSObject):
                     self.media_weather_checkbox.setState_(NSControlStateValueOff)
                     return
             self.parameters["weather.enabled"] = enabled
+            self.weather_consent = (
+                str(self.parameters.get("weather.access", "free")).casefold()
+                if enabled
+                else "disabled"
+            )
         self.mark_dirty()
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host.adoptAdvancedInterfaceParameters_weatherConsent_(
+                dict(self.parameters), self.weather_consent
+            )
 
     def textDidChange_(self, _notification):
         self.mark_dirty()
 
     def shutdown(self):
+        self._stop_project_media_watcher()
         self.cancel_adventure_autosave()
         self.control_table_preview_shutdown = True
         self._invalidate_control_preview_requests(clear_memory=True)
@@ -17707,6 +18153,106 @@ class GPXTrackerController(NSObject):
         self.window.makeFirstResponder_(self.project_dir_field)
 
 
+def build_full_gui_menu(controller, window_menu_coordinator=None):
+    main_menu = NSMenu.alloc().initWithTitle_("Main Menu")
+    app_menu = add_menu(main_menu, "myCamino")
+    app_menu.addItem_(menu_item("About myCamino", "showAbout:", controller))
+    app_menu.addItem_(menu_item("Settings…", "showParameterEditor:", controller, ",", NSEventModifierFlagCommand))
+    app_menu.addItem_(NSMenuItem.separatorItem())
+    app_menu.addItem_(menu_item("License", "showProjectLicense:", controller))
+    app_menu.addItem_(menu_item("Third-Party Notices", "showThirdPartyNotices:", controller))
+    install_application_news(app_menu)
+    app_menu.addItem_(NSMenuItem.separatorItem())
+    app_menu.addItem_(menu_item("Quit myCamino", "terminate:", NSApp(), "q", NSEventModifierFlagCommand))
+
+    file_menu = add_menu(main_menu, "File")
+    file_menu.addItem_(menu_item("Open Adventure or Project…", "chooseProjectDirectory:", controller, "o", NSEventModifierFlagCommand))
+    file_menu.addItem_(menu_item("Save Adventure", "editAdventure:", controller, "s", NSEventModifierFlagCommand))
+
+    adventure_menu = add_menu(main_menu, "Adventure")
+    adventure_menu.addItem_(menu_item("Adventure Properties…", "showAdventureProperties:", controller))
+
+    track_menu = add_menu(main_menu, "Track")
+    track_menu.addItem_(menu_item("Choose GPX Files…", "selectGPXFile:", controller))
+    track_menu.addItem_(menu_item("Add and Edit Tracks", "addAndEditTracks:", controller))
+    track_menu.addItem_(menu_item("Create Tracks from Media", "createTracksFromPhotos:", controller))
+    track_menu.addItem_(menu_item("Save Selected Tracks As…", "saveSelectedTracksMenu:", controller))
+
+    media_menu = add_menu(main_menu, "Media")
+    for title, action in (
+        ("Import Media…", "importMediaFiles:"),
+        ("View Media", "viewMediaFiles:"),
+        ("Reveal Media Folder", "editMediaFiles:"),
+        ("Add Place Names", "getPlaceNames:"),
+        ("Add Historical Weather", "addHistoricalWeatherMenu:"),
+        ("Update Metadata", "updateMediaMetadata:"),
+    ):
+        media_menu.addItem_(menu_item(title, action, controller))
+    media_menu.addItem_(NSMenuItem.separatorItem())
+    media_menu.addItem_(menu_item("Media Settings…", "showMediaSettingsMenu:", controller))
+
+    maps_menu = add_menu(main_menu, "Maps")
+    for title, action in (
+        ("Generate and Update Maps…", "makePlots:"),
+        ("View Maps", "viewPlots:"),
+        ("Reveal Maps", "editPlots:"),
+        ("Cancel Generation", "cancelMakePlots:"),
+    ):
+        maps_menu.addItem_(menu_item(title, action, controller))
+    maps_menu.addItem_(NSMenuItem.separatorItem())
+    maps_menu.addItem_(menu_item("Map Settings…", "showMapSettingsMenu:", controller))
+
+    control_menu = add_menu(main_menu, "Control File")
+    for title, action in (
+        ("Choose Control File…", "chooseControlFileMenu:"),
+        ("Create Control File", "createControlFile:"),
+        ("Edit Control File", "editControlFile:"),
+        ("Update Control File", "updateControlFile:"),
+        ("Reveal Control File", "revealControlFileMenu:"),
+    ):
+        control_menu.addItem_(menu_item(title, action, controller))
+
+    audio_menu = add_menu(main_menu, "Audio")
+    for title, action in (
+        ("Enable Audio", "toggleAudioMenu:"),
+        ("Choose Music Playlist…", "chooseMusicPlaylist:"),
+        ("Create Music Playlist", "createMusicPlaylist:"),
+        ("Update Music Playlist", "updateMusicPlaylist:"),
+        ("Edit Music Playlist", "editMusicPlaylist:"),
+        ("Reveal Music Folder", "openMusicFolder:"),
+        ("Choose Narration Playlist…", "chooseNarrationPlaylist:"),
+        ("Create Narration Playlist", "createNarrationPlaylist:"),
+        ("Update Narration Playlist", "updateNarrationPlaylist:"),
+        ("Edit Narration Playlist", "editNarrationPlaylist:"),
+        ("Reveal Narration Folder", "openNarrationFolder:"),
+        ("Normalize Video Audio", "normalizeVideoAudio:"),
+        ("Audio Directive Help", "showMusicDirectiveHelp:"),
+    ):
+        audio_menu.addItem_(menu_item(title, action, controller))
+    audio_menu.addItem_(NSMenuItem.separatorItem())
+    audio_menu.addItem_(menu_item("Audio Settings…", "showAudioSettingsMenu:", controller))
+
+    slideshow_menu = add_menu(main_menu, "Slide Show")
+    slideshow_menu.addItem_(menu_item("Start", "startSelectedSlideShow:", controller))
+    slideshow_menu.addItem_(menu_item("Continue…", "continueSelectedSlideShow:", controller))
+    slideshow_menu.addItem_(menu_item("Choose Start Position…", "editControlFile:", controller))
+    slideshow_menu.addItem_(menu_item("PDF Summary…", "exportPdfSummary:", controller))
+    slideshow_menu.addItem_(NSMenuItem.separatorItem())
+    slideshow_menu.addItem_(menu_item("Slide Show Settings…", "showSlideShowSettingsMenu:", controller))
+
+    window_menu = add_menu(main_menu, "Window")
+    coordinator = window_menu_coordinator or WindowMenuCoordinator.alloc().init()
+    coordinator.status_provider = controller.window_status_for_window
+    coordinator.attach(window_menu)
+    controller.native_window_menu_coordinator = coordinator
+
+    help_menu = add_menu(main_menu, "Help")
+    help_menu.addItem_(menu_item("myCamino Help", "showMainHelp:", controller))
+    help_menu.addItem_(menu_item("Control Directive Help", "showControlDirectiveHelp:", controller))
+    help_menu.addItem_(menu_item("Music and Narration Help", "showMusicDirectiveHelp:", controller))
+    return main_menu
+
+
 class GPSTrackShowGUIAppDelegate(NSObject):
     """Application delegate."""
 
@@ -17719,7 +18265,11 @@ class GPSTrackShowGUIAppDelegate(NSObject):
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
+        configure_mycamino_branding(bundled_resource_path("MyCaminoLogo-ohneText.png"))
         self.controller = GPXTrackerController.alloc().initWithProjectDirectory_projectFile_(self.project_directory, self.project_file)
+        self.window_menu_coordinator = WindowMenuCoordinator.alloc().init()
+        self.main_menu = build_full_gui_menu(self.controller, self.window_menu_coordinator)
+        NSApp().setMainMenu_(self.main_menu)
         self.controller.show()
         NSApp().activateIgnoringOtherApps_(True)
         self.controller.show_first_launch_beta_notice()
@@ -17747,6 +18297,11 @@ def build_argument_parser():
         help="Optional project directory to preload when the GUI starts.",
     )
     parser.add_argument(
+        "--full-gui",
+        action="store_true",
+        help="Open the full Adventure controls instead of the map-first workspace.",
+    )
+    parser.add_argument(
         "startup_path",
         nargs="?",
         metavar="ADVENTURE_OR_DIRECTORY",
@@ -17769,12 +18324,22 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    # AppKit fixes the application-menu title while creating NSApplication.
+    # Set the user-facing process name first so source launches do not say Python.
+    configure_mycamino_branding()
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
-    delegate = GPSTrackShowGUIAppDelegate.alloc().initWithProjectDirectory_projectFile_(
-        project_directory,
-        adventure_file,
-    )
+    if args.full_gui:
+        delegate = GPSTrackShowGUIAppDelegate.alloc().initWithProjectDirectory_projectFile_(
+            project_directory,
+            adventure_file,
+        )
+    else:
+        from cocoa_adventure_map import AdventureMapAppDelegate
+        delegate = AdventureMapAppDelegate.alloc().initWithProjectDirectory_projectFile_(
+            project_directory,
+            adventure_file,
+        )
     app.setDelegate_(delegate)
     app.run()
     return 0

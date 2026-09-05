@@ -42,3 +42,21 @@ running `release.sh`. The release script reads those values, verifies the
 built macOS bundle version, and explicitly supplies the release label and date
 to the website publisher. The values therefore appear consistently in the
 GUI, macOS bundle, and website release record.
+## Application news and updates
+
+The macOS applications read the public, versioned feed at
+`/api/app-news/v1/` at most once per day. Manage messages through the FediOps
+Control **Application News** page or the `app_news` management command. Keep a
+slug stable because clients use it as the read/unread identifier; set **Kind**
+to Update and provide **App version** for a release notice. Draft and
+future-dated items are not returned.
+
+```bash
+python website/manage.py app_news list --all
+python website/manage.py app_news put version-1-0 --title "myCamino 1.0" \
+  --summary "Version 1.0 is available." --kind update --app-version 1.0
+python website/manage.py app_news publish version-1-0
+```
+
+The feed request contains no installation identifier or project data. Do not
+add per-client tokens, tracking parameters, or analytics to this endpoint.

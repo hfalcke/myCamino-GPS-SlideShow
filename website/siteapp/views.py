@@ -5,7 +5,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.cache import cache
 from django.db import transaction
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
@@ -13,7 +13,7 @@ from django.utils.safestring import mark_safe
 from django.views.decorators.http import require_GET, require_http_methods
 
 from .forms import BetaRegistrationForm, ContactForm
-from .models import BetaRegistration, ContactMessage, Release
+from .models import ApplicationNews, BetaRegistration, ContactMessage, Release
 from .services import count_download, deliver_contact, digest_ip, digest_token, issue_verification, refresh_operator_exports
 
 
@@ -28,6 +28,34 @@ def page(request, template, **context):
 
 def home(request):
     return page(request, "siteapp/home.html")
+
+
+@require_GET
+def application_news(request):
+    """Return a small public feed; clients provide no installation identifier."""
+    items = ApplicationNews.objects.filter(
+        is_published=True,
+        published_at__lte=timezone.now(),
+    )[:50]
+    response = JsonResponse(
+        {
+            "format_version": 1,
+            "items": [
+                {
+                    "id": item.slug,
+                    "title": item.title,
+                    "summary": item.summary,
+                    "kind": item.kind,
+                    "app_version": item.app_version,
+                    "published_at": item.published_at.isoformat(),
+                    "url": item.link or request.build_absolute_uri("/"),
+                }
+                for item in items
+            ],
+        }
+    )
+    response.headers["Cache-Control"] = "public, max-age=900"
+    return response
 
 
 def faq(request):
