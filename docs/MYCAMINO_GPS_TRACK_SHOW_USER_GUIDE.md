@@ -990,10 +990,14 @@ The Start Slide Show section contains:
   display when a separate overview window is active, and photos or videos
   appear over the moving map. The
   standard display-swap key still swaps these two display roles. For every
-  stage, the player calculates track-free width and height choices in all four
-  corners. Each photo or video uses the corner where its own shape can be shown
-  largest. The saved 50% value is a preferred minimum, not a maximum; media can
-  grow substantially larger wherever the route-free area permits it. Where map
+  stage, the player calculates track-free width and height choices in all nine
+  supported positions. Each photo or video uses the position where its own shape
+  can be shown largest. If that track-clear layout is smaller than 45% of the
+  usable width for a landscape medium or height for a portrait medium, the
+  default adaptive mode displays it at 48-60% in a corner opposite the walker.
+  It can move to another corner as the walker approaches. Press `z` to force
+  Track Clear or Large Overlay for the current stage; the next stage returns to
+  adaptive placement. Where map
   metadata is available, placement
   remains below the map header and keeps a 5% margin inside the actual map
   area. The moving arrow keeps one fixed orientation, perpendicular to the line
@@ -1133,6 +1137,8 @@ Common slide-show keys:
 - `d` and `D`: move or swap the configured displays.
 - `e`: switch the Stage Map elevation-profile introduction on or off. The
   Adventure setting is on by default; the key changes only the running show.
+- `z`: switch between Track-Clear and Large Photo placement for the current
+  Time-Lapse stage. The next stage returns to adaptive placement.
 - `n`: switch subsequent videos between valid normalized copies and originals.
   If a video is active, playback resumes at the same time and in the same
   paused/playing state. If no current normalized copy exists, playback is left

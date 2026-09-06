@@ -42,12 +42,15 @@ from track_map_layout_utils import (
     best_media_corner_layout,
     best_unframed_media_layout,
     cached_clear_box_options,
+    choose_large_overlay_layout,
     clear_corner_rect_options,
     canonical_track_map_name,
     inset_rect,
+    large_overlay_layout_options,
     largest_clear_corner_rects,
     map_plot_rect,
     resolve_track_map_variant,
+    should_use_large_media_overlay,
 )
 from elevation_profile_cache import (
     ELEVATION_PROFILE_HEIGHT,
@@ -338,6 +341,7 @@ KEY_HELP_LINES = [
     "m                     toggle auto/manual mode",
     "e                     toggle elevation profiles",
     "g                     toggle GPS route tracking",
+    "z                     toggle Track-Clear/Large Photo mode for this stage",
     "a                     toggle background audio",
     "n                     toggle normalized/original video audio",
     "+ / -                 change duration in auto mode",
@@ -551,6 +555,7 @@ class Config:
     time_lapse_stages: bool = False
     time_lapse_duration: float = 30.0
     time_lapse_media_min_fraction: float = 0.5
+    time_lapse_adaptive_media_overlap: bool = True
     time_lapse_marker: str = "pilgrim"
     time_lapse_overview_as_media: bool = True
     time_lapse_overview_on_stage_map_dual: bool = True
@@ -1026,6 +1031,18 @@ def parse_args(argv: list[str]) -> Config:
         help="Preferred minimum framed-media size relative to the window; media grows to the largest track-free corner (default: 0.5).",
     )
     parser.add_argument(
+        "--time-lapse-adaptive-media-overlap",
+        action="store_true",
+        default=True,
+        help="Enlarge small Time-Lapse media over the route when necessary (default).",
+    )
+    parser.add_argument(
+        "--no-time-lapse-adaptive-media-overlap",
+        action="store_false",
+        dest="time_lapse_adaptive_media_overlap",
+        help="Keep Time-Lapse media inside track-clear areas unless z overrides the stage.",
+    )
+    parser.add_argument(
         "--time-lapse-marker",
         choices=("pilgrim", "bike", "car", "plane", "arrow"),
         default="pilgrim",
@@ -1309,6 +1326,7 @@ def parse_args(argv: list[str]) -> Config:
         time_lapse_stages=(resume_initial_style or initial_style) == "TIME_LAPSE",
         time_lapse_duration=float(args.time_lapse_duration),
         time_lapse_media_min_fraction=float(args.time_lapse_media_min_fraction),
+        time_lapse_adaptive_media_overlap=bool(args.time_lapse_adaptive_media_overlap),
         time_lapse_marker=str(args.time_lapse_marker),
         time_lapse_overview_as_media=bool(args.time_lapse_overview_as_media),
         time_lapse_overview_on_stage_map_dual=bool(
@@ -1495,6 +1513,7 @@ def config_from_options(
     time_lapse_duration: float = 30.0,
     time_lapse_media_min_fraction: float = 0.5,
     time_lapse_media_max_fraction: Optional[float] = None,
+    time_lapse_adaptive_media_overlap: bool = True,
     time_lapse_marker: str = "pilgrim",
     time_lapse_overview_as_media: bool = True,
     time_lapse_overview_on_stage_map_dual: bool = True,
@@ -1708,6 +1727,7 @@ def config_from_options(
         time_lapse_stages=(resume_initial_style or initial_style) == "TIME_LAPSE",
         time_lapse_duration=float(time_lapse_duration),
         time_lapse_media_min_fraction=float(time_lapse_media_min_fraction),
+        time_lapse_adaptive_media_overlap=bool(time_lapse_adaptive_media_overlap),
         time_lapse_marker=str(time_lapse_marker),
         time_lapse_overview_as_media=bool(time_lapse_overview_as_media),
         time_lapse_overview_on_stage_map_dual=bool(
@@ -3643,9 +3663,21 @@ if APPKIT_AVAILABLE:
             self.pilgrim_rotation_degrees = 0.0
             self.pilgrim_mirrored = False
             self.media_min_fraction = 0.5
+            self.adaptive_media_overlap = True
+            self.media_layout_override = None
+            self.effective_media_layout_mode = "track_clear"
             self.media_placement_cache_key = None
             self.media_clear_rects = None
             self.current_media_corner = None
+            self.current_media_outer_rect = None
+            self.current_media_content_rect = None
+            self.media_target_outer_rect = None
+            self.media_target_content_rect = None
+            self.media_layout_animation_started = None
+            self.media_layout_animation_timer = None
+            self.media_layout_animation_generation = 0
+            self.media_layout_geometry_key = None
+            self.media_corner_last_changed = 0.0
             self.media_video_view = None
             self.place_text = None
             self.metrics_lines = ()
@@ -3690,6 +3722,7 @@ if APPKIT_AVAILABLE:
 
         def configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(self, image, metadata, route_points, arrow_latlon, media_image, highlight_route):
             stage_changed = image is not self.map_image or metadata is not self.map_metadata or route_points is not self.route_points
+            media_changed = media_image is not self.media_image
             self.map_image = image
             self.map_metadata = metadata
             self.route_points = route_points or []
@@ -3707,7 +3740,92 @@ if APPKIT_AVAILABLE:
                 self.pilgrim_rotation_degrees, self.pilgrim_mirrored = pilgrim_orientation_for_tangent(
                     self.stage_tangent
                 )
+            if stage_changed or media_changed:
+                self._reset_media_layout_animation()
             self.setNeedsDisplay_(True)
+
+        def _reset_media_layout_animation(self):
+            self.media_layout_animation_generation += 1
+            if self.media_layout_animation_timer is not None:
+                self.media_layout_animation_timer.invalidate()
+                self.media_layout_animation_timer = None
+            self.current_media_outer_rect = None
+            self.current_media_content_rect = None
+            self.media_target_outer_rect = None
+            self.media_target_content_rect = None
+            self.media_layout_animation_started = None
+            self.current_media_corner = None
+            self.media_layout_geometry_key = None
+
+        @staticmethod
+        def _rect_tuple(rect):
+            return tuple(float(value) for value in rect)
+
+        @staticmethod
+        def _interpolate_rect(start, end, fraction):
+            eased = fraction * fraction * (3.0 - 2.0 * fraction)
+            return tuple(a + (b - a) * eased for a, b in zip(start, end))
+
+        def mediaAnimationTick_(self, timer):
+            if int(timer.userInfo() or -1) != self.media_layout_animation_generation:
+                timer.invalidate()
+                return
+            if self.media_layout_animation_started is None:
+                timer.invalidate()
+                self.media_layout_animation_timer = None
+                return
+            elapsed = time.monotonic() - self.media_layout_animation_started
+            if elapsed >= 0.35:
+                self.current_media_outer_rect = self.media_target_outer_rect
+                self.current_media_content_rect = self.media_target_content_rect
+                self.media_layout_animation_started = None
+                timer.invalidate()
+                self.media_layout_animation_timer = None
+            self.setNeedsDisplay_(True)
+            if self.caption_directive is not None:
+                self.updateCaptionOverlay()
+
+        def _display_media_rects(self, outer, content):
+            outer = self._rect_tuple(outer)
+            content = self._rect_tuple(content)
+            target_changed = (
+                self.media_target_outer_rect != outer
+                or self.media_target_content_rect != content
+            )
+            if self.current_media_outer_rect is None or self.current_media_content_rect is None:
+                self.current_media_outer_rect = outer
+                self.current_media_content_rect = content
+                self.media_target_outer_rect = outer
+                self.media_target_content_rect = content
+            elif target_changed:
+                if self.media_layout_animation_started is not None:
+                    elapsed = min(1.0, (time.monotonic() - self.media_layout_animation_started) / 0.35)
+                    self.current_media_outer_rect = self._interpolate_rect(
+                        self.current_media_outer_rect, self.media_target_outer_rect, elapsed
+                    )
+                    self.current_media_content_rect = self._interpolate_rect(
+                        self.current_media_content_rect, self.media_target_content_rect, elapsed
+                    )
+                self.media_target_outer_rect = outer
+                self.media_target_content_rect = content
+                self.media_layout_animation_started = time.monotonic()
+                self.media_layout_animation_generation += 1
+                if self.media_layout_animation_timer is not None:
+                    self.media_layout_animation_timer.invalidate()
+                self.media_layout_animation_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    1.0 / 60.0,
+                    self,
+                    "mediaAnimationTick:",
+                    self.media_layout_animation_generation,
+                    True,
+                )
+            if self.media_layout_animation_started is not None:
+                fraction = min(1.0, (time.monotonic() - self.media_layout_animation_started) / 0.35)
+                return (
+                    self._interpolate_rect(self.current_media_outer_rect, self.media_target_outer_rect, fraction),
+                    self._interpolate_rect(self.current_media_content_rect, self.media_target_content_rect, fraction),
+                )
+            return self.current_media_outer_rect, self.current_media_content_rect
 
         def _update_clock_overlay(self, clock_time, date_text, enabled):
             """Update the retained clock overlay only when its content or size changes."""
@@ -3921,6 +4039,7 @@ if APPKIT_AVAILABLE:
             self.header_state_generation = 0
             self.media_clear_rects = None
             self.media_placement_cache_key = None
+            self._reset_media_layout_animation()
             self.pilgrim_frames = []
             self.setHidden_(True)
 
@@ -4119,7 +4238,78 @@ if APPKIT_AVAILABLE:
                 float(self.media_min_fraction),
                 (media_width, media_height),
             )
+            image_rect, scale = self.imageRectAndScale()
+            image_tuple = (
+                float(image_rect.origin.x), float(image_rect.origin.y),
+                float(image_rect.size.width), float(image_rect.size.height),
+            )
+            plot_rect = map_plot_rect(image_tuple, self.map_metadata)
+            cache_metadata = self.map_metadata.get("media_clear_boxes") if isinstance(self.map_metadata, dict) else None
+            try:
+                margin = float(cache_metadata.get("margin_fraction", 0.05))
+            except (AttributeError, TypeError, ValueError):
+                margin = 0.05
+            placement_rect = inset_rect(plot_rect, max(0.0, min(0.49, margin)))
+            use_large = should_use_large_media_overlay(
+                content,
+                placement_rect,
+                (media_width, media_height),
+                adaptive_enabled=self.adaptive_media_overlap,
+                override=self.media_layout_override,
+            )
+            if use_large:
+                previous_corner = self.current_media_corner
+                previous_mode = self.effective_media_layout_mode
+                walker_point = None
+                if self.arrow_latlon is not None:
+                    walker_point = self.viewPointForLat_lon_imageRect_scale_(
+                        self.arrow_latlon[0], self.arrow_latlon[1], image_rect, scale
+                    )
+                options = large_overlay_layout_options(
+                    placement_rect,
+                    (media_width, media_height),
+                    walker_point,
+                )
+                current_corner = (
+                    self.current_media_corner
+                    if self.effective_media_layout_mode == "large_overlay"
+                    else None
+                )
+                candidate_corner, candidate_outer, candidate_content, _fraction = choose_large_overlay_layout(
+                    options,
+                    current_corner=current_corner,
+                )
+                if (
+                    current_corner in options
+                    and candidate_corner != current_corner
+                    and time.monotonic() - self.media_corner_last_changed < 1.0
+                ):
+                    candidate_corner = current_corner
+                    candidate_outer, candidate_content, _fraction, _distance = options[current_corner][:4]
+                geometry_key = (
+                    tuple(round(value, 2) for value in placement_rect),
+                    round(media_width, 2),
+                    round(media_height, 2),
+                )
+                if (
+                    candidate_corner == previous_corner
+                    and previous_mode == "large_overlay"
+                    and geometry_key == self.media_layout_geometry_key
+                    and self.media_target_outer_rect is not None
+                    and self.media_target_content_rect is not None
+                ):
+                    candidate_outer = self.media_target_outer_rect
+                    candidate_content = self.media_target_content_rect
+                if candidate_corner != self.current_media_corner:
+                    self.media_corner_last_changed = time.monotonic()
+                corner, outer, content = candidate_corner, candidate_outer, candidate_content
+                self.effective_media_layout_mode = "large_overlay"
+                self.media_layout_geometry_key = geometry_key
+            else:
+                self.effective_media_layout_mode = "track_clear"
+                self.media_layout_geometry_key = None
             self.current_media_corner = corner
+            outer, content = self._display_media_rects(outer, content)
             outer_rect = NSMakeRect(*outer)
             content_rect = NSMakeRect(*content)
             return outer_rect, content_rect
@@ -5639,15 +5829,49 @@ def format_overview_duration(value: object) -> Optional[str]:
     return f"{cleaned} h"
 
 
+def help_overlay_layout(width: float, height: float, lines=KEY_HELP_LINES[1:]):
+    """Return wrapped help lines and typography that fit the current display."""
+    panel_width = min(width * 0.90, 1040.0)
+    panel_height_limit = max(220.0, min(height * 0.90, height - 20.0))
+    horizontal_padding = 68.0
+    vertical_reserved = 105.0
+    for font_size in (22.0, 21.0, 20.0, 19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0):
+        maximum_characters = max(
+            28,
+            int((panel_width - horizontal_padding) / max(1.0, font_size * 0.56)),
+        )
+        wrapped = []
+        for line in lines:
+            parts = textwrap.wrap(
+                line,
+                width=maximum_characters,
+                subsequent_indent="                      ",
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            wrapped.extend(parts or [""])
+        line_height = font_size * 1.35
+        required_height = vertical_reserved + line_height * len(wrapped)
+        if required_height <= panel_height_limit or font_size == 13.0:
+            return {
+                "panel_width": panel_width,
+                "panel_height": min(panel_height_limit, max(300.0, required_height)),
+                "font_size": font_size,
+                "line_height": line_height,
+                "lines": tuple(wrapped),
+            }
+
+
 def create_help_overlay_image(width: float, height: float):
     """Create an overlay image describing keyboard controls."""
     image = NSImage.alloc().initWithSize_(NSMakeSize(width, height))
     image.lockFocus()
 
     NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.65).setFill()
-    line_height = 30.0
-    panel_width = min(width * 0.86, 980.0)
-    panel_height = min(height * 0.82, max(430.0, 108.0 + line_height * len(KEY_HELP_LINES[1:])))
+    layout = help_overlay_layout(width, height)
+    line_height = layout["line_height"]
+    panel_width = layout["panel_width"]
+    panel_height = layout["panel_height"]
     panel_x = (width - panel_width) / 2.0
     panel_y = (height - panel_height) / 2.0
     panel = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
@@ -5660,16 +5884,16 @@ def create_help_overlay_image(width: float, height: float):
     panel.setLineWidth_(2.0)
     panel.stroke()
 
-    title_font = NSFont.boldSystemFontOfSize_(28.0)
-    line_font = NSFont.systemFontOfSize_(22.0)
-    top_y = panel_y + panel_height - 52.0
+    title_font = NSFont.boldSystemFontOfSize_(max(20.0, layout["font_size"] + 6.0))
+    line_font = NSFont.systemFontOfSize_(layout["font_size"])
+    top_y = panel_y + panel_height - max(40.0, layout["font_size"] + 26.0)
     draw_outlined_text("GPSTrackShow Keys", width / 2.0, top_y, title_font, COLOR_NAMES["white"], COLOR_NAMES["black"], 2.0)
     left_x = panel_x + 34.0
-    for index, line in enumerate(KEY_HELP_LINES[1:], start=0):
+    for index, line in enumerate(layout["lines"], start=0):
         draw_outlined_text_left(
             line,
             left_x,
-            top_y - 50.0 - index * line_height,
+            top_y - max(36.0, layout["font_size"] + 22.0) - index * line_height,
             line_font,
             COLOR_NAMES["white"],
             COLOR_NAMES["black"],
@@ -9569,6 +9793,7 @@ class GPSTrackShowApp:
         self.time_lapse_caption = None
         self.time_lapse_caption_font = None
         self.time_lapse_media_draw_frame = True
+        self.time_lapse_media_layout_override = None
         self.time_lapse_media_marker_latlon: Optional[tuple[float, float]] = None
         self.time_lapse_stage_start_marker_latlon: Optional[tuple[float, float]] = None
         self.time_lapse_clock_time: Optional[tuple[int, int]] = None
@@ -10279,6 +10504,9 @@ class GPSTrackShowApp:
             if chars in {"g", "G"} or raw_chars in {"g", "G"}:
                 self._toggle_dual_screen_route_tracking()
                 return None
+            if chars in {"z", "Z"} or raw_chars in {"z", "Z"}:
+                self._toggle_time_lapse_media_layout()
+                return None
             if chars in {"a", "A"} or raw_chars in {"a", "A"}:
                 if self.music_controller.available:
                     self.music_controller.toggle()
@@ -10429,6 +10657,32 @@ class GPSTrackShowApp:
             self.photo_presenter.set_info_visible(visible)
         if self.map_presenter is not None:
             self.map_presenter.set_info_visible(visible)
+
+    def _toggle_time_lapse_media_layout(self) -> None:
+        """Force the opposite media layout for the remainder of this stage."""
+        effective = None
+        for view in (self.time_photo_view, self.time_map_view):
+            if view is not None and view.media_image is not None:
+                effective = view.effective_media_layout_mode
+                break
+        if self.time_lapse_media_layout_override is None:
+            self.time_lapse_media_layout_override = (
+                "track_clear" if effective == "large_overlay" else "large_overlay"
+            )
+        else:
+            self.time_lapse_media_layout_override = (
+                "track_clear"
+                if self.time_lapse_media_layout_override == "large_overlay"
+                else "large_overlay"
+            )
+        self._show_temporary_status_overlay(
+            "Large Photo Mode"
+            if self.time_lapse_media_layout_override == "large_overlay"
+            else "Track-Clear Photo Mode",
+            2.0,
+        )
+        if self.time_lapse_stage is not None:
+            self._set_time_lapse_views()
 
     def _set_time_lapse_info_text(self, info_text: Optional[str]) -> None:
         """Route current Time-Lapse medium information to the photo overlay."""
@@ -13881,6 +14135,10 @@ class GPSTrackShowApp:
             stage_view.route_color = self.config.route_color
             stage_view.route_width = self.config.route_width
             stage_view.media_min_fraction = self.config.time_lapse_media_min_fraction
+            stage_view.adaptive_media_overlap = self.config.time_lapse_adaptive_media_overlap
+            stage_view.media_layout_override = getattr(
+                self, "time_lapse_media_layout_override", None
+            )
             stage_view.media_draw_frame = self.time_lapse_media_draw_frame
             stage_view.caption_directive = self.time_lapse_caption
             stage_view.caption_font_state = self.time_lapse_caption_font
@@ -14145,7 +14403,10 @@ class GPSTrackShowApp:
         # or previous slide while maps and the optional profile are prepared.
         self.standard_route_tracking_active = bool(standard_tracking)
         self._suspend_standard_playback_for_time_lapse(hide_content=False)
+        previous_stage_index = self.current_stage_index
         self.current_stage_index = stage_index_for_playlist_row(self.stages, map_index)
+        if self.current_stage_index != previous_stage_index:
+            self.time_lapse_media_layout_override = None
         stage_index = self.current_stage_index
         cache_entry = (
             self._load_stage_entry(stage_index, True)
@@ -16501,6 +16762,7 @@ class GPSTrackShowApp:
             "slideshow.collage_max_images": ("collage_max_images", int),
             "timelapse.stage_duration_seconds": ("time_lapse_duration", float),
             "timelapse.media_min_fraction": ("time_lapse_media_min_fraction", float),
+            "timelapse.adaptive_media_overlap": ("time_lapse_adaptive_media_overlap", bool),
             "timelapse.marker_style": ("time_lapse_marker", str),
             "timelapse.overview_as_media": ("time_lapse_overview_as_media", bool),
             "timelapse.overview_on_stage_map_dual": ("time_lapse_overview_on_stage_map_dual", bool),

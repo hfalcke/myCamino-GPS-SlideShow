@@ -25,6 +25,7 @@ from GPSTrackShow import (
     external_jump_command_row,
     fixed_arrow_normal,
     format_elevation_change,
+    help_overlay_layout,
     inset_rect,
     largest_clear_corner_rects,
     map_plot_rect,
@@ -65,6 +66,41 @@ from track_map_layout_utils import best_unframed_media_layout
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_z_forces_opposite_layout_and_toggles_within_stage(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        app.time_lapse_media_layout_override = None
+        app.time_photo_view = SimpleNamespace(
+            media_image=object(), effective_media_layout_mode="large_overlay"
+        )
+        app.time_map_view = None
+        app.time_lapse_stage = object()
+        statuses = []
+        refreshes = []
+        app._show_temporary_status_overlay = (
+            lambda message, _duration: statuses.append(message)
+        )
+        app._set_time_lapse_views = lambda: refreshes.append(True)
+
+        app._toggle_time_lapse_media_layout()
+        self.assertEqual(app.time_lapse_media_layout_override, "track_clear")
+        self.assertEqual(statuses[-1], "Track-Clear Photo Mode")
+
+        app._toggle_time_lapse_media_layout()
+        self.assertEqual(app.time_lapse_media_layout_override, "large_overlay")
+        self.assertEqual(statuses[-1], "Large Photo Mode")
+        self.assertEqual(len(refreshes), 2)
+
+    def test_help_layout_shrinks_and_wraps_to_fit_notebook_display(self):
+        layout = help_overlay_layout(920.0, 560.0)
+        self.assertGreaterEqual(layout["font_size"], 13.0)
+        self.assertLessEqual(layout["font_size"], 22.0)
+        self.assertLessEqual(layout["panel_height"], 560.0 * 0.90)
+        self.assertLessEqual(
+            105.0 + layout["line_height"] * len(layout["lines"]),
+            layout["panel_height"],
+        )
+        self.assertTrue(any(line.strip().startswith("Settings") for line in layout["lines"]))
+
     def test_profile_media_marker_requires_a_nearby_route_position(self):
         metadata = {
             "timed_track_points": [
@@ -1445,6 +1481,7 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             self.assertFalse(config.mapwindow)
             self.assertEqual(config.time_lapse_media_min_fraction, 0.5)
             self.assertEqual(config.time_lapse_media_max_fraction, 0.5)
+            self.assertTrue(config.time_lapse_adaptive_media_overlap)
             self.assertEqual(config.time_lapse_marker, "pilgrim")
             self.assertTrue(config.time_lapse_overview_as_media)
             self.assertTrue(config.time_lapse_overview_on_stage_map_dual)

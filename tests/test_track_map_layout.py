@@ -29,16 +29,115 @@ from track_map_layout_utils import (
     best_media_corner_layout,
     build_media_clear_boxes_metadata,
     cached_clear_box_options,
+    choose_large_overlay_layout,
     clear_corner_rect_options,
     clear_box_options_for_extent,
+    large_overlay_layout_options,
+    media_matching_dimension_fraction,
     optimized_track_extent,
     resolve_track_map_variant,
+    should_use_large_media_overlay,
     time_lapse_track_map_name,
     track_map_variant_names,
 )
 
 
 class TrackMapLayoutTests(unittest.TestCase):
+    def test_adaptive_large_overlay_trigger_uses_strict_45_percent_threshold(self):
+        placement = (0.0, 0.0, 1000.0, 600.0)
+        media_size = (1600.0, 900.0)
+        self.assertTrue(
+            should_use_large_media_overlay(
+                (0.0, 0.0, 449.0, 252.5625),
+                placement,
+                media_size,
+                adaptive_enabled=True,
+            )
+        )
+        self.assertFalse(
+            should_use_large_media_overlay(
+                (0.0, 0.0, 450.0, 253.125),
+                placement,
+                media_size,
+                adaptive_enabled=True,
+            )
+        )
+        self.assertTrue(
+            should_use_large_media_overlay(
+                (0.0, 0.0, 900.0, 506.25),
+                placement,
+                media_size,
+                adaptive_enabled=False,
+                override="large_overlay",
+            )
+        )
+        self.assertFalse(
+            should_use_large_media_overlay(
+                (0.0, 0.0, 200.0, 112.5),
+                placement,
+                media_size,
+                adaptive_enabled=True,
+                override="track_clear",
+            )
+        )
+
+    def test_large_overlay_uses_matching_dimension_and_opposite_corner(self):
+        placement = (0.0, 0.0, 1000.0, 600.0)
+        options = large_overlay_layout_options(
+            placement, (1600.0, 900.0), (100.0, 100.0)
+        )
+        corner, _outer, content, fraction = choose_large_overlay_layout(options)
+        self.assertEqual(corner, "top_right")
+        self.assertGreaterEqual(fraction, 0.48)
+        self.assertLessEqual(fraction, 0.60)
+        self.assertAlmostEqual(
+            media_matching_dimension_fraction(content, placement, (1600.0, 900.0)),
+            fraction,
+        )
+
+    def test_large_overlay_uses_height_for_portrait_media(self):
+        placement = (0.0, 0.0, 1000.0, 600.0)
+        options = large_overlay_layout_options(
+            placement, (900.0, 1600.0), (900.0, 100.0)
+        )
+        _corner, _outer, content, fraction = choose_large_overlay_layout(options)
+        self.assertAlmostEqual(content[3] / placement[3], fraction)
+
+    def test_large_overlay_requires_three_percent_size_gain_to_switch(self):
+        options = {
+            "top_left": ((0, 50, 40, 40), (1, 51, 38, 38), 0.56, 100.0),
+            "top_right": ((60, 50, 40, 40), (61, 51, 38, 38), 0.58, 200.0),
+        }
+        corner, _outer, _content, _fraction = choose_large_overlay_layout(
+            options, current_corner="top_left"
+        )
+        self.assertEqual(corner, "top_left")
+        options["top_right"] = ((60, 50, 40, 40), (61, 51, 38, 38), 0.60, 200.0)
+        corner, _outer, _content, _fraction = choose_large_overlay_layout(
+            options, current_corner="top_left"
+        )
+        self.assertEqual(corner, "top_right")
+
+    def test_large_overlay_leaves_a_corner_that_falls_below_minimum(self):
+        options = {
+            "top_left": ((0, 50, 40, 40), (1, 51, 38, 38), 0.47, 100.0),
+            "top_right": ((60, 50, 40, 40), (61, 51, 38, 38), 0.49, 200.0),
+        }
+        corner, _outer, _content, _fraction = choose_large_overlay_layout(
+            options, current_corner="top_left"
+        )
+        self.assertEqual(corner, "top_right")
+
+    def test_large_overlay_does_not_retain_an_unsafe_fallback_corner(self):
+        options = {
+            "top_left": ((0, 50, 40, 40), (1, 51, 38, 38), 0.48, 100.0, False),
+            "top_right": ((60, 50, 40, 40), (61, 51, 38, 38), 0.48, 200.0, False),
+        }
+        corner, _outer, _content, _fraction = choose_large_overlay_layout(
+            options, current_corner="top_left"
+        )
+        self.assertEqual(corner, "top_right")
+
     def test_media_map_fingerprint_is_captured_before_renderer_mutates_geometry(self):
         coordinates = [(50.0, 7.0), (50.1, 7.1)]
         rendered_names = []

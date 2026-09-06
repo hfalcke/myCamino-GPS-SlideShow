@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 22
+PARAMETER_SCHEMA_VERSION = 23
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -88,6 +88,7 @@ PARAMETER_SPECS = (
 
     ParameterSpec("timelapse.stage_duration_seconds", "Slide Show", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s", subsection="Time-Lapse"),
     ParameterSpec("timelapse.media_min_fraction", "Slide Show", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%", subsection="Time-Lapse"),
+    ParameterSpec("timelapse.adaptive_media_overlap", "Slide Show", "Automatically enlarge small Time-Lapse media", True, "bool", "Allow a photo or video to overlap the route at 48-60% size when track-clear placement would be smaller than 45%.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.overview_as_media", "Slide Show", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.overview_on_stage_map_dual", "Slide Show", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.marker_style", "Slide Show", "Moving marker", "pilgrim", "choice", "Choose the moving symbol shown at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("bike", "Bicycle"), ("car", "Car"), ("plane", "Airplane"), ("arrow", "Arrow")), subsection="Time-Lapse"),

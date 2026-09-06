@@ -23,6 +23,7 @@ MEDIA_CLEAR_BOX_COMPATIBLE_VERSIONS = frozenset({1, 2, MEDIA_CLEAR_BOX_VERSION})
 MEDIA_CLEAR_BOX_COORDINATE_SPACE = "image_fraction_bottom_left"
 DEFAULT_TRACK_EDGE_MARGIN_FRACTION = 0.05
 DEFAULT_GRID_LONG_AXIS = 192
+LARGE_MEDIA_CORNERS = CORNER_ORDER
 
 
 def canonical_track_map_name(filename: str) -> str:
@@ -280,6 +281,142 @@ def best_media_corner_layout(
                 best_corner, best_outer, best_content, best_area = position, outer, content, area
                 best_minimum_ratio = minimum_ratio
     return best_corner, best_outer, best_content
+
+
+def media_matching_dimension_fraction(
+    media_rect: RectTuple,
+    placement_rect: RectTuple,
+    media_size: tuple[float, float],
+) -> float:
+    """Measure landscape width or portrait height against usable map space."""
+    media_width, media_height = media_size
+    _x, _y, width, height = placement_rect
+    if media_width >= media_height:
+        return max(0.0, media_rect[2]) / max(1.0, width)
+    return max(0.0, media_rect[3]) / max(1.0, height)
+
+
+def should_use_large_media_overlay(
+    track_clear_media_rect: RectTuple,
+    placement_rect: RectTuple,
+    media_size: tuple[float, float],
+    *,
+    adaptive_enabled: bool,
+    override: str | None = None,
+    trigger_fraction: float = 0.45,
+) -> bool:
+    """Apply a forced mode or the matching-dimension adaptive threshold."""
+    if override == "large_overlay":
+        return True
+    if override == "track_clear":
+        return False
+    return bool(adaptive_enabled) and media_matching_dimension_fraction(
+        track_clear_media_rect,
+        placement_rect,
+        media_size,
+    ) < float(trigger_fraction)
+
+
+def large_overlay_layout_options(
+    placement_rect: RectTuple,
+    media_size: tuple[float, float],
+    walker_point: tuple[float, float] | None,
+    *,
+    minimum_fraction: float = 0.48,
+    maximum_fraction: float = 0.60,
+    safety_fraction: float = 0.04,
+) -> dict[str, tuple[RectTuple, RectTuple, float, float, bool]]:
+    """Return framed corner layouts sized to avoid the live walker when possible."""
+    x, y, width, height = placement_rect
+    media_width, media_height = media_size
+    minimum = max(0.01, min(1.0, float(minimum_fraction)))
+    maximum = max(minimum, min(1.0, float(maximum_fraction)))
+    safety = max(0.0, min(width, height) * float(safety_fraction))
+
+    def layout(position: str, fraction: float) -> tuple[RectTuple, RectTuple]:
+        if media_width >= media_height:
+            draw_width = width * fraction
+            draw_height = draw_width * media_height / max(1.0, media_width)
+            if draw_height > height:
+                draw_height = height
+                draw_width = draw_height * media_width / max(1.0, media_height)
+        else:
+            draw_height = height * fraction
+            draw_width = draw_height * media_width / max(1.0, media_height)
+            if draw_width > width:
+                draw_width = width
+                draw_height = draw_width * media_height / max(1.0, media_width)
+        frame = max(5.0, min(draw_width, draw_height) * 0.025)
+        outer_width = min(width, draw_width + frame * 2.0)
+        outer_height = min(height, draw_height + frame * 2.0)
+        outer_x = x if position.endswith("left") else x + width - outer_width
+        outer_y = y if position.startswith("bottom") else y + height - outer_height
+        outer = (outer_x, outer_y, outer_width, outer_height)
+        content = (
+            outer_x + (outer_width - draw_width) / 2.0,
+            outer_y + (outer_height - draw_height) / 2.0,
+            draw_width,
+            draw_height,
+        )
+        return outer, content
+
+    result: dict[str, tuple[RectTuple, RectTuple, float, float, bool]] = {}
+    steps = max(1, int(math.ceil((maximum - minimum) / 0.01)))
+    fractions = [maximum - (maximum - minimum) * index / steps for index in range(steps + 1)]
+    for corner in LARGE_MEDIA_CORNERS:
+        chosen = None
+        for fraction in fractions:
+            outer, content = layout(corner, fraction)
+            safe = True
+            if walker_point is not None:
+                safe = not (
+                    outer[0] - safety <= walker_point[0] <= outer[0] + outer[2] + safety
+                    and outer[1] - safety <= walker_point[1] <= outer[1] + outer[3] + safety
+                )
+            if safe:
+                chosen = (outer, content, fraction, True)
+                break
+        if chosen is None:
+            outer, content = layout(corner, minimum)
+            chosen = (outer, content, minimum, False)
+        outer, content, fraction, walker_safe = chosen
+        center = (outer[0] + outer[2] / 2.0, outer[1] + outer[3] / 2.0)
+        distance = (
+            math.hypot(center[0] - walker_point[0], center[1] - walker_point[1])
+            if walker_point is not None
+            else 0.0
+        )
+        actual_fraction = media_matching_dimension_fraction(content, placement_rect, media_size)
+        result[corner] = (outer, content, actual_fraction, distance, walker_safe)
+    return result
+
+
+def choose_large_overlay_layout(
+    options: dict[str, tuple],
+    *,
+    current_corner: str | None = None,
+    minimum_advantage: float = 0.03,
+    minimum_current_fraction: float = 0.48,
+) -> tuple[str, RectTuple, RectTuple, float]:
+    """Choose a stable opposite corner, changing only for a useful size gain."""
+    if not options:
+        fallback = (0.0, 0.0, 1.0, 1.0)
+        return "top_right", fallback, fallback, 0.0
+    best_corner = max(
+        options,
+        key=lambda corner: (options[corner][2], options[corner][3], -LARGE_MEDIA_CORNERS.index(corner)),
+    )
+    if current_corner in options:
+        current = options[current_corner]
+        best = options[best_corner]
+        if (
+            (len(current) < 5 or bool(current[4]))
+            and current[2] >= float(minimum_current_fraction)
+            and best[2] < current[2] + max(0.0, float(minimum_advantage))
+        ):
+            best_corner = current_corner
+    outer, content, fraction, _distance = options[best_corner][:4]
+    return best_corner, outer, content, fraction
 
 
 def best_unframed_media_layout(

@@ -69,6 +69,7 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["gpx.maximum_vdop"], 20.0)
         self.assertEqual(defaults["gpx.running_speed_window_distance_m"], 500.0)
         self.assertEqual(defaults["gpx.media_timing_max_distance_m"], 100.0)
+        self.assertTrue(defaults["timelapse.adaptive_media_overlap"])
         self.assertEqual(defaults["trackmaps.media_point_color"], "#0066FF")
         self.assertEqual(defaults["trackmaps.track_title"], "endpoint_places")
         self.assertEqual(defaults["trackmaps.zoom"], 16)
@@ -231,6 +232,7 @@ class AdventureParameterTests(unittest.TestCase):
             {
                 "timelapse.stage_duration_seconds",
                 "timelapse.media_min_fraction",
+                "timelapse.adaptive_media_overlap",
                 "timelapse.overview_as_media",
                 "timelapse.overview_on_stage_map_dual",
                 "timelapse.marker_style",
