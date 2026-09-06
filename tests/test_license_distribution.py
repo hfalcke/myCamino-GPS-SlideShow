@@ -41,6 +41,22 @@ class LicenseResourceTests(unittest.TestCase):
         self.assertIn("Copyright (C) 2026 Heino Falcke", copyright_text)
         self.assertIn("GPL-3.0-or-later", copyright_text)
 
+    def test_repository_contains_app_store_and_contributor_terms(self):
+        exception = (ROOT / "APP_STORE_DISTRIBUTION_EXCEPTION.md").read_text(
+            encoding="utf-8"
+        )
+        eula = (ROOT / "APP_STORE_EULA_DRAFT.md").read_text(encoding="utf-8")
+        contributor = (ROOT / "CONTRIBUTOR_AGREEMENT.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("section 7", exception)
+        self.assertIn("does not convert myCamino into proprietary", exception)
+        self.assertIn("not yet in force", eula)
+        self.assertIn("Before this EULA is installed in App Store Connect", eula)
+        self.assertIn("mycamino@heinofalcke.de", eula)
+        self.assertIn("You retain ownership", contributor)
+        self.assertIn("commercial or proprietary terms", contributor)
+
     def test_source_tree_fallback_documents(self):
         self.assertEqual(
             license_document_path("license", source_root=ROOT), ROOT / "LICENSE"
@@ -48,6 +64,14 @@ class LicenseResourceTests(unittest.TestCase):
         self.assertIn(
             "Third-Party Notices",
             read_license_document("third_party", source_root=ROOT),
+        )
+        self.assertIn(
+            "Additional Permission",
+            read_license_document("app_store_exception", source_root=ROOT),
+        )
+        self.assertIn(
+            "Contributor License Agreement",
+            read_license_document("contributor_agreement", source_root=ROOT),
         )
 
     def test_packaged_document_takes_precedence(self):
@@ -93,6 +117,18 @@ class LicenseBundleTests(unittest.TestCase):
         ):
             with self.assertRaises(self.bundle.LicenseBundleError):
                 self.bundle.collect_dependency_licenses(Path(temporary))
+
+    def test_missing_first_party_legal_documents_fail_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ffmpeg_source = root / "ffmpeg.tar.xz"
+            ffmpeg_source.write_bytes(b"not reached")
+            with self.assertRaises(self.bundle.LicenseBundleError) as raised:
+                self.bundle.prepare_bundle(root, root / "output", ffmpeg_source)
+            message = str(raised.exception)
+            self.assertIn("APP_STORE_DISTRIBUTION_EXCEPTION.md", message)
+            self.assertIn("APP_STORE_EULA_DRAFT.md", message)
+            self.assertIn("CONTRIBUTOR_AGREEMENT.md", message)
 
     def test_source_archive_uses_actual_worktree_and_excludes_build_products(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -140,6 +176,9 @@ class LicenseBundleTests(unittest.TestCase):
         self.assertIn("prepare_license_bundle.py", text)
         self.assertIn("hdiutil attach -nobrowse -readonly", text)
         self.assertIn("License — GPL-3.0.txt", text)
+        self.assertIn("App Store Distribution Exception.txt", text)
+        self.assertIn("App Store EULA Draft.txt", text)
+        self.assertIn("Contributor Agreement.txt", text)
         self.assertIn("myCamino-source-*.tar.gz", text)
         self.assertIn("ffmpeg-8.1.1.tar.xz", text)
 

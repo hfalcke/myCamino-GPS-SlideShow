@@ -14,6 +14,7 @@ from AppKit import (
     NSAlert,
     NSApp,
     NSBackingStoreBuffered,
+    NSColor,
     NSFont,
     NSMakeRect,
     NSMakeSize,
@@ -21,7 +22,9 @@ from AppKit import (
     NSOffState,
     NSOnState,
     NSScrollView,
+    NSTextField,
     NSTextView,
+    NSViewMaxYMargin,
     NSViewHeightSizable,
     NSViewWidthSizable,
     NSWindow,
@@ -44,6 +47,7 @@ from cocoa_native_menus import menu_item
 
 AUTO_CHECK_KEY = "org.mycamino.news.auto-check.v1"
 LAST_CHECK_KEY = "org.mycamino.news.last-check.v1"
+LAST_ATTEMPT_KEY = "org.mycamino.news.last-attempt.v1"
 KNOWN_IDS_KEY = "org.mycamino.news.known-ids.v1"
 READ_IDS_KEY = "org.mycamino.news.read-ids.v1"
 CACHED_FEED_KEY = "org.mycamino.news.cached-feed.v1"
@@ -57,7 +61,9 @@ class ApplicationNewsController(NSObject):
             self.toggle_items = []
             self.window = None
             self.text_view = None
+            self.status_field = None
             self.checking = False
+            self.last_error = ""
             defaults = NSUserDefaults.standardUserDefaults()
             cached_feed = defaults.stringForKey_(CACHED_FEED_KEY)
             try:
@@ -121,8 +127,10 @@ class ApplicationNewsController(NSObject):
         defaults = NSUserDefaults.standardUserDefaults()
         if not self._automatic_enabled():
             return
-        last_check = float(defaults.doubleForKey_(LAST_CHECK_KEY))
-        if time.time() - last_check >= NEWS_CHECK_INTERVAL_SECONDS:
+        last_attempt = float(defaults.doubleForKey_(LAST_ATTEMPT_KEY))
+        if not last_attempt:
+            last_attempt = float(defaults.doubleForKey_(LAST_CHECK_KEY))
+        if time.time() - last_attempt >= NEWS_CHECK_INTERVAL_SECONDS:
             self._start_check(False)
 
     @objc.python_method
@@ -130,6 +138,10 @@ class ApplicationNewsController(NSObject):
         if self.checking:
             return
         self.checking = True
+        NSUserDefaults.standardUserDefaults().setDouble_forKey_(
+            time.time(), LAST_ATTEMPT_KEY
+        )
+        self._refresh_window_content()
 
         def worker():
             try:
@@ -157,15 +169,13 @@ class ApplicationNewsController(NSObject):
         items, error, manual = result
         self.checking = False
         if error:
+            self.last_error = str(error)
+            self._refresh_window_content()
             if manual:
-                alert = NSAlert.alloc().init()
-                alert.setMessageText_("Could not check for myCamino news")
-                alert.setInformativeText_(
-                    "The website could not be reached. Nothing else in myCamino is affected."
-                )
-                alert.runModal()
+                self._show_window()
             return
         defaults = NSUserDefaults.standardUserDefaults()
+        self.last_error = ""
         defaults.setDouble_forKey_(time.time(), LAST_CHECK_KEY)
         defaults.setObject_forKey_(
             json.dumps(
@@ -192,6 +202,7 @@ class ApplicationNewsController(NSObject):
         self.items = tuple(items)
         self._store_ids(KNOWN_IDS_KEY, known | {item.identifier for item in items})
         self._update_menu_items()
+        self._refresh_window_content()
         if newly_arrived:
             latest = newly_arrived[0]
             alert = NSAlert.alloc().init()
@@ -202,16 +213,26 @@ class ApplicationNewsController(NSObject):
             if int(alert.runModal()) == 1000:
                 self.showNews_(None)
         elif manual:
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("myCamino is up to date")
-            alert.setInformativeText_("There are no unread news or update notices.")
-            alert.runModal()
+            self._show_window()
 
-    @objc.IBAction
-    def showNews_(self, _sender):
-        if not self.items:
-            self._start_check(True)
-            return
+    @objc.python_method
+    def _connection_status(self):
+        timestamp = float(
+            NSUserDefaults.standardUserDefaults().doubleForKey_(LAST_CHECK_KEY)
+        )
+        if timestamp:
+            connected = time.strftime("%Y-%m-%d %H:%M", time.localtime(timestamp))
+            suffix = f"Last successful connection: {connected}"
+        else:
+            suffix = "No successful connection recorded yet"
+        if self.checking:
+            return f"Checking quietly in the background · {suffix}"
+        if self.last_error:
+            return f"Website currently unavailable · {suffix}"
+        return suffix
+
+    @objc.python_method
+    def _news_text(self):
         text = []
         for item in self.items:
             label = "UPDATE" if item.kind == "update" else "NEWS"
@@ -220,6 +241,17 @@ class ApplicationNewsController(NSObject):
                 f"{label}{version}\n{item.title}\n{item.published_at[:10]}\n\n"
                 f"{item.summary}\n\n{item.url}\n"
             )
+        return "\n\n".join(text) if text else "No published news or updates are available."
+
+    @objc.python_method
+    def _refresh_window_content(self):
+        if self.text_view is not None:
+            self.text_view.setString_(self._news_text())
+        if self.status_field is not None:
+            self.status_field.setStringValue_(self._connection_status())
+
+    @objc.python_method
+    def _show_window(self):
         if self.window is None:
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(220, 160, 700, 560),
@@ -229,7 +261,11 @@ class ApplicationNewsController(NSObject):
             )
             self.window.setReleasedWhenClosed_(False)
             self.window.setTitle_("myCamino News and Updates")
-            scroll = NSScrollView.alloc().initWithFrame_(self.window.contentView().bounds())
+            content = self.window.contentView()
+            bounds = content.bounds()
+            scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, 28, bounds.size.width, max(0, bounds.size.height - 28))
+            )
             scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             scroll.setHasVerticalScroller_(True)
             self.text_view = NSTextView.alloc().initWithFrame_(scroll.contentView().bounds())
@@ -245,13 +281,30 @@ class ApplicationNewsController(NSObject):
             self.text_view.setMaxSize_(NSMakeSize(1.0e7, 1.0e7))
             self.text_view.textContainer().setWidthTracksTextView_(True)
             scroll.setDocumentView_(self.text_view)
-            self.window.setContentView_(scroll)
-        self.text_view.setString_("\n\n".join(text))
+            content.addSubview_(scroll)
+            self.status_field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(12, 5, max(0, bounds.size.width - 24), 17)
+            )
+            self.status_field.setEditable_(False)
+            self.status_field.setSelectable_(False)
+            self.status_field.setBordered_(False)
+            self.status_field.setDrawsBackground_(False)
+            self.status_field.setFont_(NSFont.systemFontOfSize_(11.0))
+            self.status_field.setTextColor_(NSColor.secondaryLabelColor())
+            self.status_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            content.addSubview_(self.status_field)
+        self._refresh_window_content()
+        self.window.makeKeyAndOrderFront_(None)
+        self.window.orderFrontRegardless()
+
+    @objc.IBAction
+    def showNews_(self, _sender):
+        self._show_window()
         read = self._stored_ids(READ_IDS_KEY)
         self._store_ids(READ_IDS_KEY, read | {item.identifier for item in self.items})
         self._update_menu_items()
-        self.window.makeKeyAndOrderFront_(None)
-        self.window.orderFrontRegardless()
+        if not self.items:
+            self._start_check(True)
 
 
 _shared_controller = None

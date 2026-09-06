@@ -32,6 +32,7 @@ from GPSTrackShowGUI import (
     control_table_follow_selection_action,
     control_table_filter_anchor_index,
     control_table_search_indexes,
+    compact_weather_summary,
     control_table_recovery_path,
     display_control_row_type,
     media_viewer_control_row_index,
@@ -348,6 +349,20 @@ class ControlFileTrackSyncTests(unittest.TestCase):
         self.assertEqual(media_viewer_control_row_index("control", items, 1), 12)
         self.assertIsNone(media_viewer_control_row_index("project", items, 1))
         self.assertIsNone(media_viewer_control_row_index("control", items, 3))
+
+    def test_media_viewer_formats_compact_weather_summary(self):
+        metadata = {"weather": {"values": {
+            "temperature_2m": 2.34,
+            "relative_humidity_2m": 81,
+            "wind_speed_10m": 7.25,
+            "precipitation": 0.4,
+            "pressure_msl": 1013.6,
+            "cloud_cover": 65,
+        }}}
+        self.assertEqual(
+            compact_weather_summary(metadata),
+            "2.3 °C · RH 81% · wind 7.2 km/h · rain 0.4 mm · 1014 hPa · cloud 65%",
+        )
 
     def test_control_table_recovery_is_atomic_and_kept_outside_project_media(self):
         with TemporaryDirectory() as temporary:

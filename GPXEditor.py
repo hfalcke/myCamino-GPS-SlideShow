@@ -1227,6 +1227,66 @@ def visible_track_count(tracks: Iterable[TrackRecord]) -> int:
     return sum(1 for track in tracks if not track.hidden)
 
 
+def selected_tracks_export_filename(tracks: Iterable[TrackRecord]) -> str:
+    """Return a readable default filename for a selected-track export."""
+    selected = list(tracks)
+    if not selected:
+        return "Selected tracks.gpx"
+    suffix = f" - {len(selected)} tracks" if len(selected) > 1 else ""
+    name = re.sub(r'[\\/:*?"<>|]+', "_", selected[0].name).strip(" .")
+    return f"{name or 'Selected track'}{suffix}.gpx"
+
+
+def _canonical_metadata_copy(element: ET.Element) -> ET.Element:
+    """Copy GPX 1.0/unnamespaced metadata into the GPX 1.1 namespace."""
+    local_name = element.tag.rsplit("}", 1)[-1]
+    copied = ET.Element(qname(local_name), dict(element.attrib))
+    copied.text = element.text
+    copied.tail = element.tail
+    for child in element:
+        if local_name == "extensions":
+            copied.append(copy.deepcopy(child))
+        else:
+            copied.append(_canonical_metadata_copy(child))
+    return copied
+
+
+def _selected_tracks_document_template(
+    selected: list[TrackRecord], project_name: str
+) -> tuple[ET.Element, ET.Element | None]:
+    """Preserve document metadata from the first selected track's source GPX."""
+    source = Path(selected[0].source_file).expanduser() if selected and selected[0].source_file else None
+    source_root = None
+    if source is not None and source.is_file():
+        try:
+            candidate = ET.parse(source).getroot()
+            if candidate.tag.rsplit("}", 1)[-1] == "gpx":
+                source_root = candidate
+        except (ET.ParseError, OSError):
+            source_root = None
+
+    attributes = {"version": "1.1", "creator": "myCamino GPX Editor"}
+    metadata = None
+    extensions = None
+    if source_root is not None:
+        attributes.update(source_root.attrib)
+        attributes["version"] = "1.1"
+        for child in source_root:
+            local_name = child.tag.rsplit("}", 1)[-1]
+            if local_name == "metadata" and metadata is None:
+                metadata = _canonical_metadata_copy(child)
+            elif local_name == "extensions" and extensions is None:
+                extensions = _canonical_metadata_copy(child)
+
+    root = ET.Element(qname("gpx"), attributes)
+    if metadata is not None:
+        root.append(metadata)
+    elif project_name:
+        metadata = ET.SubElement(root, qname("metadata"))
+        ET.SubElement(metadata, qname("name")).text = project_name
+    return root, extensions
+
+
 def build_selected_tracks_root(
     tracks: Iterable[TrackRecord],
     output_path: Path,
@@ -1236,15 +1296,7 @@ def build_selected_tracks_root(
 ) -> ET.Element:
     """Build an independent GPX document from selected tracks in display order."""
     selected = list(tracks)
-    root = ET.Element(qname("gpx"), {"version": "1.1", "creator": "myCamino GPX Editor"})
-    if project_name:
-        metadata = ET.SubElement(root, qname("metadata"))
-        ET.SubElement(metadata, qname("name")).text = project_name
-    if anchor is not None:
-        extensions = ET.SubElement(root, qname("extensions"))
-        anchor_node = ET.SubElement(extensions, "mycamino_anchor")
-        anchor_node.set("lat", f"{anchor[0]:.8f}")
-        anchor_node.set("lon", f"{anchor[1]:.8f}")
+    root, extensions = _selected_tracks_document_template(selected, project_name)
     for number, track in enumerate(selected, start=1):
         output_track = copy.deepcopy(track.element)
         get_or_create_mycamino_track_extension(output_track).set(
@@ -1255,10 +1307,24 @@ def build_selected_tracks_root(
             source_directory=Path(track.source_file).parent if track.source_file else None,
             output_directory=Path(output_path).parent,
         )
-        for child in list(output_track):
-            if child.tag == qname("time"):
-                output_track.remove(child)
         root.append(output_track)
+    if extensions is not None or anchor is not None:
+        if extensions is None:
+            extensions = ET.Element(qname("extensions"))
+        if anchor is not None:
+            anchor_node = next(
+                (
+                    child
+                    for child in extensions
+                    if child.tag.rsplit("}", 1)[-1] == "mycamino_anchor"
+                ),
+                None,
+            )
+            if anchor_node is None:
+                anchor_node = ET.SubElement(extensions, "mycamino_anchor")
+            anchor_node.set("lat", f"{anchor[0]:.8f}")
+            anchor_node.set("lon", f"{anchor[1]:.8f}")
+        root.append(extensions)
     return root
 
 
@@ -3157,9 +3223,20 @@ class PlotView(NSView):
         self._plot_context_item(menu, "Zoom In", "zoomContextIn:")
         self._plot_context_item(menu, "Zoom Out", "zoomContextOut:")
         self._plot_context_item(menu, "Fit to Track", "fitContextTrack:")
+        if self.controller.selected_tracks():
+            menu.addItem_(NSMenuItem.separatorItem())
+            self._plot_context_item(
+                menu,
+                "Save Selected Tracks As…",
+                "saveSelectedTracksAs:",
+            )
         if self.waypoint_editing_enabled():
             title = "Show Selected Photo Thumbnail" if self.show_all_photo_thumbnails else "Show All Photo Thumbnails"
             self._plot_context_item(menu, title, "togglePhotoDisplay:")
+
+    @objc.IBAction
+    def saveSelectedTracksAs_(self, _sender):
+        self.controller.saveSelectedTracksAs_(None)
 
     @objc.IBAction
     def showElevationProfile_(self, _sender):
@@ -4538,10 +4615,12 @@ class PlotView(NSView):
                 self.inspector.select_point_index(self.marker)
             self.controller.refresh_elevation_profile_for_plot_view(self)
             self.show_info = previous_show_info
-        elif self.mode == "track" and key in {"\x08", "\x7f", "\uf728"}:
-            if self.marker is not None:
+        elif key in {"\x08", "\x7f", "\uf728"} and (
+            self.mode == "track" or self.adventure_workspace_delegate is not None
+        ):
+            if self.marker is not None and self.cursor is not None:
                 self.delete_marked_points()
-            else:
+            elif self.mode == "track":
                 self.delete_cursor_waypoint()
         elif self.mode == "track" and key in {"x", "X"}:
             self.cut_track()
@@ -8283,8 +8362,11 @@ class GPXEditorController(NSObject):
         self.recalculate()
         self.set_status(message)
         workspace = getattr(self, "adventure_workspace_delegate", None)
-        if workspace is not None and hasattr(workspace, "workspaceDocumentDidChange_"):
-            workspace.workspaceDocumentDidChange_(message)
+        if workspace is not None:
+            if hasattr(workspace, "adventureComponentDidChange_"):
+                workspace.adventureComponentDidChange_("gpx")
+            elif hasattr(workspace, "workspaceDocumentDidChange_"):
+                workspace.workspaceDocumentDidChange_(message)
 
     def invalidate_track_metrics(self, track: TrackRecord):
         track.metrics_dirty = True
@@ -10916,7 +10998,16 @@ class GPXEditorController(NSObject):
     def write_gpx_file(self, path: Path) -> ET.Element:
         path.parent.mkdir(parents=True, exist_ok=True)
         root = self.build_root(path)
-        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            ET.ElementTree(root).write(temporary, encoding="utf-8", xml_declaration=True)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return root
 
     def backup_existing_file(self, path: Path):
@@ -11253,7 +11344,8 @@ class GPXEditorController(NSObject):
             return
         panel = NSSavePanel.savePanel()
         panel.setAllowedFileTypes_(["gpx"])
-        panel.setNameFieldStringValue_(f"{self.safe_filename(selected[0].name)}.gpx")
+        panel.setCanCreateDirectories_(True)
+        panel.setNameFieldStringValue_(selected_tracks_export_filename(selected))
         project_directory = self.media_context.get("project_directory")
         if self.last_track_export_dir is not None:
             directory = self.last_track_export_dir
@@ -12370,6 +12462,11 @@ class GPXEditorController(NSObject):
         )
         self.show_scrollable_help("myCamino GPX Editor Help", text)
 
+    @objc.IBAction
+    def showQuickStart_(self, _sender):
+        from cocoa_help_document import show_help_document
+        show_help_document("myCamino Quick Start", "MYCAMINO_QUICK_START.md")
+
     def _show_project_document(self, kind, title):
         window = self.license_document_windows.get(kind)
         if window is not None:
@@ -12411,6 +12508,22 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def showProjectLicense_(self, _sender):
         self._show_project_document("license", "myCamino License — GPL-3.0-or-later")
+
+    @objc.IBAction
+    def showAppStoreException_(self, _sender):
+        self._show_project_document(
+            "app_store_exception", "Apple App Store Distribution Exception"
+        )
+
+    @objc.IBAction
+    def showAppStoreEULA_(self, _sender):
+        self._show_project_document("app_store_eula", "Apple App Store EULA — Draft")
+
+    @objc.IBAction
+    def showContributorAgreement_(self, _sender):
+        self._show_project_document(
+            "contributor_agreement", "Contributor License Agreement"
+        )
 
     @objc.IBAction
     def showAbout_(self, _sender):
@@ -12575,6 +12688,9 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
     app_menu.addItem_(menu_item("Settings…", "showSettings:", controller, ",", NSEventModifierFlagCommand))
     app_menu.addItem_(NSMenuItem.separatorItem())
     app_menu.addItem_(menu_item("License", "showProjectLicense:", controller))
+    app_menu.addItem_(menu_item("App Store Distribution Exception", "showAppStoreException:", controller))
+    app_menu.addItem_(menu_item("App Store EULA Draft", "showAppStoreEULA:", controller))
+    app_menu.addItem_(menu_item("Contributor Agreement", "showContributorAgreement:", controller))
     app_menu.addItem_(menu_item("Third-Party Notices", "showThirdPartyNotices:", controller))
     install_application_news(app_menu)
     app_menu.addItem_(NSMenuItem.separatorItem())
@@ -12607,6 +12723,7 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
     controller.native_window_menu_coordinator = coordinator
 
     help_menu = add_menu(main_menu, "Help")
+    help_menu.addItem_(menu_item("Quick Start", "showQuickStart:", controller))
     help_menu.addItem_(menu_item("GPX Editor Help", "help:", controller))
     help_menu.addItem_(menu_item("Report a Bug", "openBugReport:", controller))
     help_menu.addItem_(menu_item("Request a Feature", "openFeatureRequest:", controller))

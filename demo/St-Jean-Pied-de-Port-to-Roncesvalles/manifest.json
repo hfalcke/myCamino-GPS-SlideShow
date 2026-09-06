@@ -1,0 +1,515 @@
+{
+  "format_version": 2,
+  "title": "St-Jean-Pied-de-Port to Roncesvalles",
+  "track_name": "JW St-Jean-Pied-de-Port - Roncevalles",
+  "image_processing": {
+    "maximum_long_edge": 1920,
+    "jpeg_quality": 82,
+    "color_space": "sRGB"
+  },
+  "files": [
+    {
+      "path": "1 - GPX Track/St-Jean-Pied-de-Port-to-Roncesvalles.gpx",
+      "bytes": 646175,
+      "sha256": "dc5b8e7a1da13af06094ca25c96c7d51c981bda4c5a630774601ab0d011017ba"
+    },
+    {
+      "path": "2 - Photographs/IMG_5046.jpeg",
+      "bytes": 407449,
+      "sha256": "a8f1f0fef42357191a6cca4ac541578c3e371dc13fe2a741975a9a12ae0aed3f",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5047.jpeg",
+      "bytes": 282775,
+      "sha256": "bde4d39444a1b970ad98d3a2798d9c6caae52bbebbec03a3198f36699942df8e",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5048.jpeg",
+      "bytes": 181074,
+      "sha256": "bce3504bc6adc964604f68eabd5a4184cd34ba6550152a7fe3e7baba334300e9",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5057.jpeg",
+      "bytes": 351774,
+      "sha256": "5aaab2921bfe0eefdd10c7b29a37e3f84b4a3018ef93ab53f15a1aa2e2b895e5",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5061.jpeg",
+      "bytes": 229717,
+      "sha256": "c0ea836b220faee12ebd9a2249e81ff5dfa8eb598451571651191bad855f3e3d",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5062.jpeg",
+      "bytes": 385604,
+      "sha256": "d44fb8fa007a2cc206b7b46be400de4a1447a7fe3f206c61ee615c12d5590334",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5064.jpeg",
+      "bytes": 412147,
+      "sha256": "c08da264c9c22909ad5241c75771ec400becedbb2dff2a00dc568ba0c96bd68b",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5067.jpeg",
+      "bytes": 260450,
+      "sha256": "8c8a7e9a2cf0e4e696d3af97f891175ebc63621879585488c9dee0cf2068969d",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5073.jpeg",
+      "bytes": 633529,
+      "sha256": "b640ebde3466cd7b94910fea49517ca5014814a00a482d4d83067f64ac19c429",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5074.jpeg",
+      "bytes": 435089,
+      "sha256": "76c1f35cef7f4a0464f5047132f90cb437d6eae8f6d71c6b958eae1866d58baf",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5086.jpeg",
+      "bytes": 621506,
+      "sha256": "8c3a047cf6fd9c217b274d697c4fab3b38263c9a0cd9259340c9177a4bb45128",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5087.jpeg",
+      "bytes": 430187,
+      "sha256": "bec112c8236d2d75f668b4b764ee8428c4c778f9416e841d61e2c870d60e5f3a",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5092.jpeg",
+      "bytes": 593513,
+      "sha256": "eb010d0cbaa126c4371fb62c6e9eb3ee636d2d1feaea138df1f7728f5ba55742",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5095.jpeg",
+      "bytes": 390268,
+      "sha256": "1ad3f48e8f3964643c2f911469001a3bde3a0ac5f5e3bd95f2468e8ba2008284",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5099.jpeg",
+      "bytes": 303924,
+      "sha256": "657de2803d1013786db0063ba4c0576531a9cd6f5419a650768ad3a8cef451cf",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5113.jpeg",
+      "bytes": 397395,
+      "sha256": "e52ff51f68ed1350f865c381faa82ca47bc26fb896f06a2620fee5e904a462fb",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5117.jpeg",
+      "bytes": 646591,
+      "sha256": "a072c29a560d813cb4369180e505e0b5db078445afb05fb9d60a9f52778b9453",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5119.jpeg",
+      "bytes": 316890,
+      "sha256": "096eefc60a145aeba2b682abc2e911fe028669d057046dbaa43cf7940375adc1",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5124.jpeg",
+      "bytes": 461282,
+      "sha256": "8bf5bb75e23ced2e40de2771a0d01aa0c09af714d28cce7b3e70a45b0a8c6831",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5128.jpeg",
+      "bytes": 473713,
+      "sha256": "26cace22b10f713d962fbd3a3d1de5f2adcb4e5de68e25f512dca166078ba382",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5131.jpeg",
+      "bytes": 489906,
+      "sha256": "d37fa7f9a2e38fcec16f32e573a735048381bcf11450789c4da83398e99e67b5",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5135.jpeg",
+      "bytes": 589327,
+      "sha256": "518d700f2e299e0d616c58c42a2802c082961e7187b1b7a84fdcb9b8a33ccace",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5142.jpeg",
+      "bytes": 354237,
+      "sha256": "952a80aae7619a34f564415d375e5ee2b26111da51f7655830a87eecafb8e888",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5145.jpeg",
+      "bytes": 638694,
+      "sha256": "0b2d3fcf3b8bf57057c61e5a819193618a7999f7c13d5499e35464de4b05926c",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5161.jpeg",
+      "bytes": 816871,
+      "sha256": "17753ebe79a191cbb1535d9e2b2520afd80d4755e69f28610620125ad94e3b54",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5162.jpeg",
+      "bytes": 423168,
+      "sha256": "5146b172a8bd8f5c12761af0bcc96c568d8832dc440e49e94056967d6b639365",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5163.jpeg",
+      "bytes": 309892,
+      "sha256": "a95fb096a077cc05e10e990fb92b9f127fa6d7d2aa615e2fbd6362ae95fe142e",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5167.jpeg",
+      "bytes": 215232,
+      "sha256": "40677d1eb4aec892c4d30dc4c916a96925140a3b4161b881b9aaf9f69f7010be",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5168.jpeg",
+      "bytes": 407479,
+      "sha256": "19951a8089526535956283e573a206dec78b148a28e222b32e22c318a229a129",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5170.jpeg",
+      "bytes": 218750,
+      "sha256": "d47bb58eb002d2352b5614ee0efe4fa95385d991a6548a0b2dec9a3e3344eadd",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5172.jpeg",
+      "bytes": 376369,
+      "sha256": "835827abec4437a5414d1d18501a892648e3c51a956e7667cca1cf8223cd2299",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "2 - Photographs/IMG_5174.jpeg",
+      "bytes": 424980,
+      "sha256": "c5669b719ecdd48f5c35d761f3bee3b49e4be9e4b6bbdfc0008bbb427c91bb5f",
+      "width": 1920,
+      "height": 1080,
+      "visible_content": true,
+      "orientation": 1
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5046.jpeg.json",
+      "bytes": 2815,
+      "sha256": "c05db7c1c9b203a1bc360160b0c7653493a87404c003fd144f4bbf20238b80ea"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5047.jpeg.json",
+      "bytes": 2829,
+      "sha256": "5083a766836425d1b2513558941a44973f3767a55e6f7ad8cc3509965a23313d"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5048.jpeg.json",
+      "bytes": 2854,
+      "sha256": "08f6107f38d4b7a83d8154ae6dc08a59486f19c1feeb3304253639208108f427"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5057.jpeg.json",
+      "bytes": 2779,
+      "sha256": "41d1f6229d53eec077feeb3d617a3a2e7ce0a296451b2ba35dd79eed8f8df785"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5061.jpeg.json",
+      "bytes": 2808,
+      "sha256": "78eb9f55727d3bfa6df74677bed22de3f52c6ca09ac3991f53ca092f68a6aed2"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5062.jpeg.json",
+      "bytes": 2772,
+      "sha256": "b5e688f1bfe5e8225b006ccc56b9ab9038a128faae2f4f80fce014929eb9b4bf"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5064.jpeg.json",
+      "bytes": 2762,
+      "sha256": "d6d52db091c224e3e11cd535e952a564e59061ebd302440de6e7c0fcf15846a4"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5067.jpeg.json",
+      "bytes": 2723,
+      "sha256": "686f3db70441557ba79521c0aba39965a2d3b2948047c3dbfff155ec8ac59638"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5073.jpeg.json",
+      "bytes": 2842,
+      "sha256": "b064a97dd613e07871d1a8cdafd84130b027c2603e4bc117c241d2b0be6f37d1"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5074.jpeg.json",
+      "bytes": 2803,
+      "sha256": "d607d9976155f3cb5e3a3d309fae0286e339139bad6cb4086cad5118a3f27d6d"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5086.jpeg.json",
+      "bytes": 2807,
+      "sha256": "04eeb9c2a6489e994e013059163b3fb828e359e60bd6007fc80d5ddeb441e1f3"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5087.jpeg.json",
+      "bytes": 2769,
+      "sha256": "2f41161df2aaaa29fff91b0a9e99e695b8b4d07da70a86c47a475549b2dc9c71"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5092.jpeg.json",
+      "bytes": 2797,
+      "sha256": "6c314bdc0969e257bbe82f5da1f8f1b02a08e71064e0bc0337d61b4004d5c936"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5095.jpeg.json",
+      "bytes": 2694,
+      "sha256": "c334f95d54e07c3afc2b21da290f8dde13fbc0d0cd6dbc978517dc05f5993b78"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5099.jpeg.json",
+      "bytes": 2770,
+      "sha256": "a5ea1500475db8c8980d2a51fba6a6b55b45917b14b29d549357389366952f27"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5113.jpeg.json",
+      "bytes": 2766,
+      "sha256": "70749c9996bb96b926f285163fb2fd9e3a048cb01388eb768066ba1b894e0cbe"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5117.jpeg.json",
+      "bytes": 2781,
+      "sha256": "2b01b1d6e0ffbc37bb6afb5faf649c7e627b3b5c74be84f1ec44db1cde65ddfd"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5119.jpeg.json",
+      "bytes": 2801,
+      "sha256": "5be0158aee4a2cdcd72e834af277189c4d65fcd0211a887a7387a333e504c621"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5124.jpeg.json",
+      "bytes": 2733,
+      "sha256": "e86b7872ae07d3385a339b8d867d71a3078ea300f9604cd3e86244de4a34c15c"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5128.jpeg.json",
+      "bytes": 2753,
+      "sha256": "c559ab0235a2cd2bf1253bacb7270bbe0269f9072d3c454a33ff9134679c8be9"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5131.jpeg.json",
+      "bytes": 2774,
+      "sha256": "637b82697b6046d287e01825487210e98ba8c2a11db456bdbfe58e57a2c48bfa"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5135.jpeg.json",
+      "bytes": 2724,
+      "sha256": "c5923290f59577baca27e2bfcf9d19fbe163d9ac72cec1a196abdef7a2d96901"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5142.jpeg.json",
+      "bytes": 2715,
+      "sha256": "c5019e9c19d7bba3da3e927f611eef9f0d4bdd54b394a2ba920051c27a60bb28"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5145.jpeg.json",
+      "bytes": 2748,
+      "sha256": "3663ba419c9cb8b411e92031ad715fe78a9bb66a5578658fa7363a7d21351798"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5161.jpeg.json",
+      "bytes": 2710,
+      "sha256": "ddec49abc6fdcbfcf6d226c4bb8619dd9c77c69b8265ee8f6dbf2ac2f4ab80dd"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5162.jpeg.json",
+      "bytes": 2739,
+      "sha256": "8dceb7dfb7fdab84b506a92121a6dae56e0e29ec953a84721bc8c120e2c51c42"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5163.jpeg.json",
+      "bytes": 2739,
+      "sha256": "6034cc9dca2f94ab61932bf7a7d0be59082942f34a0d472ac561e256c51f6e72"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5167.jpeg.json",
+      "bytes": 2706,
+      "sha256": "f8b0f78bdc64e9ad79082a208a01578c4611de07c40d5f984d6782e1f34f4f3d"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5168.jpeg.json",
+      "bytes": 2803,
+      "sha256": "d0587493be61804a8f306abd3a8ec42498ca5d338bdf9736ff1b1408c9e24cda"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5170.jpeg.json",
+      "bytes": 2737,
+      "sha256": "d08e08d1e6ef13aa3b524ceb1eabc551e67eff1f8c2e4b65f6235b10ee5c7159"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5172.jpeg.json",
+      "bytes": 2836,
+      "sha256": "2614610260224f386d240f5fbbadb3c25df02d6c67c6c8870a78b8b2001bca69"
+    },
+    {
+      "path": "3 - Prepared Adventure/metadata/IMG_5174.jpeg.json",
+      "bytes": 2839,
+      "sha256": "329eac7f737c88f5fd0787f7b0a2e0249c979d40887f398db4ce8437f6f9a96c"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/0001_JW St-Jean-Pied-de-Port - Roncevalles_St Jean to Roncesvalles Demo-timelapse.json",
+      "bytes": 3143402,
+      "sha256": "c4c20a9b32bea24e17ef192f1e53fd4545c9c6f02115f9bde034d6b43245f828"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/0001_JW St-Jean-Pied-de-Port - Roncevalles_St Jean to Roncesvalles Demo-timelapse.png",
+      "bytes": 1215685,
+      "sha256": "32cefcdc03a2790b4e0e2e6c315752c538d2023bfa4c7dc903cf6f6671513ed5"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/0001_JW St-Jean-Pied-de-Port - Roncevalles_St Jean to Roncesvalles Demo.json",
+      "bytes": 3140891,
+      "sha256": "dd1076703b5a433557389d6b448c0a02149c7e83285877be61855fdd1a360914"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/0001_JW St-Jean-Pied-de-Port - Roncevalles_St Jean to Roncesvalles Demo.png",
+      "bytes": 1153143,
+      "sha256": "04a083e5282b5176868148289652f9731ee365ec79d26bfbb476ee0ffbe8be0a"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/St Jean to Roncesvalles Demo-summary.json",
+      "bytes": 3160,
+      "sha256": "c45f66084de7a0c8e4e44ad89b00747863f659d42625a2b54808e80ac0959058"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/St Jean to Roncesvalles Demo-trackdata/0001.json",
+      "bytes": 882751,
+      "sha256": "6269c9b66507f8874a0ef16105de56e1ea504b85919a904aedbcbff56a8de587"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/St Jean to Roncesvalles Demo.json",
+      "bytes": 3140804,
+      "sha256": "04fa7f01f8a9c4ad990bc6bb7dfd536c93e41d80126c612805225bf5e2650c03"
+    },
+    {
+      "path": "3 - Prepared Adventure/trackimages/St Jean to Roncesvalles Demo.png",
+      "bytes": 1153143,
+      "sha256": "04a083e5282b5176868148289652f9731ee365ec79d26bfbb476ee0ffbe8be0a"
+    },
+    {
+      "path": "PHOTO_LICENSE.md",
+      "bytes": 522,
+      "sha256": "6856e6add9c440c8a67a2185ed8480a43a3a3e90e2499b5e18910c138ece7117"
+    },
+    {
+      "path": "README.md",
+      "bytes": 646,
+      "sha256": "de25c19b0de37bbd8af2475d2b1c246fda0a49721b80d35fb97662d19e75991b"
+    }
+  ]
+}

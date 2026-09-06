@@ -437,6 +437,10 @@ class ProcessingJournal:
             prefix += f"[{phase}] "
         line = prefix + self.redact(message).rstrip() + "\n"
         with self._lock:
+            # Recovery cleanup or a project handoff may remove the journal's
+            # former directory between messages. Logging must remain harmless
+            # to the user action that produced the message.
+            self.directory.mkdir(parents=True, exist_ok=True)
             self._rotate()
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line)

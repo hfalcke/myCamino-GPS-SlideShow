@@ -52,6 +52,7 @@ def prepare_media_records(
     tracks_summary_path: Path | None = None,
     place_equivalence_m: float = 150.0,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    detail_callback: Callable[[str], None] | None = None,
     cancel_event=None,
 ) -> list[PreparedMedia]:
     """Reuse valid sidecars and batch-extract only missing/invalid/changed files."""
@@ -73,6 +74,8 @@ def prepare_media_records(
             raise ProcessingCancelled("Aborted.")
         if not path.is_file():
             prepared[index] = PreparedMedia(path, None, "missing", "unknown", "skipped", "file is missing")
+            if detail_callback is not None:
+                detail_callback(f"Skipped {path.name}: the source file is no longer present.")
             continue
         sidecar = media_sidecar_path(path)
         status, payload, reason = validate_media_sidecar(path, sidecar)
@@ -83,6 +86,8 @@ def prepare_media_records(
                 freshness = "current"
             record = record_from_sidecar_payload(payload, sidecar, path)
             prepared[index] = PreparedMedia(path, record, status, freshness, "reused")
+            if detail_callback is not None:
+                detail_callback(f"Reused current metadata for {path.name}.")
             continue
         if status == "available" and freshness == "changed" and not refresh_changed:
             record = record_from_sidecar_payload(payload, sidecar, path)
@@ -119,6 +124,14 @@ def prepare_media_records(
             prepared[index] = PreparedMedia(path, None, status, "unknown", "skipped", str(exc))
         else:
             prepared[index] = PreparedMedia(path, record, "available", "current", "extracted")
+            if detail_callback is not None:
+                date_text = record.photo_datetime.isoformat() if record.photo_datetime else "unknown date"
+                gps_text = (
+                    f"{record.latitude:.6f}, {record.longitude:.6f}"
+                    if record.latitude is not None and record.longitude is not None
+                    else "no embedded GPS"
+                )
+                detail_callback(f"Extracted {path.name}: {date_text}; {gps_text}.")
     completed = [item for item in prepared if item is not None]
     summary_path = (
         Path(tracks_summary_path).expanduser().resolve(strict=False)

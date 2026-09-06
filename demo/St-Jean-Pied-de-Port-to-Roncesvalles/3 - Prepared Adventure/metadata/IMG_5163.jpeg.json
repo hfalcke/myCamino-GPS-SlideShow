@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Navarra",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T15:52:13+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.02564166666667,
+  "locality": "Orreaga",
+  "longitude": -1.308413333333333,
+  "metadata_updated_at": "2026-08-29T10:31:05.928057+02:00",
+  "name": "31660",
+  "place": "Orreaga (Navarra), 31660",
+  "place_coordinate": {
+    "latitude": 43.02564166666667,
+    "longitude": -1.308413333333333
+  },
+  "place_details": {
+    "administrativeArea": "Navarra",
+    "areasOfInterest": [],
+    "locality": "Orreaga",
+    "name": "31660",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5163.jpeg",
+  "subLocality": null,
+  "time": "15:52",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T13:52:13+00:00",
+      "latitude": 43.02564166666667,
+      "longitude": -1.308413333333333
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.02591383333333,
+      "longitude": -1.307541666666667,
+      "response_elevation_m": 1237.0,
+      "response_latitude": 42.987698,
+      "response_longitude": -1.3373108,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.530551+00:00",
+    "sampling": {
+      "fraction": 0.87027778,
+      "lower_time": "2024-07-15T13:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T14:00:00+00:00",
+      "upper_time": "2024-07-15T14:00:00+00:00",
+      "weather_code_time": "2024-07-15T14:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 38.210277777777776,
+      "precipitation": 0.5,
+      "pressure_msl": 1015.4351388888889,
+      "relative_humidity_2m": 82.96222222222222,
+      "temperature_2m": 17.407555555555554,
+      "weather_code": 53,
+      "wind_speed_10m": 6.963222222222222
+    }
+  },
+  "photo_path": "IMG_5163.jpeg",
+  "source_file_signature": {
+    "size": 309892,
+    "mtime_ns": 1788636842371276886
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 309892,
+    "sha256": "a95fb096a077cc05e10e990fb92b9f127fa6d7d2aa615e2fbd6362ae95fe142e"
+  }
+}

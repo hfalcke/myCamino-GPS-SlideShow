@@ -1,7 +1,14 @@
 import json
 import unittest
+from unittest import mock
 
-from application_news import ApplicationNewsItem, parse_news_feed, unread_news
+from application_news import (
+    ApplicationNewsItem,
+    NEWS_CONNECT_TIMEOUT_SECONDS,
+    parse_news_feed,
+    retrieve_news_feed,
+    unread_news,
+)
 
 
 class ApplicationNewsTests(unittest.TestCase):
@@ -59,3 +66,16 @@ class ApplicationNewsTests(unittest.TestCase):
             ApplicationNewsItem("two", "Two", "Second", "2026-08-01T10:00:00Z", "https://example.test/two"),
         )
         self.assertEqual([item.identifier for item in unread_news(items, {"one"})], ["two"])
+
+    def test_retrieval_uses_short_connection_budget(self):
+        response = mock.MagicMock()
+        response.geturl.return_value = "https://mycamino.heinofalcke.de/api/app-news/v1/"
+        response.headers = {"Content-Type": "application/json"}
+        response.read.return_value = b'{"format_version": 1, "items": []}'
+        response.__enter__.return_value = response
+
+        with mock.patch("application_news.urlopen", return_value=response) as opener:
+            self.assertEqual(retrieve_news_feed(), ())
+
+        self.assertEqual(NEWS_CONNECT_TIMEOUT_SECONDS, 3.0)
+        self.assertEqual(opener.call_args.kwargs["timeout"], 3.0)

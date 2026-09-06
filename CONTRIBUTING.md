@@ -33,5 +33,19 @@ Keep changes focused and include tests where behavior changes. Run the relevant
 Python tests before submitting a pull request. Large changes should begin with a
 feature request so that the intended behavior can be discussed first.
 
-Contributions are accepted under the repository's
-[GPL-3.0-or-later licence](LICENSE).
+Accepted contributions remain available in the public repository under
+[GPL-3.0-or-later](LICENSE). myCamino also uses a Contributor License Agreement
+so official builds can be distributed through app stores and future editions
+can be dual-licensed. Copyright ownership stays with each contributor.
+
+Before a first code, documentation, or other copyrightable contribution can be
+merged:
+
+1. Read [CONTRIBUTOR_AGREEMENT.md](CONTRIBUTOR_AGREEMENT.md).
+2. Send a completed signed copy privately to mycamino@heinofalcke.de. Do not
+   commit personal contact information or a signature to the public repository.
+3. State in the pull request that a signed agreement has been submitted.
+
+Submitting an agreement does not guarantee acceptance of a contribution. No
+agreement is required merely to report bugs, request features, or discuss the
+project.

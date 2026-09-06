@@ -22,6 +22,8 @@ from GPSTrackShow import (
     adjacent_stage_map_index,
     align_datetime_timezone,
     build_time_lapse_media_queue,
+    build_walker_steering_plan,
+    apply_walker_steering_datetime,
     format_place_for_time_lapse,
     format_time_lapse_metrics,
     interpolate_timeline_point,
@@ -337,9 +339,10 @@ class TrackTimingTests(unittest.TestCase):
         marker_time = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
         late_media_time = marker_time + timedelta(hours=2)
         early_media_time = marker_time - timedelta(hours=1)
-        self.assertEqual(time_lapse_clock_datetime(marker_time, 0.99, late_media_time), marker_time)
+        self.assertEqual(time_lapse_clock_datetime(marker_time, 0.99, late_media_time), late_media_time)
         self.assertEqual(time_lapse_clock_datetime(marker_time, 1.0, late_media_time), late_media_time)
-        self.assertEqual(time_lapse_clock_datetime(marker_time, 1.0, early_media_time), marker_time)
+        self.assertEqual(time_lapse_clock_datetime(marker_time, 1.0, early_media_time), early_media_time)
+        self.assertEqual(time_lapse_clock_datetime(marker_time, 0.5, None), marker_time)
 
     def test_resume_state_captures_time_lapse_stage_and_visible_media(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
@@ -451,12 +454,86 @@ class TrackTimingTests(unittest.TestCase):
         ]
         self.assertEqual(interpolate_timeline_point(points, 0.25), (2.5, 2.5))
 
-    def test_all_untimed_media_remain_reachable_at_stage_end(self):
+    def test_media_queue_keeps_control_order_and_never_moves_backward(self):
         entry_a = PhotoListEntry("a.jpeg", "10:00", None, None, None)
         entry_b = PhotoListEntry("b.jpeg", None, None, None, None)
         entry_c = PhotoListEntry("c.jpeg", "11:00", None, None, None)
-        queue = build_time_lapse_media_queue([(None, 4, entry_a), (0.5, 2, entry_c), (None, 5, entry_b)])
-        self.assertEqual([(fraction, row) for fraction, row, _entry in queue], [(0.5, 2), (1.0, 4), (1.0, 5)])
+        queue = build_time_lapse_media_queue(
+            [(0.8, 4, entry_a), (0.2, 2, entry_c), (None, 5, entry_b)]
+        )
+        self.assertEqual(
+            [(fraction, row) for fraction, row, _entry in queue],
+            [(0.8, 4), (0.8, 2), (0.8, 5)],
+        )
+
+    def test_walker_steering_one_shot_and_repeat_ranges(self):
+        from slideshow_control_format import compile_repeat_ranges
+
+        lines = [
+            "#CONTROL: #IGNORE_TIME, #REPEAT_UNTIL $NORMAL",
+            "first.jpeg",
+            "#CONTROL: #SET_TIME 12:30",
+            "second.jpeg",
+            "third.jpeg",
+            "#CONTROL: #LABEL $NORMAL",
+            "fourth.jpeg",
+        ]
+        plan = build_walker_steering_plan(lines, compile_repeat_ranges(lines))
+        self.assertTrue(plan[1]["ignore_time"])
+        self.assertFalse(plan[3]["ignore_time"])
+        self.assertEqual(plan[3]["time"], "12:30:00")
+        self.assertTrue(plan[4]["ignore_time"])
+        self.assertNotIn(6, plan)
+
+    def test_walker_datetime_override_does_not_mutate_actual_time(self):
+        actual = datetime(2026, 8, 4, 9, 15, tzinfo=timezone.utc)
+        result = apply_walker_steering_datetime(
+            actual,
+            {"date": "2026-08-03", "time": "14:35:00", "ignore_time": False},
+            None,
+        )
+        self.assertEqual(result, datetime(2026, 8, 3, 14, 35, tzinfo=timezone.utc))
+        self.assertEqual(actual, datetime(2026, 8, 4, 9, 15, tzinfo=timezone.utc))
+
+    def test_walker_targets_clamp_outside_track_and_honor_overrides(self):
+        app = GPSTrackShowApp.__new__(GPSTrackShowApp)
+        start = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+        points = [
+            {"time": start, "has_absolute_time": True},
+            {"time": start + timedelta(hours=1), "has_absolute_time": True},
+        ]
+        entry = PhotoListEntry("photo.jpeg", None, None, None, None)
+        self.assertEqual(
+            app._time_lapse_media_fraction(
+                entry, points, None, photo_time=start - timedelta(hours=1)
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            app._time_lapse_media_fraction(
+                entry, points, None, photo_time=start + timedelta(hours=2)
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            app._time_lapse_media_fraction(
+                entry,
+                points,
+                None,
+                photo_time=start,
+                steering={"time": "10:30:00", "date": None, "ignore_time": False},
+            ),
+            0.5,
+        )
+        self.assertIsNone(
+            app._time_lapse_media_fraction(
+                entry,
+                points,
+                None,
+                photo_time=start + timedelta(minutes=30),
+                steering={"ignore_time": True},
+            )
+        )
 
     def test_control_list_date_and_time_fallback_keeps_track_timezone(self):
         reference = datetime(2020, 10, 17, 10, 0, tzinfo=timezone.utc)

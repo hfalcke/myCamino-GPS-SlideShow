@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Navarra",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T13:40:51+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.04121116666666,
+  "locality": "Luzaide/Valcarlos",
+  "longitude": -1.278196666666667,
+  "metadata_updated_at": "2026-08-29T10:31:05.906142+02:00",
+  "name": "31660",
+  "place": "Luzaide/Valcarlos (Navarra), 31660",
+  "place_coordinate": {
+    "latitude": 43.04121116666666,
+    "longitude": -1.278196666666667
+  },
+  "place_details": {
+    "administrativeArea": "Navarra",
+    "areasOfInterest": [],
+    "locality": "Luzaide/Valcarlos",
+    "name": "31660",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5145.jpeg",
+  "subLocality": null,
+  "time": "13:40",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T11:40:51+00:00",
+      "latitude": 43.04121116666666,
+      "longitude": -1.278196666666667
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.04121116666666,
+      "longitude": -1.278196666666667,
+      "response_elevation_m": 1272.0,
+      "response_latitude": 42.987698,
+      "response_longitude": -1.2035828,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.502706+00:00",
+    "sampling": {
+      "fraction": 0.68083333,
+      "lower_time": "2024-07-15T11:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T12:00:00+00:00",
+      "upper_time": "2024-07-15T12:00:00+00:00",
+      "weather_code_time": "2024-07-15T12:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 27.97833333333333,
+      "precipitation": 0.0,
+      "pressure_msl": 1013.99575,
+      "relative_humidity_2m": 64.915,
+      "temperature_2m": 19.79358333333333,
+      "weather_code": 1,
+      "wind_speed_10m": 16.219166666666666
+    }
+  },
+  "photo_path": "IMG_5145.jpeg",
+  "source_file_signature": {
+    "size": 638694,
+    "mtime_ns": 1788636830062764530
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 638694,
+    "sha256": "0b2d3fcf3b8bf57057c61e5a819193618a7999f7c13d5499e35464de4b05926c"
+  }
+}

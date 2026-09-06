@@ -121,7 +121,8 @@ class MediaUpdateReviewWindowTests(unittest.TestCase):
             "self.pending_control_update_offer_after_status = list("
         )
         refresh = automatic_branch.index(
-            'self.start_async_project_status_refresh("automatic map generation")'
+            'self.start_async_project_status_refresh("automatic map generation")',
+            pending,
         )
         self.assertLess(pending, refresh)
         self.assertIn(

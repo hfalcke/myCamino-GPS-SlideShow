@@ -92,7 +92,16 @@ echo "==> Checking Python syntax"
   GPSTrackShow.py \
   video_audio_normalization.py \
   license_resources.py \
+  help_resources.py \
+  demo_resources.py \
+  cocoa_circular_progress.py \
+  cocoa_help_document.py \
+  cocoa_guided_demo.py \
+  scripts/prepare_demo_assets.py \
   scripts/prepare_license_bundle.py
+
+echo "==> Verifying guided demo assets"
+"$PYTHON" scripts/prepare_demo_assets.py --verify
 
 echo "==> Fetching and verifying corresponding FFmpeg source"
 scripts/build_ffmpeg_lgpl.sh --source-only
@@ -123,9 +132,16 @@ move_previous_build_product "${APP_NAME}.app"
 echo "==> Preparing DMG root"
 cp -R "dist/${APP_NAME}.app" "$TMP_ROOT/"
 cp -R "dist/myCamino GPX Editor.app" "$TMP_ROOT/"
+cp -R "demo/St-Jean-Pied-de-Port-to-Roncesvalles" "$TMP_ROOT/myCamino Demo"
 cp "DMG_README.txt" "$TMP_ROOT/README.txt"
 cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/GPL-3.0.txt" \
   "$TMP_ROOT/License — GPL-3.0.txt"
+cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/App Store Distribution Exception.txt" \
+  "$TMP_ROOT/App Store Distribution Exception.txt"
+cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/App Store EULA Draft.txt" \
+  "$TMP_ROOT/App Store EULA Draft.txt"
+cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/Contributor Agreement.txt" \
+  "$TMP_ROOT/Contributor Agreement.txt"
 cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/Third-Party Notices.txt" \
   "$TMP_ROOT/Third-Party Notices.txt"
 cp "$LICENSE_BUNDLE/app_resources/licenses/myCamino/Source Code Information.txt" \
@@ -156,8 +172,14 @@ VERIFY_MOUNT="$(hdiutil attach -nobrowse -readonly "$DMG_PATH" | awk '/\/Volumes
 }
 for required in \
   "$VERIFY_MOUNT/License — GPL-3.0.txt" \
+  "$VERIFY_MOUNT/App Store Distribution Exception.txt" \
+  "$VERIFY_MOUNT/App Store EULA Draft.txt" \
+  "$VERIFY_MOUNT/Contributor Agreement.txt" \
   "$VERIFY_MOUNT/Third-Party Notices.txt" \
   "$VERIFY_MOUNT/Source Code Information.txt" \
+  "$VERIFY_MOUNT/myCamino Demo/manifest.json" \
+  "$VERIFY_MOUNT/myCamino Demo/PHOTO_LICENSE.md" \
+  "$VERIFY_MOUNT/myCamino GPS Track Show.app/Contents/Resources/demo/St-Jean-Pied-de-Port-to-Roncesvalles/manifest.json" \
   "$VERIFY_MOUNT/myCamino GPS Track Show.app/Contents/Resources/licenses/myCamino/GPL-3.0.txt" \
   "$VERIFY_MOUNT/myCamino GPX Editor.app/Contents/Resources/licenses/myCamino/GPL-3.0.txt"; do
   [[ -f "$required" ]] || {

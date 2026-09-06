@@ -260,6 +260,7 @@ from slideshow_control_format import (
     FontSyntaxError,
     MusicSyntaxError,
     AudioSelectionSyntaxError,
+    compile_repeat_ranges,
     control_labels,
     parse_caption_parameters,
     parse_control_parameters,
@@ -502,7 +503,7 @@ PH_COLLECTION_SUBTYPE_ANY = 9223372036854775807
 PH_ASSET_MEDIA_TYPE_IMAGE = 1
 PROJECT_AUDIO_DIRECTORY_NAME = "audio"
 PROJECT_NARRATION_DIRECTORY_NAME = "narration"
-SLIDESHOW_CHECKPOINT_VERSION = 5
+SLIDESHOW_CHECKPOINT_VERSION = 6
 SLIDESHOW_CHECKPOINT_HISTORY_LIMIT = 20
 
 
@@ -1107,6 +1108,57 @@ def media_viewer_control_row_index(source, items, index):
         return int(items[index]["index"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def compact_weather_summary(metadata):
+    """Return a compact one-line weather description from a media sidecar."""
+    weather = metadata.get("weather") if isinstance(metadata, dict) else None
+    values = weather.get("values") if isinstance(weather, dict) else None
+    if not isinstance(values, dict):
+        return ""
+    fields = []
+    formats = (
+        ("temperature_2m", lambda value: f"{value:.1f} °C"),
+        ("relative_humidity_2m", lambda value: f"RH {value:.0f}%"),
+        ("wind_speed_10m", lambda value: f"wind {value:.1f} km/h"),
+        ("precipitation", lambda value: f"rain {value:.1f} mm"),
+        ("pressure_msl", lambda value: f"{value:.0f} hPa"),
+        ("cloud_cover", lambda value: f"cloud {value:.0f}%"),
+    )
+    for key, formatter in formats:
+        try:
+            value = values.get(key)
+            if value is not None:
+                fields.append(formatter(float(value)))
+        except (TypeError, ValueError):
+            continue
+    return " · ".join(fields)
+
+
+def missing_control_map_assets(control_text, trackimages_dir):
+    """Return unavailable enabled map assets required by a control file."""
+    directory = Path(trackimages_dir)
+    missing = []
+    for raw_line in str(control_text).splitlines():
+        if not raw_line.strip():
+            continue
+        row = parse_slideshow_control_line(raw_line)
+        row_type = str(row.get("type", "")).upper()
+        if bool(row.get("disabled")) or row_type not in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+            continue
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        standard = Path(name).expanduser()
+        if not standard.is_absolute():
+            standard = directory / standard
+        required = [standard]
+        if row_type == "TRK":
+            required.append(standard.with_name(time_lapse_track_map_name(standard.name)))
+        for path in required:
+            if not path.is_file() and path.name not in missing:
+                missing.append(path.name)
+    return missing
 
 
 def normalize_control_row_type(value: str) -> str:
@@ -2005,7 +2057,9 @@ class SlideShowMediaViewerView(NSView):
             lines.append(f"GPS: {item.get('gps')}")
         if item.get("place"):
             lines.append(f"Place: {item.get('place')}")
-        self._draw_panel(lines, bounds, width=520.0, bottom=True)
+        if item.get("weather"):
+            lines.append(f"Weather: {item.get('weather')}")
+        self._draw_panel(lines, bounds, width=720.0, bottom=True)
 
     def _draw_panel(self, lines, bounds, width=420.0, bottom=False):
         panel_height = 22.0 + 18.0 * len(lines)
@@ -2359,6 +2413,7 @@ class GPXTrackerController(NSObject):
         self.discovered_media_retry_scheduled = False
         self.discovered_media_generate_maps = True
         self.pending_map_provider_action = None
+        self.pending_slideshow_after_map_generation = None
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
         self.slideshow_resume_history = []
@@ -2413,6 +2468,7 @@ class GPXTrackerController(NSObject):
         self.processing_phase_title = None
         self.preserve_processing_output_next = False
         self.assistant_control_skip_maps = False
+        self.assistant_control_replace_without_confirmation = False
         self.status_refresh_generation = 0
         self.project_status_processing_gate = threading.Event()
         self.project_status_processing_gate.set()
@@ -3891,6 +3947,14 @@ class GPXTrackerController(NSObject):
         self.progress_bar.setMaxValue_(total)
         self.progress_bar.setDoubleValue_(current)
         self.progress_bar.setNeedsDisplay_(True)
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host._set_background_progress(
+                "advanced",
+                self.processing_phase_title or "Processing",
+                int(current),
+                int(total),
+            )
         self.layout_window()
 
     def reset_progress(self):
@@ -3899,6 +3963,9 @@ class GPXTrackerController(NSObject):
         self.progress_bar.setDoubleValue_(0.0)
         self.progress_bar.setHidden_(True)
         self.progress_bar.setNeedsDisplay_(True)
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host._clear_background_progress("advanced")
         self.layout_window()
 
     def setProgressFromWorker_(self, progress_pair):
@@ -3919,7 +3986,10 @@ class GPXTrackerController(NSObject):
 
     def mark_dirty(self, immediate=False):
         self.project_dirty = True
-        if self.adventure_autosave_suspended == 0 and self.current_project_file is not None:
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host.adventureComponentDidChange_("adventure")
+        elif self.adventure_autosave_suspended == 0 and self.current_project_file is not None:
             self.schedule_adventure_autosave(immediate=immediate)
 
     def mark_clean(self):
@@ -3952,6 +4022,9 @@ class GPXTrackerController(NSObject):
 
     def flush_adventure_autosave(self):
         self.cancel_adventure_autosave()
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            return host._flush_workspace_autosave(show_errors=True)
         if self.current_project_file is None or not self.project_payload_changed():
             return True
         return self._write_project_configuration(status_prefix="Auto-saved adventure")
@@ -6979,6 +7052,8 @@ class GPXTrackerController(NSObject):
             return False
         if action == "cancel":
             self.pending_map_provider_action = None
+            if pending_action and pending_action[0] == "automatic_maps":
+                self.pending_slideshow_after_map_generation = None
             self.set_status("Map-provider setup cancelled.")
             return False
         selected_provider = str(result.get("provider", provider))
@@ -7126,6 +7201,11 @@ class GPXTrackerController(NSObject):
         self.main_help_window.makeKeyAndOrderFront_(None)
 
     @objc.IBAction
+    def showQuickStart_(self, _sender):
+        from cocoa_help_document import show_help_document
+        show_help_document("myCamino Quick Start", "MYCAMINO_QUICK_START.md")
+
+    @objc.IBAction
     def showAbout_(self, _sender):
         show_alert("myCamino", full_version_label())
 
@@ -7211,6 +7291,22 @@ class GPXTrackerController(NSObject):
     @objc.IBAction
     def showProjectLicense_(self, _sender):
         self._show_project_document("license", "myCamino License — GPL-3.0-or-later")
+
+    @objc.IBAction
+    def showAppStoreException_(self, _sender):
+        self._show_project_document(
+            "app_store_exception", "Apple App Store Distribution Exception"
+        )
+
+    @objc.IBAction
+    def showAppStoreEULA_(self, _sender):
+        self._show_project_document("app_store_eula", "Apple App Store EULA — Draft")
+
+    @objc.IBAction
+    def showContributorAgreement_(self, _sender):
+        self._show_project_document(
+            "contributor_agreement", "Contributor License Agreement"
+        )
 
     @objc.IBAction
     def showThirdPartyNotices_(self, _sender):
@@ -7460,6 +7556,7 @@ class GPXTrackerController(NSObject):
                 self.automatic_map_pending_imported_paths = []
                 self.automatic_map_review_control = False
                 self.pending_control_update_offer_after_status = None
+                self.pending_slideshow_after_map_generation = None
                 self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run("Aborted.", "Map generation cancelled.")
             elif mode in {"media_update_analysis", "media_update_commit"}:
@@ -7492,6 +7589,7 @@ class GPXTrackerController(NSObject):
                 self.automatic_map_pending_imported_paths = []
                 self.automatic_map_review_control = False
                 self.pending_control_update_offer_after_status = None
+                self.pending_slideshow_after_map_generation = None
                 self._cleanup_geolocations_temp_paths()
                 self._finish_geolocations_run(status, "Map generation failed.")
             elif mode in {"media_update_analysis", "media_update_commit"}:
@@ -7601,6 +7699,9 @@ class GPXTrackerController(NSObject):
             result = getattr(self, "automatic_map_generation_result", {}) or {}
             created_count = int(result.get("created_count", 0))
             failures = list(result.get("failures", []))
+            resume_slideshow = bool(
+                getattr(self, "pending_slideshow_after_map_generation", None)
+            )
             pending_imported_paths = list(
                 getattr(self, "automatic_map_pending_imported_paths", [])
             )
@@ -7625,6 +7726,17 @@ class GPXTrackerController(NSObject):
             )
             self.automatic_map_review_control = False
             self.pending_control_update_offer_after_status = None
+            if resume_slideshow:
+                if failures:
+                    self.pending_slideshow_after_map_generation = None
+                    self._finish_geolocations_run(summary, summary)
+                else:
+                    self._finish_geolocations_run(summary, summary)
+                    self.performSelector_withObject_afterDelay_(
+                        "resumeSlideShowAfterMaps:", None, 0.0
+                    )
+                self.start_async_project_status_refresh("automatic map generation")
+                return
             if (
                 not failures
                 and control_path is not None
@@ -7656,8 +7768,9 @@ class GPXTrackerController(NSObject):
                 self._finish_geolocations_run(summary, summary)
             return
         if mode == "assistant_control_assets":
+            failures = list(getattr(self, "assistant_control_map_failures", []))
             control_path = self._control_file_path()
-            if control_path is not None and control_path.is_file():
+            if not failures and control_path is not None and control_path.is_file():
                 self.load_slideshow_control_file(control_path, force_reload=True)
                 try:
                     control_text = control_path.read_text(encoding="utf-8")
@@ -7677,21 +7790,26 @@ class GPXTrackerController(NSObject):
                     if updated_places:
                         self._save_control_table_changes()
                 self._refresh_project_file_menus()
-            failures = list(getattr(self, "assistant_control_map_failures", []))
             if failures:
                 lines = [f"{item.get('filename')}: {item.get('error')}" for item in failures]
                 self._show_scrollable_list("Maps Not Created", lines)
                 summary = (
-                    f"Created the control file, but {len(failures)} map operation(s) failed. "
-                    "Use Generate and Update Maps when the map service is available."
+                    f"The control file was not installed because {len(failures)} required "
+                    "map operation(s) failed. Choose a map provider or retry Generate and Update Maps."
                 )
             else:
                 summary = "Created the control file, overview, and both map variants."
             if bool(getattr(self, "assistant_control_places_skipped", False)):
                 summary += " Place-name extraction was skipped for now."
-            self.mark_dirty(immediate=True)
+            if not failures:
+                self.mark_dirty(immediate=True)
             self._finish_geolocations_run(summary, summary)
             self.start_async_project_status_refresh("guided control and maps creation")
+            host = getattr(self, "adventure_map_host", None)
+            if host is not None:
+                host.controlAssetsCreationDidFinish_success_(
+                    not failures and control_path is not None and control_path.is_file()
+                )
             return
         if mode == "media_update_analysis":
             appended_analysis = bool(self.media_update_analysis_append)
@@ -8321,7 +8439,11 @@ class GPXTrackerController(NSObject):
         if self.pending_map_provider_action is not None:
             action = self.pending_map_provider_action[0]
             self.pending_map_provider_action = None
-            self.set_status("Map-provider setup cancelled; automatic Map Generation remains pending.")
+            if self.pending_slideshow_after_map_generation is not None:
+                self.pending_slideshow_after_map_generation = None
+                self.set_status("Map-provider setup cancelled; slide show was not started.")
+            else:
+                self.set_status("Map-provider setup cancelled; automatic Map Generation remains pending.")
             if action == "automatic_maps" and self.geolocations_running:
                 self._finish_geolocations_run(
                     "Map-provider setup was deferred.",
@@ -9081,24 +9203,33 @@ class GPXTrackerController(NSObject):
             None,
             False,
         )
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host.adventureComponentDidChange_("control")
 
     def _control_table_text(self):
         lines = [serialize_slideshow_control_row(row) for row in self.control_table_rows]
         return "\n".join(lines) + ("\n" if lines else "")
 
-    def _validate_control_table_directive_rows(self):
+    def _validate_control_table_directive_rows(self, *, show_errors=True):
+        def report(title, detail=""):
+            if show_errors:
+                show_alert(title, detail)
+            else:
+                self.set_status(f"Auto-save deferred: {title} {detail}".strip())
+
         serialized_lines = []
         for index, row in enumerate(self.control_table_rows, start=1):
             row_type = str(row.get("type", "")).strip().upper()
             if not row_type:
-                show_alert(f"Row {index} has no type.", "Choose a Type before saving the control file.")
+                report(f"Row {index} has no type.", "Choose a Type before saving the control file.")
                 return False
             serialized_lines.append(serialize_slideshow_control_row(row))
             if row_type == "MUS":
                 try:
                     parse_music_parameters(str(row.get("name", "")))
                 except MusicSyntaxError as exc:
-                    show_alert(f"Invalid music directive in row {index}.", str(exc))
+                    report(f"Invalid music directive in row {index}.", str(exc))
                     return False
             elif row_type in {"PLY", "NAR"}:
                 try:
@@ -9107,37 +9238,42 @@ class GPXTrackerController(NSObject):
                         "#PLAY" if row_type == "PLY" else "#NARRATOR",
                     )
                 except AudioSelectionSyntaxError as exc:
-                    show_alert(f"Invalid audio selection in row {index}.", str(exc))
+                    report(f"Invalid audio selection in row {index}.", str(exc))
                     return False
             elif row_type == "CTL":
                 try:
                     parse_control_parameters(str(row.get("name", "")))
                 except ControlSyntaxError as exc:
-                    show_alert(f"Invalid slide-show control directive in row {index}.", str(exc))
+                    report(f"Invalid slide-show control directive in row {index}.", str(exc))
                     return False
             elif row_type == "CAP":
                 try:
                     parse_caption_parameters(str(row.get("name", "")))
                 except CaptionSyntaxError as exc:
-                    show_alert(f"Invalid caption directive in row {index}.", str(exc))
+                    report(f"Invalid caption directive in row {index}.", str(exc))
                     return False
             elif row_type == "FNT":
                 try:
                     parse_font_parameters(str(row.get("name", "")))
                 except FontSyntaxError as exc:
-                    show_alert(f"Invalid font directive in row {index}.", str(exc))
+                    report(f"Invalid font directive in row {index}.", str(exc))
                     return False
         try:
             _labels, duplicates = control_labels(serialized_lines)
         except ControlSyntaxError as exc:
-            show_alert("Invalid slide-show control directive.", str(exc))
+            report("Invalid slide-show control directive.", str(exc))
             return False
         if duplicates:
             label, first_row, duplicate_row = duplicates[0]
-            show_alert(
+            report(
                 f"Duplicate slide-show label ${label}.",
                 f"Rows {first_row + 1} and {duplicate_row + 1} define the same label. Labels must be unique.",
             )
+            return False
+        try:
+            compile_repeat_ranges(serialized_lines)
+        except (ControlSyntaxError, MusicSyntaxError, AudioSelectionSyntaxError, CaptionSyntaxError, FontSyntaxError) as exc:
+            report("Invalid repeated directive.", str(exc))
             return False
         return True
 
@@ -9764,6 +9900,9 @@ class GPXTrackerController(NSObject):
             kind = "video" if row_type == "VID" else "image"
             time_text = str(row.get("time", ""))
             date_time_text = " ".join(part for part in (current_date, time_text) if part).strip()
+            sidecar_status, sidecar, _reason = validate_media_sidecar(path)
+            metadata = sidecar if sidecar_status == "available" and isinstance(sidecar, dict) else {}
+            sidecar_info = self.metadata_for_project_media_path(path)
             items.append({
                 "index": index,
                 "row": row,
@@ -9771,9 +9910,10 @@ class GPXTrackerController(NSObject):
                 "kind": kind,
                 "image": None,
                 "name": str(row.get("name", "")),
-                "time": date_time_text,
-                "gps": str(row.get("gps", "")),
-                "place": str(row.get("place", "")),
+                "time": date_time_text or str(sidecar_info.get("time", "")),
+                "gps": str(row.get("gps", "")) or str(sidecar_info.get("gps", "")),
+                "place": str(row.get("place", "")) or str(sidecar_info.get("place", "")),
+                "weather": compact_weather_summary(metadata),
             })
         return items
 
@@ -10148,6 +10288,7 @@ class GPXTrackerController(NSObject):
             "time": time_text,
             "gps": gps_text,
             "place": place_text,
+            "weather": compact_weather_summary(metadata),
             "sort_datetime": sort_datetime,
         }
 
@@ -10744,6 +10885,14 @@ class GPXTrackerController(NSObject):
         self.control_table_file_datetime_cache = {}
         self._ensure_control_table_window()
         self._reload_control_table()
+        if self.control_table_rows and not self._selected_control_table_indexes():
+            first_visible = (
+                self.control_table_view_model_indexes[0]
+                if self.control_table_view_model_indexes
+                else 0
+            )
+            self._select_control_table_indexes([first_visible])
+            self._scroll_control_table_model_row_to_visible(first_visible)
         if hasattr(self, "control_file_summary_label"):
             self.control_file_summary_label.setStringValue_(
                 self._control_file_summary_text(self.control_table_rows, path)
@@ -10979,7 +11128,8 @@ class GPXTrackerController(NSObject):
             "#LOOPALBUM, $LABEL   loop the album containing the target\n"
             "#LOOPALL             loop the complete playlist\n"
             "#VOLUME+ / #VOLUME-  change the internal level by one\n"
-            "#VOLUME N            set level 0 through 9\n\n"
+            "#VOLUME N            set level 0 through 9\n"
+            "#REPEAT_UNTIL $LABEL restart this directive at each display\n\n"
             "Example:\n"
             '#ON, #LOOPLINE, $INTRO, "Song1.mp3"\n\n'
             f"Available labels:\n{label_text}"
@@ -10998,13 +11148,21 @@ class GPXTrackerController(NSObject):
             "#DURATION NN          set following media display time in seconds\n"
             "#TRANSITION STYLE     select the following playback style\n"
             "#PAUSE NN             hold the current picture for NN seconds\n"
+            "#SET_TIME HH:MM[:SS]  set the next medium's walker time only\n"
+            "#SET_DATE YYYY-MM-DD  set the next medium's walker date only\n"
+            "#IGNORE_TIME          show the next medium without moving the walker\n"
+            "#REPEAT_UNTIL $LABEL repeat this line at each display until a label\n"
             "#END                  apply the configured end behavior\n\n"
             f"Styles:\n{styles}\n\n"
             "TIME-LAPSE, TIME_LAPSE, and TIMELAPSE are equivalent. A pause "
-            "does not pause background music.\n\n"
+            "does not pause background music. SET_TIME, SET_DATE, and IGNORE_TIME "
+            "never change the displayed media clock or metadata. REPEAT_UNTIL is "
+            "the final item on a directive line and also works with MUSIC, PLAY, "
+            "NARRATOR, CAPTION, and FONT. Flow-transfer commands cannot repeat.\n\n"
             "Examples:\n"
             "#LABEL $CHAPTER2\n"
             "#DURATION 5, #TRANSITION FADE\n"
+            "#IGNORE_TIME, #REPEAT_UNTIL $CHAPTER2\n"
             "#GOTO $CHAPTER2"
         )
 
@@ -11035,6 +11193,8 @@ class GPXTrackerController(NSObject):
             "Use comma-separated labels and pathnames. An isolated hyphen between two "
             "labels selects the inclusive playlist range. Quote or backslash-escape "
             "filenames containing blanks, commas, quotes, backslashes, or ambiguous hyphens.\n\n"
+            "Add #REPEAT_UNTIL $LABEL as the final item to restart the selection "
+            "at every visible display before that slide-show label.\n\n"
             "Examples:\n"
             "#PLAY: $INTRO, $A - $D, \"Special Song.mp3\"\n"
             "#NARRATOR: $STAGE_1, $DETAIL_A - $DETAIL_C\n\n"
@@ -11051,6 +11211,8 @@ class GPXTrackerController(NSObject):
             "#TOP / #MIDDLE / #BOTTOM   vertical position\n"
             "#LEFT / #CENTER / #RIGHT  horizontal alignment\n"
             "#TEXT                     introduces text that resembles a command\n\n"
+            "A final #REPEAT_UNTIL $LABEL repeats CAPTION on each following photo "
+            "or video. It can also repeat FONT at each display boundary.\n\n"
             "Examples:\n"
             "#CAPTION: A simple caption\n"
             '#CAPTION: #TOP, #LEFT, "First line\\nSecond line"\n\n'
@@ -11325,12 +11487,12 @@ class GPXTrackerController(NSObject):
     def saveControlTable_(self, _sender):
         self._save_control_table_changes()
 
-    def _save_control_table_changes(self):
+    def _save_control_table_changes(self, *, show_errors=True):
         """Save the editable control table and return whether it succeeded."""
         if self.control_table_path is None:
             show_alert("No slide show control file is loaded.")
             return False
-        if not self._validate_control_table_directive_rows():
+        if not self._validate_control_table_directive_rows(show_errors=show_errors):
             return False
         control_text = self._control_table_text()
         try:
@@ -11342,7 +11504,10 @@ class GPXTrackerController(NSObject):
             )
             control_table_recovery_path(self.control_table_path).unlink(missing_ok=True)
         except OSError as exc:
-            show_alert("Could not save slide show control file.", str(exc))
+            if show_errors:
+                show_alert("Could not save slide show control file.", str(exc))
+            else:
+                self.set_status(f"Could not auto-save control file: {exc}")
             return False
         if self.control_table_recovery_timer is not None:
             self.control_table_recovery_timer.invalidate()
@@ -12697,7 +12862,10 @@ class GPXTrackerController(NSObject):
         if project_dir is None or control_path is None:
             return
         self.automatic_map_pending_imported_paths = list(imported_paths or [])
-        self.automatic_map_review_control = control_path.is_file()
+        self.automatic_map_review_control = bool(
+            control_path.is_file()
+            and not getattr(self, "pending_slideshow_after_map_generation", None)
+        )
         self._prepare_geolocations_window("Generate and Update Maps")
         self.appendGeoLocationsOutputLine_(
             "Checking the shared overview and paired Standard/Time-Lapse maps."
@@ -13031,7 +13199,11 @@ class GPXTrackerController(NSObject):
             ("control_assets", None)
         ):
             return
-        if control_path.exists():
+        replace_without_confirmation = bool(
+            self.assistant_control_replace_without_confirmation
+        )
+        self.assistant_control_replace_without_confirmation = False
+        if control_path.exists() and not replace_without_confirmation:
             if not confirm_alert(
                 "Replace the existing slide-show control file?",
                 "The current file will be replaced only after the new list has been prepared successfully.",
@@ -13063,6 +13235,7 @@ class GPXTrackerController(NSObject):
         self.geolocations_cancel_event = cancel_event
         self.geolocations_mode = "assistant_control_assets"
         self.geolocations_result_path = control_path
+        self.assistant_control_map_failures = []
         output_writer = GeoLocationsOutputWriter(self)
         media_map_options = self._media_map_options()
         media_map_options.update(
@@ -13124,6 +13297,15 @@ class GPXTrackerController(NSObject):
                 for failure in map_result.get("failures", []):
                     if failure not in map_failures:
                         map_failures.append(failure)
+                if map_failures:
+                    self.assistant_control_map_failures = list(map_failures)
+                    output_writer.write(
+                        "Required maps are incomplete; the existing control file was left unchanged.\n"
+                    )
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "geoLocationsRunFinished:", "success", True
+                    )
+                    return
                 summary_text = map_result.get("tracks_summary_path")
                 tracks_summary_path = (
                     Path(summary_text).resolve(strict=False)
@@ -13178,6 +13360,25 @@ class GPXTrackerController(NSObject):
                         )
                 if cancel_event.is_set():
                     raise GeoLocationsCancelled("Aborted.")
+                missing_maps = missing_control_map_assets(
+                    staged_control.read_text(encoding="utf-8"),
+                    trackimages_dir,
+                )
+                if missing_maps:
+                    self.assistant_control_map_failures = [
+                        {
+                            "filename": name,
+                            "error": "required map asset is unavailable",
+                        }
+                        for name in missing_maps
+                    ]
+                    output_writer.write(
+                        "Required maps are incomplete; the control file was not installed.\n"
+                    )
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "geoLocationsRunFinished:", "success", True
+                    )
+                    return
                 os.replace(staged_control, control_path)
                 report_progress(3.5, "Installing control file...")
                 if requested_places and tracks_summary_path is not None:
@@ -15034,19 +15235,32 @@ class GPXTrackerController(NSObject):
             )
             self.set_status("Slide show control file missing.")
             return
-        trackimages_dir = self._track_images_dir()
-        if trackimages_dir is None or not trackimages_dir.exists() or not trackimages_dir.is_dir():
-            show_alert(
-                "Track images directory does not exist.",
-                "Run Generate and Update Maps first to create the map directory and images.",
-            )
-            self.set_status("Track images directory missing.")
-            return
         if self.slideshow_process is not None and self.slideshow_process.poll() is None:
             if continue_previous:
                 self._restart_running_slideshow()
             else:
                 self.set_status("Slide show is already running.")
+            return
+
+        trackimages_dir = self._track_images_dir()
+        if trackimages_dir is None:
+            show_alert("Could not determine the map directory.")
+            return
+        try:
+            missing_maps = missing_control_map_assets(
+                control_file_path.read_text(encoding="utf-8"),
+                trackimages_dir,
+            )
+        except OSError as exc:
+            show_alert("Could not validate slide-show maps.", str(exc))
+            return
+        if missing_maps:
+            self._prepare_maps_then_start_slideshow(
+                missing_maps,
+                time_lapse=time_lapse,
+                continue_previous=continue_previous,
+                transient_resume_position=transient_resume_position,
+            )
             return
 
         if not self._ensure_running_speed_sidecars_current(trackimages_dir):
@@ -15128,6 +15342,67 @@ class GPXTrackerController(NSObject):
         self.set_status(
             f"Started slide show with {style} as the initial style, "
             f"{control_file_path.name}, and trackdir {trackimages_dir}."
+        )
+
+    def _prepare_maps_then_start_slideshow(
+        self,
+        missing_maps,
+        *,
+        time_lapse=None,
+        continue_previous=False,
+        transient_resume_position=None,
+    ):
+        """Repair required maps and resume the exact requested slideshow launch."""
+        missing = [str(name) for name in missing_maps]
+        if len(missing) > 6 and not confirm_alert(
+            f"Prepare {len(missing)} maps before starting?",
+            "The slide show needs these missing map files. myCamino can create only "
+            "the missing or outdated maps now and start the show automatically when "
+            "they are ready.",
+            confirm_title="Prepare Maps and Start",
+            cancel_title="Not Now",
+        ):
+            self.set_status("Slide-show start cancelled; required maps are still missing.")
+            return
+
+        self.pending_slideshow_after_map_generation = {
+            "time_lapse": time_lapse,
+            "continue_previous": bool(continue_previous),
+            "transient_resume_position": (
+                dict(transient_resume_position)
+                if isinstance(transient_resume_position, dict)
+                else None
+            ),
+        }
+        provider = str(self.parameters.get("maps.output_provider", "osm")).casefold()
+        if provider == "osm":
+            self.set_status(
+                "Select the required maps. Public OSM can use cached tiles; "
+                "the provider dialog offers download-capable alternatives."
+            )
+            self.makePlots_(None)
+            return
+
+        self.set_status(
+            f"Preparing {len(missing)} required map file(s) before starting the slide show..."
+        )
+        self.startAutomaticMapGeneration_([])
+        thread = getattr(self, "geolocations_thread", None)
+        provider_action = getattr(self, "pending_map_provider_action", None)
+        deferred = bool(provider_action and provider_action[0] == "automatic_maps")
+        if not deferred and not (thread is not None and thread.is_alive()):
+            self.pending_slideshow_after_map_generation = None
+
+    def resumeSlideShowAfterMaps_(self, _sender):
+        """Retry a deferred slideshow request after map generation completes."""
+        request = self.pending_slideshow_after_map_generation
+        self.pending_slideshow_after_map_generation = None
+        if not isinstance(request, dict):
+            return
+        self._start_slide_show(
+            time_lapse=request.get("time_lapse"),
+            continue_previous=bool(request.get("continue_previous", False)),
+            transient_resume_position=request.get("transient_resume_position"),
         )
 
     def _ensure_running_speed_sidecars_current(self, trackimages_dir):
@@ -17013,6 +17288,7 @@ class GPXTrackerController(NSObject):
                 preselected_numbers=([] if selected == "all" else selected),
             )
             if selected is None:
+                self.pending_slideshow_after_map_generation = None
                 self.set_status("Map generation cancelled.")
                 return
             payload["selected_numbers"] = selected
@@ -17269,6 +17545,7 @@ class GPXTrackerController(NSObject):
                 analysis_loader=analyze_media_maps,
             )
             if selected is None or context is None:
+                self.pending_slideshow_after_map_generation = None
                 self.set_status("Map generation cancelled.")
                 return
             self._continue_manual_map_workflow(
@@ -17281,9 +17558,11 @@ class GPXTrackerController(NSObject):
             return
         validated = self._validate_plot_request()
         if validated is None:
+            self.pending_slideshow_after_map_generation = None
             return
         project_name, gpx_path, trackimages_dir = validated
         if not self._confirm_shared_asset_change("track_map_base", self.track_map_base, "generated maps"):
+            self.pending_slideshow_after_map_generation = None
             return
         common_options = self._plot_common_options(project_name, trackimages_dir)
         parameter_signatures = {
@@ -17417,8 +17696,13 @@ class GPXTrackerController(NSObject):
         if status == "success":
             message = f"Created overview and {created_count} track/media map(s) in {trackimages_dir}."
             self._finish_geolocations_run("Map generation finished.", message)
+            if self.pending_slideshow_after_map_generation is not None:
+                self.performSelector_withObject_afterDelay_(
+                    "resumeSlideShowAfterMaps:", None, 0.0
+                )
             return
         if status == "cancelled":
+            self.pending_slideshow_after_map_generation = None
             message = f"Map generation cancelled after {created_count} track/media map(s)."
             self._finish_geolocations_run("Map generation cancelled.", message)
             return
@@ -17440,12 +17724,20 @@ class GPXTrackerController(NSObject):
             payload = self.last_manual_map_payload
             if isinstance(payload, dict):
                 if response == 1000:
-                    if self._choose_manual_map_provider(payload) == "changed":
+                    choice = self._choose_manual_map_provider(payload)
+                    if choice == "changed":
                         self._continue_manual_map_workflow(payload, provider_changed=True)
+                    elif choice != "deferred":
+                        self.pending_slideshow_after_map_generation = None
                 elif response == 1001:
                     self._continue_manual_map_workflow(payload, provider_changed=True)
+                else:
+                    self.pending_slideshow_after_map_generation = None
+            else:
+                self.pending_slideshow_after_map_generation = None
             return
         if status.startswith("error:"):
+            self.pending_slideshow_after_map_generation = None
             show_alert("Could not create plot images.", status[6:].strip())
             self._finish_geolocations_run(status, "Map generation failed.")
 
@@ -18160,6 +18452,9 @@ def build_full_gui_menu(controller, window_menu_coordinator=None):
     app_menu.addItem_(menu_item("Settings…", "showParameterEditor:", controller, ",", NSEventModifierFlagCommand))
     app_menu.addItem_(NSMenuItem.separatorItem())
     app_menu.addItem_(menu_item("License", "showProjectLicense:", controller))
+    app_menu.addItem_(menu_item("App Store Distribution Exception", "showAppStoreException:", controller))
+    app_menu.addItem_(menu_item("App Store EULA Draft", "showAppStoreEULA:", controller))
+    app_menu.addItem_(menu_item("Contributor Agreement", "showContributorAgreement:", controller))
     app_menu.addItem_(menu_item("Third-Party Notices", "showThirdPartyNotices:", controller))
     install_application_news(app_menu)
     app_menu.addItem_(NSMenuItem.separatorItem())
@@ -18247,6 +18542,7 @@ def build_full_gui_menu(controller, window_menu_coordinator=None):
     controller.native_window_menu_coordinator = coordinator
 
     help_menu = add_menu(main_menu, "Help")
+    help_menu.addItem_(menu_item("Quick Start", "showQuickStart:", controller))
     help_menu.addItem_(menu_item("myCamino Help", "showMainHelp:", controller))
     help_menu.addItem_(menu_item("Control Directive Help", "showControlDirectiveHelp:", controller))
     help_menu.addItem_(menu_item("Music and Narration Help", "showMusicDirectiveHelp:", controller))

@@ -6,8 +6,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from GPSTrackShow import GPSTrackShowApp, Transition, parse_stage_descriptors
-from slideshow_control_format import parse_control_directive
+from GPSTrackShow import (
+    CaptionFontState,
+    GPSTrackShowApp,
+    Transition,
+    build_caption_plan,
+    parse_stage_descriptors,
+)
+from slideshow_control_format import compile_repeat_ranges, parse_control_directive
 
 
 class SlideshowControlTests(unittest.TestCase):
@@ -35,10 +41,101 @@ class SlideshowControlTests(unittest.TestCase):
         app.control_pause_active = False
         app.control_pause_resume_callback = None
         app.active_callback = None
+        app.repeat_ranges = ()
+        app.default_caption_font = CaptionFontState(30.0, "regular", "System")
+        app.font_state_by_row = {}
+        app.music_controller = SimpleNamespace(
+            repeat_row=Mock(),
+            synchronize_row=Mock(),
+        )
+        app.narration_controller = SimpleNamespace(
+            repeat_row=Mock(),
+            synchronize_row=Mock(),
+        )
         app._show_temporary_status_overlay = Mock()
         app._update_window_titles = Mock()
         app._advance = Mock()
         return app
+
+    def test_repeat_dispatch_runs_in_source_order_before_boundary(self):
+        app = self.make_app()
+        app.playlist_lines = [
+            "#MUSIC: #VOLUME 4, #REPEAT_UNTIL $DONE",
+            "#NARRATOR: $VOICE, #REPEAT_UNTIL $DONE",
+            "photo.jpeg",
+            "#CONTROL: #LABEL $DONE",
+        ]
+        app.repeat_ranges = compile_repeat_ranges(app.playlist_lines)
+        calls = []
+        app.music_controller.repeat_row = lambda row: calls.append(("music", row))
+        app.narration_controller.repeat_row = lambda row: calls.append(("narrator", row))
+
+        self.assertTrue(
+            app._run_repeated_directives(2, "media", lambda: calls.append(("display", 2)))
+        )
+        self.assertEqual(calls, [("music", 0), ("narrator", 1), ("display", 2)])
+
+    def test_repeated_pause_defers_the_display_continuation(self):
+        app = self.make_app()
+        app.playlist_lines = [
+            "#CONTROL: #PAUSE 2, #REPEAT_UNTIL $DONE",
+            "photo.jpeg",
+            "#CONTROL: #LABEL $DONE",
+        ]
+        app.repeat_ranges = compile_repeat_ranges(app.playlist_lines)
+        callbacks = []
+        app._schedule_callback = (
+            lambda _seconds, callback: callbacks.append(callback) or Mock()
+        )
+        displayed = []
+
+        self.assertTrue(
+            app._run_repeated_directives(
+                1,
+                "media",
+                lambda: displayed.append(True),
+            )
+        )
+        self.assertEqual(displayed, [])
+        callbacks.pop()()
+        self.assertEqual(displayed, [True])
+
+    def test_reconstruction_reapplies_active_duration_and_transition_ranges(self):
+        app = self.make_app()
+        app.playlist_lines = [
+            "#CONTROL: #DURATION 4, #TRANSITION TIME_LAPSE, #REPEAT_UNTIL $DONE",
+            "#CONTROL: #DURATION 8, #TRANSITION FADE",
+            "photo.jpeg",
+            "#CONTROL: #LABEL $DONE",
+        ]
+        app.control_directives = {
+            index: directive
+            for index, line in enumerate(app.playlist_lines)
+            if (directive := parse_control_directive(line)) is not None
+        }
+        app.repeat_ranges = compile_repeat_ranges(app.playlist_lines)
+
+        app._reconstruct_control_state_before(2)
+
+        self.assertEqual(app.config.duration, 4.0)
+        self.assertEqual(app._playback_style_name(), "TIME_LAPSE")
+
+    def test_repeated_font_reapplies_after_a_later_normal_font(self):
+        app = self.make_app()
+        app.playlist_lines = [
+            "#FONT: #SIZE 42, #REPEAT_UNTIL $DONE",
+            "#FONT: #SIZE 18",
+            "photo.jpeg",
+            "#CONTROL: #LABEL $DONE",
+        ]
+        _captions, app.font_state_by_row = build_caption_plan(
+            app.playlist_lines,
+            app.default_caption_font,
+        )
+        app.repeat_ranges = compile_repeat_ranges(app.playlist_lines)
+
+        self.assertEqual(app.font_state_by_row[2].size, 18.0)
+        self.assertEqual(app._font_state_for_boundary(2).size, 42.0)
 
     def test_duration_and_transition_apply_in_order(self):
         app = self.make_app()

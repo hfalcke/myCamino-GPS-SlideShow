@@ -6,6 +6,13 @@ Those components are not relicensed as original myCamino project content.
 Complete license texts and build-specific package versions are included in the
 `licenses/third-party` directory of each application and in the DMG.
 
+## Bundled Guided Demo
+
+The demo photographs are original project content by Heino Falcke but are
+distributed under CC BY 4.0 rather than GPL. Their attribution and license
+notice is included in the demo directory. No third-party photographs are
+included.
+
 ## Open-Meteo Weather Data
 
 Optional historical weather is supplied by [Open-Meteo](https://open-meteo.com/).

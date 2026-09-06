@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Nouvelle-Aquitaine",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T08:28:24+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.12075833333333,
+  "locality": "Saint-Michel",
+  "longitude": -1.242483333333333,
+  "metadata_updated_at": "2026-08-29T10:31:05.809820+02:00",
+  "name": "64220",
+  "place": "Saint-Michel (Nouvelle-Aquitaine), 64220",
+  "place_coordinate": {
+    "latitude": 43.12075833333333,
+    "longitude": -1.242483333333333
+  },
+  "place_details": {
+    "administrativeArea": "Nouvelle-Aquitaine",
+    "areasOfInterest": [],
+    "locality": "Saint-Michel",
+    "name": "64220",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5062.jpeg",
+  "subLocality": null,
+  "time": "08:28",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T06:28:24+00:00",
+      "latitude": 43.12075833333333,
+      "longitude": -1.242483333333333
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.12075833333333,
+      "longitude": -1.242483333333333,
+      "response_elevation_m": 567.0,
+      "response_latitude": 43.128292,
+      "response_longitude": -1.2071533,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.390006+00:00",
+    "sampling": {
+      "fraction": 0.47333333,
+      "lower_time": "2024-07-15T06:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T07:00:00+00:00",
+      "upper_time": "2024-07-15T07:00:00+00:00",
+      "weather_code_time": "2024-07-15T06:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 73.82666666666667,
+      "precipitation": 0.0,
+      "pressure_msl": 1010.2313333333333,
+      "relative_humidity_2m": 65.05333333333333,
+      "temperature_2m": 22.01,
+      "weather_code": 2,
+      "wind_speed_10m": 16.699333333333332
+    }
+  },
+  "photo_path": "IMG_5062.jpeg",
+  "source_file_signature": {
+    "size": 385604,
+    "mtime_ns": 1788636778118169825
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 385604,
+    "sha256": "d44fb8fa007a2cc206b7b46be400de4a1447a7fe3f206c61ee615c12d5590334"
+  }
+}

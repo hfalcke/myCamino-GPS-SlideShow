@@ -1,3 +1,4 @@
+import copy
 import unittest
 import xml.etree.ElementTree as ET
 import tempfile
@@ -34,6 +35,7 @@ from GPXEditor import (
     renumber_track_records,
     reordered_selected_items,
     sampled_polyline_points,
+    selected_tracks_export_filename,
     suppressed_untimed_track_identities,
     untimed_tracks_requiring_prompt,
     unique_track_copy_name,
@@ -60,6 +62,22 @@ class FakeDefaults:
 
 
 class InspectorPointSelectionTests(unittest.TestCase):
+    def test_selected_track_export_filename_includes_selection_count(self):
+        tracks = [
+            SimpleNamespace(name="Coast / Mountain"),
+            SimpleNamespace(name="Second"),
+            SimpleNamespace(name="Third"),
+        ]
+
+        self.assertEqual(
+            selected_tracks_export_filename(tracks),
+            "Coast _ Mountain - 3 tracks.gpx",
+        )
+        self.assertEqual(
+            selected_tracks_export_filename(tracks[:1]),
+            "Coast _ Mountain.gpx",
+        )
+
     def test_selected_track_export_is_atomic_renumbered_and_preserves_segments(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -102,6 +120,54 @@ class InspectorPointSelectionTests(unittest.TestCase):
             self.assertEqual(
                 tracks[0].element.find(".//gpx:link", {"gpx": "http://www.topografix.com/GPX/1/1"}).get("href"),
                 str(media),
+            )
+
+    def test_selected_track_export_inherits_source_document_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            source = directory / "source.gpx"
+            source_root = ET.Element(
+                qname("gpx"),
+                {"version": "1.1", "creator": "Original GPS", "custom": "kept"},
+            )
+            metadata = ET.SubElement(source_root, qname("metadata"))
+            ET.SubElement(metadata, qname("name")).text = "Original journey"
+            ET.SubElement(metadata, qname("desc")).text = "Complete source metadata"
+            original_track = ET.SubElement(source_root, qname("trk"))
+            ET.SubElement(original_track, qname("name")).text = "Original track"
+            original_segment = ET.SubElement(original_track, qname("trkseg"))
+            ET.SubElement(original_segment, qname("trkpt"), {"lat": "50", "lon": "7"})
+            extensions = ET.SubElement(source_root, qname("extensions"))
+            ET.SubElement(extensions, "source_marker", {"value": "preserved"})
+            ET.ElementTree(source_root).write(source, encoding="utf-8", xml_declaration=True)
+
+            selected_element = copy.deepcopy(original_track)
+            ET.SubElement(selected_element, qname("desc")).text = "Selected track metadata"
+            selected = TrackRecord(9, selected_element, str(source))
+            destination = directory / "selection.gpx"
+
+            write_selected_tracks_gpx([selected], destination, project_name="Ignored replacement")
+
+            exported_root = ET.parse(destination).getroot()
+            self.assertEqual(exported_root.get("creator"), "Original GPS")
+            self.assertEqual(exported_root.get("custom"), "kept")
+            self.assertEqual(
+                exported_root.findtext("gpx:metadata/gpx:name", namespaces={"gpx": "http://www.topografix.com/GPX/1/1"}),
+                "Original journey",
+            )
+            self.assertEqual(
+                exported_root.findtext("gpx:metadata/gpx:desc", namespaces={"gpx": "http://www.topografix.com/GPX/1/1"}),
+                "Complete source metadata",
+            )
+            self.assertIsNotNone(
+                exported_root.find(
+                    "gpx:extensions/gpx:source_marker",
+                    {"gpx": "http://www.topografix.com/GPX/1/1"},
+                )
+            )
+            self.assertEqual(
+                exported_root.findtext("gpx:trk/gpx:desc", namespaces={"gpx": "http://www.topografix.com/GPX/1/1"}),
+                "Selected track metadata",
             )
 
     def test_media_rubber_band_requires_command_modifier(self):
@@ -192,6 +258,41 @@ class InspectorPointSelectionTests(unittest.TestCase):
         PlotView.showElevationProfile_(plot, None)
 
         controller.open_elevation_profile_for_plot_view.assert_called_once_with(plot)
+
+    def test_map_context_exports_the_controller_track_selection(self):
+        controller = SimpleNamespace(saveSelectedTracksAs_=Mock())
+        plot = PlotView.alloc().init()
+        plot.controller = controller
+
+        PlotView.saveSelectedTracksAs_(plot, None)
+
+        controller.saveSelectedTracksAs_.assert_called_once_with(None)
+
+    def test_backspace_deletes_marked_segment_in_adventure_map(self):
+        event = SimpleNamespace(
+            charactersIgnoringModifiers=Mock(return_value="\x7f"),
+            characters=Mock(return_value="\x7f"),
+            keyCode=Mock(return_value=51),
+            modifierFlags=Mock(return_value=0),
+        )
+        plot = PlotView.alloc().init()
+        plot.transient_help_until = None
+        plot.adventure_workspace_delegate = SimpleNamespace(
+            handleWorkspaceKeyEvent_=Mock(return_value=False)
+        )
+        plot.workspace_media_selection_active = False
+        plot.mode = "overview"
+        plot.marker = 3
+        plot.cursor = (7, object(), object())
+        plot.inspector = None
+        plot.show_help = False
+        plot.controller = SimpleNamespace(tracks=[])
+        plot.track_index = 0
+
+        with patch.object(PlotView, "delete_marked_points") as delete_marked:
+            PlotView.keyDown_(plot, event)
+
+        delete_marked.assert_called_once_with()
 
     def test_track_table_hides_instead_of_closing_map_first_workspace(self):
         table_window = Mock()

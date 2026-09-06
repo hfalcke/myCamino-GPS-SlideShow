@@ -45,11 +45,13 @@ class MediaMetadataServiceTests(unittest.TestCase):
                 },
                 media_sidecar_path(media),
             )
+            details = []
             with patch("GetGeoLocations.prefetch_media_metadata") as prefetch:
-                result = prepare_media_records([media])
+                result = prepare_media_records([media], detail_callback=details.append)
             prefetch.assert_not_called()
             self.assertEqual(result[0].action, "reused")
             self.assertEqual(result[0].record.latitude, 50.0)
+            self.assertEqual(details, ["Reused current metadata for photo.jpg."])
 
     def test_missing_sidecar_uses_canonical_batched_extraction(self):
         with tempfile.TemporaryDirectory() as directory:

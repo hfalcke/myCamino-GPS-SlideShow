@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Navarra",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T16:51:19+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.01041666666666,
+  "locality": "Orreaga",
+  "longitude": -1.3194,
+  "metadata_updated_at": "2026-08-29T10:31:05.939395+02:00",
+  "name": "Orreaga Roncesvalles, 11",
+  "place": "Orreaga-Orreaga Roncesvalles (Navarra), Orreaga Roncesvalles, 11",
+  "place_coordinate": {
+    "latitude": 43.01041666666666,
+    "longitude": -1.3194
+  },
+  "place_details": {
+    "administrativeArea": "Navarra",
+    "areasOfInterest": [],
+    "locality": "Orreaga",
+    "name": "Orreaga Roncesvalles, 11",
+    "subLocality": "Orreaga Roncesvalles"
+  },
+  "source_filename": "IMG_5168.jpeg",
+  "subLocality": "Orreaga Roncesvalles",
+  "time": "16:51",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T14:51:19+00:00",
+      "latitude": 43.01041666666666,
+      "longitude": -1.3194
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.01013055,
+      "longitude": -1.319775,
+      "response_elevation_m": 991.0,
+      "response_latitude": 42.987698,
+      "response_longitude": -1.3373108,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.543991+00:00",
+    "sampling": {
+      "fraction": 0.85527778,
+      "lower_time": "2024-07-15T14:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T15:00:00+00:00",
+      "upper_time": "2024-07-15T15:00:00+00:00",
+      "weather_code_time": "2024-07-15T15:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 51.23722222222222,
+      "precipitation": 0.2,
+      "pressure_msl": 1015.2434166666667,
+      "relative_humidity_2m": 83.14472222222223,
+      "temperature_2m": 19.38422222222222,
+      "weather_code": 51,
+      "wind_speed_10m": 5.2315555555555555
+    }
+  },
+  "photo_path": "IMG_5168.jpeg",
+  "source_file_signature": {
+    "size": 407479,
+    "mtime_ns": 1788636846731718982
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 407479,
+    "sha256": "19951a8089526535956283e573a206dec78b148a28e222b32e22c318a229a129"
+  }
+}

@@ -9,6 +9,15 @@ import sys
 
 DOCUMENTS = {
     "license": ("GPL-3.0.txt", "LICENSE"),
+    "app_store_exception": (
+        "App Store Distribution Exception.txt",
+        "APP_STORE_DISTRIBUTION_EXCEPTION.md",
+    ),
+    "app_store_eula": ("App Store EULA Draft.txt", "APP_STORE_EULA_DRAFT.md"),
+    "contributor_agreement": (
+        "Contributor Agreement.txt",
+        "CONTRIBUTOR_AGREEMENT.md",
+    ),
     "copyright": ("COPYRIGHT.txt", "COPYRIGHT"),
     "third_party": ("Third-Party Notices.txt", "THIRD_PARTY_NOTICES.md"),
     "source": ("Source Code Information.txt", "SOURCE_CODE.md"),

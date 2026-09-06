@@ -1,5 +1,10 @@
 # myCamino GPS SlideShow
 
+Packaged releases include a small guided demo and a **Help > Quick Start**
+guide. The demo photographs are distributed under CC BY 4.0 with attribution
+to Heino Falcke; all other original demo material follows the project GPL
+license. See the notice and manifest in `demo/`.
+
 myCamino is a macOS application for presenting multi-day journeys from GPX
 tracks and recorded media. It associates photographs and videos with track
 positions and times, then presents the journey using maps, route progress,
@@ -91,3 +96,16 @@ Release DMGs include the corresponding source archive, build identification
 and third-party licence notices. Further details are in
 [SOURCE_CODE.md](SOURCE_CODE.md), [COPYRIGHT](COPYRIGHT) and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Official Apple App Store builds may use the narrowly scoped
+[App Store distribution exception](APP_STORE_DISTRIBUTION_EXCEPTION.md). The
+exception permits that distribution channel without making myCamino
+proprietary or removing GPL source-code rights. The proposed
+[custom App Store EULA](APP_STORE_EULA_DRAFT.md) remains a draft until its
+required contact details and legal review are complete.
+
+Contributions remain owned by their authors. Before a first code or content
+contribution is merged, contributors are asked to sign the
+[Contributor License Agreement](CONTRIBUTOR_AGREEMENT.md), which keeps the
+public contribution under GPL while permitting official App Store and future
+dual-licensed distributions. See [CONTRIBUTING.md](CONTRIBUTING.md).

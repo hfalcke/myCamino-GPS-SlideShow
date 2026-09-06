@@ -1,6 +1,14 @@
 myCamino GPS SlideShow
 ======================
 
+Guided Demo
+-----------
+
+The myCamino Demo folder contains a compact GPX track and reduced-quality
+photographs for the guided first-launch tutorial. The demo photos are Copyright
+(C) Heino Falcke and licensed under CC BY 4.0; see PHOTO_LICENSE.md in that
+folder. You can restart the tutorial from Help > Start Guided Demo.
+
 Installation
 ------------
 
@@ -31,6 +39,12 @@ License and source code
 myCamino is free and open-source software licensed under GPL-3.0-or-later.
 The complete license is in "License — GPL-3.0.txt". Third-party terms are in
 "Third-Party Notices.txt" and the Licenses folder.
+
+"App Store Distribution Exception.txt" contains the limited permission used
+for an official Apple App Store build. It does not remove GPL rights.
+"App Store EULA Draft.txt" is visibly marked as an incomplete legal-review
+draft and does not govern this direct DMG distribution. Prospective
+contributors can read "Contributor Agreement.txt".
 
 The DMG contains the exact myCamino source archive used for this build and the
 source archive for the bundled FFmpeg executable. Build revision and SHA-256

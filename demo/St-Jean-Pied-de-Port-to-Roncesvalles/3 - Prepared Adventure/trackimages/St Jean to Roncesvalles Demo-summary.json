@@ -1,0 +1,87 @@
+{
+  "adventure_processing_parameters": {
+    "gpx.elevation_smoothing_distance_m": 50.0,
+    "gpx.fallback_walking_speed_kmh": 3.5,
+    "gpx.horizontal_smoothing_distance_m": 10.0,
+    "gpx.maximum_accuracy_m": 10.0,
+    "gpx.maximum_hdop": 20.0,
+    "gpx.maximum_vdop": 20.0,
+    "gpx.maximum_vertical_accuracy_m": 20.0,
+    "gpx.minimum_point_spacing_m": 10.0,
+    "trackmaps.ordering": "track_number",
+    "trackmaps.remove_name_prefix": ""
+  },
+  "gpx_processing": {
+    "elevation_smoothing_distance_m": 50.0,
+    "horizontal_smoothing_distance_m": 10.0,
+    "maximum_hdop": 20.0,
+    "maximum_horizontal_accuracy_m": 10.0,
+    "maximum_vdop": 20.0,
+    "maximum_vertical_accuracy_m": 20.0,
+    "minimum_point_spacing_m": 10.0,
+    "running_speed_window_distance_m": 500.0,
+    "stationary_speed_threshold_kmh": 1.5
+  },
+  "source_gpx": "St Jean to Roncesvalles Demo.gpx",
+  "output_image": "St Jean to Roncesvalles Demo.png",
+  "output_metadata": "St Jean to Roncesvalles Demo.json",
+  "tracks": [
+    {
+      "abstand_km": 0.0,
+      "ascent_m": 1537.7,
+      "dauer": "10:17",
+      "descent_m": 760.6,
+      "end_point": {
+        "lat": 43.008329876,
+        "lon": -1.3195112583
+      },
+      "end_time": "15.07.2024 16:59:21",
+      "erstellungsdatum": "15.07.2024 06:41",
+      "filtered_point_count": 2393,
+      "has_absolute_time": true,
+      "kumulativ_km": 26.9,
+      "laenge_km": 26.9,
+      "maximum_running_speed_kmh": 9.96,
+      "moving_average_speed_kmh": 4.07,
+      "nr": 1,
+      "original_sequence_number": 1,
+      "processing_options": {
+        "elevation_smoothing_distance_m": 50.0,
+        "horizontal_smoothing_distance_m": 10.0,
+        "maximum_hdop": 20.0,
+        "maximum_horizontal_accuracy_m": 10.0,
+        "maximum_vdop": 20.0,
+        "maximum_vertical_accuracy_m": 20.0,
+        "minimum_point_spacing_m": 10.0,
+        "running_speed_window_distance_m": 500.0,
+        "stationary_speed_threshold_kmh": 1.5
+      },
+      "raw_point_count": 2419,
+      "rejection_counts": {
+        "elevation": {
+          "not retained": 26,
+          "retained": 2393
+        },
+        "horizontal": {
+          "retained": 2393,
+          "smoothing only": 26
+        }
+      },
+      "source_structure": "track",
+      "start_point": {
+        "lat": 43.1642848237,
+        "lon": -1.2364916925
+      },
+      "start_time": "15.07.2024 06:41:58",
+      "timing_status": "recorded",
+      "track_data_fingerprint": "d714fb1dfff1c79a590334bdebca2623c03f0d5f1713d1885ec108d33976e795",
+      "track_data_sidecar": "St Jean to Roncesvalles Demo-trackdata/0001.json",
+      "track_fingerprint": "d714fb1dfff1c79a590334bdebca2623c03f0d5f1713d1885ec108d33976e795",
+      "track_fingerprint_version": 2,
+      "track_geometry_fingerprint": "1d50f36b569f23ea244ad06bf13d6ea7e248cd19fc8309e5a56d00284d159926",
+      "track_name": "JW St-Jean-Pied-de-Port - Roncevalles",
+      "track_plot_image_filename": "0001_JW St-Jean-Pied-de-Port - Roncevalles_St Jean to Roncesvalles Demo.png",
+      "track_plot_time_lapse_image_filename": "0001_JW St-Jean-Pied-de-Port - Roncevalles_St Jean to Roncesvalles Demo-timelapse.png"
+    }
+  ]
+}

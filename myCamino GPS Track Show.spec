@@ -41,6 +41,7 @@ a = Analysis(
     datas=[
         ('dist/GPSTrackShow', 'GPSTrackShow'),
         ('docs', 'docs'),
+        ('demo', 'demo'),
         ('myCaminoTrackLogo.PNG', '.'),
         ('MyCaminoLogo-ohneText.png', '.'),
         ('build/license_bundle/app_resources/licenses', 'licenses'),

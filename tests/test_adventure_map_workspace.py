@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -276,6 +277,16 @@ class AdventureMapWorkspaceTests(unittest.TestCase):
             text = journal.read()
             self.assertIn("before", text)
             self.assertIn("after", text)
+
+    def test_processing_journal_recovers_if_temporary_directory_was_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "temporary" / "logs"
+            journal = ProcessingJournal(root)
+            shutil.rmtree(root.parent)
+
+            journal.append("after recovery cleanup", phase="Demo")
+
+            self.assertIn("after recovery cleanup", journal.read())
 
 
 if __name__ == "__main__":

@@ -86,6 +86,29 @@ def running_speed_metadata(track):
     }
 
 
+def processed_track_extent_mercator(segments):
+    """Return the exact processed-route bounds without relying on endpoints."""
+    projected = []
+    for segment in segments or []:
+        for point in segment:
+            try:
+                latitude = float(point.lat if hasattr(point, "lat") else point[0])
+                longitude = float(point.lon if hasattr(point, "lon") else point[1])
+                projected.append(lonlat_to_web_mercator(longitude, latitude))
+            except (IndexError, TypeError, ValueError):
+                continue
+    if not projected:
+        return None
+    xs = [point[0] for point in projected]
+    ys = [point[1] for point in projected]
+    return {
+        "min_x": min(xs),
+        "max_x": max(xs),
+        "min_y": min(ys),
+        "max_y": max(ys),
+    }
+
+
 # AI prompt: "Write a function that parses GPX/ISO timestamps, handles trailing Z,
 # treats naive times as UTC, and returns a timezone-aware datetime or None."
 # AI prompt: "Write a haversine helper that returns distance in kilometers
@@ -375,6 +398,9 @@ def summarize_track(
     last_point = None if processed.last_point is None else (processed.last_point.lat, processed.last_point.lon)
     geometry_fingerprint = processed_track_geometry_fingerprint(processed)
     data_fingerprint = processed_track_data_fingerprint(processed)
+    track_extent_mercator = processed_track_extent_mercator(
+        [segment.points for segment in processed.segments]
+    )
 
     return {
         "name": track_name,
@@ -409,6 +435,7 @@ def summarize_track(
         "track_fingerprint_version": TRACK_FINGERPRINT_VERSION,
         "track_geometry_fingerprint": geometry_fingerprint,
         "track_data_fingerprint": data_fingerprint,
+        "track_extent_mercator": track_extent_mercator,
         "legacy_semantic_track_fingerprint": semantic_track_fingerprint(track_element),
     }
 
@@ -886,6 +913,7 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "track_fingerprint_version": track.get("track_fingerprint_version"),
                 "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
                 "track_data_fingerprint": track.get("track_data_fingerprint"),
+                "track_extent_mercator": track.get("track_extent_mercator"),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
                 "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                 "track_data_sidecar": track.get("track_data_sidecar"),
@@ -942,6 +970,7 @@ def derived_track_data_payload(track, fallback_walking_speed_kmh=3.5):
         "track_fingerprint_version": track.get("track_fingerprint_version"),
         "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
         "track_data_fingerprint": track.get("track_data_fingerprint"),
+        "track_extent_mercator": track.get("track_extent_mercator"),
         "timing_status": track.get("timing_status", "recorded"),
         "has_absolute_time": bool(track.get("has_absolute_time")),
         "gpx_processing": track.get("processing_options", {}),
@@ -2704,6 +2733,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                         "track_fingerprint_version": track.get("track_fingerprint_version"),
                         "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
                         "track_data_fingerprint": track.get("track_data_fingerprint"),
+                        "track_extent_mercator": track.get("track_extent_mercator"),
                         "track_plot_image_filename": track.get("track_plot_image_filename"),
                         "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                         "start_time": format_datetime_local_seconds(track["start_time"]),
@@ -2815,6 +2845,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "track_fingerprint_version": track.get("track_fingerprint_version"),
                     "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
                     "track_data_fingerprint": track.get("track_data_fingerprint"),
+                    "track_extent_mercator": track.get("track_extent_mercator"),
                     "track_date": format_date_local(track["time"]),
                     "track_start_time": format_datetime_local_seconds(track["start_time"]),
                     "track_length_km": round(track["length_km"], 1),

@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Nouvelle-Aquitaine",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T06:47:20+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.1621695,
+  "locality": "Saint-Jean-Pied-de-Port",
+  "longitude": -1.237321666666667,
+  "metadata_updated_at": "2026-08-29T10:31:05.796978+02:00",
+  "name": "2 Rue de l'Église",
+  "place": "Saint-Jean-Pied-de-Port (Nouvelle-Aquitaine), 2 Rue de l'Église",
+  "place_coordinate": {
+    "latitude": 43.1621695,
+    "longitude": -1.237321666666667
+  },
+  "place_details": {
+    "administrativeArea": "Nouvelle-Aquitaine",
+    "areasOfInterest": [],
+    "locality": "Saint-Jean-Pied-de-Port",
+    "name": "2 Rue de l'Église",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5047.jpeg",
+  "subLocality": null,
+  "time": "06:47",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T04:47:20+00:00",
+      "latitude": 43.1621695,
+      "longitude": -1.237321666666667
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.1621695,
+      "longitude": -1.237321666666667,
+      "response_elevation_m": 168.0,
+      "response_latitude": 43.198593,
+      "response_longitude": -1.2089233,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.356148+00:00",
+    "sampling": {
+      "fraction": 0.78888889,
+      "lower_time": "2024-07-15T04:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T05:00:00+00:00",
+      "upper_time": "2024-07-15T05:00:00+00:00",
+      "weather_code_time": "2024-07-15T05:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 1.5777777777777777,
+      "precipitation": 0.0,
+      "pressure_msl": 1008.7155555555555,
+      "relative_humidity_2m": 66.11111111111111,
+      "temperature_2m": 22.50888888888889,
+      "weather_code": 0,
+      "wind_speed_10m": 14.556666666666667
+    }
+  },
+  "photo_path": "IMG_5047.jpeg",
+  "source_file_signature": {
+    "size": 282775,
+    "mtime_ns": 1788636767777103059
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 282775,
+    "sha256": "bde4d39444a1b970ad98d3a2798d9c6caae52bbebbec03a3198f36699942df8e"
+  }
+}

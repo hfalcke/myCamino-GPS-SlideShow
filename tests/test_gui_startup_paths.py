@@ -1,12 +1,17 @@
 import tempfile
 import unittest
 import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from GPXEditor import GPXEditorController
-from cocoa_adventure_map import AdventureMapAppDelegate, AdventureMapController
+from cocoa_adventure_map import (
+    AdventureMapAppDelegate,
+    AdventureMapController,
+    adventure_autosave_delays,
+)
 from GPSTrackShowGUI import (
     GPXTrackerController,
     SLIDESHOW_CHECKPOINT_VERSION,
@@ -19,11 +24,117 @@ from GPSTrackShowGUI import (
     resolve_gui_startup_paths,
     slideshow_settings_command_payload,
     style_control_table_cell,
+    missing_control_map_assets,
     validated_slideshow_resume_position,
 )
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_adventure_autosave_uses_recovery_then_real_file(self):
+        self.assertEqual(adventure_autosave_delays(True), (1.0, 2.0))
+        self.assertEqual(adventure_autosave_delays(False), (1.0, None))
+
+    def test_control_map_validation_reports_unavailable_maps(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "trackimages").mkdir()
+            (root / "trackimages" / "available.png").write_bytes(b"png")
+            (root / "trackimages" / "available-timelapse.png").write_bytes(b"png")
+            missing = missing_control_map_assets(
+                "#Overviewmap: missing.png\n#Map: available.png\nphoto.jpg | 12:00\n",
+                root / "trackimages",
+            )
+            self.assertEqual(missing, ["missing.png"])
+
+    def test_slideshow_missing_maps_start_automatic_hosted_repair(self):
+        class RunningThread:
+            @staticmethod
+            def is_alive():
+                return True
+
+        controller = SimpleNamespace(
+            parameters={"maps.output_provider": "geoapify"},
+            pending_slideshow_after_map_generation=None,
+            pending_map_provider_action=None,
+            geolocations_thread=None,
+            set_status=Mock(),
+            startAutomaticMapGeneration_=Mock(),
+        )
+        controller.startAutomaticMapGeneration_.side_effect = lambda _paths: setattr(
+            controller, "geolocations_thread", RunningThread()
+        )
+
+        GPXTrackerController._prepare_maps_then_start_slideshow(
+            controller,
+            ["overview.png", "stage.png"],
+            continue_previous=True,
+            transient_resume_position={"row": 8},
+        )
+
+        controller.startAutomaticMapGeneration_.assert_called_once_with([])
+        self.assertTrue(
+            controller.pending_slideshow_after_map_generation["continue_previous"]
+        )
+        self.assertEqual(
+            controller.pending_slideshow_after_map_generation[
+                "transient_resume_position"
+            ],
+            {"row": 8},
+        )
+
+    def test_slideshow_missing_maps_opens_osm_map_workflow(self):
+        controller = SimpleNamespace(
+            parameters={"maps.output_provider": "osm"},
+            pending_slideshow_after_map_generation=None,
+            set_status=Mock(),
+            makePlots_=Mock(),
+        )
+
+        GPXTrackerController._prepare_maps_then_start_slideshow(
+            controller,
+            ["stage.png"],
+        )
+
+        controller.makePlots_.assert_called_once_with(None)
+        self.assertIsNotNone(controller.pending_slideshow_after_map_generation)
+
+    def test_large_slideshow_map_repair_can_be_declined(self):
+        controller = SimpleNamespace(
+            parameters={"maps.output_provider": "geoapify"},
+            pending_slideshow_after_map_generation=None,
+            set_status=Mock(),
+            startAutomaticMapGeneration_=Mock(),
+        )
+
+        with patch("GPSTrackShowGUI.confirm_alert", return_value=False):
+            GPXTrackerController._prepare_maps_then_start_slideshow(
+                controller,
+                [f"map-{index}.png" for index in range(7)],
+            )
+
+        controller.startAutomaticMapGeneration_.assert_not_called()
+        self.assertIsNone(controller.pending_slideshow_after_map_generation)
+
+    def test_slideshow_request_resumes_with_original_arguments_after_maps(self):
+        request = {
+            "time_lapse": False,
+            "continue_previous": True,
+            "transient_resume_position": {"row": 12},
+        }
+        controller = SimpleNamespace(
+            pending_slideshow_after_map_generation=request,
+            _start_slide_show=Mock(),
+        )
+
+        GPXTrackerController.resumeSlideShowAfterMaps_.callable(controller, None)
+
+        self.assertIsNone(controller.pending_slideshow_after_map_generation)
+        controller._start_slide_show.assert_called_once_with(
+            time_lapse=False,
+            continue_previous=True,
+            transient_resume_position={"row": 12},
+        )
+
     def test_adventure_map_waits_for_weather_decision_before_metadata(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             media = Path(temporary_directory) / "photo.jpg"
@@ -85,6 +196,40 @@ class GUIStartupPathTests(unittest.TestCase):
 
         delegate.controller.startup_in_progress = False
         self.assertTrue(delegate.applicationShouldTerminateAfterLastWindowClosed_(None))
+
+    def test_empty_placeholder_track_does_not_create_recovery(self):
+        controller = SimpleNamespace(
+            gpx_controller=SimpleNamespace(
+                tracks=[SimpleNamespace(element=ET.fromstring("<trk><trkseg /></trk>"))],
+                dirty=True,
+            ),
+            control_rows=[],
+            pending_media=set(),
+            pending_control_media=set(),
+            recovery_dirty=False,
+            control_file=None,
+            _saved_gpx_contains_points=Mock(return_value=False),
+        )
+        self.assertFalse(
+            AdventureMapController._has_recoverable_workspace_content(controller)
+        )
+
+    def test_track_points_are_meaningful_recovery_content(self):
+        controller = SimpleNamespace(
+            gpx_controller=SimpleNamespace(
+                tracks=[SimpleNamespace(element=ET.fromstring("<trk><trkseg><trkpt /></trkseg></trk>"))],
+                dirty=True,
+            ),
+            control_rows=[],
+            pending_media=set(),
+            pending_control_media=set(),
+            recovery_dirty=False,
+            control_file=None,
+            _saved_gpx_contains_points=Mock(return_value=False),
+        )
+        self.assertTrue(
+            AdventureMapController._has_recoverable_workspace_content(controller)
+        )
 
     def test_workspace_track_inspection_bypasses_legacy_map_window(self):
         expected_inspector = object()

@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Nouvelle-Aquitaine",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T11:52:51+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.06634166666667,
+  "locality": "Arnéguy",
+  "longitude": -1.267436666666667,
+  "metadata_updated_at": "2026-08-29T10:31:05.861468+02:00",
+  "name": "Route Napoleon",
+  "place": "Arnéguy (Nouvelle-Aquitaine), Route Napoleon",
+  "place_coordinate": {
+    "latitude": 43.06634166666667,
+    "longitude": -1.267436666666667
+  },
+  "place_details": {
+    "administrativeArea": "Nouvelle-Aquitaine",
+    "areasOfInterest": [],
+    "locality": "Arnéguy",
+    "name": "Route Napoleon",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5117.jpeg",
+  "subLocality": null,
+  "time": "11:52",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T09:52:51+00:00",
+      "latitude": 43.06634166666667,
+      "longitude": -1.267436666666667
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.06634166666667,
+      "longitude": -1.267436666666667,
+      "response_elevation_m": 1191.0,
+      "response_latitude": 42.987698,
+      "response_longitude": -1.2035828,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.454958+00:00",
+    "sampling": {
+      "fraction": 0.88083333,
+      "lower_time": "2024-07-15T09:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T10:00:00+00:00",
+      "upper_time": "2024-07-15T10:00:00+00:00",
+      "weather_code_time": "2024-07-15T10:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 95.23833333333333,
+      "precipitation": 0.8,
+      "pressure_msl": 1013.6761666666667,
+      "relative_humidity_2m": 65.715,
+      "temperature_2m": 19.440416666666668,
+      "weather_code": 53,
+      "wind_speed_10m": 20.74975
+    }
+  },
+  "photo_path": "IMG_5117.jpeg",
+  "source_file_signature": {
+    "size": 646591,
+    "mtime_ns": 1788636806415479826
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 646591,
+    "sha256": "a072c29a560d813cb4369180e505e0b5db078445afb05fb9d60a9f52778b9453"
+  }
+}

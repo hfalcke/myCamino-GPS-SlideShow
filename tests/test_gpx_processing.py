@@ -673,7 +673,11 @@ class SharedGpxProcessingTests(unittest.TestCase):
         self.assertAlmostEqual(table["ascent_m"], shared.ascent_m, places=9)
         self.assertAlmostEqual(listed.length_km, shared.length_km, places=9)
         self.assertEqual(table["filtered_point_count"], shared.retained_point_count)
+        extent = table["track_extent_mercator"]
+        self.assertLess(extent["min_x"], extent["max_x"])
+        self.assertLessEqual(extent["min_y"], extent["max_y"])
         payload = build_table_summary_data("example.gpx", [{**table, "table_number": 1, "original_sequence_number": 1, "distance_km": None}])
+        self.assertEqual(payload["tracks"][0]["track_extent_mercator"], extent)
         serialized = json.dumps(payload)
         self.assertNotIn("processed_segments", serialized)
         self.assertNotIn("timed_track_points", serialized)

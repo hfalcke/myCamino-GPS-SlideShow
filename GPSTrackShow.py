@@ -28,6 +28,7 @@ from typing import Callable, Optional
 from plot_metadata_utils import (
     coordinate_to_pixel,
     extract_coordinate_point,
+    lonlat_to_web_mercator,
     media_sidecar_matches_media,
     media_sidecar_path,
     read_photo_metadata,
@@ -82,6 +83,7 @@ from slideshow_control_format import (
     MusicDirective,
     MusicSyntaxError,
     AudioSelectionSyntaxError,
+    compile_repeat_ranges,
     control_label_key,
     is_control_directive,
     is_music_directive,
@@ -95,6 +97,7 @@ from slideshow_control_format import (
     parse_music_directive,
     parse_narrator_directive,
     parse_play_directive,
+    repeat_ranges_at_row,
 )
 
 try:
@@ -308,7 +311,7 @@ WIPE_TRANSITION_STEPS = 100
 FIRST_STAGE_OVERVIEW_STARTUP_GRACE_SECONDS = 1.0
 FULLSCREEN_PLAYBACK_START_TIMEOUT_SECONDS = 3.0
 INTRO_AUTO_ADVANCE_SECONDS = 30.0
-SLIDESHOW_CHECKPOINT_VERSION = 5
+SLIDESHOW_CHECKPOINT_VERSION = 6
 MUSIC_RESUME_STATE_VERSION = 1
 DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
@@ -1783,22 +1786,165 @@ def configure_round_stroke(path) -> None:
 def simplify_display_path(
     points: list[tuple[float, float]],
     tolerance_pixels: float = 0.75,
+    maximum_points: Optional[int] = None,
 ) -> list[tuple[float, float]]:
     """Drop sub-pixel route vertices while preserving endpoints."""
-    if len(points) <= 2 or tolerance_pixels <= 0.0:
+    if len(points) <= 2:
         return points
-    tolerance_squared = float(tolerance_pixels) ** 2
-    simplified = [points[0]]
-    last_x, last_y = points[0]
-    for point in points[1:-1]:
-        delta_x = point[0] - last_x
-        delta_y = point[1] - last_y
-        if delta_x * delta_x + delta_y * delta_y >= tolerance_squared:
-            simplified.append(point)
-            last_x, last_y = point
-    if points[-1] != simplified[-1]:
-        simplified.append(points[-1])
+    if tolerance_pixels <= 0.0:
+        simplified = list(points)
+    else:
+        tolerance_squared = float(tolerance_pixels) ** 2
+        simplified = [points[0]]
+        last_x, last_y = points[0]
+        for point in points[1:-1]:
+            delta_x = point[0] - last_x
+            delta_y = point[1] - last_y
+            if delta_x * delta_x + delta_y * delta_y >= tolerance_squared:
+                simplified.append(point)
+                last_x, last_y = point
+        if points[-1] != simplified[-1]:
+            simplified.append(points[-1])
+    if maximum_points is not None and len(simplified) > max(2, int(maximum_points)):
+        simplified = _largest_triangle_path(simplified, max(2, int(maximum_points)))
     return simplified
+
+
+def _largest_triangle_path(
+    points: list[tuple[float, float]],
+    threshold: int,
+) -> list[tuple[float, float]]:
+    """Reduce a path in linear time while retaining visually important bends."""
+    count = len(points)
+    threshold = max(2, min(int(threshold), count))
+    if threshold >= count:
+        return list(points)
+    if threshold == 2:
+        return [points[0], points[-1]]
+    every = (count - 2) / float(threshold - 2)
+    sampled = [points[0]]
+    anchor_index = 0
+    for bucket in range(threshold - 2):
+        average_start = min(count, int(math.floor((bucket + 1) * every)) + 1)
+        average_end = min(count, int(math.floor((bucket + 2) * every)) + 1)
+        if average_start >= average_end:
+            average_x, average_y = points[min(average_start, count - 1)]
+        else:
+            average_count = average_end - average_start
+            average_x = sum(points[index][0] for index in range(average_start, average_end)) / average_count
+            average_y = sum(points[index][1] for index in range(average_start, average_end)) / average_count
+        range_start = int(math.floor(bucket * every)) + 1
+        range_end = min(count - 1, int(math.floor((bucket + 1) * every)) + 1)
+        anchor_x, anchor_y = points[anchor_index]
+        best_index = range_start
+        best_area = -1.0
+        for index in range(range_start, max(range_start + 1, range_end)):
+            point_x, point_y = points[index]
+            area = abs(
+                (anchor_x - average_x) * (point_y - anchor_y)
+                - (anchor_x - point_x) * (average_y - anchor_y)
+            )
+            if area > best_area:
+                best_area = area
+                best_index = index
+        sampled.append(points[best_index])
+        anchor_index = best_index
+    sampled.append(points[-1])
+    return sampled
+
+
+def adaptive_overview_segments(
+    segments: list[list[tuple[float, float]]],
+    *,
+    tolerance_pixels: float = 0.75,
+    points_per_pixel: float = 1.5,
+    minimum_points: int = 24,
+    maximum_points: int = 1500,
+) -> list[list[tuple[float, float]]]:
+    """Return bounded screen-space route geometry without joining segments."""
+    usable = [list(segment) for segment in segments if segment]
+    all_points = [point for segment in usable for point in segment]
+    if len(all_points) <= 2:
+        return usable
+    min_x = min(point[0] for point in all_points)
+    max_x = max(point[0] for point in all_points)
+    min_y = min(point[1] for point in all_points)
+    max_y = max(point[1] for point in all_points)
+    projected_extent = math.hypot(max_x - min_x, max_y - min_y)
+    budget = max(
+        int(minimum_points),
+        min(int(maximum_points), int(math.ceil(projected_extent * points_per_pixel)) + 2),
+    )
+    radial = [simplify_display_path(segment, tolerance_pixels) for segment in usable]
+    radial_count = sum(len(segment) for segment in radial)
+    if radial_count <= budget:
+        return radial
+
+    lengths = []
+    for segment in radial:
+        lengths.append(
+            sum(
+                math.hypot(end[0] - start[0], end[1] - start[1])
+                for start, end in zip(segment, segment[1:])
+            )
+        )
+    total_length = sum(lengths)
+    minimum_budget = sum(min(2, len(segment)) for segment in radial)
+    remaining = max(0, budget - minimum_budget)
+    targets = [min(2, len(segment)) for segment in radial]
+    if remaining:
+        weights = lengths if total_length > 0 else [float(len(segment)) for segment in radial]
+        total_weight = sum(weights) or 1.0
+        fractions = []
+        for index, (segment, weight) in enumerate(zip(radial, weights)):
+            capacity = max(0, len(segment) - targets[index])
+            exact = remaining * weight / total_weight
+            addition = min(capacity, int(math.floor(exact)))
+            targets[index] += addition
+            fractions.append((exact - addition, index))
+        unassigned = budget - sum(targets)
+        for _fraction, index in sorted(fractions, reverse=True):
+            if unassigned <= 0:
+                break
+            if targets[index] < len(radial[index]):
+                targets[index] += 1
+                unassigned -= 1
+    return [
+        simplify_display_path(segment, 0.0, target)
+        if len(segment) > target
+        else segment
+        for segment, target in zip(radial, targets)
+    ]
+
+
+def overview_route_direction(
+    segments: list[list[tuple[float, float]]],
+    fraction: float = 0.60,
+) -> Optional[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return a route point and forward tangent at a cumulative path fraction."""
+    edges = []
+    total = 0.0
+    for segment in segments:
+        for start, end in zip(segment, segment[1:]):
+            length = math.hypot(end[0] - start[0], end[1] - start[1])
+            if length > 0.0:
+                edges.append((start, end, length))
+                total += length
+    if total <= 0.0:
+        return None
+    target = total * max(0.0, min(1.0, float(fraction)))
+    traversed = 0.0
+    for start, end, length in edges:
+        if traversed + length >= target:
+            local = (target - traversed) / length
+            point = (
+                start[0] + (end[0] - start[0]) * local,
+                start[1] + (end[1] - start[1]) * local,
+            )
+            return point, ((end[0] - start[0]) / length, (end[1] - start[1]) / length)
+        traversed += length
+    start, end, length = edges[-1]
+    return end, ((end[0] - start[0]) / length, (end[1] - start[1]) / length)
 
 
 def background_cgcolor(color: tuple[float, float, float, float]):
@@ -1854,14 +2000,10 @@ def build_caption_plan(
             warn_message(f"font line {index + 1}: {exc}")
             continue
         if font_directive is not None:
-            active_font = (
-                default_font
-                if font_directive.reset
-                else CaptionFontState(
-                    font_directive.size if font_directive.size is not None else active_font.size,
-                    font_directive.style if font_directive.style is not None else active_font.style,
-                    font_directive.family if font_directive.family is not None else active_font.family,
-                )
+            active_font = apply_caption_font_directive(
+                active_font,
+                font_directive,
+                default_font,
             )
             fonts[index] = active_font
             continue
@@ -1882,6 +2024,21 @@ def build_caption_plan(
         if entry.source_name:
             captions[index + 1] = (caption, active_font)
     return captions, fonts
+
+
+def apply_caption_font_directive(
+    current: CaptionFontState,
+    directive: FontDirective,
+    default: CaptionFontState,
+) -> CaptionFontState:
+    """Apply one partial FONT directive to a retained font state."""
+    if directive.reset:
+        return default
+    return CaptionFontState(
+        directive.size if directive.size is not None else current.size,
+        directive.style if directive.style is not None else current.style,
+        directive.family if directive.family is not None else current.family,
+    )
 
 
 def parse_iso_datetime(value: object) -> Optional[datetime]:
@@ -1923,13 +2080,9 @@ def time_lapse_clock_datetime(
     progress: float,
     media_time: Optional[datetime],
 ) -> Optional[datetime]:
-    """Advance the clock to late media after the marker reaches track end."""
-    if progress < 1.0 or media_time is None:
-        return marker_time
-    if marker_time is None:
-        return media_time
-    comparable_media_time = align_datetime_timezone(media_time, marker_time)
-    return comparable_media_time if comparable_media_time > marker_time else marker_time
+    """Show real media time during a hold, otherwise the walker's time."""
+    del progress
+    return media_time if media_time is not None else marker_time
 
 
 def time_lapse_clock_layout(
@@ -2533,11 +2686,90 @@ def timeline_sample_count(duration_seconds: float) -> int:
 
 
 def build_time_lapse_media_queue(events: list[tuple[Optional[float], int, PhotoListEntry]]) -> list[tuple[float, int, PhotoListEntry]]:
-    """Order timed media first and retain every untimed row at stage end."""
-    timed = [(fraction, row_index, entry) for fraction, row_index, entry in events if fraction is not None]
-    untimed = [(1.0, row_index, entry) for fraction, row_index, entry in events if fraction is None]
-    timed.sort(key=lambda item: (item[0], item[1]))
-    return [*timed, *untimed]
+    """Keep control-file order and prevent the walker from moving backward."""
+    queue = []
+    current = 0.0
+    for fraction, row_index, entry in events:
+        if fraction is not None:
+            current = max(current, max(0.0, min(1.0, float(fraction))))
+        queue.append((current, row_index, entry))
+    return queue
+
+
+def build_walker_steering_plan(lines, repeat_ranges) -> dict[int, dict]:
+    """Resolve one-shot and repeated walker-time controls by media row."""
+    plan = {}
+    pending = []
+    for row_index, line in enumerate(lines):
+        directive = None
+        if is_control_directive(line) and not is_disabled_control_line(line):
+            try:
+                directive = parse_control_directive(line)
+            except ControlSyntaxError:
+                directive = None
+        if directive is not None:
+            actions = tuple(
+                action
+                for action in directive.actions
+                if action.kind in {"set_time", "set_date", "ignore_time"}
+            )
+            if actions:
+                pending.append((row_index, actions))
+            continue
+        if str(line).startswith("#"):
+            continue
+        sources = [
+            (scope.source_row, tuple(
+                action for action in scope.directive.actions
+                if action.kind in {"set_time", "set_date", "ignore_time"}
+            ))
+            for scope in repeat_ranges_at_row(repeat_ranges, row_index, "all")
+            if scope.family == "control"
+        ]
+        sources.extend(pending)
+        state = {"ignore_time": False, "date": None, "time": None, "sources": []}
+        seen = set()
+        for source_row, actions in sorted(sources, key=lambda item: item[0]):
+            for action in actions:
+                identity = (source_row, action.kind, action.value)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                state["sources"].append(source_row)
+                if action.kind == "ignore_time":
+                    state.update(ignore_time=True, date=None, time=None)
+                else:
+                    state["ignore_time"] = False
+                    state["date" if action.kind == "set_date" else "time"] = action.value
+        if sources:
+            plan[row_index] = state
+        pending = []
+    return plan
+
+
+def apply_walker_steering_datetime(
+    actual: Optional[datetime],
+    steering: Optional[dict],
+    reference: Optional[datetime],
+) -> Optional[datetime]:
+    """Apply route-only date/time components without changing media metadata."""
+    if not steering:
+        return actual
+    if steering.get("ignore_time"):
+        return None
+    base = actual or reference
+    if not isinstance(base, datetime):
+        return None
+    date_text, time_text = steering.get("date"), steering.get("time")
+    try:
+        chosen_date = datetime.strptime(date_text, "%Y-%m-%d").date() if date_text else base.date()
+        chosen_time = datetime.strptime(
+            time_text,
+            "%H:%M:%S" if time_text and time_text.count(":") == 2 else "%H:%M",
+        ).time() if time_text else base.time().replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return actual
+    return datetime.combine(chosen_date, chosen_time, tzinfo=base.tzinfo)
 
 
 def advance_time_lapse_progress(
@@ -2715,6 +2947,24 @@ def photo_track_state(
     if selected is None and candidates:
         selected = candidates[-1]
     return selected
+
+
+def photo_track_state_by_location(
+    metadata: Optional[dict],
+    latitude: Optional[float],
+    longitude: Optional[float],
+    maximum_distance_km: float = 0.15,
+) -> Optional[dict]:
+    """Return a profile state only when the real media position is near the route."""
+    if latitude is None or longitude is None:
+        return None
+    selected = photo_track_state(metadata, latitude, longitude, None)
+    if selected is None:
+        return None
+    distance = haversine_km(
+        float(latitude), float(longitude), selected["lat"], selected["lon"]
+    )
+    return selected if distance <= max(0.0, float(maximum_distance_km)) else None
 
 
 def photo_track_metrics(
@@ -3377,6 +3627,8 @@ if APPKIT_AVAILABLE:
             self.caption_font_state = None
             self.media_draw_frame = True
             self.highlight_route = False
+            self.projected_highlight_key = None
+            self.projected_highlight_segments = []
             self.route_visible = True
             self.route_color = COLOR_NAMES["blue"]
             self.route_width = 4.0
@@ -3444,6 +3696,8 @@ if APPKIT_AVAILABLE:
             self.media_image = media_image
             self.highlight_route = highlight_route
             if stage_changed:
+                self.projected_highlight_key = None
+                self.projected_highlight_segments = []
                 self.media_placement_cache_key = None
                 self.media_clear_rects = None
                 self.current_media_corner = None
@@ -4059,20 +4313,76 @@ if APPKIT_AVAILABLE:
             image_rect, scale = self.imageRectAndScale()
             image_w, image_h = image_size_tuple(self.map_image)
             self.map_image.drawInRect_fromRect_operation_fraction_(image_rect, NSMakeRect(0, 0, image_w, image_h), NSCompositingOperationSourceOver, 1.0)
-            route = [self.viewPointForLat_lon_imageRect_scale_(item["lat"], item["lon"], image_rect, scale) for item in self.route_points]
-            route = [point for point in route if point is not None]
-            if self.highlight_route and self.route_visible and len(route) >= 2:
-                path = NSBezierPath.bezierPath()
-                configure_round_stroke(path)
-                path.moveToPoint_(route[0])
-                for point in route[1:]:
-                    path.lineToPoint_(point)
-                ns_color(self.route_color).setStroke()
-                path.setLineWidth_(max(float(self.route_width), bounds.size.width * 0.002))
-                path.stroke()
+            if self.highlight_route and self.route_visible:
+                scale_components = self._scale_components(scale)
+                route_key = (
+                    id(self.route_points),
+                    id(self.map_metadata),
+                    round(float(image_rect.origin.x), 2),
+                    round(float(image_rect.origin.y), 2),
+                    round(float(image_rect.size.width), 2),
+                    round(float(image_rect.size.height), 2),
+                    tuple(round(float(value), 6) for value in scale_components),
+                )
+                if route_key != self.projected_highlight_key:
+                    grouped = []
+                    current_segment = []
+                    current_index = None
+                    for item in self.route_points:
+                        segment_index = item.get("segment_index", 0)
+                        if current_segment and segment_index != current_index:
+                            grouped.append(current_segment)
+                            current_segment = []
+                        current_index = segment_index
+                        point = self.viewPointForLat_lon_imageRect_scale_(
+                            item["lat"], item["lon"], image_rect, scale
+                        )
+                        if point is not None:
+                            current_segment.append((float(point[0]), float(point[1])))
+                    if current_segment:
+                        grouped.append(current_segment)
+                    self.projected_highlight_segments = adaptive_overview_segments(grouped)
+                    self.projected_highlight_key = route_key
+                is_overview = scene_from_metadata(
+                    self.map_metadata, show_header=False
+                ).stage_kind == "overview"
+                route_color = COLOR_NAMES["red"] if is_overview else self.route_color
+                line_width = max(float(self.route_width), bounds.size.width * 0.002)
+                for route in self.projected_highlight_segments:
+                    if len(route) < 2:
+                        continue
+                    path = NSBezierPath.bezierPath()
+                    configure_round_stroke(path)
+                    path.moveToPoint_(route[0])
+                    for point in route[1:]:
+                        path.lineToPoint_(point)
+                    ns_color(COLOR_NAMES["black"]).setStroke()
+                    path.setLineWidth_(line_width + max(2.0, line_width * 0.55))
+                    path.stroke()
+                    ns_color(route_color).setStroke()
+                    path.setLineWidth_(line_width)
+                    path.stroke()
+                if is_overview and (
+                    direction := overview_route_direction(self.projected_highlight_segments)
+                ) is not None:
+                    direction_point, tangent = direction
+                    cue_length = max(16.0, min(36.0, bounds.size.width * 0.018))
+                    draw_arrow_line(
+                        direction_point[0] - tangent[0] * cue_length / 2.0,
+                        bounds.size.height - direction_point[1] + tangent[1] * cue_length / 2.0,
+                        direction_point[0] + tangent[0] * cue_length / 2.0,
+                        bounds.size.height - direction_point[1] - tangent[1] * cue_length / 2.0,
+                        bounds.size.height,
+                        COLOR_NAMES["red"],
+                        max(1.5, line_width * 0.55),
+                    )
             if self.media_marker_latlon is not None:
                 marker_pixel = self.imagePixelForLat_lon_(self.media_marker_latlon[0], self.media_marker_latlon[1])
-                if marker_pixel is not None:
+                if (
+                    marker_pixel is not None
+                    and 0.0 <= float(marker_pixel[0]) <= float(image_w)
+                    and 0.0 <= float(marker_pixel[1]) <= float(image_h)
+                ):
                     scale_x, scale_y = self._scale_components(scale)
                     view_x = image_rect.origin.x + marker_pixel[0] * scale_x
                     view_y = image_rect.origin.y + (image_h - marker_pixel[1]) * scale_y
@@ -6300,6 +6610,9 @@ def draw_overview_overlay(
         if projected:
             projected_segments.append(projected)
 
+    if scene.stage_kind != "media_stage":
+        projected_segments = adaptive_overview_segments(projected_segments)
+
     if scene.stage_kind == "media_stage":
         for segment in projected_segments:
             for pixel_x, pixel_y in segment:
@@ -6323,7 +6636,7 @@ def draw_overview_overlay(
             ns_color(COLOR_NAMES["black"]).setStroke()
             path.setLineWidth_(max(5.0, width * 0.0055))
             path.stroke()
-            ns_color(COLOR_NAMES["yellow"]).setStroke()
+            ns_color(COLOR_NAMES["red"]).setStroke()
             path.setLineWidth_(max(3.0, width * 0.0035))
             path.stroke()
 
@@ -6358,15 +6671,18 @@ def draw_overview_overlay(
             config.dot_size,
             config.arrow_length,
         )
-    elif point_pixels[0] is not None and point_pixels[1] is not None:
+    elif (direction := overview_route_direction(projected_segments)) is not None:
+        direction_point, tangent = direction
+        cue_length = max(18.0, min(42.0, width * 0.018))
+        half_length = cue_length / 2.0
         draw_arrow_line(
-            point_pixels[0][0],
-            point_pixels[0][1],
-            point_pixels[1][0],
-            point_pixels[1][1],
+            direction_point[0] - tangent[0] * half_length,
+            direction_point[1] - tangent[1] * half_length,
+            direction_point[0] + tangent[0] * half_length,
+            direction_point[1] + tangent[1] * half_length,
             height,
-            config.dot_color,
-            max(1.0, config.dot_size / 2.0),
+            COLOR_NAMES["red"],
+            max(1.5, width * 0.0015),
         )
 
     marker_pixels = point_pixels[:1] if scene.stage_kind == "media_stage" else point_pixels
@@ -6753,7 +7069,7 @@ def combined_stage_metadata(
     row = summary_row if isinstance(summary_row, dict) else None
     if row is not None:
         metadata = dict(metadata or {})
-        for key in ("ascent_m", "descent_m"):
+        for key in ("ascent_m", "descent_m", "track_extent_mercator"):
             if row.get(key) is not None:
                 metadata[key] = row[key]
     relative = row.get("track_data_sidecar") if row is not None else None
@@ -6779,6 +7095,7 @@ def combined_stage_metadata(
         "has_absolute_time",
         "gpx_processing",
         "track_endpoint_places",
+        "track_extent_mercator",
     ):
         if key in derived:
             combined[key] = derived[key]
@@ -6811,6 +7128,20 @@ def combined_stage_metadata(
             point for segment in segments.values() for point in segment
         ]
         combined["processed_track_segments"] = list(profiles.values())
+    if not isinstance(combined.get("track_extent_mercator"), dict):
+        scene = scene_from_metadata(combined, show_header=False)
+        projected = [
+            lonlat_to_web_mercator(point.longitude, point.latitude)
+            for segment in scene.segments
+            for point in segment
+        ]
+        if projected:
+            combined["track_extent_mercator"] = {
+                "min_x": min(point[0] for point in projected),
+                "max_x": max(point[0] for point in projected),
+                "min_y": min(point[1] for point in projected),
+                "max_y": max(point[1] for point in projected),
+            }
     return combined
 
 
@@ -8337,6 +8668,17 @@ class BackgroundMusicController:
                 self._execute_play_directive(play_directive, switch_player=True)
         self.last_control_row = row_index
 
+    def repeat_row(self, row_index: int) -> None:
+        """Execute one audio row again without changing reconstruction cursors."""
+        if not self.available:
+            return
+        directive = self.directives.get(int(row_index))
+        if directive is not None:
+            self._execute_directive(directive, switch_player=True, show_status=True)
+        play_directive = self.play_directives.get(int(row_index))
+        if play_directive is not None:
+            self._execute_play_directive(play_directive, switch_player=True)
+
     def _warn_once(self, message: str) -> None:
         key = str(message).casefold()
         if key not in self.warned_music_errors:
@@ -9016,6 +9358,11 @@ class NarrationController:
                 self.execute(directive)
         self.last_control_row = row_index
 
+    def repeat_row(self, row_index):
+        directive = self.directives.get(int(row_index))
+        if directive is not None:
+            self.execute(directive)
+
     def _schedule_poll(self):
         if self.poll_handle is None and not self.disposed:
             self.poll_handle = self.schedule_callback(0.25, self._poll)
@@ -9161,6 +9508,17 @@ class GPSTrackShowApp:
                 f"duplicate slide-show label ${label} on lines {first_row + 1} and "
                 f"{duplicate_row + 1}; the first definition is used"
             )
+        self.repeat_ranges = compile_repeat_ranges(
+            self.playlist_lines,
+            strict=False,
+            warning_callback=lambda message: warn_message(
+                f"repeated directive ignored: {message}"
+            ),
+        )
+        self.walker_steering_by_row = build_walker_steering_plan(
+            self.playlist_lines,
+            self.repeat_ranges,
+        )
         self.playlist_index = 0
         self.current_date: Optional[str] = None
         self.current_overview_image = None
@@ -10213,7 +10571,7 @@ class GPSTrackShowApp:
         self._raise_time_lapse_view(overview_view)
         overview_view.elevation_profile_view.clear()
         overview_view.route_visible = True
-        overview_view.route_color = COLOR_NAMES["yellow"]
+        overview_view.route_color = COLOR_NAMES["red"]
         overview_view.route_width = max(3.0, float(self.config.route_width))
         overview_view.media_image = None
         overview_view.media_marker_latlon = None
@@ -10361,7 +10719,7 @@ class GPSTrackShowApp:
             self._raise_time_lapse_view(overview_view)
             overview_view.elevation_profile_view.clear()
             overview_view.route_visible = True
-            overview_view.route_color = COLOR_NAMES["yellow"]
+            overview_view.route_color = COLOR_NAMES["red"]
             overview_view.route_width = max(3.0, float(self.config.route_width))
             overview_view.media_image = None
             overview_view.media_marker_latlon = None
@@ -10903,6 +11261,16 @@ class GPSTrackShowApp:
         style = self.initial_playback_style
         for index in sorted(key for key in self.control_directives if key < int(row_index)):
             for action in self.control_directives[index].actions:
+                if action.kind == "duration":
+                    duration = float(action.value)
+                elif action.kind == "transition":
+                    style = str(action.value)
+        for scope in repeat_ranges_at_row(
+            getattr(self, "repeat_ranges", ()), int(row_index), "all"
+        ):
+            if scope.family != "control":
+                continue
+            for action in scope.directive.actions:
                 if action.kind == "duration":
                     duration = float(action.value)
                 elif action.kind == "transition":
@@ -12713,7 +13081,7 @@ class GPSTrackShowApp:
             clean_overview = make_blank_canvas(
                 width,
                 height,
-                self.config.background_color,
+                COLOR_NAMES["white"],
             )
         else:
             clean_overview = self.current_overview_image
@@ -13033,8 +13401,40 @@ class GPSTrackShowApp:
             self._show_targets(self._ordered_targets(self.role_targets), on_complete=None)
             return
 
-    def _display_state(self, state: DisplayState) -> None:
+    def _display_state(self, state: DisplayState, *, _repeats_applied: bool = False) -> None:
         """Display one slideshow state without retaining older rendered images."""
+        if (
+            not _repeats_applied
+            and not self.time_lapse_active
+            and not self.standard_route_tracking_active
+            and self.current_phase not in {
+                PlaybackPhase.INTRO_INFO,
+                PlaybackPhase.INTRO_OVERVIEW,
+            }
+        ):
+            boundary_row = (
+                self.pending_display_index
+                if self.pending_display_index is not None
+                else state.playlist_index
+            )
+            target = "media" if self.current_phase == PlaybackPhase.MEDIA else "all"
+
+            def continue_display() -> None:
+                if not any(item.video_path is not None for item in state.targets):
+                    state.auto_delay = (
+                        None if state.auto_delay is None else self.config.duration
+                    )
+                for item in state.targets:
+                    if item.presenter_name == "photo":
+                        item.transition = self._effective_photo_transition()
+                self._display_state(state, _repeats_applied=True)
+
+            if self._run_repeated_directives(
+                boundary_row,
+                target,
+                continue_display,
+            ):
+                return
         self.control_flow_steps = 0
         self.music_controller.set_video_active(
             any(target.presenter_name == "photo" and target.video_path is not None for target in state.targets)
@@ -13329,6 +13729,7 @@ class GPSTrackShowApp:
         points: list[dict],
         date_text: Optional[str],
         photo_time: Optional[datetime] = None,
+        steering: Optional[dict] = None,
     ) -> Optional[float]:
         # Synthetic track times establish motion only; they cannot safely align
         # a real camera timestamp, so keep those media entries at stage end.
@@ -13338,6 +13739,11 @@ class GPSTrackShowApp:
             return None
         if photo_time is None:
             photo_time = self._time_lapse_media_datetime(entry, points, date_text)
+        photo_time = apply_walker_steering_datetime(
+            photo_time,
+            steering,
+            points[0].get("time") if points else None,
+        )
         if photo_time is None:
             return None
         start, end = points[0]["time"], points[-1]["time"]
@@ -13825,7 +14231,10 @@ class GPSTrackShowApp:
                 point.get("has_absolute_time") for point in self.time_lapse_points
             )
         ):
-            warn_message("Track map has no stored timing; using distance-based motion and showing untimed media at stage end.")
+            warn_message(
+                "Track map has no stored timing; using distance-based motion and "
+                "showing media in control-file order without advancing the walker."
+            )
         self.time_lapse_progress = max(0.0, min(1.0, start_fraction))
         if cache_entry.media_queue is not None and cache_entry.media_datetimes is not None:
             self.time_lapse_media_datetimes = dict(cache_entry.media_datetimes)
@@ -13846,6 +14255,7 @@ class GPSTrackShowApp:
                     self.time_lapse_points,
                     date_text,
                     photo_time=media_datetime,
+                    steering=self.walker_steering_by_row.get(row_index),
                 )
                 media_events.append((fraction, row_index, entry))
             queue = (
@@ -13939,9 +14349,15 @@ class GPSTrackShowApp:
             relation,
         )
 
-    def _begin_time_lapse_stage_map_preview(self) -> None:
+    def _begin_time_lapse_stage_map_preview(self, _repeats_applied: bool = False) -> None:
         """Show the elevation profile inset after the stage overview."""
         if self.time_lapse_stage is None:
+            return
+        if not _repeats_applied and self._run_repeated_directives(
+            self.time_lapse_stage.map_index,
+            "all",
+            lambda: self._begin_time_lapse_stage_map_preview(True),
+        ):
             return
         profile = self._current_elevation_profile()
         if profile is None:
@@ -13979,6 +14395,7 @@ class GPSTrackShowApp:
         start_fraction: float,
         resume_media: Optional[tuple[int, PhotoListEntry]],
         relation: Optional[str],
+        _repeats_applied: bool = False,
     ) -> None:
         show_stage_overview = should_show_stage_overview_preview(
             self.map_presenter is not None,
@@ -13991,6 +14408,18 @@ class GPSTrackShowApp:
             self._begin_special_time_lapse_stage(skip_map_delay=resume_media is not None)
             return
         if show_stage_overview:
+            if not _repeats_applied and self.time_lapse_stage is not None:
+                if self._run_repeated_directives(
+                    self.time_lapse_stage.map_index,
+                    "all",
+                    lambda: self._show_time_lapse_overview_or_begin(
+                        start_fraction,
+                        resume_media,
+                        relation,
+                        True,
+                    ),
+                ):
+                    return
             first_overview = not self.time_lapse_overview_has_been_displayed
             self.time_lapse_overview_has_been_displayed = True
             self.time_lapse_overview_preview_active = True
@@ -14105,9 +14534,19 @@ class GPSTrackShowApp:
                 presenter.set_content_visible(False)
         self._begin_special_time_lapse_stage()
 
-    def _begin_special_time_lapse_stage(self, skip_map_delay: bool = False) -> None:
+    def _begin_special_time_lapse_stage(
+        self,
+        skip_map_delay: bool = False,
+        _repeats_applied: bool = False,
+    ) -> None:
         """Show an adjacent-day map statically before its sequential media."""
         if self.time_lapse_stage is None or self.time_lapse_stage.relation is None:
+            return
+        if not _repeats_applied and self._run_repeated_directives(
+            self.time_lapse_stage.map_index,
+            "all",
+            lambda: self._begin_special_time_lapse_stage(skip_map_delay, True),
+        ):
             return
         self.time_lapse_overview_preview_active = False
         self.time_lapse_overview_inset_active = False
@@ -14125,7 +14564,7 @@ class GPSTrackShowApp:
             delay = 0.0 if skip_map_delay else self.config.duration
         self._schedule_special_time_lapse_advance(delay)
 
-    def _begin_standard_route_tracking_motion(self) -> None:
+    def _begin_standard_route_tracking_motion(self, _repeats_applied: bool = False) -> None:
         """Animate the Time-Lapse map while retaining Standard media presentation."""
         if (
             self.time_lapse_stage is None
@@ -14133,6 +14572,12 @@ class GPSTrackShowApp:
             or not self._has_separate_map_display()
         ):
             self._leave_standard_route_tracking(continue_stage=True)
+            return
+        if not _repeats_applied and self._run_repeated_directives(
+            self.time_lapse_stage.map_index,
+            "all",
+            lambda: self._begin_standard_route_tracking_motion(True),
+        ):
             return
         self.time_lapse_overview_preview_active = False
         self.time_lapse_overview_inset_active = False
@@ -14186,9 +14631,15 @@ class GPSTrackShowApp:
                 self.time_lapse_media_remaining or self.config.duration
             )
 
-    def _begin_time_lapse_motion(self) -> None:
+    def _begin_time_lapse_motion(self, _repeats_applied: bool = False) -> None:
         """Leave the optional single-window overview and animate the stage."""
         if self.time_lapse_stage is None or not self.time_lapse_active:
+            return
+        if not _repeats_applied and self._run_repeated_directives(
+            self.time_lapse_stage.map_index,
+            "all",
+            lambda: self._begin_time_lapse_motion(True),
+        ):
             return
         if self.time_lapse_overview_inset_active:
             self.time_lapse_media_image = None
@@ -14311,6 +14762,7 @@ class GPSTrackShowApp:
         entry: PhotoListEntry,
         *,
         controls_synced: bool = False,
+        repeats_applied: bool = False,
         navigation_generation: Optional[int] = None,
     ) -> bool:
         if (
@@ -14319,6 +14771,32 @@ class GPSTrackShowApp:
             != int(getattr(self, "time_lapse_navigation_generation", 0))
         ):
             return False
+        if not repeats_applied:
+            state = {"done": False, "result": False, "returned": False}
+
+            def continue_after_repeats() -> None:
+                state["done"] = True
+                state["result"] = self._start_time_lapse_media(
+                    row_index,
+                    entry,
+                    controls_synced=controls_synced,
+                    repeats_applied=True,
+                    navigation_generation=navigation_generation,
+                )
+                if state["returned"] and state["result"]:
+                    self._resume_after_deferred_time_lapse_media_start()
+
+            owned = self._run_repeated_directives(
+                row_index,
+                "media",
+                continue_after_repeats,
+            )
+            state["returned"] = True
+            if owned:
+                if not state["done"]:
+                    self.time_lapse_control_deferred = True
+                    return False
+                return bool(state["result"])
         if not controls_synced:
             state = {"asynchronous": False, "result": False}
 
@@ -14333,22 +14811,12 @@ class GPSTrackShowApp:
                     row_index,
                     entry,
                     controls_synced=True,
+                    repeats_applied=True,
                     navigation_generation=navigation_generation,
                 )
                 if not state["asynchronous"] or not state["result"]:
                     return
-                self.time_lapse_control_deferred = False
-                if self.time_lapse_stage is None or not (
-                    self.time_lapse_active or self.standard_route_tracking_active
-                ):
-                    return
-                if self.time_lapse_stage.relation is not None:
-                    if not self.manual_mode and not self.paused:
-                        self._schedule_special_time_lapse_advance(
-                            self.time_lapse_media_remaining or self.config.duration
-                        )
-                elif not self.manual_mode and not self.paused:
-                    self._schedule_time_lapse_tick(0.020)
+                self._resume_after_deferred_time_lapse_media_start()
 
             deferred = self._sync_time_lapse_controls_through(
                 row_index,
@@ -14358,7 +14826,7 @@ class GPSTrackShowApp:
             self.time_lapse_control_deferred = deferred
             return False if deferred else bool(state["result"])
         self.control_flow_steps = 0
-        self.active_caption_font = self.font_state_by_row.get(row_index, self.default_caption_font)
+        self.active_caption_font = self._font_state_for_boundary(row_index)
         path = resolve_path(self.config.photodir, entry.source_name)
         try:
             image = load_media_preview(path)
@@ -14371,10 +14839,7 @@ class GPSTrackShowApp:
         self.playlist_index = row_index + 1
         self.time_lapse_current_media = (row_index, entry)
         self.time_lapse_current_media_is_video = is_video_path(path)
-        self.time_lapse_media_profile_state = interpolate_timeline_state(
-            self.time_lapse_points,
-            self.time_lapse_progress,
-        )
+        self.time_lapse_media_profile_state = None
         self.current_phase = PlaybackPhase.TIME_LAPSE
         if self.current_stage_index is not None:
             stage = self.stages[self.current_stage_index]
@@ -14383,9 +14848,14 @@ class GPSTrackShowApp:
             except ValueError:
                 self.current_stage_media_position = None
         self.time_lapse_media_image = image
-        caption_data = self.caption_by_row.get(row_index)
+        caption_data = (
+            self._repeated_caption_for_row(row_index)
+            or self.caption_by_row.get(row_index)
+        )
         self.time_lapse_caption = caption_data[0] if caption_data else None
-        self.time_lapse_caption_font = caption_data[1] if caption_data else None
+        self.time_lapse_caption_font = (
+            self._font_state_for_boundary(row_index) if caption_data else None
+        )
         self.time_lapse_media_draw_frame = True
         metadata = try_read_photo_metadata(media_sidecar_path(path), path) or {}
         self._set_time_lapse_info_text(
@@ -14407,21 +14877,20 @@ class GPSTrackShowApp:
         if not isinstance(raw_place, str) or not raw_place.strip():
             raw_place = entry.place
         self.time_lapse_place_text = format_place_for_time_lapse(raw_place)
-        if self.time_lapse_stage is not None and self.time_lapse_stage.relation is not None:
-            latitude = safe_float(metadata.get("latitude"))
-            longitude = safe_float(metadata.get("longitude"))
-            if latitude is None or longitude is None:
-                latitude, longitude = entry.latitude, entry.longitude
-            self.time_lapse_media_marker_latlon = (
-                (latitude, longitude)
-                if latitude is not None and longitude is not None
-                else None
-            )
-        else:
-            self.time_lapse_media_marker_latlon = interpolate_timeline_point(
-                self.time_lapse_points,
-                self.time_lapse_progress,
-            )
+        latitude = safe_float(metadata.get("latitude"))
+        longitude = safe_float(metadata.get("longitude"))
+        if latitude is None or longitude is None:
+            latitude, longitude = entry.latitude, entry.longitude
+        self.time_lapse_media_marker_latlon = (
+            (latitude, longitude)
+            if latitude is not None and longitude is not None
+            else None
+        )
+        self.time_lapse_media_profile_state = photo_track_state_by_location(
+            self.current_track_metadata,
+            latitude,
+            longitude,
+        )
         self.time_lapse_media_remaining = max(0.1, delay)
         display_started = time.monotonic()
         self.time_lapse_media_deadline = None if self.manual_mode else display_started + self.time_lapse_media_remaining
@@ -14450,6 +14919,22 @@ class GPSTrackShowApp:
             if self.manual_mode and self.time_lapse_video_player is not None:
                 self.time_lapse_video_player.pause()
         return True
+
+    def _resume_after_deferred_time_lapse_media_start(self) -> None:
+        """Resume the appropriate stage scheduler after a directive pause."""
+        self.time_lapse_control_deferred = False
+        if self.time_lapse_stage is None or not (
+            self.time_lapse_active or self.standard_route_tracking_active
+        ):
+            return
+        if self.manual_mode or self.paused:
+            return
+        if self.time_lapse_stage.relation is not None:
+            self._schedule_special_time_lapse_advance(
+                self.time_lapse_media_remaining or self.config.duration
+            )
+        else:
+            self._schedule_time_lapse_tick(0.020)
 
     def _show_standard_route_tracking_media(
         self,
@@ -14490,7 +14975,10 @@ class GPSTrackShowApp:
             longitude,
             media_datetime,
         )
-        caption_data = self.caption_by_row.get(row_index)
+        caption_data = (
+            self._repeated_caption_for_row(row_index)
+            or self.caption_by_row.get(row_index)
+        )
         self._consume_pending_transition()
         target = WindowTarget(
             presenter_name="photo",
@@ -14514,7 +15002,9 @@ class GPSTrackShowApp:
             header_metrics=header_metrics,
             header_metadata=self.current_track_metadata,
             caption=caption_data[0] if caption_data else None,
-            caption_font=caption_data[1] if caption_data else None,
+            caption_font=(
+                self._font_state_for_boundary(row_index) if caption_data else None
+            ),
         )
         self.current_display_index = row_index
         self.pending_display_index = row_index
@@ -14901,6 +15391,67 @@ class GPSTrackShowApp:
             on_complete()
         return False
 
+    def _run_repeated_directives(
+        self,
+        row_index: int,
+        target: str,
+        continuation: Callable[[], None],
+    ) -> bool:
+        """Re-execute active generic repeat scopes before one display boundary."""
+        scopes = repeat_ranges_at_row(
+            getattr(self, "repeat_ranges", ()), int(row_index), target
+        )
+        if not scopes:
+            return False
+        self.active_caption_font = self._font_state_for_boundary(row_index)
+        position = 0
+
+        def process_next() -> None:
+            nonlocal position
+            while position < len(scopes):
+                scope = scopes[position]
+                position += 1
+                if scope.family in {"music", "play"}:
+                    self.music_controller.repeat_row(scope.source_row)
+                    continue
+                if scope.family == "narrator":
+                    self.narration_controller.repeat_row(scope.source_row)
+                    continue
+                if scope.family == "control":
+                    self._execute_control_actions(
+                        scope.directive,
+                        scope.source_row,
+                        on_complete=process_next,
+                    )
+                    return
+                # FONT has persistent normal semantics. CAPTION is selected
+                # when the compatible media target is assembled.
+            continuation()
+
+        process_next()
+        return True
+
+    def _font_state_for_boundary(self, row_index: int) -> CaptionFontState:
+        """Return persistent FONT state after active repeat scopes are reapplied."""
+        default = getattr(self, "default_caption_font", CaptionFontState(30.0, "bold", "System"))
+        state = getattr(self, "font_state_by_row", {}).get(int(row_index), default)
+        for scope in repeat_ranges_at_row(
+            getattr(self, "repeat_ranges", ()), int(row_index), "all"
+        ):
+            if scope.family == "font":
+                state = apply_caption_font_directive(state, scope.directive, default)
+        return state
+
+    def _repeated_caption_for_row(self, row_index: int):
+        scopes = repeat_ranges_at_row(
+            getattr(self, "repeat_ranges", ()), int(row_index), "media"
+        )
+        captions = [scope.directive for scope in scopes if scope.family == "caption"]
+        if not captions:
+            return None
+        directive = captions[-1]
+        return directive, self._font_state_for_boundary(row_index)
+
     def _advance(self) -> None:
         debug_print(self.config, f"Advance called at playlist index {self.playlist_index}")
         if not self.running:
@@ -15284,7 +15835,9 @@ class GPSTrackShowApp:
         photo_identity = str(photo_path.resolve())
         caption_data = self.caption_by_row.get(row_index)
         caption = caption_data[0] if caption_data else None
-        caption_font_state = caption_data[1] if caption_data else None
+        caption_font_state = (
+            self._font_state_for_boundary(row_index) if caption_data else None
+        )
 
         header_lines = selected_stage_header_lines(
             self.current_track_metadata,

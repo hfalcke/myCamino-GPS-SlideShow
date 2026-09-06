@@ -1,5 +1,29 @@
 # myCamino GPS Track Show Programmer Guide
 
+## Guided demo resources
+
+The packaged demo is stored under
+`demo/St-Jean-Pied-de-Port-to-Roncesvalles`. Build it reproducibly with
+`scripts/prepare_demo_assets.py`; the script extracts the named GPX track,
+selects still photographs from the corresponding control-file stage, converts
+them to 1920-pixel JPEGs at quality 82 in sRGB, retains only useful capture/GPS
+metadata, and writes a SHA-256/dimension manifest. The main PyInstaller spec
+bundles this directory. Distribution verification must run the script's
+`--verify` mode.
+
+`GuidedDemoCoordinator` creates a disposable temporary Adventure and wraps the
+existing workspace drop handlers. It must not implement a second metadata or
+control-file pipeline. Demo mode disables place names, weather, recent-project
+updates, and recovery snapshots. Completion stores a versioned `NSUserDefaults`
+choice; source launches never show the automatic offer.
+
+The Adventure Map's `CircularProgressView` consumes the same phase/current/total
+state used by workspace background processing. Determinate work is drawn as a
+clockwise pie sector and unknown totals as a rotating quarter sector. The
+Advanced Interface retains its horizontal `NSProgressIndicator`; producers must
+continue reporting through the existing progress callbacks rather than update
+either view directly.
+
 ## Media-Derived Tracks and Planning
 
 `media_metadata_service.py` is the shared sidecar-backed preparation boundary
@@ -40,6 +64,14 @@ Original project content is GPL-3.0-or-later, copyright 2026 Heino Falcke.
 repository-level declarations. New first-party source files should include
 `SPDX-License-Identifier: GPL-3.0-or-later`.
 
+`APP_STORE_DISTRIBUTION_EXCEPTION.md` grants a narrow GPL section 7 permission
+for official Apple App Store builds. `APP_STORE_EULA_DRAFT.md` is not active
+until its completion checklist and legal review are finished.
+`CONTRIBUTOR_AGREEMENT.md` preserves contributor ownership while granting the
+maintainer the relicensing rights needed for official App Store and possible
+future dual-licensed distributions. Signed copies are handled privately as
+described in `CONTRIBUTING.md`.
+
 `scripts/prepare_license_bundle.py` collects the exact Python runtime package
 versions and their supplied license files, locates the Python license, verifies
 the pinned FFmpeg source checksum, and creates an archive from the actual Git
@@ -49,6 +81,10 @@ mounts the completed DMG to verify required resources. Keep the explicit
 runtime distribution list synchronized with dependencies added to the
 PyInstaller specifications; a release intentionally fails if a required
 license cannot be found.
+
+The bundle preparation also fails when any first-party legal document is
+missing. `license_resources.py` is the single development/frozen lookup used
+by the main interface, Adventure Map, and standalone GPX Editor.
 
 This project is a native macOS/PyObjC workflow for building a GPS-aware photo
 and video slide show from one adventure: a project directory, one combined GPX
@@ -266,10 +302,14 @@ The GUI saves and loads them with:
 `adventure_files.py` validates and discovers format-2 files, sorts them by
 modification time, and implements transactional rename/copy operations. An
 empty directory remains active without an Adventure until its suggested or
-typed name is committed. After creation, `mark_dirty()` schedules a 500 ms coalesced auto-save. Discrete
-operations use the same path, while callers that need durability immediately
-flush it. `atomic_write_json(...)` writes and fsyncs a temporary sibling before
-`os.replace(...)`. `current_project_file`, `gpx_file`, `control_file`, and
+typed name is committed. In map-first Adventure mode, one workspace coordinator
+coalesces GPX, control-file, playlist, and parameter changes for two seconds.
+It saves changed referenced documents first and the `.adv` payload last; a
+one-second recovery snapshot protects the interval before the real-file save.
+The hosted Advanced Interface delegates its former 500 ms `.adv` autosave to
+that coordinator. Standalone GPX and control editors retain explicit Save and
+Revert behavior. `atomic_write_json(...)` and the GPX writer use temporary
+siblings followed by `os.replace(...)`. `current_project_file`, `gpx_file`, `control_file`, and
 `track_map_base` are authoritative. Adventure-name edits are never autosaved
 as ordinary text changes; committing them invokes Rename/Copy/Cancel.
 
@@ -789,7 +829,7 @@ Supported line types:
 - `#NARRATOR: target, $A - $D, ...`: finite narration selection on the retained
   narrator channel.
 - `#CONTROL: command, ...`: ordered non-display slide-show timing, style,
-  label, jump, pause, and end commands.
+  label, jump, pause, walker-time, and end commands.
 - `#CAPTION: command, ..., text`: a retained visual caption for the immediately
   following enabled image or video.
 - `#FONT: command, ...`: persistent partial caption/header font changes or
@@ -802,9 +842,24 @@ normalize case-insensitive `$LABEL` references, and reject malformed command
 syntax. `#CONTROL` labels are indexed once; duplicate labels warn and the first
 definition wins in direct-player launches. GetGeoLocations merge/sync and
 Adventure rename/copy and control-file maintenance preserve disabled rows and
-all four directive families without interpreting their payload as a map path.
+all directive families without interpreting their payload as a map path.
 The player precomputes caption targets and font state by model row so Start
 Here, resume, jumps, backward navigation, and Time-Lapse use identical state.
+
+`#REPEAT_UNTIL $LABEL` is parsed as a shared final modifier rather than as an
+action owned by one directive parser. `compile_repeat_ranges()` resolves its
+forward positional scope, and `DIRECTIVE_REPEAT_CAPABILITIES` requires every
+directive family to declare compatible display targets and forbidden transfer
+actions. Active ranges are reconstructed from the destination row, making
+jumps and resume deterministic. Repetition occurs at display boundaries, never
+at Time-Lapse animation ticks.
+
+Time-Lapse media queues retain control-file order. Their target fractions are
+made monotonically nondecreasing; missing, ignored, and past times therefore
+hold the walker rather than reorder or reverse it. SET_DATE and SET_TIME alter
+only this steering timestamp. The media marker uses the actual sidecar GPS
+coordinate, while the profile ring is omitted when no position within 150 m of
+the route can be established.
 
 The control-table window intercepts Command- and Control-C/X/V before row
 commands and sends them to the shared field editor whenever a cell is actively
@@ -1030,10 +1085,12 @@ height metrics. Every displayed medium marks its GPS position on the location
 map and overview. The location map uses the standard marker plus a fixed
 45-degree arrow. In both regular and media-only Time-Lapse stages, markers and
 arrows are drawn before the framed medium, so the medium may cover them. The
-editor writes a debounced recovery file and minute-spaced
-snapshots under `.mycamino-control-backups`; when a newer recovery file is
-found, reopening the table offers to restore it. Saving replaces the real list
-atomically and removes the active recovery file.
+standalone editor writes a debounced recovery file and minute-spaced snapshots
+under `.mycamino-control-backups`; when a newer recovery file is found,
+reopening the table offers to restore it. In Adventure mode, valid edits also
+auto-save the real list and media inventory through the shared workspace
+coordinator. Invalid intermediate directives remain recovery-only. Saving
+replaces the real list atomically and removes the active recovery file.
 
 `--time-lapse-duration SECONDS` controls active route motion and defaults to
 30 seconds. In time-lapse mode, the existing `--duration` setting is the
@@ -1173,7 +1230,7 @@ paths after playlist reordering and falls back to replaying preceding
 `#MUSIC:` directives when exact restoration is impossible.
 The control snapshot restores the effective media duration and playback style.
 
-Only checkpoint format version 4 is accepted. Older
+Only checkpoint format version 6 is accepted. Older
 `slideshow_resume_position` data and unsupported history entries are ignored
 and are omitted by the next Adventure save. Copying an Adventure clears its
 history; renaming preserves it. Natural completion neither adds a checkpoint
@@ -1453,7 +1510,11 @@ version in a generic User-Agent but no persistent client identifier or Adventure
 data. `cocoa_application_news.py` owns the process-wide asynchronous checker,
 local `NSUserDefaults` read state, first-arrival alert, Dock badge, retained News
 window, and native-menu entries. Automatic checks run at most once per 24 hours
-and can be disabled without disabling manual checks.
+and can be disabled without disabling manual checks. Attempts and successful
+connections use separate `NSUserDefaults` timestamps: an offline attempt does
+not retry on every startup, while the News window can still report the last
+successful contact. Retrieval has a three-second network timeout and always
+runs on a daemon worker; automatic failures create no alert or startup delay.
 
 The Django `ApplicationNews` model supplies the feed. Its stable slug is the
 client-visible identity; unpublished and future-dated rows are excluded. The

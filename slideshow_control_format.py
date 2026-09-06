@@ -7,6 +7,7 @@ import io
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 
 MUSIC_DIRECTIVE_PREFIX = "#MUSIC:"
@@ -59,6 +60,7 @@ class MusicAction:
 class MusicDirective:
     actions: tuple[MusicAction, ...]
     source: str = ""
+    repeat_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,7 @@ class AudioSelectionItem:
 class AudioSelectionDirective:
     items: tuple[AudioSelectionItem, ...]
     source: str = ""
+    repeat_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class ControlAction:
 class ControlDirective:
     actions: tuple[ControlAction, ...]
     source: str = ""
+    repeat_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class CaptionDirective:
     vertical: str = "bottom"
     horizontal: str = "center"
     source: str = ""
+    repeat_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +105,101 @@ class FontDirective:
     family: str | None = None
     reset: bool = False
     source: str = ""
+    repeat_until: str | None = None
+
+
+@dataclass(frozen=True)
+class RepeatRange:
+    source_row: int
+    end_row: int
+    family: str
+    directive: object
+
+
+DIRECTIVE_REPEAT_CAPABILITIES = {
+    "control": {
+        "targets": "all",
+        "commands": {
+            "label": False,
+            "goto": False,
+            "end": False,
+            "duration": True,
+            "transition": True,
+            "pause": True,
+            "set_time": True,
+            "set_date": True,
+            "ignore_time": True,
+        },
+    },
+    "music": {
+        "targets": "all",
+        "commands": {
+            "on": True,
+            "off": True,
+            "continue": True,
+            "loop_line": True,
+            "loop_one": True,
+            "loop_all": True,
+            "loop_album": True,
+            "volume_up": True,
+            "volume_down": True,
+            "volume": True,
+            "loop_range": True,
+            "target_label": True,
+            "target_path": True,
+            "jump": False,
+        },
+    },
+    "play": {"targets": "all", "commands": {"selection": True}},
+    "narrator": {"targets": "all", "commands": {"selection": True}},
+    "caption": {"targets": "media", "commands": {"caption": True}},
+    "font": {"targets": "all", "commands": {"font": True}},
+}
+
+
+def _validate_repeat_capability(
+    family,
+    command_kinds,
+    repeat_until,
+    error_type,
+    *,
+    enforce_repeatability=False,
+):
+    """Require explicit repeat policy for every parsed directive command."""
+    capabilities = DIRECTIVE_REPEAT_CAPABILITIES[family]["commands"]
+    for kind in command_kinds:
+        if kind not in capabilities:
+            raise AssertionError(
+                f"{family} command {kind!r} has no repeat capability declaration"
+            )
+        if enforce_repeatability and repeat_until and not capabilities[kind]:
+            label = "#GOTO/#JUMP" if kind in {"goto", "jump"} else f"#{kind.upper()}"
+            raise error_type(f"{label} cannot be used with #REPEAT_UNTIL")
+
+
+def _take_repeat_modifier(fields, error_type):
+    """Remove one final generic repeat modifier and return its label."""
+    matches = []
+    for index, field in enumerate(fields):
+        text = field[0] if isinstance(field, tuple) else field
+        match = re.fullmatch(r"#REPEAT_UNTIL\s+(\$\S+)", str(text).strip(), re.IGNORECASE)
+        if match:
+            matches.append((index, match))
+    if not matches:
+        return fields, None
+    if len(matches) != 1 or matches[0][0] != len(fields) - 1:
+        raise error_type("#REPEAT_UNTIL must appear once as the final comma-separated item")
+    try:
+        label = normalize_control_label(matches[0][1].group(1))
+    except ControlSyntaxError as exc:
+        raise error_type(str(exc)) from exc
+    return fields[:-1], label
+
+
+def _append_repeat(fields: list[str], repeat_until: str | None) -> list[str]:
+    if repeat_until:
+        fields.append(f"#REPEAT_UNTIL ${normalize_control_label(repeat_until)}")
+    return fields
 
 
 def split_disabled_control_line(line: str) -> tuple[bool, str]:
@@ -155,6 +255,7 @@ def _serialize_csv_fields(fields: list[str]) -> str:
 def parse_caption_parameters(parameters: str) -> CaptionDirective:
     """Parse placement commands and text following ``#CAPTION:``."""
     source, fields = _csv_fields(parameters, "#CAPTION", CaptionSyntaxError)
+    fields, repeat_until = _take_repeat_modifier(fields, CaptionSyntaxError)
     vertical = "bottom"
     horizontal = "center"
     text_value = None
@@ -183,7 +284,10 @@ def parse_caption_parameters(parameters: str) -> CaptionDirective:
     decoded = _decode_caption_text(text_value or "")
     if not decoded.strip():
         raise CaptionSyntaxError("#CAPTION requires non-empty text")
-    return CaptionDirective(decoded, vertical, horizontal, source)
+    _validate_repeat_capability(
+        "caption", ("caption",), repeat_until, CaptionSyntaxError
+    )
+    return CaptionDirective(decoded, vertical, horizontal, source, repeat_until)
 
 
 def parse_caption_directive(line: str) -> CaptionDirective | None:
@@ -202,14 +306,16 @@ def serialize_caption_parameters(directive: CaptionDirective) -> str:
         fields.append(f"#{directive.horizontal.upper()}")
     text = _encode_caption_text(directive.text)
     fields.append(text)
-    return _serialize_csv_fields(fields)
+    return _serialize_csv_fields(_append_repeat(fields, directive.repeat_until))
 
 
 def parse_font_parameters(parameters: str) -> FontDirective:
     """Parse partial persistent font changes following ``#FONT:``."""
     source, fields = _csv_fields(parameters, "#FONT", FontSyntaxError)
+    fields, repeat_until = _take_repeat_modifier(fields, FontSyntaxError)
     if len(fields) == 1 and fields[0].strip().upper() in {"#DEFAULT", "DEFAULT"}:
-        return FontDirective(reset=True, source=source)
+        _validate_repeat_capability("font", ("font",), repeat_until, FontSyntaxError)
+        return FontDirective(reset=True, source=source, repeat_until=repeat_until)
     size = None
     style = None
     family = None
@@ -237,7 +343,8 @@ def parse_font_parameters(parameters: str) -> FontDirective:
             raise FontSyntaxError(f"unknown or malformed font command: {token}")
     if size is None and style is None and family is None:
         raise FontSyntaxError("#FONT requires #SIZE, #STYLE, #FAMILY, or #DEFAULT")
-    return FontDirective(size, style, family, False, source)
+    _validate_repeat_capability("font", ("font",), repeat_until, FontSyntaxError)
+    return FontDirective(size, style, family, False, source, repeat_until)
 
 
 def parse_font_directive(line: str) -> FontDirective | None:
@@ -250,7 +357,7 @@ def parse_font_directive(line: str) -> FontDirective | None:
 
 def serialize_font_parameters(directive: FontDirective) -> str:
     if directive.reset:
-        return "#DEFAULT"
+        return ", ".join(_append_repeat(["#DEFAULT"], directive.repeat_until))
     fields = []
     if directive.size is not None:
         fields.append(f"#SIZE {float(directive.size):g}")
@@ -258,7 +365,7 @@ def serialize_font_parameters(directive: FontDirective) -> str:
         fields.append(f"#STYLE {directive.style.upper()}")
     if directive.family is not None:
         fields.append(f"#FAMILY {directive.family}")
-    return _serialize_csv_fields(fields)
+    return _serialize_csv_fields(_append_repeat(fields, directive.repeat_until))
 
 
 def normalize_playlist_label(value: object) -> str:
@@ -330,8 +437,14 @@ def parse_music_parameters(parameters: str) -> MusicDirective:
             raise MusicSyntaxError("#MUSIC must occupy one control-file line")
     except csv.Error as exc:
         raise MusicSyntaxError(f"invalid comma-separated music parameters: {exc}") from exc
+    fields, repeat_until = _take_repeat_modifier(fields, MusicSyntaxError)
+    if not fields:
+        raise MusicSyntaxError("#MUSIC requires a command before #REPEAT_UNTIL")
     actions = tuple(_parse_music_token(field) for field in fields)
-    return MusicDirective(actions, text)
+    _validate_repeat_capability(
+        "music", (action.kind for action in actions), repeat_until, MusicSyntaxError
+    )
+    return MusicDirective(actions, text, repeat_until)
 
 
 def parse_music_directive(line: str) -> MusicDirective | None:
@@ -419,9 +532,22 @@ def parse_audio_selection_parameters(parameters: str, directive: str) -> AudioSe
     if "\n" in text or "\r" in text:
         raise AudioSelectionSyntaxError(f"{directive} must occupy one control-file line")
     fields = _split_audio_selection_fields(text, directive)
+    fields, repeat_until = _take_repeat_modifier(fields, AudioSelectionSyntaxError)
+    if not fields:
+        raise AudioSelectionSyntaxError(
+            f"{directive} requires a selection before #REPEAT_UNTIL"
+        )
+    family = "play" if directive.upper().startswith("#PLAY") else "narrator"
+    _validate_repeat_capability(
+        family,
+        ("selection",),
+        repeat_until,
+        AudioSelectionSyntaxError,
+    )
     return AudioSelectionDirective(
         tuple(_parse_audio_selection_field(field, protected) for field, protected in fields),
         text,
+        repeat_until,
     )
 
 
@@ -496,6 +622,22 @@ def _parse_control_token(token: str) -> ControlAction:
     upper = text.upper()
     if upper == "#END":
         return ControlAction("end")
+    if upper == "#IGNORE_TIME":
+        return ControlAction("ignore_time")
+    match = re.fullmatch(r"#SET_TIME\s+(\d{1,2}:\d{2}(?::\d{2})?)", text, flags=re.IGNORECASE)
+    if match:
+        try:
+            value = datetime.strptime(match.group(1), "%H:%M:%S" if match.group(1).count(":") == 2 else "%H:%M").time()
+        except ValueError as exc:
+            raise ControlSyntaxError("#SET_TIME requires a valid 24-hour HH:MM[:SS] value") from exc
+        return ControlAction("set_time", value.isoformat())
+    match = re.fullmatch(r"#SET_DATE\s+(\d{4}-\d{2}-\d{2})", text, flags=re.IGNORECASE)
+    if match:
+        try:
+            value = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ControlSyntaxError("#SET_DATE requires a valid YYYY-MM-DD value") from exc
+        return ControlAction("set_date", value.isoformat())
     match = re.fullmatch(r"#LABEL\s+(\$\S+)", text, flags=re.IGNORECASE)
     if match:
         return ControlAction("label", normalize_control_label(match.group(1)))
@@ -529,8 +671,14 @@ def parse_control_parameters(parameters: str) -> ControlDirective:
             raise ControlSyntaxError("#CONTROL must occupy one control-file line")
     except csv.Error as exc:
         raise ControlSyntaxError(f"invalid comma-separated control parameters: {exc}") from exc
+    fields, repeat_until = _take_repeat_modifier(fields, ControlSyntaxError)
+    if not fields:
+        raise ControlSyntaxError("#CONTROL requires a command before #REPEAT_UNTIL")
     actions = tuple(_parse_control_token(field) for field in fields)
-    return ControlDirective(actions, text)
+    _validate_repeat_capability(
+        "control", (action.kind for action in actions), repeat_until, ControlSyntaxError
+    )
+    return ControlDirective(actions, text, repeat_until)
 
 
 def parse_control_directive(line: str) -> ControlDirective | None:
@@ -557,9 +705,15 @@ def serialize_control_parameters(directive: ControlDirective) -> str:
             fields.append(f"#PAUSE {float(action.value):g}")
         elif action.kind == "end":
             fields.append("#END")
+        elif action.kind == "set_time":
+            fields.append(f"#SET_TIME {action.value}")
+        elif action.kind == "set_date":
+            fields.append(f"#SET_DATE {action.value}")
+        elif action.kind == "ignore_time":
+            fields.append("#IGNORE_TIME")
         else:
             raise ControlSyntaxError(f"cannot serialize control action: {action.kind}")
-    return ", ".join(fields)
+    return ", ".join(_append_repeat(fields, directive.repeat_until))
 
 
 def is_control_directive(line: str) -> bool:
@@ -585,3 +739,123 @@ def control_labels(
             else:
                 labels[key] = row_index
     return labels, tuple(duplicates)
+
+
+def compile_repeat_ranges(
+    lines: list[str] | tuple[str, ...],
+    *,
+    strict: bool = True,
+    warning_callback=None,
+) -> tuple[RepeatRange, ...]:
+    """Compile positional repeat scopes, optionally skipping invalid direct input."""
+    labels = {}
+    duplicates = []
+    for row_index, line in enumerate(lines):
+        if is_disabled_control_line(line):
+            continue
+        try:
+            directive = parse_control_directive(line)
+        except ControlSyntaxError as exc:
+            if strict:
+                raise
+            if warning_callback is not None:
+                warning_callback(f"row {row_index + 1}: {exc}")
+            continue
+        for action in directive.actions if directive is not None else ():
+            if action.kind != "label":
+                continue
+            key = control_label_key(action.value)
+            if key in labels:
+                duplicates.append((str(action.value), labels[key], row_index))
+            else:
+                labels[key] = row_index
+    if duplicates:
+        label, first, duplicate = duplicates[0]
+        message = f"duplicate label ${label} in rows {first + 1} and {duplicate + 1}"
+        if strict:
+            raise ControlSyntaxError(message)
+        if warning_callback is not None:
+            warning_callback(message)
+    parsers = (
+        ("control", parse_control_directive),
+        ("music", parse_music_directive),
+        ("play", parse_play_directive),
+        ("narrator", parse_narrator_directive),
+        ("caption", parse_caption_directive),
+        ("font", parse_font_directive),
+    )
+    ranges = []
+    for row_index, line in enumerate(lines):
+        if is_disabled_control_line(line):
+            continue
+        for family, parser in parsers:
+            try:
+                directive = parser(line)
+            except (ControlSyntaxError, MusicSyntaxError, AudioSelectionSyntaxError, CaptionSyntaxError, FontSyntaxError) as exc:
+                if strict:
+                    raise
+                if warning_callback is not None:
+                    warning_callback(f"row {row_index + 1}: {exc}")
+                break
+            if directive is None:
+                continue
+            repeat_until = getattr(directive, "repeat_until", None)
+            if repeat_until:
+                command_kinds = (
+                    tuple(action.kind for action in directive.actions)
+                    if family in {"control", "music"}
+                    else (("selection",) if family in {"play", "narrator"} else (family,))
+                )
+                try:
+                    _validate_repeat_capability(
+                        family,
+                        command_kinds,
+                        repeat_until,
+                        {
+                            "control": ControlSyntaxError,
+                            "music": MusicSyntaxError,
+                            "play": AudioSelectionSyntaxError,
+                            "narrator": AudioSelectionSyntaxError,
+                            "caption": CaptionSyntaxError,
+                            "font": FontSyntaxError,
+                        }[family],
+                        enforce_repeatability=True,
+                    )
+                except (ControlSyntaxError, MusicSyntaxError, AudioSelectionSyntaxError, CaptionSyntaxError, FontSyntaxError) as exc:
+                    if strict:
+                        raise
+                    if warning_callback is not None:
+                        warning_callback(f"row {row_index + 1}: {exc}")
+                    break
+                target = labels.get(control_label_key(repeat_until))
+                if target is None:
+                    message = f"row {row_index + 1}: repeat label ${repeat_until} is not defined"
+                    if strict:
+                        raise ControlSyntaxError(message)
+                    if warning_callback is not None:
+                        warning_callback(message)
+                    break
+                if target <= row_index:
+                    message = f"row {row_index + 1}: repeat label ${repeat_until} must be forward"
+                    if strict:
+                        raise ControlSyntaxError(message)
+                    if warning_callback is not None:
+                        warning_callback(message)
+                    break
+                ranges.append(RepeatRange(row_index, target, family, directive))
+            break
+    return tuple(ranges)
+
+
+def repeat_ranges_at_row(
+    ranges: tuple[RepeatRange, ...] | list[RepeatRange],
+    row_index: int,
+    target: str,
+) -> tuple[RepeatRange, ...]:
+    """Return active ranges in source order for one display boundary."""
+    return tuple(
+        item
+        for item in ranges
+        if item.source_row < int(row_index) < item.end_row
+        and DIRECTIVE_REPEAT_CAPABILITIES[item.family]["targets"] in {"all", target}
+    )

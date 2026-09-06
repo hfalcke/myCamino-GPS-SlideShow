@@ -16,6 +16,7 @@ from application_metadata import APP_VERSION
 NEWS_FEED_URL = "https://mycamino.heinofalcke.de/api/app-news/v1/"
 NEWS_WEBSITE_URL = "https://mycamino.heinofalcke.de/"
 NEWS_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+NEWS_CONNECT_TIMEOUT_SECONDS = 3.0
 MAX_FEED_BYTES = 512 * 1024
 
 
@@ -85,7 +86,9 @@ def parse_news_feed(payload: bytes | str) -> tuple[ApplicationNewsItem, ...]:
     )
 
 
-def retrieve_news_feed(timeout_seconds: float = 8.0) -> tuple[ApplicationNewsItem, ...]:
+def retrieve_news_feed(
+    timeout_seconds: float = NEWS_CONNECT_TIMEOUT_SECONDS,
+) -> tuple[ApplicationNewsItem, ...]:
     """Retrieve the feed without sending an installation or project identifier."""
     request = Request(
         NEWS_FEED_URL,

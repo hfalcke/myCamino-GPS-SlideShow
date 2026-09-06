@@ -237,6 +237,9 @@ def render_inventory(base_notice: str, inventory: list[dict[str, str]]) -> str:
 def prepare_bundle(root: Path, output: Path, ffmpeg_source: Path) -> dict[str, Path]:
     required = [
         root / "LICENSE",
+        root / "APP_STORE_DISTRIBUTION_EXCEPTION.md",
+        root / "APP_STORE_EULA_DRAFT.md",
+        root / "CONTRIBUTOR_AGREEMENT.md",
         root / "COPYRIGHT",
         root / "THIRD_PARTY_NOTICES.md",
         root / "SOURCE_CODE.md",
@@ -267,6 +270,18 @@ def prepare_bundle(root: Path, output: Path, ffmpeg_source: Path) -> dict[str, P
     shutil.copy2(root / "vendor" / "ffmpeg" / "README.txt", ffmpeg_dir)
 
     shutil.copy2(root / "LICENSE", project_dir / "GPL-3.0.txt")
+    shutil.copy2(
+        root / "APP_STORE_DISTRIBUTION_EXCEPTION.md",
+        project_dir / "App Store Distribution Exception.txt",
+    )
+    shutil.copy2(
+        root / "APP_STORE_EULA_DRAFT.md",
+        project_dir / "App Store EULA Draft.txt",
+    )
+    shutil.copy2(
+        root / "CONTRIBUTOR_AGREEMENT.md",
+        project_dir / "Contributor Agreement.txt",
+    )
     shutil.copy2(root / "COPYRIGHT", project_dir / "COPYRIGHT.txt")
     notice = render_inventory(
         (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8"), inventory

@@ -43,8 +43,6 @@ from AppKit import (
     NSMenuItem,
     NSOpenPanel,
     NSPopUpButton,
-    NSProgressIndicator,
-    NSProgressIndicatorStyleSpinning,
     NSScrollView,
     NSShadow,
     NSShadowAttributeName,
@@ -68,6 +66,7 @@ from adventure_files import (
     discover_adventure_candidates,
     filename_base,
     load_adventure,
+    validate_adventure_payload,
 )
 from adventure_map_workspace import (
     MediaMapItem,
@@ -101,10 +100,15 @@ from cocoa_native_menus import (
     menu_item,
 )
 from cocoa_application_news import install_application_news
+from cocoa_circular_progress import CircularProgressView
+from cocoa_guided_demo import GuidedDemoCoordinator, is_guided_demo_recovery
+from cocoa_help_document import show_help_document
 from cocoa_parameter_editor import CocoaParameterEditor
+from demo_resources import demo_prepared_render_parameters, install_demo_prepared_assets
 from control_media_inventory import (
     build_control_media_inventory_payload,
     classify_project_media,
+    control_media_inventory_path,
     load_control_media_inventory,
     mark_imported_media,
     write_control_media_inventory,
@@ -121,6 +125,11 @@ from license_resources import read_license_document
 from media_metadata_service import media_paths_from_control_file, prepare_media_records
 from plot_metadata_utils import media_sidecar_freshness, media_sidecar_path, validate_media_sidecar
 from project_media_watcher import ProjectMediaWatcher
+
+
+def adventure_autosave_delays(has_saved_adventure: bool) -> tuple[float, float | None]:
+    """Return recovery and real-file debounce delays for a workspace mutation."""
+    return 1.0, 2.0 if has_saved_adventure else None
 
 
 MEDIA_EXTENSIONS = {
@@ -159,10 +168,11 @@ def _atomic_write_text(path: Path, text: str):
 
 
 class _JournalWriter:
-    def __init__(self, journal, phase):
+    def __init__(self, journal, phase, line_callback=None):
         self.journal = journal
         self.phase = phase
         self.pending = ""
+        self.line_callback = line_callback
 
     def write(self, value):
         self.pending += str(value)
@@ -170,36 +180,16 @@ class _JournalWriter:
             line, self.pending = self.pending.split("\n", 1)
             if line.strip():
                 self.journal.append(line, phase=self.phase)
+                if self.line_callback is not None:
+                    self.line_callback(line)
         return len(str(value))
 
     def flush(self):
         if self.pending.strip():
             self.journal.append(self.pending, phase=self.phase)
+            if self.line_callback is not None:
+                self.line_callback(self.pending)
         self.pending = ""
-
-
-class WorkspaceProgressIndicator(NSProgressIndicator):
-    def initWithFrame_owner_(self, frame, owner):
-        self = objc.super(WorkspaceProgressIndicator, self).initWithFrame_(frame)
-        if self is not None:
-            self.owner = owner
-        return self
-
-    def mouseDown_(self, event):
-        self.owner.showProcessingDetails_(None)
-
-    def rightMouseDown_(self, event):
-        from AppKit import NSMenu, NSMenuItem
-        menu = NSMenu.alloc().initWithTitle_("Processing")
-        for title, action in (
-            ("Show Processing Details", "showProcessingDetails:"),
-            ("Cancel Current Operation", "cancelCurrentOperation:"),
-            ("Reveal Log File", "revealLogFile:"),
-        ):
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
-            item.setTarget_(self.owner)
-            menu.addItem_(item)
-        NSMenu.popUpContextMenu_withEvent_forView_(menu, event, self)
 
 
 class AdventureMapController(NSObject):
@@ -238,6 +228,7 @@ class AdventureMapController(NSObject):
         self.plot_view = None
         self.window = None
         self.full_gui_controller = None
+        self.retired_full_gui_controllers = []
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="mycamino-workspace")
         self.cancel_event = threading.Event()
         self.processing_generation = 0
@@ -265,6 +256,10 @@ class AdventureMapController(NSObject):
         self.recovery_dirty = False
         self.recovery_debounce_timer = None
         self.recovery_periodic_timer = None
+        self.workspace_autosave_timer = None
+        self.workspace_autosave_generation = 0
+        self.workspace_autosave_in_progress = False
+        self.workspace_dirty_components: set[str] = set()
         self.journal = ProcessingJournal(self.recovery.directory / "logs")
         self.journal_window = None
         self.journal_text = None
@@ -279,7 +274,10 @@ class AdventureMapController(NSObject):
         self.startup_post_track_work_pending = False
         self.startup_pending_media_paths: set[Path] = set()
         self.document_windows = {}
+        self.recent_adventure_menu = None
         self.help_window = None
+        self.demo_mode = False
+        self.demo_coordinator = None
         self.gpx_controller = GPXEditorController.alloc().initStandalone_(False)
         self.gpx_controller.adventure_workspace_delegate = self
         self.gpx_controller.on_initial_load_complete_callback = self._tracks_loaded
@@ -348,11 +346,9 @@ class AdventureMapController(NSObject):
             container.addSubview_(view)
         finally:
             view.reparenting_for_adventure_workspace = False
-        self.progress_indicator = WorkspaceProgressIndicator.alloc().initWithFrame_owner_(
-            NSMakeRect(old_bounds.size.width - 30, old_bounds.size.height - 30, 20, 20), self
+        self.progress_indicator = CircularProgressView.alloc().initWithFrame_owner_(
+            NSMakeRect(old_bounds.size.width - 40, old_bounds.size.height - 40, 30, 30), self
         )
-        self.progress_indicator.setStyle_(NSProgressIndicatorStyleSpinning)
-        self.progress_indicator.setDisplayedWhenStopped_(False)
         self.progress_indicator.setAutoresizingMask_(1 << 0 | 1 << 4)
         container.addSubview_(self.progress_indicator)
         self.progress_label = NSTextField.labelWithString_("")
@@ -361,6 +357,11 @@ class AdventureMapController(NSObject):
         self.progress_label.setDrawsBackground_(False)
         self.progress_label.setBezeled_(False)
         self.progress_label.setTextColor_(NSColor.whiteColor())
+        progress_shadow = NSShadow.alloc().init()
+        progress_shadow.setShadowColor_(NSColor.blackColor().colorWithAlphaComponent_(0.95))
+        progress_shadow.setShadowOffset_(NSMakeSize(1.0, -1.0))
+        progress_shadow.setShadowBlurRadius_(4.0)
+        self.progress_label.setShadow_(progress_shadow)
         self.progress_label.setAutoresizingMask_(1 << 0 | 1 << 4)
         container.addSubview_(self.progress_label)
         window.setContentView_(container)
@@ -396,6 +397,8 @@ class AdventureMapController(NSObject):
 
     def validateMenuItem_(self, item):
         action = str(item.action() or "")
+        if self.full_gui_controller is not None:
+            self._synchronize_control_file_from_full_gui()
         has_project = self.project_directory is not None
         has_tracks = bool(self.gpx_controller.tracks)
         has_selection = bool(self.gpx_controller.selected_tracks())
@@ -667,6 +670,11 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def load_adventure_path(self, path: Path):
+        if self.adventure_file is not None and (
+            self.workspace_dirty_components or self.gpx_controller.dirty
+        ):
+            if not self._flush_workspace_autosave(show_errors=True):
+                return
         self._stop_media_watcher()
         self.startup_track_loading = False
         self.startup_media_scan_deferred = False
@@ -678,6 +686,11 @@ class AdventureMapController(NSObject):
         except AdventureFormatError as exc:
             self._alert("Could not load Adventure.", str(exc))
             return
+        if self.workspace_autosave_timer is not None:
+            self.workspace_autosave_timer.invalidate()
+            self.workspace_autosave_timer = None
+        self.workspace_dirty_components.clear()
+        self.recovery_dirty = False
         self.adventure_file = record.path
         self.overview_viewport = None
         self.track_viewports.clear()
@@ -685,6 +698,8 @@ class AdventureMapController(NSObject):
         self.adventure_payload = dict(record.payload)
         self.project_directory = record.path.parent
         self.adventure_name = record.project_name
+        self.demo_mode = bool(record.payload.get("guided_demo", False))
+        self._remember_recent_adventure(self.project_directory)
         self.control_file = self.project_directory / str(record.payload.get("control_file", ""))
         self.temporary_control_model = not self.control_file.is_file()
         self.parameters = normalize_parameters(record.payload.get("parameters") or {})
@@ -1024,10 +1039,14 @@ class AdventureMapController(NSObject):
         generation = self.processing_generation = self.processing_generation + 1
         self._journal("Metadata", f"Preparing {len(paths)} media file(s).")
         self._set_progress("Metadata", 0, len(paths))
-        def progress(current, total, name):
+        def phase_progress(phase, current, total, name=""):
             if generation != self.processing_generation:
                 return
-            self.performSelectorOnMainThread_withObject_waitUntilDone_("applyProgress:", ("Metadata", current, total, name), False)
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "applyProgress:", (phase, current, total, name), False
+            )
+        def progress(current, total, name):
+            phase_progress("Extracting coordinates", current, total, name)
         parameters = dict(self.parameters)
         def prepare_and_enrich():
             summary_path = None
@@ -1047,9 +1066,36 @@ class AdventureMapController(NSObject):
                     parameters.get("locations.reuse_radius_m", 150.0)
                 ),
                 progress_callback=progress,
+                detail_callback=lambda message: self._journal("Metadata", message),
                 cancel_event=self.cancel_event,
             )
             usable_paths = [item.path for item in prepared if item.record is not None]
+            if usable_paths and bool(parameters.get("weather.enabled", False)):
+                from historical_weather import WeatherOptions, enrich_media_weather
+                from map_provider_utils import read_provider_credential
+                access = str(parameters.get("weather.access", "free")).casefold()
+                credential = str(parameters.get("weather.credential_id", "default"))
+                self._journal("Historical Weather", f"Checking {len(usable_paths)} new media file(s).")
+                weather_report = enrich_media_weather(
+                    usable_paths,
+                    options=WeatherOptions(
+                        access="customer" if access == "customer" else "free",
+                        api_key=read_provider_credential("open-meteo", credential) if access == "customer" else "",
+                        timeout_seconds=float(parameters.get("weather.timeout_seconds", 20.0)),
+                        minimum_request_interval_seconds=0.2 if access == "customer" else 1.0,
+                    ),
+                    progress_callback=lambda current, total, name: phase_progress(
+                        "Historical weather", current, total, name
+                    ),
+                    detail_callback=lambda message: self._journal("Historical Weather", message),
+                    cancel_event=self.cancel_event,
+                )
+                self._journal(
+                    "Historical Weather",
+                    f"Complete: {weather_report.updated} downloaded, "
+                    f"{weather_report.reused} reused, {weather_report.current} already current, "
+                    f"{weather_report.failed + weather_report.unavailable} unavailable.",
+                )
             if usable_paths and bool(parameters.get("locations.add_place_names", True)):
                 from GetGeoLocations import run_with_options
                 self._journal("Place Names", f"Checking {len(usable_paths)} new media file(s).")
@@ -1060,26 +1106,12 @@ class AdventureMapController(NSObject):
                     infer_gps_from_tracks=False,
                     photonames=",".join(path.name for path in usable_paths),
                     distance=float(parameters.get("locations.reuse_radius_m", 150.0)),
+                    progress_callback=lambda current, total, name: phase_progress(
+                        "Place names", current, total, name
+                    ),
                     cancel_event=self.cancel_event,
                     stdout=_JournalWriter(self.journal, "Place Names"),
                     stderr=_JournalWriter(self.journal, "Place Names"),
-                )
-            if usable_paths and bool(parameters.get("weather.enabled", False)):
-                from historical_weather import WeatherOptions, enrich_media_weather
-                from map_provider_utils import read_provider_credential
-                access = str(parameters.get("weather.access", "free")).casefold()
-                credential = str(parameters.get("weather.credential_id", "default"))
-                self._journal("Historical Weather", f"Checking {len(usable_paths)} new media file(s).")
-                enrich_media_weather(
-                    usable_paths,
-                    options=WeatherOptions(
-                        access="customer" if access == "customer" else "free",
-                        api_key=read_provider_credential("open-meteo", credential) if access == "customer" else "",
-                        timeout_seconds=float(parameters.get("weather.timeout_seconds", 20.0)),
-                        minimum_request_interval_seconds=0.2 if access == "customer" else 1.0,
-                    ),
-                    detail_callback=lambda message: self._journal("Historical Weather", message),
-                    cancel_event=self.cancel_event,
                 )
             return prepared
         future = self.executor.submit(prepare_and_enrich)
@@ -1140,12 +1172,12 @@ class AdventureMapController(NSObject):
         if hasattr(self, "progress_indicator"):
             if self.background_progress:
                 phase, current, total = next(reversed(self.background_progress.values()))
-                self.progress_indicator.startAnimation_(None)
+                self.progress_indicator.setProgress_current_total_(True, current, total)
                 self.progress_label.setStringValue_(
                     f"{phase} {current}/{total}" if total else phase
                 )
             else:
-                self.progress_indicator.stopAnimation_(None)
+                self.progress_indicator.setProgress_current_total_(False, 0, 0)
                 self.progress_label.setStringValue_("")
 
     @objc.python_method
@@ -1790,10 +1822,7 @@ class AdventureMapController(NSObject):
             return
         self.adventure_payload["weather_consent"] = self.weather_consent
         self.adventure_payload["parameters"] = parameter_payload(self.parameters)
-        try:
-            atomic_write_json(self.adventure_file, self.adventure_payload)
-        except OSError as exc:
-            self._journal("Weather", f"Could not save the weather choice: {exc}")
+        self.adventureComponentDidChange_("adventure")
 
     @objc.python_method
     def _request_initial_weather_choice(self):
@@ -1865,53 +1894,39 @@ class AdventureMapController(NSObject):
                 controller.reviewDiscoveredMediaPaths_(paths)
             return
 
-        # Build the same stage plan used by map generation, but serialize it
-        # directly so this automatic path performs no rendering or tile access.
-        from GetGeoLocations import project_control_plan_text, project_map_plan_from_sidecars
-
         base = filename_base(self.adventure_name)
         self.control_file = self.project_directory / f"{base}-sorted.lst"
-        summary_candidate = (
-            self.project_directory / "trackimages" / f"{base}-summary.json"
-        )
-        plan = project_map_plan_from_sidecars(
-            self.project_directory,
-            self.control_file,
-            tracks_summary_path=summary_candidate if summary_candidate.is_file() else None,
-            sort_date_sections_by_tracks=(
-                str(self.parameters.get("trackmaps.ordering", "track_number"))
-                == "track_number"
-            ),
-            media_map_options={
-                "output_dir": str(self.project_directory / "trackimages"),
-                "filename_base": base,
-            },
-            infer_gps_from_tracks=summary_candidate.is_file(),
-            place_equivalence_m=float(
-                self.parameters.get("locations.reuse_radius_m", 150.0)
-            ),
-        )
-        _atomic_write_text(self.control_file, project_control_plan_text(plan))
-        self._load_control_rows()
-        self.saveWorkspace_(None)
-        if self.control_file is None or not self.control_file.is_file():
+        if isinstance(self.adventure_payload, dict):
+            self.adventure_payload["control_file"] = self.control_file.name
+        controller = self._ensure_full_gui(show_window=False)
+        if controller is None:
             self.pending_control_media.update(paths)
             return
-        inventory = load_control_media_inventory(self.control_file)
-        included = [
-            str(row.get("name", ""))
-            for row in self.control_rows
-            if str(row.get("type", "")).upper() in {"IMG", "VID"}
-            and not bool(row.get("disabled", False))
-        ]
-        payload = build_control_media_inventory_payload(
-            inventory,
-            self._project_media_paths(),
-            included,
-            control_text=self.control_file.read_text(encoding="utf-8"),
-        )
-        write_control_media_inventory(payload, inventory.path)
-        self.openControlFile_(None)
+        controller.pending_imported_media_for_control_update = [str(path) for path in paths]
+        controller.assistant_control_skip_maps = bool(self.demo_mode)
+        controller.assistant_control_replace_without_confirmation = bool(self.demo_mode)
+        self._journal("Maps", "Preparing all required maps before creating the control file.")
+        controller._start_assistant_control_assets_creation()
+
+    @objc.python_method
+    def controlAssetsCreationDidFinish_success_(self, success):
+        """Receive completion from the shared Maps-to-Control-File pipeline."""
+        controller = self.full_gui_controller
+        if not bool(success) or controller is None:
+            self._journal(
+                "Control File",
+                "The control file was not created because required maps are unavailable.",
+            )
+            return
+        control_path = controller._control_file_path()
+        if control_path is None or not control_path.is_file():
+            return
+        self.control_file = Path(control_path).resolve(strict=False)
+        self.temporary_control_model = False
+        self._load_control_rows()
+        self.saveWorkspace_(None)
+        if self.demo_coordinator is not None:
+            self.demo_coordinator.controlFileDidOpen()
 
     def performWorkspaceDrop_(self, raw_paths):
         paths = [Path(str(path)).expanduser().resolve(strict=False) for path in raw_paths]
@@ -1928,12 +1943,28 @@ class AdventureMapController(NSObject):
         audio_paths = [path for path in paths if path.suffix.casefold() in AUDIO_EXTENSIONS]
         media_paths = self._expand_media_paths([path for path in paths if path not in gpx_paths + control_paths + audio_paths])
         if gpx_paths:
+            if len(self.gpx_controller.tracks) == 1 and not self.gpx_controller.tracks[0].points():
+                self.gpx_controller.tracks = []
+                self.gpx_controller.next_nr = 1
             self.gpx_controller.load_gpx_paths(
                 gpx_paths,
                 mark_dirty=True,
                 offer_sort_after_drop=True,
             )
-            self.workspaceDocumentDidChange_("Tracks added")
+            # The staged loader has already installed the parsed TrackRecords.
+            # Mark the GPX component explicitly so delayed autosave replaces the
+            # initial empty New Track document rather than saving only the .adv.
+            self.adventureComponentDidChange_("gpx")
+            if self.demo_coordinator is not None:
+                # Advance the guide immediately.  Demo persistence uses the
+                # shared delayed autosave and must not hold the Finder step
+                # behind GPX metrics/cache writing.
+                self.demo_coordinator.workspaceDidDropGPX(gpx_paths)
+            if (self.adventure_file is None or self.demo_mode) and any(
+                track.points() for track in self.gpx_controller.tracks
+            ):
+                if not self.demo_mode:
+                    self.saveWorkspace_(None)
         if control_paths:
             self.control_file = control_paths[0]
             self.temporary_control_model = False
@@ -1965,6 +1996,7 @@ class AdventureMapController(NSObject):
         panel = NSOpenPanel.openPanel()
         panel.setCanChooseDirectories_(True)
         panel.setCanChooseFiles_(False)
+        panel.setCanCreateDirectories_(True)
         panel.setPrompt_("Use Adventure Folder")
         if source is not None:
             directory = source if source.is_dir() else source.parent
@@ -1990,7 +2022,10 @@ class AdventureMapController(NSObject):
                 target = self.project_directory / f"{source.stem}-{counter}{source.suffix}"
                 counter += 1
             if not target.exists():
+                self._journal("Media Import", f"Copying {source.name} to the Adventure.")
                 shutil.copy2(source, target)
+            else:
+                self._journal("Media Import", f"Using existing Adventure file {target.name}.")
             result.append(target)
         return result
 
@@ -1998,9 +2033,12 @@ class AdventureMapController(NSObject):
     def _handle_media_drop(self, paths):
         alert = NSAlert.alloc().init()
         alert.setMessageText_(f"Use {len(paths)} dropped media file(s)")
-        alert.setInformativeText_("Create or extend a GPS track from their locations, or add them to the slide show. Metadata is prepared in the background.")
-        alert.addButtonWithTitle_("Create or Extend Track")
+        alert.setInformativeText_(
+            "Add the media to the slide show, or use their GPS locations to create or extend a track. "
+            "For the guided demo, choose Add to Slide Show. Metadata is prepared in the background."
+        )
         alert.addButtonWithTitle_("Add to Slide Show")
+        alert.addButtonWithTitle_("Create or Extend Track")
         alert.addButtonWithTitle_("Cancel")
         response = int(alert.runModal())
         if response == 1002:
@@ -2012,7 +2050,43 @@ class AdventureMapController(NSObject):
             if not self._request_initial_weather_choice():
                 return
         imported = self._import_media_files(paths)
-        if response == 1001:
+        if self.demo_mode and self.demo_coordinator is not None:
+            try:
+                self._set_progress("Loading bundled metadata and maps", 0, 1)
+                demo_asset_name = filename_base(
+                    self.adventure_file.stem
+                    if self.adventure_file is not None
+                    else self.adventure_name
+                )
+                installed = install_demo_prepared_assets(
+                    self.demo_coordinator.inputs_directory,
+                    self.project_directory,
+                    demo_asset_name,
+                )
+                rendered_with = demo_prepared_render_parameters(
+                    self.demo_coordinator.inputs_directory
+                )
+                self.parameters.update(
+                    (key, value) for key, value in rendered_with.items() if key in self.parameters
+                )
+                self._journal(
+                    "Preparing metadata",
+                    f"Reused {installed['sidecars']} bundled metadata sidecar(s); no media extraction was needed.",
+                )
+                self._journal(
+                    "Loading place names and weather",
+                    "Reused bundled place names and historical weather; no network request was made.",
+                )
+                self._journal(
+                    "Preparing maps",
+                    f"Reused {installed['map_assets']} bundled map asset(s); no tiles were requested.",
+                )
+                self._set_progress("Loading bundled metadata and maps", 1, 1)
+            except OSError as exc:
+                self._journal("Demo", f"Could not load bundled offline assets: {exc}")
+                self._alert("The offline demo assets are incomplete.", str(exc))
+                return
+        if response == 1000:
             self.pending_control_media.update(imported)
             if self.control_file is not None and self.control_file.is_file():
                 try:
@@ -2023,7 +2097,7 @@ class AdventureMapController(NSObject):
                         f"Could not record import timestamps: {exc}",
                     )
         self.queue_media_processing(imported)
-        if response == 1000:
+        if response == 1001:
             self.gpx_controller.media_context["_pending_media_paths"] = [str(path) for path in imported]
             self.gpx_controller.media_context["_skip_media_selection_once"] = True
             self.gpx_controller.addTracksFromPhotos_(None)
@@ -2032,6 +2106,8 @@ class AdventureMapController(NSObject):
                 "Media Import",
                 f"Copied {len(imported)} media file(s); preparing them before control-file review.",
             )
+            if self.demo_coordinator is not None:
+                self.demo_coordinator.workspaceDidAcceptSlideShowMedia(imported)
 
     @objc.python_method
     def _create_adventure_for_media_drop(self):
@@ -2091,12 +2167,233 @@ class AdventureMapController(NSObject):
         self.workspaceDocumentDidChange_("Audio added")
 
     def workspaceDocumentDidChange_(self, _message):
+        self.adventureComponentDidChange_("workspace")
+
+    def adventureComponentDidChange_(self, component):
+        """Debounce real Adventure saves while retaining crash recovery."""
+        name = str(component or "workspace")
+        self.workspace_dirty_components.add(name)
+        self.workspace_autosave_generation += 1
         self.recovery_dirty = True
+        recovery_delay, autosave_delay = adventure_autosave_delays(
+            self.adventure_file is not None and self.project_directory is not None
+        )
         if self.recovery_debounce_timer is not None:
             self.recovery_debounce_timer.invalidate()
         self.recovery_debounce_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            2.0, self, "writeRecovery:", None, False
+            recovery_delay, self, "writeRecovery:", None, False
         )
+        if self.workspace_autosave_timer is not None:
+            self.workspace_autosave_timer.invalidate()
+        if autosave_delay is not None:
+            self.workspace_autosave_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                autosave_delay, self, "performWorkspaceAutosave:", None, False
+            )
+
+    @objc.IBAction
+    def performWorkspaceAutosave_(self, _sender):
+        self.workspace_autosave_timer = None
+        self._flush_workspace_autosave(show_errors=False)
+
+    @objc.python_method
+    def _flush_workspace_autosave(self, *, show_errors=True, force=False):
+        if self.workspace_autosave_in_progress:
+            return False
+        if self.project_directory is None or self.adventure_file is None:
+            return not self.workspace_dirty_components
+        components = set(self.workspace_dirty_components)
+        if force:
+            components.update({"gpx", "control", "adventure"})
+        if not components and not self.gpx_controller.dirty:
+            return True
+        generation = self.workspace_autosave_generation
+        self.workspace_autosave_in_progress = True
+        failures = []
+        saved_components = set()
+        try:
+            self._set_background_progress("workspace-save", "Saving Adventure", 0, 1)
+            controller = self.full_gui_controller
+            if controller is not None:
+                if controller.current_project_dir is not None:
+                    self.project_directory = Path(controller.current_project_dir)
+                if controller.current_project_file is not None:
+                    self.adventure_file = Path(controller.current_project_file)
+                self.adventure_name = controller._current_project_name()
+                current_control = controller._control_file_path()
+                if current_control is not None:
+                    self.control_file = current_control
+            if controller is not None and controller.control_table_dirty:
+                if controller._save_control_table_changes(show_errors=show_errors):
+                    self.control_file = controller.control_table_path
+                    self.control_rows = copy.deepcopy(controller.control_table_rows)
+                    saved_components.add("control")
+                else:
+                    failures.append("control file contains invalid or unsavable changes")
+            elif controller is not None and "control" in components:
+                if controller.control_table_path is not None:
+                    self.control_file = controller.control_table_path
+                    self.control_rows = copy.deepcopy(controller.control_table_rows)
+                saved_components.add("control")
+            elif "control" in components and self.temporary_control_model:
+                # Temporary rows are a review model, not a playable control
+                # file. Only the combined Maps-to-Control pipeline may install
+                # the initial .lst after its assets have been validated.
+                saved_components.add("control")
+            elif "control" in components and self.control_rows:
+                try:
+                    serialize = _main_gui_module().serialize_slideshow_control_row
+                    control_path = self.control_file or self.project_directory / f"{filename_base(self.adventure_name)}-sorted.lst"
+                    _atomic_write_text(
+                        control_path,
+                        "\n".join(serialize(row) for row in self.control_rows) + "\n",
+                    )
+                    control_text = control_path.read_text(encoding="utf-8")
+                    inventory = load_control_media_inventory(control_path)
+                    inventory_payload = build_control_media_inventory_payload(
+                        inventory,
+                        [item.path for item in self.media_items],
+                        [
+                            str(row.get("name", ""))
+                            for row in self.control_rows
+                            if str(row.get("type", "")).upper() in {"IMG", "VID"}
+                        ],
+                        control_text=control_text,
+                    )
+                    write_control_media_inventory(
+                        inventory_payload,
+                        control_media_inventory_path(control_path),
+                    )
+                    self.control_file = control_path
+                    saved_components.add("control")
+                except OSError as exc:
+                    failures.append(f"control file: {exc}")
+            elif "control" in components:
+                saved_components.add("control")
+
+            if "gpx" in components or self.gpx_controller.dirty:
+                try:
+                    gpx_path = self.project_directory / f"{filename_base(self.adventure_name)}.gpx"
+                    if force:
+                        self.gpx_controller.save_to_path(gpx_path)
+                    else:
+                        self.gpx_controller.write_gpx_file(gpx_path)
+                        self.gpx_controller.set_output_path(gpx_path)
+                        self.gpx_controller.dirty = False
+                        self.gpx_controller.set_status(
+                            f"Auto-saved {len(self.gpx_controller.tracks)} track(s) to {gpx_path}."
+                        )
+                    saved_components.add("gpx")
+                except OSError as exc:
+                    failures.append(f"GPX file: {exc}")
+
+            if controller is not None:
+                payload = dict(controller._collect_project_payload())
+                self.parameters = normalize_parameters(controller.parameters)
+                self.weather_consent = controller.weather_consent
+            else:
+                payload = dict(self.adventure_payload or {})
+            base = filename_base(self.adventure_name)
+            control_path = self.control_file or self.project_directory / f"{base}-sorted.lst"
+            payload.update({
+                "adventure_format_version": 2,
+                "project_name": base,
+                "project_directory": str(self.project_directory),
+                "gpx_file": f"{base}.gpx",
+                "control_file": control_path.name,
+                "track_map_base": base,
+                "parameters": parameter_payload(self.parameters),
+                "weather_consent": self.weather_consent,
+                "guided_demo": bool(self.demo_mode),
+            })
+            adventure_components = components - {"gpx", "control"}
+            adventure_needs_save = (
+                force
+                or bool(adventure_components)
+                or payload != (self.adventure_payload or {})
+            )
+            if adventure_needs_save and not failures:
+                try:
+                    validate_adventure_payload(payload, self.adventure_file)
+                    atomic_write_json(self.adventure_file, payload)
+                    self.adventure_payload = payload
+                    saved_components.add("adventure")
+                    saved_components.update(adventure_components)
+                    if controller is not None:
+                        controller.current_project_file = self.adventure_file
+                        controller.saved_project_payload = dict(payload)
+                        controller.mark_clean()
+                except (OSError, AdventureFormatError) as exc:
+                    failures.append(f"Adventure file: {exc}")
+
+            if generation == self.workspace_autosave_generation:
+                self.workspace_dirty_components.difference_update(saved_components)
+            if not failures and not self.workspace_dirty_components:
+                self.recovery_dirty = False
+                # The journal initially lives inside the recovery session.
+                # Move it before discarding that session or the next message
+                # would target a deleted processing.log during drag-and-drop.
+                self.journal.move_to(self.project_directory / ".mycamino" / "logs")
+                self.recovery.discard()
+                self.recovery = WorkspaceRecoverySession()
+                self._journal("Save", f"Auto-saved {self.adventure_file.name}.")
+                self._remember_recent_adventure(self.project_directory)
+                return True
+            if failures:
+                self._journal("Save", "Auto-save failed: " + "; ".join(failures))
+                if show_errors:
+                    self._alert("Could not save all Adventure changes.", "\n".join(failures))
+            return not failures
+        except Exception as exc:
+            self._journal("Save", f"Auto-save failed unexpectedly: {exc}")
+            if show_errors:
+                self._alert("Could not save the Adventure.", str(exc))
+            return False
+        finally:
+            self.workspace_autosave_in_progress = False
+            self._clear_background_progress("workspace-save")
+            if self.workspace_dirty_components and generation != self.workspace_autosave_generation:
+                self.adventureComponentDidChange_(next(iter(self.workspace_dirty_components)))
+
+    @objc.python_method
+    def _saved_gpx_contains_points(self):
+        if self.project_directory is None or not isinstance(self.adventure_payload, dict):
+            return False
+        name = str(self.adventure_payload.get("gpx_file", "")).strip()
+        path = self.project_directory / name if name else None
+        if path is None or not path.is_file():
+            return False
+        tail = b""
+        try:
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(64 * 1024), b""):
+                    sample = tail + block
+                    if b"<trkpt" in sample or b":trkpt" in sample:
+                        return True
+                    tail = sample[-16:]
+        except OSError:
+            return False
+        return False
+
+    @objc.python_method
+    def _has_recoverable_workspace_content(self):
+        """Exclude the automatic empty-track placeholder from crash recovery."""
+        if getattr(self, "workspace_dirty_components", None):
+            return True
+        for track in self.gpx_controller.tracks:
+            if any(element.tag.rsplit("}", 1)[-1] == "trkpt" for element in track.element.iter()):
+                return True
+        if self.control_rows or self.pending_media or self.pending_control_media:
+            return True
+        if self.gpx_controller.dirty and self._saved_gpx_contains_points():
+            # Preserve an intentional deletion of all points from a saved track.
+            return True
+        if self.recovery_dirty and self.control_file is not None:
+            try:
+                if self.control_file.is_file() and self.control_file.stat().st_size > 0:
+                    return True
+            except OSError:
+                pass
+        return False
 
     @objc.IBAction
     def periodicRecovery_(self, _sender):
@@ -2107,11 +2404,25 @@ class AdventureMapController(NSObject):
     def writeRecovery_(self, _sender):
         if not self.recovery_dirty:
             return
+        if not self._has_recoverable_workspace_content():
+            self.recovery_dirty = False
+            self.recovery.discard()
+            self.recovery = WorkspaceRecoverySession()
+            return
+        control_rows = self.control_rows
+        adventure_draft = self.adventure_payload or {}
+        if self.full_gui_controller is not None:
+            if self.full_gui_controller.control_table_dirty:
+                control_rows = self.full_gui_controller.control_table_rows
+            try:
+                adventure_draft = self.full_gui_controller._collect_project_payload()
+            except Exception:
+                pass
         root = self.gpx_controller.build_root()
         snapshot = RecoverySnapshot(
             datetime.now().astimezone().isoformat(), self.adventure_name,
-            ET.tostring(root, encoding="unicode"), copy.deepcopy(self.control_rows),
-            str(self.project_directory or ""), copy.deepcopy(self.adventure_payload or {}),
+            ET.tostring(root, encoding="unicode"), copy.deepcopy(control_rows),
+            str(self.project_directory or ""), copy.deepcopy(adventure_draft),
             {}, [{"path": str(item.path)} for item in self.media_items], self.selected_track_identity,
         )
         self.recovery.write(snapshot)
@@ -2125,6 +2436,7 @@ class AdventureMapController(NSObject):
             else self.project_directory
         )
         sessions = discover_recovery_sessions(project_directory=recovery_project)
+        sessions = [session for session in sessions if not is_guided_demo_recovery(session)]
         if not sessions:
             return False
         newest = sessions[0]
@@ -2164,35 +2476,18 @@ class AdventureMapController(NSObject):
     @objc.IBAction
     def saveWorkspace_(self, _sender):
         if self.project_directory is None and not self._request_project_directory(None):
-            return
+            return False
         base = filename_base(self.adventure_name)
-        gpx_path = self.project_directory / f"{base}.gpx"
-        control_path = self.control_file or self.project_directory / f"{base}-sorted.lst"
-        self.gpx_controller.save_to_path(gpx_path)
-        if self.control_rows:
-            serialize_slideshow_control_row = _main_gui_module().serialize_slideshow_control_row
-            _atomic_write_text(
-                control_path,
-                "\n".join(serialize_slideshow_control_row(row) for row in self.control_rows) + "\n",
-            )
-        payload = dict(self.adventure_payload or {})
-        payload.update({
-            "adventure_format_version": 2, "project_name": base,
-            "project_directory": str(self.project_directory), "gpx_file": gpx_path.name,
-            "control_file": control_path.name, "track_map_base": base,
-            "parameters": parameter_payload(self.parameters),
-            "weather_consent": self.weather_consent,
-        })
-        self.adventure_file = self.project_directory / f"{base}.adv"
-        atomic_write_json(self.adventure_file, payload)
-        self.adventure_payload = payload
-        self.control_file = control_path
-        self.recovery.discard()
-        self.recovery = WorkspaceRecoverySession()
-        self.journal.move_to(self.project_directory / ".mycamino" / "logs")
-        self._journal("Save", f"Saved {self.adventure_file.name}.")
-        if self.media_watcher is None:
-            self._start_media_watcher()
+        if self.adventure_file is None:
+            self.adventure_file = self.project_directory / f"{base}.adv"
+        self.workspace_dirty_components.update({"gpx", "control", "adventure"})
+        self.workspace_autosave_generation += 1
+        success = self._flush_workspace_autosave(show_errors=True, force=True)
+        if success:
+            self.journal.move_to(self.project_directory / ".mycamino" / "logs")
+            if self.media_watcher is None:
+                self._start_media_watcher()
+        return success
 
     @objc.python_method
     def _manage_map_provider_from_settings(self, draft):
@@ -2237,20 +2532,13 @@ class AdventureMapController(NSObject):
         if self.adventure_payload is not None:
             self.adventure_payload["parameters"] = parameter_payload(self.parameters)
             self.adventure_payload["weather_consent"] = self.weather_consent
-            if self.adventure_file is not None:
-                try:
-                    atomic_write_json(self.adventure_file, self.adventure_payload)
-                except OSError as exc:
-                    self._alert("Could not save Adventure Settings.", str(exc))
-                    self.parameters = old
-                    self.gpx_controller.apply_project_parameters(old)
-                    return False
         if self.full_gui_controller is not None:
             self.full_gui_controller._apply_parameter_values(
                 self.parameters, propagate_to_editor=True
             )
         if self.plot_view is not None:
             self.plot_view.setNeedsDisplay_(True)
+        self.adventureComponentDidChange_("adventure")
         return True
 
     @objc.IBAction
@@ -2461,6 +2749,7 @@ class AdventureMapController(NSObject):
             self.parameter_editor_controller.update_values(self.parameters)
         if self.plot_view is not None:
             self.plot_view.setNeedsDisplay_(True)
+        self.adventureComponentDidChange_("adventure")
 
     @objc.python_method
     def _ensure_full_gui(self, show_window=True):
@@ -2481,6 +2770,14 @@ class AdventureMapController(NSObject):
                         self.parameters, propagate_to_editor=True
                     )
                 controller.weather_consent = self.weather_consent
+                if self.demo_mode and self.project_directory is not None:
+                    demo_path = str(self.project_directory.resolve(strict=False))
+                    controller.recent_adventures = [
+                        path for path in controller.recent_adventures
+                        if str(path.resolve(strict=False)) != demo_path
+                    ]
+                    controller._save_recent_adventures()
+                    controller._refresh_recent_adventure_menu()
                 if not show_window:
                     controller.window.orderOut_(None)
             window = self.full_gui_controller.window
@@ -2494,6 +2791,28 @@ class AdventureMapController(NSObject):
             self._journal("Advanced Interface", f"Could not open: {exc}")
             self._alert("Could not open the Advanced Interface.", str(exc))
             return None
+
+    @objc.python_method
+    def _synchronize_control_file_from_full_gui(self):
+        """Adopt a control file created or selected by the retained controller."""
+        controller = self.full_gui_controller
+        if controller is None:
+            return self.control_file
+        path = controller._control_file_path()
+        if path is None or not Path(path).is_file():
+            return self.control_file
+        resolved = Path(path).resolve(strict=False)
+        if resolved != self.control_file:
+            self.control_file = resolved
+            self.temporary_control_model = False
+            self._load_control_rows()
+            if isinstance(self.adventure_payload, dict):
+                try:
+                    stored = str(resolved.relative_to(self.project_directory))
+                except ValueError:
+                    stored = str(resolved)
+                self.adventure_payload["control_file"] = stored
+        return self.control_file
 
     @objc.IBAction
     def openAdventureGUI_(self, _sender):
@@ -2544,6 +2863,66 @@ class AdventureMapController(NSObject):
         if self.adventure_file is not None and self.adventure_file.exists():
             paths = [self.adventure_file] + [path for path in paths if path != self.adventure_file]
         return paths[:10]
+
+    @objc.python_method
+    def _recent_adventures_store_path(self):
+        return (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "myCamino GPS Track Show"
+            / "recent_adventures.json"
+        )
+
+    @objc.python_method
+    def _remember_recent_adventure(self, project):
+        if project is None:
+            return
+        path = Path(project).expanduser().resolve(strict=False)
+        if path.suffix.casefold() == ".adv":
+            path = path.parent
+        if not path.is_dir():
+            return
+        if self.demo_mode and any(part.startswith("mycamino-demo-") for part in path.parts):
+            return
+        recent = []
+        for candidate in [path, *self.recent_adventure_paths()]:
+            candidate = Path(candidate)
+            if candidate.suffix.casefold() == ".adv":
+                candidate = candidate.parent
+            candidate = candidate.resolve(strict=False)
+            if candidate.is_dir() and candidate not in recent:
+                recent.append(candidate)
+            if len(recent) >= 10:
+                break
+        try:
+            atomic_write_json(
+                self._recent_adventures_store_path(),
+                [str(candidate) for candidate in recent],
+            )
+        except OSError as exc:
+            self._journal("Adventure", f"Could not update recent Adventures: {exc}")
+            return
+        self._refresh_recent_adventure_menu()
+
+    @objc.python_method
+    def _refresh_recent_adventure_menu(self):
+        menu = self.recent_adventure_menu
+        if menu is None:
+            return
+        menu.removeAllItems()
+        paths = self.recent_adventure_paths()
+        if not paths:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "No Recent Adventures", None, ""
+            )
+            item.setEnabled_(False)
+            menu.addItem_(item)
+            return
+        for path in paths:
+            item = menu_item(path.name, "openRecentAdventure:", self)
+            item.setRepresentedObject_(str(path))
+            menu.addItem_(item)
 
     @objc.IBAction
     def openRecentAdventure_(self, sender):
@@ -2759,6 +3138,7 @@ class AdventureMapController(NSObject):
 
     @objc.IBAction
     def openControlFile_(self, _sender):
+        self._synchronize_control_file_from_full_gui()
         if self.control_file is None or not self.control_file.is_file():
             if self.control_rows:
                 self.saveWorkspace_(None)
@@ -2785,6 +3165,7 @@ class AdventureMapController(NSObject):
         controller = self._ensure_full_gui(show_window=False)
         if controller is None:
             return
+        self._synchronize_control_file_from_full_gui()
         control_path = controller._control_file_path()
         if control_path is not None and control_path.is_file():
             controller.startSlideShow_(None)
@@ -2852,6 +3233,73 @@ class AdventureMapController(NSObject):
         self.help_window.orderFrontRegardless()
 
     @objc.IBAction
+    def showQuickStart_(self, _sender):
+        show_help_document("myCamino Quick Start", "MYCAMINO_QUICK_START.md")
+
+    @objc.IBAction
+    def startGuidedDemo_(self, _sender):
+        if self.demo_coordinator is None:
+            self.demo_coordinator = GuidedDemoCoordinator.alloc().initWithWorkspaceController_(self)
+        self.demo_coordinator.start()
+
+    @objc.python_method
+    def discardGuidedDemoWorkspace(self):
+        """Return to an empty map without retaining references to demo files."""
+        self._stop_media_watcher()
+        self.cancel_event.set()
+        self.processing_generation += 1
+        self.media_index_generation += 1
+        self.processing_active = False
+        self.background_progress.clear()
+        if self.workspace_autosave_timer is not None:
+            self.workspace_autosave_timer.invalidate()
+            self.workspace_autosave_timer = None
+        if self.full_gui_controller is not None:
+            retired = self.full_gui_controller
+            retired.adventure_map_host = None
+            try:
+                retired._stop_project_media_watcher()
+                retired.cancel_adventure_autosave()
+                if retired.geolocations_cancel_event is not None:
+                    retired.geolocations_cancel_event.set()
+                retired.window.orderOut_(None)
+            except Exception:
+                pass
+            # Do not release a PyObjC window graph from inside the Stop Demo
+            # button callback. AppKit and worker callbacks may still have it on
+            # their stacks; retaining it until process exit avoids native use-
+            # after-free crashes.
+            self.retired_full_gui_controllers.append(retired)
+            self.full_gui_controller = None
+        self.workspace_dirty_components.clear()
+        self.workspace_autosave_in_progress = False
+        self.recovery_dirty = False
+        self.pending_media.clear()
+        self.pending_control_media.clear()
+        self.media_items = []
+        self.selected_media_paths.clear()
+        self.selected_media_path = None
+        self.control_rows = []
+        self.control_file = None
+        self.temporary_control_model = True
+        self.adventure_payload = None
+        self.adventure_file = None
+        self.project_directory = None
+        self.adventure_name = "Untitled"
+        self.parameters = default_parameters()
+        self.weather_consent = "unasked"
+        if self.gpx_controller.track_load_timer is not None:
+            self.gpx_controller.on_initial_load_complete_callback = None
+            self.gpx_controller.cancel_staged_track_loading()
+        self.gpx_controller.tracks = []
+        self.gpx_controller.next_nr = 1
+        self.gpx_controller.dirty = False
+        self.gpx_controller.apply_project_parameters(self.parameters)
+        self.journal.move_to(self.recovery.directory / "logs")
+        self._show_empty_world()
+        self._set_title()
+
+    @objc.IBAction
     def showElevationProfile_(self, _sender):
         if self.plot_view is not None:
             self.gpx_controller.open_elevation_profile_for_plot_view(self.plot_view)
@@ -2903,6 +3351,22 @@ class AdventureMapController(NSObject):
     @objc.IBAction
     def showProjectLicense_(self, _sender):
         self._show_project_document("license", "myCamino License — GPL-3.0-or-later")
+
+    @objc.IBAction
+    def showAppStoreException_(self, _sender):
+        self._show_project_document(
+            "app_store_exception", "Apple App Store Distribution Exception"
+        )
+
+    @objc.IBAction
+    def showAppStoreEULA_(self, _sender):
+        self._show_project_document("app_store_eula", "Apple App Store EULA — Draft")
+
+    @objc.IBAction
+    def showContributorAgreement_(self, _sender):
+        self._show_project_document(
+            "contributor_agreement", "Contributor License Agreement"
+        )
 
     @objc.IBAction
     def showThirdPartyNotices_(self, _sender):
@@ -2975,10 +3439,41 @@ class AdventureMapController(NSObject):
     @objc.python_method
     def shutdown(self):
         self._stop_media_watcher()
-        if self.recovery_dirty or self.gpx_controller.dirty:
+        was_demo = bool(self.demo_mode)
+        if self.workspace_autosave_timer is not None:
+            self.workspace_autosave_timer.invalidate()
+            self.workspace_autosave_timer = None
+        save_failed = False
+        if self.adventure_file is not None and (
+            self.workspace_dirty_components
+            or self.gpx_controller.dirty
+            or (
+                self.full_gui_controller is not None
+                and (
+                    self.full_gui_controller.project_dirty
+                    or self.full_gui_controller.control_table_dirty
+                )
+            )
+        ):
+            saved = self._flush_workspace_autosave(show_errors=False)
+            if not saved:
+                saved = self._flush_workspace_autosave(show_errors=False)
+            save_failed = not saved
+            if save_failed:
+                self.recovery_dirty = True
+                self.writeRecovery_(None)
+                self._alert(
+                    "Adventure autosave failed before quitting.",
+                    f"myCamino retried the save and retained recovery data in:\n{self.recovery.directory}",
+                )
+        if self.demo_coordinator is not None and was_demo:
+            self.demo_coordinator.suspendForShutdown()
+        if not save_failed and was_demo:
+            self.recovery.discard()
+        elif not save_failed and (self.recovery_dirty or self.gpx_controller.dirty) and self._has_recoverable_workspace_content():
             self.recovery_dirty = True
             self.writeRecovery_(None)
-        else:
+        elif not save_failed:
             self.recovery.discard()
         self.cancel_event.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -3037,6 +3532,9 @@ def build_adventure_map_menu(controller):
     application_menu.addItem_(menu_item("Settings…", "showSettings:", controller, ",", NSEventModifierFlagCommand))
     application_menu.addItem_(NSMenuItem.separatorItem())
     application_menu.addItem_(menu_item("License", "showProjectLicense:", controller))
+    application_menu.addItem_(menu_item("App Store Distribution Exception", "showAppStoreException:", controller))
+    application_menu.addItem_(menu_item("App Store EULA Draft", "showAppStoreEULA:", controller))
+    application_menu.addItem_(menu_item("Contributor Agreement", "showContributorAgreement:", controller))
     application_menu.addItem_(menu_item("Third-Party Notices", "showThirdPartyNotices:", controller))
     install_application_news(application_menu)
     application_menu.addItem_(NSMenuItem.separatorItem())
@@ -3047,16 +3545,8 @@ def build_adventure_map_menu(controller):
     recent_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Open Recent", None, "")
     recent_menu = NSMenu.alloc().initWithTitle_("Open Recent")
     recent_root.setSubmenu_(recent_menu)
-    recent_paths = controller.recent_adventure_paths()
-    if recent_paths:
-        for recent_path in recent_paths:
-            recent_item = menu_item(recent_path.name, "openRecentAdventure:", controller)
-            recent_item.setRepresentedObject_(str(recent_path))
-            recent_menu.addItem_(recent_item)
-    else:
-        empty_recent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("No Recent Adventures", None, "")
-        empty_recent.setEnabled_(False)
-        recent_menu.addItem_(empty_recent)
+    controller.recent_adventure_menu = recent_menu
+    controller._refresh_recent_adventure_menu()
     file_menu.addItem_(recent_root)
     file_menu.addItem_(menu_item("Save Workspace", "saveWorkspace:", controller, "s", NSEventModifierFlagCommand))
     file_menu.addItem_(menu_item("Save Workspace As…", "saveWorkspaceAs:", controller))
@@ -3151,6 +3641,9 @@ def build_adventure_map_menu(controller):
     controller.window_menu_coordinator = coordinator
 
     help_menu = add_menu(main_menu, "Help")
+    help_menu.addItem_(menu_item("Quick Start", "showQuickStart:", controller))
+    help_menu.addItem_(menu_item("Start Guided Demo", "startGuidedDemo:", controller))
+    help_menu.addItem_(NSMenuItem.separatorItem())
     help_menu.addItem_(menu_item("Adventure Map Help", "showHelp:", controller))
     help_menu.addItem_(menu_item("GPX Editor Help", "showGPXEditorHelp:", controller))
     help_menu.addItem_(menu_item("Control Directive Help", "showControlDirectiveHelp:", controller))
@@ -3176,6 +3669,11 @@ class AdventureMapAppDelegate(NSObject):
         NSApp().setMainMenu_(self.main_menu)
         self.controller.show()
         NSApp().activateIgnoringOtherApps_(True)
+        self.demo_coordinator = GuidedDemoCoordinator.alloc().initWithWorkspaceController_(self.controller)
+        self.controller.demo_coordinator = self.demo_coordinator
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.35, self.demo_coordinator, "offerAtStartup:", None, False
+        )
 
     def applicationWillTerminate_(self, _notification):
         if getattr(self, "controller", None) is not None:

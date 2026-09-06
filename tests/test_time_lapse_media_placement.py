@@ -14,6 +14,7 @@ from GPSTrackShow import (
     PlaybackPhase,
     PilgrimWalkState,
     advance_time_lapse_progress,
+    adaptive_overview_segments,
     best_media_corner_layout,
     clear_corner_rect_options,
     config_from_options,
@@ -29,6 +30,7 @@ from GPSTrackShow import (
     map_plot_rect,
     normalize_time_lapse_resume_phase,
     normalize_transition,
+    overview_route_direction,
     parse_stage_descriptors,
     stage_name_endpoints,
     stage_index_for_playlist_row,
@@ -40,6 +42,7 @@ from GPSTrackShow import (
     should_restart_slideshow,
     pilgrim_orientation_for_tangent,
     pilgrim_motion_threshold,
+    photo_track_state_by_location,
     relation_title_band,
     resolve_intro_title_image,
     resolve_map_window,
@@ -62,6 +65,30 @@ from track_map_layout_utils import best_unframed_media_layout
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_profile_media_marker_requires_a_nearby_route_position(self):
+        metadata = {
+            "timed_track_points": [
+                {
+                    "lat": 50.0,
+                    "lon": 7.0,
+                    "cumulative_distance_km": 0.0,
+                    "elevation_m": 100.0,
+                },
+                {
+                    "lat": 50.001,
+                    "lon": 7.001,
+                    "cumulative_distance_km": 0.15,
+                    "elevation_m": 110.0,
+                },
+            ]
+        }
+        self.assertIsNotNone(
+            photo_track_state_by_location(metadata, 50.0001, 7.0001)
+        )
+        self.assertIsNone(
+            photo_track_state_by_location(metadata, 51.0, 8.0)
+        )
+
     def test_dual_screen_route_tracking_is_not_a_transition_style(self):
         self.assertNotIn("TRACKING", PLAYBACK_STYLE_VALUES)
 
@@ -1769,6 +1796,47 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
         self.assertEqual(simplified[0], points[0])
         self.assertEqual(simplified[-1], points[-1])
         self.assertLess(len(simplified), len(points))
+
+    def test_adaptive_overview_geometry_is_bounded_by_projected_extent(self):
+        points = [
+            (index * 0.05, 20.0 + (index % 7) * 0.01)
+            for index in range(10000)
+        ]
+        simplified = adaptive_overview_segments(
+            [points],
+            points_per_pixel=1.0,
+            minimum_points=24,
+            maximum_points=300,
+        )
+        self.assertLessEqual(sum(len(segment) for segment in simplified), 300)
+        self.assertEqual(simplified[0][0], points[0])
+        self.assertEqual(simplified[0][-1], points[-1])
+
+    def test_adaptive_overview_geometry_preserves_segment_gaps(self):
+        segments = [
+            [(0.0, 0.0), (10.0, 5.0), (20.0, 0.0)],
+            [(100.0, 100.0), (110.0, 105.0), (120.0, 100.0)],
+        ]
+        simplified = adaptive_overview_segments(segments)
+        self.assertEqual(len(simplified), 2)
+        self.assertEqual(simplified[0][-1], (20.0, 0.0))
+        self.assertEqual(simplified[1][0], (100.0, 100.0))
+
+    def test_closed_overview_route_keeps_extent_and_forward_direction(self):
+        loop = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (0.0, 100.0),
+            (0.0, 0.0),
+        ]
+        simplified = adaptive_overview_segments([loop], maximum_points=24)
+        self.assertGreaterEqual(len(simplified[0]), 5)
+        self.assertEqual(simplified[0][0], simplified[0][-1])
+        direction = overview_route_direction(simplified)
+        self.assertIsNotNone(direction)
+        _point, tangent = direction
+        self.assertAlmostEqual(1.0, (tangent[0] ** 2 + tangent[1] ** 2) ** 0.5)
 
     def test_space_begins_waiting_intro_and_starts_music(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)

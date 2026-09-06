@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Nouvelle-Aquitaine",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T07:55:37+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.12918883333333,
+  "locality": "Uhart-Cize",
+  "longitude": -1.244608333333333,
+  "metadata_updated_at": "2026-08-29T10:31:05.808430+02:00",
+  "name": "3711 Route Napoleon",
+  "place": "Uhart-Cize (Nouvelle-Aquitaine), 3711 Route Napoleon",
+  "place_coordinate": {
+    "latitude": 43.12918883333333,
+    "longitude": -1.244608333333333
+  },
+  "place_details": {
+    "administrativeArea": "Nouvelle-Aquitaine",
+    "areasOfInterest": [],
+    "locality": "Uhart-Cize",
+    "name": "3711 Route Napoleon",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5061.jpeg",
+  "subLocality": null,
+  "time": "07:55",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T05:55:37+00:00",
+      "latitude": 43.12918883333333,
+      "longitude": -1.244608333333333
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.12918883333333,
+      "longitude": -1.244608333333333,
+      "response_elevation_m": 395.0,
+      "response_latitude": 43.198593,
+      "response_longitude": -1.2089233,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.387366+00:00",
+    "sampling": {
+      "fraction": 0.92694444,
+      "lower_time": "2024-07-15T05:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T06:00:00+00:00",
+      "upper_time": "2024-07-15T06:00:00+00:00",
+      "weather_code_time": "2024-07-15T06:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 51.128055555555555,
+      "precipitation": 0.0,
+      "pressure_msl": 1009.2634722222222,
+      "relative_humidity_2m": 63.0,
+      "temperature_2m": 22.61963888888889,
+      "weather_code": 2,
+      "wind_speed_10m": 14.073055555555555
+    }
+  },
+  "photo_path": "IMG_5061.jpeg",
+  "source_file_signature": {
+    "size": 229717,
+    "mtime_ns": 1788636776665593880
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 229717,
+    "sha256": "c0ea836b220faee12ebd9a2249e81ff5dfa8eb598451571651191bad855f3e3d"
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "administrativeArea": "Nouvelle-Aquitaine",
+  "areasOfInterest": [],
+  "date_german": "Montag, 15.07.2024",
+  "datetime_iso": "2024-07-15T12:37:02+02:00",
+  "datetime_source": "exiftool:DateTimeOriginal",
+  "gps_source": "embedded",
+  "has_gps": true,
+  "latitude": 43.05478333333333,
+  "locality": "Arnéguy",
+  "longitude": -1.266763333333333,
+  "metadata_updated_at": "2026-08-29T10:31:05.877828+02:00",
+  "name": "64220",
+  "place": "Arnéguy (Nouvelle-Aquitaine), 64220",
+  "place_coordinate": {
+    "latitude": 43.05478333333333,
+    "longitude": -1.266763333333333
+  },
+  "place_details": {
+    "administrativeArea": "Nouvelle-Aquitaine",
+    "areasOfInterest": [],
+    "locality": "Arnéguy",
+    "name": "64220",
+    "subLocality": null
+  },
+  "source_filename": "IMG_5128.jpeg",
+  "subLocality": null,
+  "time": "12:37",
+  "weather": {
+    "attribution": "Weather data by Open-Meteo.com",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "media_source": {
+      "datetime_iso": "2024-07-15T10:37:02+00:00",
+      "latitude": 43.05478333333333,
+      "longitude": -1.266763333333333
+    },
+    "model": "best_match",
+    "provider": "open-meteo",
+    "provider_url": "https://open-meteo.com/",
+    "query": {
+      "end_date": "2024-07-15",
+      "latitude": 43.0548,
+      "longitude": -1.2668,
+      "response_elevation_m": 1273.0,
+      "response_latitude": 42.987698,
+      "response_longitude": -1.2035828,
+      "start_date": "2024-07-15"
+    },
+    "retrieved_at": "2026-08-29T23:03:19.477877+00:00",
+    "sampling": {
+      "fraction": 0.61722222,
+      "lower_time": "2024-07-15T10:00:00+00:00",
+      "method": "mixed_hourly_interpolation",
+      "precipitation_interval_end": "2024-07-15T11:00:00+00:00",
+      "upper_time": "2024-07-15T11:00:00+00:00",
+      "weather_code_time": "2024-07-15T11:00:00+00:00"
+    },
+    "schema_version": 1,
+    "units": {
+      "cloud_cover": "%",
+      "precipitation": "mm",
+      "pressure_msl": "hPa",
+      "relative_humidity_2m": "%",
+      "temperature_2m": "°C",
+      "weather_code": "wmo code",
+      "wind_speed_10m": "km/h"
+    },
+    "values": {
+      "cloud_cover": 44.38777777777778,
+      "precipitation": 0.0,
+      "pressure_msl": 1014.0086111111111,
+      "relative_humidity_2m": 67.08611111111111,
+      "temperature_2m": 18.653111111111112,
+      "weather_code": 0,
+      "wind_speed_10m": 18.469388888888886
+    }
+  },
+  "photo_path": "IMG_5128.jpeg",
+  "source_file_signature": {
+    "size": 473713,
+    "mtime_ns": 1788636816539791431
+  },
+  "source_file_identity": {
+    "version": 1,
+    "algorithm": "sha256",
+    "size": 473713,
+    "sha256": "26cace22b10f713d962fbd3a3d1de5f2adcb4e5de68e25f512dca166078ba382"
+  }
+}

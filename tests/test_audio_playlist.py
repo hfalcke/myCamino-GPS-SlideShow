@@ -19,20 +19,163 @@ from audio_playlist import (
 )
 from slideshow_control_format import (
     CONTROL_TRANSITIONS,
+    DIRECTIVE_REPEAT_CAPABILITIES,
     ControlSyntaxError,
     MusicSyntaxError,
     AudioSelectionSyntaxError,
+    compile_repeat_ranges,
     control_labels,
     parse_control_directive,
     parse_music_directive,
     parse_narrator_directive,
     parse_play_directive,
+    parse_caption_directive,
+    parse_font_directive,
+    repeat_ranges_at_row,
+    serialize_caption_parameters,
     serialize_control_parameters,
+    serialize_font_parameters,
 )
 from GPSTrackShow import BackgroundMusicController
 
 
 class AudioPlaylistTests(unittest.TestCase):
+    def test_every_directive_family_has_explicit_repeat_capabilities(self):
+        self.assertEqual(
+            set(DIRECTIVE_REPEAT_CAPABILITIES),
+            {"control", "music", "play", "narrator", "caption", "font"},
+        )
+        self.assertEqual(
+            set(DIRECTIVE_REPEAT_CAPABILITIES["control"]["commands"]),
+            {
+                "label",
+                "goto",
+                "end",
+                "duration",
+                "transition",
+                "pause",
+                "set_time",
+                "set_date",
+                "ignore_time",
+            },
+        )
+
+    def test_generic_repeat_modifier_compiles_for_every_directive_family(self):
+        lines = [
+            "#CONTROL: #DURATION 4, #REPEAT_UNTIL $DONE",
+            "#MUSIC: #VOLUME 4, #REPEAT_UNTIL $DONE",
+            "#PLAY: $INTRO, #REPEAT_UNTIL $DONE",
+            "#NARRATOR: $VOICE, #REPEAT_UNTIL $DONE",
+            '#CAPTION: "Repeated", #REPEAT_UNTIL $DONE',
+            "#FONT: #SIZE 42, #REPEAT_UNTIL $DONE",
+            "photo.jpeg",
+            "#CONTROL: #LABEL $DONE",
+        ]
+        ranges = compile_repeat_ranges(lines)
+        self.assertEqual(
+            [item.family for item in ranges],
+            ["control", "music", "play", "narrator", "caption", "font"],
+        )
+        self.assertTrue(all(item.end_row == 7 for item in ranges))
+
+    def test_repeat_ranges_are_nested_ordered_and_target_aware(self):
+        lines = [
+            "#CONTROL: #DURATION 4, #REPEAT_UNTIL $OUTER",
+            "#CAPTION: Inner, #REPEAT_UNTIL $INNER",
+            "photo.jpeg",
+            "#CONTROL: #LABEL $INNER",
+            "map.png",
+            "#CONTROL: #LABEL $OUTER",
+        ]
+        ranges = compile_repeat_ranges(lines)
+        self.assertEqual(
+            [item.family for item in repeat_ranges_at_row(ranges, 2, "media")],
+            ["control", "caption"],
+        )
+        self.assertEqual(
+            [item.family for item in repeat_ranges_at_row(ranges, 4, "all")],
+            ["control"],
+        )
+
+    def test_caption_and_font_repeat_modifiers_round_trip(self):
+        caption = parse_caption_directive(
+            '#CAPTION: #TOP, #LEFT, "Line one\\nLine two", #REPEAT_UNTIL $DONE'
+        )
+        self.assertEqual(caption.repeat_until, "DONE")
+        self.assertIn("#REPEAT_UNTIL $DONE", serialize_caption_parameters(caption))
+        font = parse_font_directive(
+            "#FONT: #DEFAULT, #REPEAT_UNTIL $DONE"
+        )
+        self.assertEqual(
+            serialize_font_parameters(font),
+            "#DEFAULT, #REPEAT_UNTIL $DONE",
+        )
+
+    def test_repeat_modifier_requires_a_directive_body(self):
+        with self.assertRaises(MusicSyntaxError):
+            parse_music_directive("#MUSIC: #REPEAT_UNTIL $DONE")
+        with self.assertRaises(AudioSelectionSyntaxError):
+            parse_play_directive("#PLAY: #REPEAT_UNTIL $DONE")
+        with self.assertRaises(ControlSyntaxError):
+            parse_control_directive("#CONTROL: #REPEAT_UNTIL $DONE")
+
+    def test_repeat_rejects_transfer_commands_and_non_forward_labels(self):
+        with self.assertRaises(MusicSyntaxError):
+            compile_repeat_ranges([
+                "#MUSIC: #GOTO $SONG, #REPEAT_UNTIL $DONE",
+                "#CONTROL: #LABEL $DONE",
+            ])
+        with self.assertRaises(ControlSyntaxError):
+            compile_repeat_ranges([
+                "#CONTROL: #END, #REPEAT_UNTIL $DONE",
+                "#CONTROL: #LABEL $DONE",
+            ])
+        with self.assertRaises(ControlSyntaxError):
+            compile_repeat_ranges([
+                "#CONTROL: #LABEL $DONE",
+                "#CONTROL: #PAUSE 1, #REPEAT_UNTIL $DONE",
+            ])
+
+    def test_non_strict_compilation_keeps_valid_ranges(self):
+        warnings = []
+        ranges = compile_repeat_ranges(
+            [
+                "#MUSIC: #VOLUME 4, #REPEAT_UNTIL $MISSING",
+                "#CONTROL: #DURATION 3, #REPEAT_UNTIL $DONE",
+                "photo.jpeg",
+                "#CONTROL: #LABEL $DONE",
+            ],
+            strict=False,
+            warning_callback=warnings.append,
+        )
+        self.assertEqual([(item.family, item.source_row) for item in ranges], [("control", 1)])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("$MISSING", warnings[0])
+
+    def test_non_strict_transfer_retains_its_normal_directive(self):
+        line = "#MUSIC: #GOTO $SONG, #REPEAT_UNTIL $DONE"
+        directive = parse_music_directive(line)
+        self.assertEqual(directive.actions[0].kind, "jump")
+        warnings = []
+        ranges = compile_repeat_ranges(
+            [line, "#CONTROL: #LABEL $DONE"],
+            strict=False,
+            warning_callback=warnings.append,
+        )
+        self.assertEqual(ranges, ())
+        self.assertEqual(len(warnings), 1)
+
+    def test_walker_control_commands_round_trip(self):
+        directive = parse_control_directive(
+            "#CONTROL: #SET_DATE 2026-08-03, #SET_TIME 14:35:06, "
+            "#REPEAT_UNTIL $NORMAL"
+        )
+        self.assertEqual(directive.repeat_until, "NORMAL")
+        self.assertEqual(
+            serialize_control_parameters(directive),
+            "#SET_DATE 2026-08-03, #SET_TIME 14:35:06, #REPEAT_UNTIL $NORMAL",
+        )
+
     def _controller_without_players(self, playlist):
         controller = BackgroundMusicController.__new__(BackgroundMusicController)
         controller.playlist = playlist
