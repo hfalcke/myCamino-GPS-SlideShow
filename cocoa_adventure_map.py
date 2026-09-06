@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from security_scoped_access import SecurityScopedAccessManager
 import objc
 from AppKit import (
     NSAlert,
@@ -242,6 +243,8 @@ class AdventureMapController(NSObject):
         self.auto_processed_paths: set[Path] = set()
         self.pending_start_after_processing = False
         self.pending_control_media: set[Path] = set()
+        self.pending_route_timing_media: set[Path] = set()
+        self.pending_route_timing_track_nr: int | None = None
         self.media_watch_seen_paths: set[Path] = set()
         self.media_watcher = None
         self.parameter_editor_controller = None
@@ -252,6 +255,7 @@ class AdventureMapController(NSObject):
         self.properties_title_image_field = None
         self.properties_name_unlocked = False
         self.window_menu_coordinator = None
+        self.project_access = SecurityScopedAccessManager()
         self.recovery = WorkspaceRecoverySession()
         self.recovery_dirty = False
         self.recovery_debounce_timer = None
@@ -424,7 +428,10 @@ class AdventureMapController(NSObject):
             return has_project
         if action in {"openControlFile:", "updateControlFile:", "revealControlFile:", "chooseSlideShowStart:"}:
             return has_control
-        if action in {"showTrackTable:", "showWaypointTable:", "showElevationProfile:", "fitToTrack:", "renumberTracks:"}:
+        if action in {
+            "showTrackTable:", "showWaypointTable:", "showElevationProfile:",
+            "fitToTrack:", "renumberTracks:", "estimateRouteTimesFromMedia:",
+        }:
             return has_tracks
         if action == "saveSelectedTracksAs:":
             return has_selection
@@ -609,6 +616,13 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def load_project_directory(self, directory: Path):
+        directory = Path(directory).expanduser().resolve(strict=False)
+        if not self.project_access.activate_directory(directory):
+            self._alert(
+                "Adventure folder access is unavailable.",
+                "Choose the folder again to renew myCamino's permission.",
+            )
+            return
         self._stop_media_watcher()
         self.startup_track_loading = False
         self.startup_media_scan_deferred = False
@@ -670,6 +684,13 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def load_adventure_path(self, path: Path):
+        path = Path(path).expanduser().resolve(strict=False)
+        if not self.project_access.activate_directory(path.parent):
+            self._alert(
+                "Adventure folder access is unavailable.",
+                "Choose the folder again to renew myCamino's permission.",
+            )
+            return
         if self.adventure_file is not None and (
             self.workspace_dirty_components or self.gpx_controller.dirty
         ):
@@ -1131,6 +1152,23 @@ class AdventureMapController(NSObject):
                     self._journal("Metadata", f"Skipped {item.path.name}: {item.error or item.action}")
                 else:
                     self._journal("Metadata", f"{item.action.title()} {item.path.name}")
+            timing_paths = self.pending_route_timing_media.intersection(paths)
+            timing_track = next(
+                (
+                    track
+                    for track in self.gpx_controller.tracks
+                    if track.nr == self.pending_route_timing_track_nr
+                ),
+                None,
+            )
+            if timing_paths and timing_track is not None:
+                self.pending_route_timing_media.difference_update(timing_paths)
+                timing_records = [item for item in prepared if item.path in timing_paths]
+                self.gpx_controller.offer_route_timing_from_prepared(
+                    timing_records,
+                    timing_track,
+                )
+                self.pending_route_timing_track_nr = None
             self.auto_processed_paths.update(paths)
             self._scan_project_media()
             self._start_next_media_batch()
@@ -2088,6 +2126,15 @@ class AdventureMapController(NSObject):
                 return
         if response == 1000:
             self.pending_control_media.update(imported)
+            selected = self.gpx_controller.selected_tracks()
+            timing_candidates = [
+                track
+                for track in (selected or self.gpx_controller.tracks)
+                if self.gpx_controller._fully_untimed_route(track)
+            ]
+            if len(timing_candidates) == 1:
+                self.pending_route_timing_media.update(imported)
+                self.pending_route_timing_track_nr = timing_candidates[0].nr
             if self.control_file is not None and self.control_file.is_file():
                 try:
                     mark_imported_media(self.control_file, imported)
@@ -2957,6 +3004,102 @@ class AdventureMapController(NSObject):
         self.gpx_controller.plotSelected_(None)
 
     @objc.IBAction
+    def estimateRouteTimesFromMedia_(self, _sender):
+        self.gpx_controller.estimateRouteTimesFromMedia_(None)
+
+    @objc.python_method
+    def workspace_tracks_did_load(self, loaded_records):
+        """Offer geometry-preserving timing after a route is dropped into an Adventure."""
+        untimed = [
+            track
+            for track in loaded_records
+            if self.gpx_controller._fully_untimed_route(track)
+        ]
+        if len(untimed) != 1:
+            return
+        track = untimed[0]
+        self.pending_route_timing_track_nr = track.nr
+        self.gpx_controller.selected_nrs = [track.nr]
+        self.gpx_controller.update_selection_field()
+        self.gpx_controller.highlight_selected_rows()
+        if self.pending_route_timing_media and self.processing_active:
+            return
+        media_paths = list(self.pending_route_timing_media) or self._project_media_paths()
+        if not media_paths:
+            return
+        self.pending_route_timing_media.difference_update(media_paths)
+        self._prepare_route_timing_offer(track.nr, media_paths)
+
+    @objc.python_method
+    def _prepare_route_timing_offer(self, track_nr, media_paths):
+        """Prepare existing media off the AppKit thread, then show one offer."""
+        paths = list(dict.fromkeys(Path(path).resolve(strict=False) for path in media_paths))
+        if not paths:
+            return
+        self._journal(
+            "Route Timing",
+            f"Checking {len(paths)} media file(s) against untimed track #{track_nr}.",
+        )
+        self._set_background_progress("route_timing", "Checking route timing", 0, len(paths))
+
+        def progress(current, total, _name):
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "applyRouteTimingProgress:",
+                (current, total),
+                False,
+            )
+
+        future = self.executor.submit(
+            prepare_media_records,
+            paths,
+            refresh_changed=True,
+            progress_callback=progress,
+        )
+
+        def poll(timer):
+            if not future.done():
+                return
+            timer.invalidate()
+            self._clear_background_progress("route_timing")
+            try:
+                prepared = future.result()
+            except Exception as exc:
+                self._journal("Route Timing", f"Could not inspect media: {exc}")
+                return
+            track = next(
+                (item for item in self.gpx_controller.tracks if item.nr == track_nr),
+                None,
+            )
+            if track is not None:
+                changed = self.gpx_controller.offer_route_timing_from_prepared(prepared, track)
+                self._journal(
+                    "Route Timing",
+                    "Applied media-derived route timestamps."
+                    if changed
+                    else "Route timestamps were not changed.",
+                )
+            if self.pending_route_timing_track_nr == track_nr:
+                self.pending_route_timing_track_nr = None
+
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.1,
+            _BlockTimer.alloc().initWithBlock_(poll),
+            "fire:",
+            None,
+            True,
+        )
+
+    @objc.IBAction
+    def applyRouteTimingProgress_(self, value):
+        current, total = value
+        self._set_background_progress(
+            "route_timing",
+            "Checking route timing",
+            current,
+            total,
+        )
+
+    @objc.IBAction
     def renumberTracks_(self, _sender):
         self.gpx_controller.renumberTracks_(None)
 
@@ -3477,6 +3620,7 @@ class AdventureMapController(NSObject):
             self.recovery.discard()
         self.cancel_event.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.project_access.stop()
         if self.parameter_editor_controller is not None:
             self.parameter_editor_controller.close()
             self.parameter_editor_controller = None
@@ -3565,6 +3709,7 @@ def build_adventure_map_menu(controller):
         ("Waypoint Table", "showWaypointTable:"),
         ("Elevation Profile", "showElevationProfile:"),
         ("Fit to Track", "fitToTrack:"),
+        ("Estimate Route Times from Media…", "estimateRouteTimesFromMedia:"),
         ("Renumber Tracks", "renumberTracks:"),
         ("Save Selected Tracks As…", "saveSelectedTracksAs:"),
     ):

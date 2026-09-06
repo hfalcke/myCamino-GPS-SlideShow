@@ -68,6 +68,7 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertEqual(defaults["gpx.maximum_hdop"], 20.0)
         self.assertEqual(defaults["gpx.maximum_vdop"], 20.0)
         self.assertEqual(defaults["gpx.running_speed_window_distance_m"], 500.0)
+        self.assertEqual(defaults["gpx.media_timing_max_distance_m"], 100.0)
         self.assertEqual(defaults["trackmaps.media_point_color"], "#0066FF")
         self.assertEqual(defaults["trackmaps.track_title"], "endpoint_places")
         self.assertEqual(defaults["trackmaps.zoom"], 16)

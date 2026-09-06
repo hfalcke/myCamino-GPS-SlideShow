@@ -1,6 +1,6 @@
 # myCamino Mac App Store Release Plan
 
-Status: Planning
+Status: Store build foundation implemented; signing, sandbox validation, and submission remain
 Target: One integrated myCamino app for Apple Silicon, macOS 14 or later
 Distribution: Free Mac App Store app plus the existing direct GPL distribution
 
@@ -15,12 +15,12 @@ Distribution: Free Mac App Store app plus the existing direct GPL distribution
 ## Current Blocking Issues
 
 - [ ] Replace the current ad-hoc signature with Apple Distribution signing and a Mac App Store provisioning profile.
-- [ ] Enable App Sandbox. The current build has no entitlements.
-- [ ] Correct the generated bundle identifier. The inspected build contains `myCamino GPS Track Show` instead of the intended `org.mycamino`.
-- [ ] Replace persistent raw-path access with security-scoped bookmarks for user-selected Adventure directories.
+- [x] Add App Sandbox entitlements to the separate Store build configuration; validate them on the first signed package.
+- [x] Correct the generated bundle identifier to `org.mycamino`.
+- [x] Add persistent security-scoped bookmarks for user-selected Adventure directories; complete signed-sandbox workflow testing.
 - [ ] Make the bundled Slide Show process and FFmpeg valid sandbox-inheriting helper tools.
-- [ ] Remove runtime dependence on optional or separately installed tools such as ExifTool.
-- [ ] Add `PrivacyInfo.xcprivacy` and complete the App Store privacy declarations.
+- [x] Remove runtime dependence on separately installed ExifTool, `mdls`, `sips`, `security`, and `ps` from the Store feature path. Direct builds retain compatibility fallbacks.
+- [x] Add an initial `PrivacyInfo.xcprivacy`; complete the final privacy audit and App Store declarations before submission.
 - [ ] Disable direct-update behavior in the App Store build.
 - [ ] Complete the App Store metadata, legal review, TestFlight testing, and submission workflow.
 
@@ -36,14 +36,14 @@ Distribution: Free Mac App Store app plus the existing direct GPL distribution
 
 ## 2. Sandbox and File Access
 
-- [ ] Add a main-app entitlements file containing:
+- [x] Add a main-app entitlements file containing:
   - `com.apple.security.app-sandbox`
   - `com.apple.security.files.user-selected.read-write`
   - `com.apple.security.network.client`
 - [ ] Route initial project access through `NSOpenPanel`, document opening, or drag and drop.
-- [ ] Create security-scoped bookmarks for Adventure directories the user wants to reopen later.
-- [ ] Resolve bookmarks on startup and balance every `startAccessingSecurityScopedResource` call with a corresponding stop call.
-- [ ] Detect stale bookmarks and ask the user to locate the directory again without losing Adventure history.
+- [x] Create security-scoped bookmarks for Adventure directories the user wants to reopen later.
+- [x] Resolve bookmarks on startup and balance every `startAccessingSecurityScopedResource` call with a corresponding stop call.
+- [x] Detect stale bookmarks and ask the user to locate the directory again without losing Adventure history.
 - [ ] Centralize authorized project-directory access for media, GPX, sidecars, maps, control files, playlists, logs, normalization, and file watching.
 - [ ] Verify that child processes inherit access to the active Adventure directory.
 - [ ] Store caches and application state using the sandbox container's Caches and Application Support directories.
@@ -58,9 +58,9 @@ References:
 
 ## 3. Metadata and Native System APIs
 
-- [ ] Replace runtime `mdls` subprocess calls with ImageIO, AVFoundation, or other public framework APIs.
-- [ ] Replace runtime `sips` subprocess calls with ImageIO/CoreGraphics conversion.
-- [ ] Remove the optional external ExifTool dependency from the App Store feature path.
+- [x] Replace runtime `mdls` subprocess calls in the Store path with ImageIO and AVFoundation APIs.
+- [x] Replace runtime `sips` subprocess calls with ImageIO/CoreGraphics conversion.
+- [x] Remove the optional external ExifTool dependency from the App Store feature path.
 - [ ] Define and test the supported EXIF, HEIC, JPEG, QuickTime, and common video metadata fields.
 - [ ] Report unsupported metadata clearly instead of asking users to install another program.
 - [ ] Keep build-time development scripts separate from the shipped runtime.
@@ -83,24 +83,24 @@ Reference:
 
 ## 5. Bundle Metadata and Documents
 
-- [ ] Set `CFBundleIdentifier` to the registered App ID.
-- [ ] Set `CFBundleDisplayName` and `CFBundleName` to `myCamino`.
+- [x] Set `CFBundleIdentifier` to the proposed App ID; confirm registration before upload.
+- [x] Set `CFBundleDisplayName` and `CFBundleName` to `myCamino`.
 - [ ] Set `CFBundleShortVersionString` from the public release version.
 - [ ] Set a monotonically increasing `CFBundleVersion`.
-- [ ] Set `LSMinimumSystemVersion` to `14.0`.
-- [ ] Set the macOS category to Photo & Video and use Travel as the secondary App Store category.
-- [ ] Add `NSHumanReadableCopyright` for Heino Falcke.
-- [ ] Declare `.adv` and `.gpx` document types and their imported type identifiers.
+- [x] Set `LSMinimumSystemVersion` to `14.0` in Store builds.
+- [x] Set the bundle category to Photo & Video; configure Travel as the secondary App Store Connect category.
+- [x] Add `NSHumanReadableCopyright` for Heino Falcke.
+- [x] Declare `.adv` and `.gpx` document types; verify Finder opening in the signed build.
 - [ ] Test Finder opening for Adventure and GPX files.
 - [ ] Verify the complete icon set at all required macOS sizes.
 - [ ] Confirm that the clean release bundle identifies itself as `org.mycamino`, not by its executable name.
 
 ## 6. Privacy and Network Services
 
-- [ ] Add `PrivacyInfo.xcprivacy` to `Contents/Resources`.
-- [ ] Declare tracking as disabled.
-- [ ] Declare file timestamp and metadata access for explicitly user-selected files using reason `3B52.1`.
-- [ ] Declare app-owned User Defaults access using reason `CA92.1` where required.
+- [x] Add `PrivacyInfo.xcprivacy` to `Contents/Resources`.
+- [x] Declare tracking as disabled.
+- [x] Declare file timestamp and metadata access for explicitly user-selected files using reason `3B52.1`.
+- [x] Declare app-owned User Defaults access using reason `CA92.1`; reconfirm reason codes against current Apple documentation before submission.
 - [ ] Scan the frozen Python runtime and all bundled libraries for additional required-reason APIs.
 - [ ] Document that photos, videos, GPX tracks, playlists, and control files are processed locally.
 - [ ] Document optional transmission of coordinates and timestamps to map, geocoding, and weather providers.
@@ -138,16 +138,16 @@ Reference:
 
 ## 8. App Store Build Pipeline
 
-- [ ] Add a separate reproducible `build_app_store.sh`; do not replace `build_dmg.sh`.
+- [x] Add a separate reproducible `build_app_store.sh`; do not replace `build_dmg.sh`.
 - [ ] Build in a clean arm64 environment against the macOS 14 deployment target.
 - [ ] Freeze the main app and helper without machine-specific absolute dependencies.
-- [ ] Embed the provisioning profile and finalized Info.plist.
+- [x] Make the build embed the supplied provisioning profile and Store-specific Info.plist values.
 - [ ] Sign nested dynamic libraries, Python extensions, FFmpeg, and helper executables from the inside out.
 - [ ] Sign the main bundle with Apple Distribution and the finalized entitlements.
 - [ ] Build the upload package using the Mac Installer distribution identity.
-- [ ] Add automated checks for signatures, Team ID, identifiers, architectures, deployment targets, entitlements, and privacy resources.
+- [x] Add initial automated checks for nested signatures, identifier, deployment target, sandbox entitlement, provisioning profile, and privacy manifest; extend with Team ID and architecture validation after the first signed build.
 - [ ] Fail the build for unsigned Mach-O files, missing notices, external runtime dependencies, or development paths.
-- [ ] Keep direct-DMG and App-Store feature flags explicit and covered by tests.
+- [x] Keep direct-DMG and App-Store feature flags explicit and covered by tests.
 - [ ] In the App Store build, keep the news feature but remove direct download and self-update actions.
 - [ ] Validate the package with Apple's tooling before upload.
 

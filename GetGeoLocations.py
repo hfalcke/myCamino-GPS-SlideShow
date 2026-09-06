@@ -29,6 +29,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from apple_media_metadata import read_native_media_metadata
+from runtime_distribution import (
+    external_runtime_tool_allowed,
+    is_app_store_build,
+    metadata_backend_name,
+)
 from plot_metadata_utils import (
     build_photo_metadata_payload,
     legacy_media_sidecar_path,
@@ -265,6 +271,7 @@ class MediaMetadataBundle:
     spotlight: dict[str, Any]
     exiftool_available: bool
     file_stat: os.stat_result
+    provider: str = "legacy"
 
 
 @dataclass
@@ -1064,6 +1071,8 @@ def params_from_options(
 
 def read_mdls_raw(file_path: Path, metadata_key: str) -> Optional[str]:
     """Read one raw metadata value using mdls."""
+    if not external_runtime_tool_allowed("mdls"):
+        return None
     command = ["mdls", "-raw", "-name", metadata_key, str(file_path)]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -1081,6 +1090,8 @@ def read_mdls_raw(file_path: Path, metadata_key: str) -> Optional[str]:
 
 def read_mdls_metadata(file_path: Path) -> dict[str, Any]:
     """Read all Spotlight fields in one process for batched metadata work."""
+    if not external_runtime_tool_allowed("mdls"):
+        return {}
     command = ["mdls", "-plist", "-", str(file_path)]
     try:
         result = subprocess.run(command, capture_output=True, check=False)
@@ -1260,11 +1271,16 @@ def read_mdls_gps_pair_with_debug(file_path: Path) -> tuple[Optional[float], Opt
 
 def is_exiftool_available() -> bool:
     """Return True when exiftool is available on PATH."""
-    return shutil.which("exiftool") is not None
+    return (
+        external_runtime_tool_allowed("exiftool")
+        and shutil.which("exiftool") is not None
+    )
 
 
 def warn_exiftool_missing_once() -> None:
     """Print a one-time warning when exiftool fallback is unavailable."""
+    if not external_runtime_tool_allowed("exiftool"):
+        return
     global EXIFTOOL_WARNING_SHOWN
     if EXIFTOOL_WARNING_SHOWN:
         return
@@ -1400,11 +1416,20 @@ def prefetch_media_metadata(
             file_stat = path.stat()
         except OSError:
             continue
+        native = read_native_media_metadata(path)
+        embedded = dict(native.embedded)
+        for key, value in (exiftool_payloads.get(path) or {}).items():
+            embedded.setdefault(key, value)
+        spotlight = dict(native.file_metadata)
+        if external_runtime_tool_allowed("mdls"):
+            for key, value in read_mdls_metadata(path).items():
+                spotlight.setdefault(key, value)
         bundles[path] = MediaMetadataBundle(
-            exiftool=exiftool_payloads.get(path),
-            spotlight=read_mdls_metadata(path),
+            exiftool=embedded or None,
+            spotlight=spotlight,
             exiftool_available=available,
             file_stat=file_stat,
+            provider=metadata_backend_name(),
         )
     if progress_callback is not None:
         progress_callback(total, total, "")
@@ -1525,6 +1550,16 @@ def parse_mdls_datetime(raw_value: str) -> Optional[datetime]:
 
 def get_photo_datetime(file_path: Path) -> datetime:
     """Return the best available photo timestamp."""
+    if is_app_store_build():
+        native = read_native_media_metadata(file_path)
+        bundle = MediaMetadataBundle(
+            exiftool=native.embedded or None,
+            spotlight=native.file_metadata,
+            exiftool_available=False,
+            file_stat=file_path.stat(),
+            provider="native",
+        )
+        return datetime_from_metadata_bundle(bundle)[0]
     exif_datetime = read_exiftool_datetime(file_path)
     if exif_datetime is not None:
         return exif_datetime
@@ -1548,6 +1583,16 @@ def get_photo_datetime(file_path: Path) -> datetime:
 
 def get_photo_datetime_with_debug(file_path: Path) -> tuple[datetime, dict[str, Any]]:
     """Return the best timestamp and describe how it was selected."""
+    if is_app_store_build():
+        native = read_native_media_metadata(file_path)
+        bundle = MediaMetadataBundle(
+            exiftool=native.embedded or None,
+            spotlight=native.file_metadata,
+            exiftool_available=False,
+            file_stat=file_path.stat(),
+            provider="native",
+        )
+        return datetime_from_metadata_bundle(bundle)
     debug_info: dict[str, Any] = {"candidates": []}
 
     exif_datetime, exif_debug = read_exiftool_datetime_with_debug(file_path)
@@ -1594,11 +1639,15 @@ def datetime_from_metadata_bundle(
     debug_info: dict[str, Any] = {"candidates": []}
     selected, exif_debug = datetime_from_exiftool_metadata(
         bundle.exiftool,
-        available=bundle.exiftool_available,
+        available=bool(bundle.exiftool),
     )
+    exif_debug["provider"] = bundle.provider
     debug_info["exiftool"] = exif_debug
     if selected is not None:
-        debug_info["selected_source"] = f"exiftool:{exif_debug.get('selected_source')}"
+        source_family = "native" if bundle.provider == "native" else "exiftool"
+        debug_info["selected_source"] = (
+            f"{source_family}:{exif_debug.get('selected_source')}"
+        )
         return selected, debug_info
 
     for metadata_key in ("kMDItemContentCreationDate", "kMDItemFSCreationDate"):
@@ -2934,13 +2983,17 @@ def build_record_from_photo(
     check_cancelled()
     debug_info: dict[str, Any] = {}
 
+    if metadata_bundle is None and is_app_store_build():
+        metadata_bundle = prefetch_media_metadata([photo_path]).get(photo_path)
+
     if metadata_bundle is not None:
         latitude, longitude, gps_debug = gps_from_spotlight_metadata(metadata_bundle.spotlight)
         if latitude is None or longitude is None:
             exif_latitude, exif_longitude, exif_gps_debug = gps_from_exiftool_metadata(
                 metadata_bundle.exiftool
             )
-            exif_gps_debug["available"] = metadata_bundle.exiftool_available
+            exif_gps_debug["available"] = bool(metadata_bundle.exiftool)
+            exif_gps_debug["provider"] = metadata_bundle.provider
             gps_debug["exiftool"] = exif_gps_debug
             if exif_latitude is not None and exif_longitude is not None:
                 latitude, longitude = exif_latitude, exif_longitude

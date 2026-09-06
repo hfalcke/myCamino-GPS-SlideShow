@@ -86,6 +86,46 @@ The bundle preparation also fails when any first-party legal document is
 missing. `license_resources.py` is the single development/frozen lookup used
 by the main interface, Adventure Map, and standalone GPX Editor.
 
+### App Store build lane
+
+`build_app_store.sh` is deliberately separate from `build_dmg.sh`. It selects
+the `app-store` runtime distribution, embeds `PrivacyInfo.xcprivacy`, applies
+the sandbox entitlements in `packaging/app-store`, installs a Mac App Store
+provisioning profile, signs nested code, performs a fail-closed bundle
+preflight, and creates the upload `.pkg`. It requires Apple Distribution and
+Mac Installer identities plus a provisioning profile; the normal direct build
+does not require or inherit these settings.
+
+`runtime_distribution.py` is the central runtime boundary. Store builds do not
+launch separately installed `exiftool`, `mdls`, `sips`, `security`, or `ps`
+commands. They use ImageIO and AVFoundation through
+`apple_media_metadata.py`, ImageIO image conversion, and the public
+Security.framework wrapper in `macos_keychain.py`. Direct builds retain the
+existing command-line fallbacks for compatibility with uncommon camera
+metadata. FFmpeg and the Slide Show executable are bundled application helpers,
+not tools discovered on `PATH`.
+
+`security_scoped_access.py` owns the active Adventure-directory scope and its
+persisted bookmark. The map-first controller starts the scope before loading a
+project and keeps it active for embedded editors and background work. The Slide
+Show helper receives the bookmark explicitly and resolves it before opening
+project assets. Every new Store workflow that reads or writes outside the app
+container must pass through this shared authorization rather than accepting an
+unscoped stored pathname.
+
+Build a Store package only after installing the required Apple credentials:
+
+```bash
+APPLE_DISTRIBUTION_IDENTITY="Apple Distribution: ..." \
+MAC_INSTALLER_IDENTITY="3rd Party Mac Developer Installer: ..." \
+MYCAMINO_PROVISIONING_PROFILE="/path/to/myCamino.provisionprofile" \
+./build_app_store.sh
+```
+
+The generated package is still a development artifact until it passes Apple
+validation, sandbox testing on a clean Mac, and TestFlight. Run the direct DMG
+build separately to ensure Store restrictions never regress that distribution.
+
 This project is a native macOS/PyObjC workflow for building a GPS-aware photo
 and video slide show from one adventure: a project directory, one combined GPX
 track file, imported media, generated map images, geolocation metadata, and a
@@ -460,6 +500,14 @@ fetch missing public OSM tiles; that endpoint is limited to interactive use and
 one explicitly selected map plan.
 
 ## Shared GPX Processing
+
+`media_route_timing.py` provides the geometry-preserving route-timing service.
+It projects dated media onto GPX segments within the configured
+`gpx.media_timing_max_distance_m`, selects a forward monotonic set of anchors,
+and interpolates timestamps by route distance. The service returns a proposal
+only; `GPXEditorController` owns confirmation, Undo, and writing `<time>`
+elements to the existing points. Media files are not attached to or inserted
+into the route by this workflow.
 
 `gpx_import.py` is the common document-level importer. It accepts GPX 1.0 and
 1.1 core namespaces plus namespace-free documents that declare one of those

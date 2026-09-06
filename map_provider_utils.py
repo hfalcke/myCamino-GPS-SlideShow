@@ -11,6 +11,7 @@ import time
 from threading import RLock, local
 
 from application_metadata import APP_VERSION
+from runtime_distribution import external_runtime_tool_allowed
 
 
 _REQUEST_PATCH_LOCK = RLock()
@@ -56,6 +57,15 @@ def read_provider_credential(provider: str, credential_id: str = "default") -> s
         return str(os.environ[environment_key]).strip()
     if not provider_requires_credential(normalized):
         return ""
+    if not external_runtime_tool_allowed("security"):
+        try:
+            from macos_keychain import read_generic_password
+
+            return read_generic_password(
+                provider_credential_service(normalized), str(credential_id or "default")
+            ).strip()
+        except OSError:
+            return ""
     try:
         result = subprocess.run(
             [
@@ -78,6 +88,20 @@ def store_provider_credential(provider: str, api_key: str, credential_id: str = 
     value = str(api_key or "").strip()
     if not provider_requires_credential(normalized) or not value:
         raise ValueError("a non-empty API key is required for this provider")
+    if not external_runtime_tool_allowed("security"):
+        try:
+            from macos_keychain import store_generic_password
+
+            store_generic_password(
+                provider_credential_service(normalized),
+                str(credential_id or "default"),
+                value,
+            )
+            return
+        except OSError as exc:
+            raise OSError(
+                f"Could not store the {provider_display_name(normalized)} key."
+            ) from exc
     try:
         subprocess.run(
             [

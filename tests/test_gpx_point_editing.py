@@ -17,6 +17,7 @@ from gpx_point_editing import (
     point_locations,
     point_from_values,
     media_paths_for_point,
+    mark_track_media_timed,
     monotonic_route_matches,
     rewrite_local_media_links,
     serialized_points,
@@ -57,6 +58,24 @@ def coordinates(track):
 
 
 class PointEditingTests(unittest.TestCase):
+    def test_media_timing_provenance_does_not_change_route_geometry(self):
+        track = track_with_points(
+            [(50.0, 7.0, None, None), (50.0, 7.01, None, None)]
+        )
+        before = coordinates(track)
+        mark_track_media_timed(
+            track,
+            maximum_distance_m=125.0,
+            anchor_count=3,
+        )
+        self.assertEqual(coordinates(track), before)
+        origin = next(
+            node for node in track.iter() if node.tag.endswith("timingOrigin")
+        )
+        self.assertEqual(origin.attrib["kind"], "media-anchored")
+        self.assertEqual(origin.attrib["maximum_distance_m"], "125")
+        self.assertEqual(origin.attrib["anchor_count"], "3")
+
     def test_insert_first_point_into_empty_track(self):
         track = track_with_points([])
         point = point_from_values(track, 50.0, 7.0, name="Start")

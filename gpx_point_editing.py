@@ -207,6 +207,29 @@ def mark_track_media_derived(track: ET.Element) -> None:
     origin.set("estimated", "true")
 
 
+def mark_track_media_timed(
+    track: ET.Element,
+    *,
+    maximum_distance_m: float,
+    anchor_count: int,
+) -> None:
+    """Record geometry-preserving media timestamp reconstruction."""
+    extensions = next(
+        (child for child in list(track) if local_name(child.tag) == "extensions"),
+        None,
+    )
+    if extensions is None:
+        extensions = ET.SubElement(track, qualified_like(track, "extensions"))
+    tag = f"{{{MYCAMINO_NAMESPACE}}}timingOrigin"
+    origin = next((child for child in list(extensions) if child.tag == tag), None)
+    if origin is None:
+        origin = ET.SubElement(extensions, tag)
+    origin.set("kind", "media-anchored")
+    origin.set("estimated", "true")
+    origin.set("maximum_distance_m", f"{float(maximum_distance_m):g}")
+    origin.set("anchor_count", str(max(0, int(anchor_count))))
+
+
 def media_paths_for_point(point: ET.Element, source_directory: Path | None = None) -> list[Path]:
     """Resolve local media links attached to one standard GPX waypoint."""
     result = []

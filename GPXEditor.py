@@ -158,6 +158,7 @@ from gpx_point_editing import (
     joinable_segment_boundary,
     media_paths_for_point,
     mark_track_media_derived,
+    mark_track_media_timed,
     monotonic_route_matches,
     move_rows as move_point_rows,
     point_from_values,
@@ -166,6 +167,7 @@ from gpx_point_editing import (
     serialized_points,
     translate_points_web_mercator,
 )
+from media_route_timing import MediaObservation, RoutePoint, propose_route_timing
 from gpx_coordinate_input import CoordinateParseError, ParsedCoordinate, parse_coordinate_text
 from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
 from map_provider_utils import (
@@ -7208,6 +7210,7 @@ class GPXEditorController(NSObject):
         self.pending_track_load_start_index = 0
         self.pending_track_load_offer_sort = False
         self.pending_track_load_anchor_was_set = False
+        self.pending_route_timing_media_after_load: list[Path] = []
         self.pending_pdf_export_after_load = False
         self.on_initial_load_complete_callback = None
         self.initial_load_completion_notified = False
@@ -7273,6 +7276,7 @@ class GPXEditorController(NSObject):
         self.maximum_hdop = float(values["gpx.maximum_hdop"])
         self.maximum_vdop = float(values["gpx.maximum_vdop"])
         self.running_speed_window_distance_m = float(values["gpx.running_speed_window_distance_m"])
+        self.media_timing_max_distance_m = float(values["gpx.media_timing_max_distance_m"])
         self.stationary_speed_threshold_kmh = float(values["gpx.stationary_speed_threshold_kmh"])
         self.elevation_headroom_fraction = float(values["gpx.elevation_headroom_fraction"])
         self.maximum_map_tiles = int(values["gpx.maximum_map_tiles"])
@@ -7796,6 +7800,14 @@ class GPXEditorController(NSObject):
         self._track_context_item(menu, "New Track", "newTrack:", True)
         self._track_context_item(menu, "Add Points From Clipboard", "addPointsFromClipboard:", count == 1)
         self._track_context_item(menu, "Add Media Points…", "addTracksFromPhotos:", count == 1)
+        self._track_context_item(
+            menu,
+            "Estimate Route Times from Media…",
+            "estimateRouteTimesFromMedia:",
+            count == 1
+            and bool(selected[0].points())
+            and all(point.time is None for point in selected[0].points()),
+        )
         menu.addItem_(NSMenuItem.separatorItem())
         self._track_context_item(menu, "Inspect Track", "contextInspectTrack:", count == 1)
         self._track_context_item(menu, "Plot Track(s)", "contextPlotTracks:", count > 0)
@@ -8681,6 +8693,9 @@ class GPXEditorController(NSObject):
             return bool(self.selected_tracks())
         if action == "renumberTracks:":
             return bool(self.tracks)
+        if action == "estimateRouteTimesFromMedia:":
+            selected = self.selected_tracks()
+            return len(selected) == 1 and self._fully_untimed_route(selected[0])
         if action == "undo:":
             return bool(self.undo_stack)
         if action == "redo:":
@@ -9272,17 +9287,195 @@ class GPXEditorController(NSObject):
             paths = [Path(str(url.path())).resolve() for url in panel.URLs()]
             self.load_gpx_paths(paths)
 
+    @objc.python_method
+    def _expanded_media_inputs(self, selected):
+        from GetGeoLocations import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+        from media_metadata_service import media_paths_from_control_file
+        from video_audio_normalization import GENERATED_DIRECTORY_NAMES
+
+        media_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        excluded_names = set(GENERATED_DIRECTORY_NAMES) | {"__pycache__"}
+        media_paths = []
+        for selected_path in (
+            Path(path).expanduser().resolve(strict=False) for path in selected
+        ):
+            if selected_path.is_file() and selected_path.suffix.casefold() == ".lst":
+                try:
+                    media_paths.extend(
+                        media_paths_from_control_file(selected_path, media_extensions)
+                    )
+                except OSError as exc:
+                    show_alert("Could not read the control file.", str(exc))
+                continue
+            candidates = selected_path.rglob("*") if selected_path.is_dir() else [selected_path]
+            for candidate in candidates:
+                if (
+                    candidate.is_file()
+                    and candidate.suffix.casefold() in media_extensions
+                    and not any(part.casefold() in excluded_names for part in candidate.parts)
+                ):
+                    media_paths.append(candidate.resolve(strict=False))
+        return sorted(set(media_paths), key=lambda path: str(path).casefold())
+
+    @objc.python_method
+    def _fully_untimed_route(self, track):
+        points = track.points() if track is not None else []
+        return bool(points) and all(point.time is None for point in points)
+
+    @objc.python_method
+    def _route_timing_proposal(self, track, prepared):
+        raw_points = extract_raw_track_points(track.element)
+        route = [
+            RoutePoint(point.lat, point.lon, point.segment_index)
+            for point in raw_points
+        ]
+        observations = []
+        for item in prepared:
+            record = item.record
+            if (
+                record is None
+                or record.photo_datetime is None
+                or record.latitude is None
+                or record.longitude is None
+            ):
+                continue
+            observations.append(
+                MediaObservation(
+                    item.path,
+                    record.photo_datetime,
+                    float(record.latitude),
+                    float(record.longitude),
+                )
+            )
+        proposal = propose_route_timing(
+            route,
+            observations,
+            maximum_distance_m=self.media_timing_max_distance_m,
+            fallback_speed_kmh=float(
+                self.project_parameters["gpx.fallback_walking_speed_kmh"]
+            ),
+        )
+        return raw_points, observations, proposal
+
+    @objc.python_method
+    def offer_route_timing_from_prepared(self, prepared, track=None):
+        if track is None:
+            selected = self.selected_tracks()
+            track = selected[0] if len(selected) == 1 else None
+        if not self._fully_untimed_route(track):
+            return False
+        raw_points, _observations, proposal = self._route_timing_proposal(track, prepared)
+        if not proposal.anchors:
+            self.set_status(
+                f"No dated media were within {self.media_timing_max_distance_m:g} m "
+                f"of untimed track #{track.nr}; route timing was unchanged."
+            )
+            return False
+        ignored_count = max(0, len(prepared) - len(proposal.anchors))
+        start_text = format_datetime_local(proposal.point_times[0])
+        end_text = format_datetime_local(proposal.point_times[-1])
+        speed_note = (
+            f"The {float(self.project_parameters['gpx.fallback_walking_speed_kmh']):g} km/h "
+            "fallback is used outside the single anchor."
+            if len(proposal.anchors) == 1
+            else f"Extrapolation uses {proposal.extrapolation_speed_kmh:.1f} km/h."
+        )
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(f"Estimate times for {track.name}?")
+        alert.setInformativeText_(
+            f"{len(proposal.anchors)} of {len(prepared)} media file(s) provide monotonic "
+            f"timing anchors within {self.media_timing_max_distance_m:g} m; "
+            f"{ignored_count} will be ignored for timing but remain media.\n\n"
+            f"Estimated route: {start_text} to {end_text}. {speed_note}\n\n"
+            "Only timestamps on existing route points will change. Route coordinates "
+            "and segments remain untouched."
+        )
+        alert.addButtonWithTitle_("Estimate Route Times")
+        alert.addButtonWithTitle_("Not Now")
+        if int(alert.runModal()) != 1000:
+            self.set_status("Route timing was left unchanged.")
+            return False
+        if len(raw_points) != len(proposal.point_times):
+            show_alert("Could not estimate route times.", "The route changed while media were analyzed.")
+            return False
+        self.push_undo()
+        for point, point_time in zip(raw_points, proposal.point_times):
+            if point.element is not None:
+                get_or_create_point_time(point.element).text = format_gpx_time(point_time)
+        mark_track_media_timed(
+            track.element,
+            maximum_distance_m=self.media_timing_max_distance_m,
+            anchor_count=len(proposal.anchors),
+        )
+        self.invalidate_track_metrics(track)
+        self.mark_dirty(
+            f"Estimated track #{track.nr} timestamps from {len(proposal.anchors)} nearby media file(s)."
+        )
+        inspector = self.existing_inspector_for_track(track)
+        if inspector is not None:
+            inspector.reload_rows()
+        for _window, _delegate, view in self.plot_windows:
+            if hasattr(view, "setNeedsDisplay_"):
+                view.setNeedsDisplay_(True)
+        return True
+
+    @objc.python_method
+    def offerRouteTimingForPaths_(self, payload):
+        from media_metadata_service import prepare_media_records
+
+        track_nr, raw_paths = payload
+        track = next((item for item in self.tracks if item.nr == int(track_nr)), None)
+        if not self._fully_untimed_route(track):
+            return
+        paths = self._expanded_media_inputs(raw_paths)
+        if not paths:
+            self.set_status("No supported media were available for route timing.")
+            return
+        self.set_status(f"Preparing {len(paths)} media file(s) for route timing...")
+        prepared = prepare_media_records(paths, refresh_changed=True)
+        self.offer_route_timing_from_prepared(prepared, track)
+
+    @objc.IBAction
+    def estimateRouteTimesFromMedia_(self, _sender):
+        selected_tracks = self.selected_tracks()
+        if len(selected_tracks) != 1 or not self._fully_untimed_route(selected_tracks[0]):
+            show_alert("Select one completely untimed route.")
+            return
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(True)
+        panel.setCanCreateDirectories_(False)
+        panel.setAllowsMultipleSelection_(True)
+        panel.setPrompt_("Use Media for Timing")
+        project_directory = self.media_context.get("project_directory")
+        if project_directory:
+            candidate = Path(project_directory).expanduser().resolve(strict=False)
+            if candidate.is_dir():
+                panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(candidate)))
+        if not panel.runModal():
+            return
+        paths = [Path(str(url.path())).resolve(strict=False) for url in panel.URLs()]
+        self.offerRouteTimingForPaths_((selected_tracks[0].nr, paths))
+
     def addDroppedMediaPaths_(self, paths):
         """Review media or a control file dropped onto the active track map."""
+        if self.track_load_timer is not None:
+            self.pending_route_timing_media_after_load.extend(
+                Path(path).expanduser().resolve(strict=False) for path in paths or []
+            )
+            self.set_status("Media will be checked against the route after GPX loading finishes.")
+            return
+        selected = self.selected_tracks()
+        if len(selected) == 1 and self._fully_untimed_route(selected[0]):
+            self.offerRouteTimingForPaths_((selected[0].nr, list(paths or [])))
+            return
         self.media_context["_pending_media_paths"] = [str(path) for path in paths or []]
         self.addTracksFromPhotos_(None)
 
     @objc.IBAction
     def addTracksFromPhotos_(self, _sender):
-        from GetGeoLocations import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-        from media_metadata_service import media_paths_from_control_file, prepare_media_records
+        from media_metadata_service import prepare_media_records
         from track_timing_utils import repair_timed_points
-        from video_audio_normalization import GENERATED_DIRECTORY_NAMES
 
         pending_paths = self.media_context.pop("_pending_media_paths", None)
         if pending_paths:
@@ -9301,31 +9494,7 @@ class GPXEditorController(NSObject):
             if not panel.runModal():
                 return
             selected = [Path(str(url.path())).expanduser().resolve() for url in panel.URLs()]
-        media_extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-        excluded_names = set(GENERATED_DIRECTORY_NAMES) | {"__pycache__"}
-        media_paths = []
-        for selected_path in selected:
-            if selected_path.is_file() and selected_path.suffix.casefold() == ".lst":
-                try:
-                    media_paths.extend(
-                        media_paths_from_control_file(selected_path, media_extensions)
-                    )
-                except OSError as exc:
-                    show_alert("Could not read the control file.", str(exc))
-                continue
-            candidates = (
-                selected_path.rglob("*")
-                if selected_path.is_dir()
-                else [selected_path]
-            )
-            for candidate in candidates:
-                if (
-                    candidate.is_file()
-                    and candidate.suffix.casefold() in media_extensions
-                    and not any(part.casefold() in excluded_names for part in candidate.parts)
-                ):
-                    media_paths.append(candidate.resolve())
-        media_paths = sorted(set(media_paths), key=lambda path: str(path).casefold())
+        media_paths = self._expanded_media_inputs(selected)
         if not media_paths:
             show_alert("No supported photos or videos were selected.")
             return
@@ -9714,6 +9883,15 @@ class GPXEditorController(NSObject):
         self.set_status(f"{action} {added} track(s) from {path_count} GPX file(s).{ignored_suffix}")
         if offer_sort and len(loaded_records) > 1:
             self.offer_sort_dropped_tracks(loaded_records, anchor_was_set)
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if mark_dirty and workspace is not None and hasattr(workspace, "workspace_tracks_did_load"):
+            workspace.workspace_tracks_did_load(loaded_records)
+        if self.pending_route_timing_media_after_load:
+            pending_media = list(dict.fromkeys(self.pending_route_timing_media_after_load))
+            self.pending_route_timing_media_after_load = []
+            untimed = [track for track in loaded_records if self._fully_untimed_route(track)]
+            if len(untimed) == 1:
+                self.offerRouteTimingForPaths_((untimed[0].nr, pending_media))
         self.notify_initial_load_complete()
         self.offer_track_time_entry()
         if self.pending_pdf_export_after_load:
@@ -12451,7 +12629,7 @@ class GPXEditorController(NSObject):
             "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
-            "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
+            "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation. Estimate Route Times from Media keeps an untimed route's geometry unchanged and timestamps its existing points from nearby media within the configured Photo-to-route distance. More distant media is ignored only for timing. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
             "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint table. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row.\n\n"
             "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber Tracks records the current row order as persistent track numbers; after another sort, sorting by Track Number restores that order. Hidden rows remain numbered but are gray and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
@@ -12712,6 +12890,7 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
         ("Waypoint Table", "inspectTrack:"),
         ("Plot Track(s)", "plotSelected:"),
         ("Elevation Profile", "contextElevationProfile:"),
+        ("Estimate Route Times from Media…", "estimateRouteTimesFromMedia:"),
         ("Renumber Tracks", "renumberTracks:"),
         ("Save Selected Tracks As…", "saveSelectedTracksAs:"),
     ):

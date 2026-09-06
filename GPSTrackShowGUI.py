@@ -25,6 +25,8 @@ if __name__ == "__main__":
     sys.modules.setdefault("GPSTrackShowGUI", sys.modules[__name__])
 
 import objc
+from apple_media_metadata import convert_image_to_jpeg
+from runtime_distribution import is_app_store_build
 from AppKit import (
     NSApp,
     NSApplication,
@@ -11697,14 +11699,7 @@ class GPXTrackerController(NSObject):
             self.set_status(f"Importing {index}/{len(media_files)}: {source_path.name}")
             try:
                 if force_jpeg and source_path.suffix.lower() not in {".jpg", ".jpeg"}:
-                    completed = subprocess.run(
-                        ["sips", "-s", "format", "jpeg", str(source_path), "--out", str(target_path)],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if completed.returncode != 0:
-                        failed.append(f"{target_name}: conversion failed")
+                    convert_image_to_jpeg(source_path, target_path)
                 else:
                     shutil.copy2(source_path, target_path)
             except OSError as exc:
@@ -11973,15 +11968,11 @@ class GPXTrackerController(NSObject):
                 failed.append(f"{target_name}: source photo was unavailable")
                 self.set_progress(index + 1, total)
                 continue
-            completed = subprocess.run(
-                ["sips", "-s", "format", "jpeg", "-s", "formatOptions", "best", str(source_path), "--out", str(target_path)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if completed.returncode != 0 or not target_path.exists():
+            try:
+                convert_image_to_jpeg(source_path, target_path, quality=0.95)
+            except OSError:
                 failed.append(f"{target_name}: export failed")
-            else:
+            if target_path.exists():
                 copied += 1
                 imported_paths.append(target_path.resolve(strict=False))
             self.set_progress(index + 1, total)
@@ -15314,9 +15305,19 @@ class GPXTrackerController(NSObject):
                 state_file=state_file,
                 command_file=command_file,
             )
+            child_environment = os.environ.copy()
+            if is_app_store_build():
+                child_environment["MYCAMINO_DISTRIBUTION"] = "app-store"
+                host = getattr(self, "adventure_map_host", None)
+                access = getattr(host, "project_access", None)
+                if access is not None:
+                    bookmark = access.encoded_bookmark(project_dir)
+                    if bookmark:
+                        child_environment["MYCAMINO_PROJECT_BOOKMARK"] = bookmark
             self.slideshow_process = subprocess.Popen(
                 command,
                 cwd=str(self.base_dir),
+                env=child_environment,
             )
             self.slideshow_live_state = None
             self.slideshow_live_state_sequence = -1

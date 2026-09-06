@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 21
+PARAMETER_SCHEMA_VERSION = 22
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -119,6 +119,7 @@ PARAMETER_SPECS = (
     ParameterSpec("trackmaps.edge_margin_fraction", "Map Generation", "Time-Lapse edge margin", 0.05, "fraction", "Minimum route distance from the plotting-area edge.", 0.0, 0.49, advanced=True, unit="%"),
 
     ParameterSpec("gpx.fallback_walking_speed_kmh", "GPX Processing", "Fallback walking speed", 3.5, "float", "Speed used when missing timestamps cannot be anchored.", 0.1, 50.0, unit="km/h"),
+    ParameterSpec("gpx.media_timing_max_distance_m", "GPX Processing", "Photo-to-route distance", 100.0, "float", "Maximum distance from an untimed route at which a photo may provide a timestamp anchor.", 1.0, 10000.0, unit="m"),
     ParameterSpec("gpx.horizontal_smoothing_distance_m", "GPX Processing", "Horizontal smoothing", 10.0, "float", "Smooth horizontal GPS coordinates over this route distance before spacing and length calculations. Set to zero to disable.", 0.0, 10000.0, unit="m"),
     ParameterSpec("gpx.minimum_point_spacing_m", "GPX Processing", "Minimum point spacing", 10.0, "float", "Retain processed points at least this far apart. Set to zero to retain every quality-accepted point.", 0.0, 10000.0, unit="m"),
     ParameterSpec("gpx.maximum_accuracy_m", "GPX Processing", "Maximum horizontal error", 10.0, "float", "Reject coordinates whose explicit horizontal uncertainty exceeds this value. Set to zero to disable.", 0.0, 10000.0, unit="m"),

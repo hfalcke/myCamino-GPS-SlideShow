@@ -28,6 +28,16 @@ inserted chronologically. If the destination
 contains untimed points, the editor asks before estimating their times by route
 distance; known timestamps are never replaced.
 
+For an existing route whose points have no timestamps, **Estimate Route Times
+from Media** provides the complementary workflow: media with exposure times
+and GPS positions within the configured **Photo-to-route distance** (100 m by
+default) become timing anchors for the route's existing points. The route
+geometry is not changed and the media is not inserted as extra GPX points.
+More distant media remains available to the Adventure and slideshow but is
+ignored for timing. This offer also appears automatically when media is added
+to a selected untimed route, or when one untimed route is added to an Adventure
+that already contains media.
+
 Media links are ordinary GPX `<link>` elements. They are relative when the
 media is below the saved GPX directory and file URLs otherwise. Map pins mark
 linked media. Press `p` to switch between selected-photo and all-photo

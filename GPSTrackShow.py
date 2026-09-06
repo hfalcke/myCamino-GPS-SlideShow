@@ -25,6 +25,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
+from runtime_distribution import external_runtime_tool_allowed
 from plot_metadata_utils import (
     coordinate_to_pixel,
     extract_coordinate_point,
@@ -7210,6 +7211,8 @@ def memory_watchdog_limits() -> tuple[int, int]:
 def current_process_resident_bytes() -> Optional[int]:
     """Return current RSS, with a conservative peak-RSS fallback."""
     try:
+        if not external_runtime_tool_allowed("ps"):
+            raise OSError("external process inspection is disabled")
         result = subprocess.run(
             ["/bin/ps", "-o", "rss=", "-p", str(os.getpid())],
             capture_output=True,
@@ -16769,6 +16772,15 @@ def run_with_options(
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Run the slideshow CLI."""
+    if not external_runtime_tool_allowed("ps"):
+        from security_scoped_access import activate_helper_project_access
+
+        if not activate_helper_project_access():
+            print(
+                "Error: the slideshow could not obtain access to the Adventure folder.",
+                file=sys.stderr,
+            )
+            return 2
     args = sys.argv[1:] if argv is None else argv
     config = parse_args(args)
     if not APPKIT_AVAILABLE:

@@ -42,6 +42,9 @@ windows.
 ## Main functions
 
 - Import GPX tracks, photographs and videos from a multi-day journey.
+- Create new tracks from map points, pasted coordinates, or photo locations;
+  nearby dated photos can also reconstruct timing for an existing untimed
+  route without changing its geometry.
 - Generate stage and overview maps using OpenStreetMap or another configured
   tile provider. Guided first-use setup links to supported provider accounts;
   hosted API keys remain in the user's macOS Keychain.

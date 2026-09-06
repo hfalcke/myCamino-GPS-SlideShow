@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+import os
 import runpy
 
 from PyInstaller.utils.hooks import collect_submodules
@@ -8,6 +9,9 @@ PROJECT_ROOT = Path(SPECPATH).resolve()
 APPLICATION_METADATA = runpy.run_path(str(PROJECT_ROOT / 'application_metadata.py'))
 APP_BUNDLE_VERSION = APPLICATION_METADATA['APP_BUNDLE_VERSION']
 bundle_build_number = APPLICATION_METADATA['bundle_build_number']
+APP_STORE = os.environ.get('MYCAMINO_DISTRIBUTION', '').strip().lower() in {'app-store', 'appstore', 'store'}
+CODESIGN_IDENTITY = os.environ.get('MYCAMINO_CODESIGN_IDENTITY') or None
+ENTITLEMENTS_FILE = os.environ.get('MYCAMINO_ENTITLEMENTS') or None
 
 hiddenimports = ['pyexpat', 'PIL._tkinter_finder']
 hiddenimports += collect_submodules('objc')
@@ -45,6 +49,7 @@ a = Analysis(
         ('myCaminoTrackLogo.PNG', '.'),
         ('MyCaminoLogo-ohneText.png', '.'),
         ('build/license_bundle/app_resources/licenses', 'licenses'),
+        *([('packaging/app-store/PrivacyInfo.xcprivacy', '.')] if APP_STORE else []),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -70,8 +75,8 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    codesign_identity=CODESIGN_IDENTITY,
+    entitlements_file=ENTITLEMENTS_FILE,
 )
 coll = COLLECT(
     exe,
@@ -93,5 +98,22 @@ app = BUNDLE(
         'CFBundleDisplayName': 'myCamino',
         'CFBundleName': 'myCamino',
         'NSHighResolutionCapable': True,
+        'LSMinimumSystemVersion': '14.0' if APP_STORE else '12.0',
+        'LSApplicationCategoryType': 'public.app-category.photography',
+        'NSHumanReadableCopyright': 'Copyright © 2026 Heino Falcke',
+        'ITSAppUsesNonExemptEncryption': False,
+        'MYCaminoDistribution': 'app-store' if APP_STORE else 'direct',
+        'CFBundleDocumentTypes': [
+            {
+                'CFBundleTypeName': 'myCamino Adventure',
+                'CFBundleTypeExtensions': ['adv'],
+                'CFBundleTypeRole': 'Editor',
+            },
+            {
+                'CFBundleTypeName': 'GPS Exchange Format',
+                'CFBundleTypeExtensions': ['gpx'],
+                'CFBundleTypeRole': 'Editor',
+            },
+        ],
     },
 )
