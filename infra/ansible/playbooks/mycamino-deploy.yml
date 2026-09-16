@@ -1,0 +1,142 @@
+- name: Deploy independent myCamino website
+  hosts: staging
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Verify shared network exists (owned by FediPass infrastructure)
+      ansible.builtin.command:
+        argv: [docker, network, inspect, "{{ mycamino_public_network }}"]
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect the running shared gateway
+      ansible.builtin.command:
+        argv: [docker, inspect, staging-caddy-1]
+      register: gateway_inspect
+      changed_when: false
+      check_mode: false
+
+    - name: Require the protected gateway mount and network
+      ansible.builtin.assert:
+        that:
+          - (gateway_inspect.stdout | from_json)[0].State.Running
+          - mycamino_public_network in (gateway_inspect.stdout | from_json)[0].NetworkSettings.Networks
+          - ((gateway_inspect.stdout | from_json)[0].Mounts | selectattr('Destination', 'equalto', '/srv/mycamino-releases') | selectattr('Source', 'equalto', mycamino_data_root ~ '/releases') | selectattr('RW', 'equalto', false) | list | length) == 1
+        fail_msg: Shared gateway integration is missing. Repair it through fedipass-infra before deploying myCamino.
+
+    - name: Require complete myCamino configuration
+      ansible.builtin.assert:
+        that:
+          - lookup('vars', item, default='') | length > 0
+          - not lookup('vars', item, default='').startswith('REPLACE_WITH')
+        fail_msg: "Configure {{ item }} before deploying the public myCamino website."
+      loop:
+        - mycamino_host
+        - mycamino_image
+        - mycamino_operator_name
+        - mycamino_operator_address
+        - mycamino_operator_email
+        - mycamino_django_secret_key
+        - mycamino_form_ip_salt
+        - mycamino_smtp_username
+        - mycamino_smtp_password
+        - mycamino_admin_username
+        - mycamino_admin_email
+        - mycamino_admin_password
+  tasks:
+    - name: Create myCamino application and data directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ mycamino_app_root }}", owner: "{{ deploy_user | default('deploy') }}", group: "{{ deploy_user | default('deploy') }}", mode: "0750"}
+        - {path: "{{ mycamino_data_root }}", owner: "{{ deploy_user | default('deploy') }}", group: "{{ deploy_user | default('deploy') }}", mode: "0750"}
+        - {path: "{{ mycamino_data_root }}/database", owner: "10001", group: "10001", mode: "0750"}
+        - {path: "{{ mycamino_data_root }}/exports", owner: "10001", group: "10001", mode: "0750"}
+        - {path: "{{ mycamino_data_root }}/releases", owner: "{{ deploy_user | default('deploy') }}", group: "{{ deploy_user | default('deploy') }}", mode: "0755"}
+        - {path: "{{ mycamino_data_root }}/backups", owner: "{{ deploy_user | default('deploy') }}", group: "{{ deploy_user | default('deploy') }}", mode: "0750"}
+
+    - name: Render independent myCamino Compose project
+      ansible.builtin.template:
+        src: mycamino-compose.yml.j2
+        dest: "{{ mycamino_app_root }}/docker-compose.yml"
+        owner: "{{ deploy_user | default('deploy') }}"
+        group: "{{ deploy_user | default('deploy') }}"
+        mode: "0640"
+
+    - name: Render myCamino environment with secrets
+      ansible.builtin.template:
+        src: mycamino.env.j2
+        dest: "{{ mycamino_app_root }}/mycamino.env"
+        owner: "{{ deploy_user | default('deploy') }}"
+        group: "{{ deploy_user | default('deploy') }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Log in to GHCR
+      ansible.builtin.command:
+        cmd: docker login ghcr.io --username "{{ mycamino_ghcr_username }}" --password-stdin
+        stdin: "{{ mycamino_ghcr_token }}"
+      no_log: true
+      changed_when: false
+
+    - name: Pull myCamino website image
+      ansible.builtin.command:
+        cmd: docker compose pull
+        chdir: "{{ mycamino_app_root }}"
+      changed_when: true
+
+    - name: Start only the myCamino Compose project
+      ansible.builtin.command:
+        cmd: docker compose up -d --remove-orphans
+        chdir: "{{ mycamino_app_root }}"
+      changed_when: true
+
+    - name: Wait for the myCamino health endpoint
+      ansible.builtin.command:
+        cmd: >-
+          docker compose exec -T web python -c
+          "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8003/health/', headers={'Host': '{{ mycamino_host }}', 'X-Forwarded-Proto': 'https'}), timeout=3)"
+        chdir: "{{ mycamino_app_root }}"
+      register: mycamino_health
+      retries: 12
+      delay: 5
+      until: mycamino_health.rc == 0
+      changed_when: false
+
+    - name: Create or update the protected myCamino administrator
+      ansible.builtin.command:
+        cmd: >-
+          docker compose exec -T
+          -e MYCAMINO_ADMIN_USERNAME={{ mycamino_admin_username }}
+          -e MYCAMINO_ADMIN_EMAIL={{ mycamino_admin_email }}
+          -e MYCAMINO_ADMIN_PASSWORD={{ mycamino_admin_password }}
+          web python manage.py shell -c
+          "import os; from django.contrib.auth import get_user_model; U=get_user_model(); u,_=U.objects.get_or_create(username=os.environ['MYCAMINO_ADMIN_USERNAME'], defaults={'email': os.environ['MYCAMINO_ADMIN_EMAIL']}); u.email=os.environ['MYCAMINO_ADMIN_EMAIL']; u.is_staff=True; u.is_superuser=True; u.set_password(os.environ['MYCAMINO_ADMIN_PASSWORD']); u.save()"
+        chdir: "{{ mycamino_app_root }}"
+      no_log: true
+      changed_when: true
+
+    - name: Refresh myCamino operator CSV and audit exports
+      ansible.builtin.command:
+        argv: [docker, compose, exec, -T, web, python, manage.py, export_operator_data]
+        chdir: "{{ mycamino_app_root }}"
+      changed_when: false
+
+    - name: Schedule daily personal-data retention cleanup
+      ansible.builtin.cron:
+        name: myCamino personal-data retention cleanup
+        user: root
+        minute: "17"
+        hour: "3"
+        job: "cd {{ mycamino_app_root }} && docker compose exec -T web python manage.py purge_personal_data >/var/log/mycamino-retention.log 2>&1"
+
+    - name: Schedule regular myCamino operator export refresh
+      ansible.builtin.cron:
+        name: myCamino operator exports
+        user: root
+        minute: "*/15"
+        job: "cd {{ mycamino_app_root }} && docker compose exec -T web python manage.py export_operator_data >/var/log/mycamino-exports.log 2>&1"

@@ -1,0 +1,52 @@
+- name: Smoke-test the public myCamino website
+  hosts: staging
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Check public pages and security headers
+      check_mode: false
+      ansible.builtin.uri:
+        url: "https://{{ mycamino_host }}{{ item }}"
+        status_code: 200
+        return_content: true
+      loop:
+        - /
+        - /documentation/
+        - /faq/
+        - /contact/
+        - /privacy/
+        - /imprint/
+        - /download/
+      register: mycamino_pages
+      retries: 12
+      delay: 5
+      until: mycamino_pages.status == 200
+
+    - name: Confirm an unverified DMG request is denied
+      check_mode: false
+      ansible.builtin.uri:
+        url: "https://{{ mycamino_host }}/downloads/myCamino-GPS-Track-Show.dmg"
+        status_code: 401
+
+    - name: Confirm the site identifies the product
+      ansible.builtin.assert:
+        quiet: true
+        fail_msg: "Missing product name or security header on {{ item.item }}"
+        that:
+          - "'myCamino' in item.content"
+          - "'nosniff' in (item.x_content_type_options | default(''))"
+      loop: "{{ mycamino_pages.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check free disk space for releases and backups
+      check_mode: false
+      ansible.builtin.command:
+        argv: [df, --output=avail, -B1, "{{ mycamino_data_root }}"]
+      register: mycamino_disk
+      changed_when: false
+
+    - name: Require at least one GiB of free myCamino storage
+      ansible.builtin.assert:
+        that: (mycamino_disk.stdout_lines | last | trim | int) > 1073741824
+        fail_msg: "Less than one GiB remains for myCamino releases, database and backups."

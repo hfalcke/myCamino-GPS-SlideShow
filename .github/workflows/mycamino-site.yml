@@ -3,9 +3,9 @@ name: myCamino website
 on:
   push:
     branches: [main]
-    paths: ["website/**", "docs/**", "scripts/publish_website_release.sh", ".github/workflows/mycamino-site.yml"]
+    paths: ["website/**", "docs/**", "ops_control/**", "infra/**", "control.sh", "scripts/ops/**", "scripts/deploy/**", "scripts/tests/**", "scripts/publish_website_release.sh", ".github/workflows/mycamino-site.yml"]
   pull_request:
-    paths: ["website/**", "docs/**", "scripts/publish_website_release.sh", ".github/workflows/mycamino-site.yml"]
+    paths: ["website/**", "docs/**", "ops_control/**", "infra/**", "control.sh", "scripts/ops/**", "scripts/deploy/**", "scripts/tests/**", "scripts/publish_website_release.sh", ".github/workflows/mycamino-site.yml"]
   workflow_dispatch:
 
 permissions:
@@ -23,7 +23,9 @@ jobs:
           cache: pip
           cache-dependency-path: website/requirements.txt
       - run: pip install -r website/requirements.txt
+      - run: pip install -r infra/requirements.txt
       - run: python website/manage.py test siteapp
+      - run: python -m unittest discover -s scripts/tests
       - run: python website/manage.py check --deploy
         env:
           DJANGO_DEBUG: "false"

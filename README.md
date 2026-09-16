@@ -89,6 +89,9 @@ information should instead use the private
 The published SHA-256 checksum should be compared with the downloaded DMG
 before installation.
 
+Website operators can run `./control.sh` for the independent notebook-local
+[myCamino control panel](docs/CONTROL_PANEL.md).
+
 ## Source code and licence
 
 myCamino is free software licensed under

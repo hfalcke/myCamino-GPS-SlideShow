@@ -13,3 +13,6 @@ website/.pytest_cache/
 website/exports/
 .DS_Store
 **/.mycamino/logs/
+.venv-ops/
+.mycamino-control/
+infra/private/

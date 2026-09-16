@@ -1,0 +1,8 @@
+all:
+  children:
+    staging:
+      hosts:
+        mycamino-server:
+          ansible_host: staging.fedipass.org
+          ansible_user: deploy
+          ansible_ssh_private_key_file: /absolute/path/to/ssh/key

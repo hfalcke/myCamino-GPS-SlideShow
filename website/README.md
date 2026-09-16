@@ -4,6 +4,14 @@ This standalone Django service shares only the existing public Docker network
 with the FediPass Caddy container. It has its own image, Compose project,
 SQLite database, release directory and deployment lifecycle.
 
+## Operator control panel
+
+Run `./control.sh` from the myCamino repository to open **myCamino Control** at
+`http://127.0.0.1:8788/`. Website releases, preview, deployment, GitHub reports,
+download data and application news are managed here. See
+[the control-panel guide](../docs/CONTROL_PANEL.md) for configuration and the
+shared gateway contract. FediOps no longer hosts these operations.
+
 ## Local development
 
 ```bash
@@ -45,8 +53,8 @@ GUI, macOS bundle, and website release record.
 ## Application news and updates
 
 The macOS applications read the public, versioned feed at
-`/api/app-news/v1/` at most once per day. Manage messages through the FediOps
-Control **Application News** page or the `app_news` management command. Keep a
+`/api/app-news/v1/` at most once per day. Manage messages through the
+**myCamino Control → Application News** page or the `app_news` management command. Keep a
 slug stable because clients use it as the read/unread identifier; set **Kind**
 to Update and provide **App version** for a release notice. Draft and
 future-dated items are not returned.

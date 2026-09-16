@@ -1,0 +1,26 @@
+services:
+  web:
+    image: {{ mycamino_image }}
+    container_name: mycamino-site
+    restart: unless-stopped
+    env_file:
+      - ./mycamino.env
+    environment:
+      MYCAMINO_EXPORT_ROOT: /exports
+    volumes:
+      - {{ mycamino_data_root }}/database:/data
+      - {{ mycamino_data_root }}/releases:/releases:ro
+      - {{ mycamino_data_root }}/exports:/exports
+    networks:
+      - public
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8003/health/', headers={'Host': '{{ mycamino_host }}', 'X-Forwarded-Proto': 'https'}), timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  public:
+    external: true
+    name: {{ mycamino_public_network }}

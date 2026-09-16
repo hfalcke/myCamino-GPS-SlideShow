@@ -1,0 +1,13 @@
+mycamino_host: mycamino.heinofalcke.de
+mycamino_app_root: /opt/mycamino/site
+mycamino_data_root: /var/lib/mycamino
+mycamino_image: ghcr.io/hfalcke/mycamino-site:main
+mycamino_public_network: fedipass_staging_public
+deploy_user: deploy
+mycamino_operator_name: REPLACE_WITH_OPERATOR
+mycamino_operator_address: REPLACE_WITH_POSTAL_ADDRESS
+mycamino_operator_email: mycamino@heinofalcke.de
+mycamino_smtp_host: REPLACE_WITH_SMTP_HOST
+mycamino_smtp_port: 587
+mycamino_smtp_use_tls: true
+mycamino_smtp_use_ssl: false
