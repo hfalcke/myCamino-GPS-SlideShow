@@ -37,6 +37,7 @@ class PanelSecurityTests(unittest.TestCase):
         h = {'Cookie': COOKIE+'=test-token'} if authenticated else {}
         if data is not None:
             h['Content-Type'] = 'application/x-www-form-urlencoded'
+            h['Origin'] = f'http://127.0.0.1:{self.server.server_port}'
         h.update(headers or {})
         conn.request(method, path, body=urlencode(data) if data is not None else None, headers=h)
         res = conn.getresponse()
@@ -51,7 +52,9 @@ class PanelSecurityTests(unittest.TestCase):
         self.assertEqual(headers['Location'], '/')
         self.assertIn('HttpOnly', headers['Set-Cookie'])
         self.assertIn('SameSite=Strict', headers['Set-Cookie'])
-        page = self.request()[2]
+        self.assertEqual(headers['Referrer-Policy'], 'no-referrer')
+        _, headers, page = self.request()
+        self.assertEqual(headers['Referrer-Policy'], 'same-origin')
         self.assertIn('myCamino Control', page)
         self.assertNotIn('test-token', page)
         self.assertNotIn('FediOps', page)
@@ -60,8 +63,35 @@ class PanelSecurityTests(unittest.TestCase):
         with patch.object(self.panel, 'run_action') as run:
             self.assertEqual(self.request('/action-run', 'POST', {'action': 'stop_mycamino_staging'})[0], 403)
             self.assertEqual(self.request('/action-run', 'POST', {'csrf': self.panel.csrf}, {'Origin':'https://evil.test'})[0], 403)
+            self.assertEqual(self.request('/action-run', 'POST', {'csrf': self.panel.csrf}, {'Origin':'null'})[0], 403)
+            self.assertEqual(self.request('/action-run', 'POST', {'csrf': self.panel.csrf}, {'Origin':'http://127.0.0.1:1'})[0], 403)
             self.assertEqual(self.request(headers={'Host':'evil.test'})[0], 403)
             self.assertEqual(self.request('/action-run', 'POST', {'csrf':self.panel.csrf, 'padding':'a'*33000})[0], 413)
+            run.assert_not_called()
+
+    def test_all_operations_accept_same_origin_forms_and_explain_the_action(self):
+        home = self.request()[2]
+        for action in self.panel.actions().values():
+            with self.subTest(action=action.key):
+                self.assertIn(action.description, home)
+                _, headers, page = self.request('/action-confirm?action='+action.key)
+                # Native form submissions must retain a non-null same-origin Origin.
+                self.assertEqual(headers['Referrer-Policy'], 'same-origin')
+                self.assertIn(action.description, page)
+                self.assertIn('name="csrf"', page)
+                with patch.object(self.panel, 'run_action', return_value=CheckResult('test', '', 1, '', 'Synthetic command failure')) as run:
+                    status, _, content = self.request('/action-run', 'POST', {
+                        'csrf': self.panel.csrf, 'action': action.key,
+                        'confirmation': action.confirmation})
+                    self.assertEqual(status, 200)
+                    self.assertIn(action.description, content)
+                    self.assertIn('Synthetic command failure', content)
+                    run.assert_called_once_with(action.key, action.confirmation)
+
+    def test_unknown_action_is_never_executed(self):
+        with patch.object(self.panel, 'run_action') as run:
+            self.assertEqual(self.request('/action-run', 'POST', {
+                'csrf': self.panel.csrf, 'action': 'arbitrary-command'})[0], 404)
             run.assert_not_called()
 
     def test_confirmation_and_safe_results(self):

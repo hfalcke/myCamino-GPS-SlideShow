@@ -22,6 +22,12 @@ manage the panel. Closing the browser does not stop it. Set
 - Local preview controls use port 8765 and an isolated preview database.
 - GitHub report controls are read-only. “New” means open issues retaining the
   `needs-triage` label. Review and remove that label on GitHub to clear the queue.
+  **List All Open myCamino Reports & Requests** also includes already-reviewed
+  open issues, ordered by most recent activity. Neither list includes private
+  website contact messages.
+- **Check myCamino GitHub Build** shows the five latest website image builds
+  and their status (running, succeeded, or failed). It does not start a build,
+  deploy the website, or check the desktop DMG packaging.
 - **Downloads** shows 30 requests per page, newest first. A request records
   authorized access, not proof that an entire DMG transfer completed.
 - **Beta data** shows registrations, contact messages, and the download log;
@@ -32,6 +38,8 @@ manage the panel. Closing the browser does not stop it. Set
 Long operations return their result in the same page. Other pages remain
 available while they run. Modifying operations are serialized across the panel
 and website-release CLI; wait for a running operation before starting another.
+Each operation has an explanation on the home page, confirmation page, and
+results page. Read-only checks are identified separately from modifying actions.
 
 Desktop application releases continue to use `./release.sh`. Website publishing
 does not stage desktop application files or the user guides automatically.

@@ -91,9 +91,21 @@ class ControlPanel(RemoteOperations):
             ('mycamino_new_reports', 'Check New myCamino Reports & Requests', 'python3 scripts/ops/mycamino_github_issues.py --mode new', False, 90, ''),
             ('mycamino_open_reports', 'List All Open myCamino Reports & Requests', 'python3 scripts/ops/mycamino_github_issues.py --mode open', False, 90, ''),
         ]
-        return {k: ControlAction(k, label, 'mycamino', 'notebook',
-                'Website operations only. Application DMG packaging uses release.sh separately.'
-                if k in ('release_mycamino_website', 'publish_mycamino_site') else label,
+        descriptions = {
+            'release_mycamino_website': 'Publish website changes to GitHub, wait for its website image to build, then deploy and check the live website. Desktop app DMGs are packaged separately with release.sh.',
+            'publish_mycamino_site': 'Commit and push the website and control-panel files to GitHub. This starts the website image build; deploying it to the server is a separate step. Desktop app files are excluded.',
+            'mycamino_build_status': 'Show the five latest website image builds on GitHub and whether they are running, succeeded, or failed. This read-only check does not start a build or update the website.',
+            'deploy_mycamino_site': 'Pull the published website image onto the server, apply database updates, restart the website, and check its health. This updates the live website, not the downloadable app.',
+            'mycamino_staging_status': 'Check whether the website service is running on the server and whether its public health endpoint responds. No settings are changed.',
+            'start_mycamino_staging': 'Start the existing website service on the server so visitors can access it. This does not publish a new release.',
+            'stop_mycamino_staging': 'Stop the website service on the server. Visitors will lose access until you start it again; stored data and releases are kept.',
+            'start_mycamino_local_preview': 'Start a website preview on this notebook at port 8765, using a separate preview database. The public website is unchanged.',
+            'stop_mycamino_local_preview': 'Stop the website preview on this notebook. The public website is unchanged.',
+            'mycamino_local_preview_status': 'Check whether the notebook website preview is running and show its address. This does not start or stop it.',
+            'mycamino_new_reports': 'List open GitHub bug reports and feature requests still marked needs-triage (awaiting review). This is read-only. Remove that label on GitHub after reviewing an issue to clear it from this list.',
+            'mycamino_open_reports': 'List all open GitHub issues, including bug reports and feature requests already reviewed, with the most recently updated first. Show counts and links to each issue. This is read-only; private website contact messages are not included.',
+        }
+        return {k: ControlAction(k, label, 'mycamino', 'notebook', descriptions[k],
                 command, REPO_ROOT, timeout, mutating, confirmation, 'notebook')
                 for k, label, command, mutating, timeout, confirmation in specs}
 
@@ -156,13 +168,16 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # Base class logs query strings, including the bootstrap token.
 
-    def reply(self, status, content, *, content_type='text/html; charset=utf-8', headers=None):
+    def reply(self, status, content, *, content_type='text/html; charset=utf-8', headers=None,
+              referrer_policy='same-origin'):
         body = content.encode('utf-8') if isinstance(content, str) else content
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
-        self.send_header('Referrer-Policy', 'no-referrer')
+        # no-referrer turns native form POST origins into "null" in browsers.
+        # Preserve our own origin without leaking referrers to external sites.
+        self.send_header('Referrer-Policy', referrer_policy)
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
         for key, value in (headers or {}).items():
@@ -189,7 +204,9 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         if url.path == '/' and 'token' in query:
             if secrets.compare_digest(query['token'][0], self.panel.token):
-                return self.reply(303, '', headers={'Location': '/', 'Set-Cookie':
+                # The bootstrap URL contains a secret: never forward its referrer,
+                # including on the redirect to the authenticated home page.
+                return self.reply(303, '', referrer_policy='no-referrer', headers={'Location': '/', 'Set-Cookie':
                     f'{COOKIE}={self.panel.token}; HttpOnly; SameSite=Strict; Path=/'})
             return self.reply(403, 'Invalid token')
         if not self.authorized():
@@ -248,9 +265,13 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == '/action-run':
             key = form.get('action', [''])[0]
+            action = self.panel.actions().get(key)
+            if action is None:
+                return self.reply(404, 'Unknown action')
             result = self.panel.run_action(key, form.get('confirmation', [''])[0])
             content = self.render_mycamino_issue_result(key, result) if key in ('mycamino_new_reports', 'mycamino_open_reports') else self.render_check_result(result)
-            return self.reply(200, self.page('Operation result', '<h1>Operation result</h1>'+content))
+            heading = f'<h1>{html.escape(action.label)}</h1><p>{html.escape(action.description)}</p>'
+            return self.reply(200, self.page(action.label, heading+content+self.back_link()))
         operations = {'/mycamino-news-save': self.panel.save_mycamino_news,
                       '/mycamino-news-state': self.panel.change_mycamino_news_state,
                       '/mycamino-news-delete': self.panel.delete_mycamino_news}
@@ -267,7 +288,8 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
     def home(self):
         content = '<h1>myCamino Control</h1><p>Manage the website, downloads, beta feedback, and application news.</p><p><a class="button" href="http://127.0.0.1:8765/" target="_blank" rel="noopener">Open local preview</a> <a class="button" href="https://mycamino.heinofalcke.de/" target="_blank" rel="noopener">Open website</a></p><div class="operations">'
         for action in self.panel.actions().values():
-            content += f'<a class="button" href="/action-confirm?action={action.key}">{html.escape(action.label)}</a>'
+            kind = 'Confirmation required' if action.mutating else 'Read-only check'
+            content += f'<article class="operation-card"><a class="button" href="/action-confirm?action={action.key}">{html.escape(action.label)}</a><p class="operation-kind">{kind}</p><p>{html.escape(action.description)}</p></article>'
         return self.page('Operations', content+'</div>')
 
     def back_link(self):
