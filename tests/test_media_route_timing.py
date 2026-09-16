@@ -67,6 +67,29 @@ class MediaRouteTimingTests(unittest.TestCase):
         self.assertEqual(proposal.ignored[0][0].path.name, "back.jpg")
         self.assertEqual(proposal.ignored[0][1], "inconsistent route order")
 
+    def test_media_can_establish_the_reverse_of_the_authored_route_direction(self):
+        media = [
+            observation("first.jpg", 0, 50.0, 7.025),
+            observation("second.jpg", 20, 50.0, 7.005),
+        ]
+
+        proposal = propose_route_timing(self.route, media, maximum_distance_m=100)
+
+        self.assertTrue(proposal.route_reversed)
+        self.assertEqual(len(proposal.anchors), 2)
+        self.assertEqual(
+            [item.observation.path.name for item in proposal.anchors],
+            ["first.jpg", "second.jpg"],
+        )
+        self.assertTrue(
+            all(
+                later > earlier
+                for earlier, later in zip(
+                    proposal.point_times, proposal.point_times[1:]
+                )
+            )
+        )
+
     def test_one_anchor_uses_fallback_speed(self):
         proposal = propose_route_timing(
             self.route,
@@ -75,6 +98,71 @@ class MediaRouteTimingTests(unittest.TestCase):
         )
         self.assertAlmostEqual(proposal.extrapolation_speed_kmh, 4.2)
         self.assertEqual(len(proposal.point_times), len(self.route))
+
+    def test_manual_waypoint_anchor_is_preserved_in_timeline(self):
+        manual_time = datetime(2026, 8, 3, 10, 10, tzinfo=UTC)
+        proposal = propose_route_timing(
+            self.route,
+            [
+                observation("first.jpg", 0, 50.0, 7.005),
+                observation("last.jpg", 20, 50.0, 7.025),
+            ],
+            fixed_point_times={1: manual_time},
+            allow_reverse=False,
+        )
+
+        self.assertEqual(proposal.point_times[1], manual_time)
+
+    def test_unclassified_existing_times_do_not_constrain_retiming(self):
+        proposal = propose_route_timing(
+            self.route,
+            [
+                observation("first.jpg", 0, 50.0, 7.025),
+                observation("second.jpg", 20, 50.0, 7.005),
+            ],
+            fixed_point_times={},
+        )
+
+        self.assertTrue(proposal.route_reversed)
+
+    def test_duplicate_content_identity_counts_once_for_direction(self):
+        duplicated = MediaObservation(
+            Path("copy.jpeg"),
+            datetime(2026, 8, 3, 10, 0, tzinfo=UTC),
+            50.0,
+            7.025,
+            "a" * 64,
+        )
+        original = MediaObservation(
+            Path("original.jpeg"),
+            duplicated.timestamp,
+            duplicated.latitude,
+            duplicated.longitude,
+            "a" * 64,
+        )
+        last = MediaObservation(
+            Path("last.jpeg"),
+            datetime(2026, 8, 3, 10, 20, tzinfo=UTC),
+            50.0,
+            7.005,
+            "b" * 64,
+        )
+
+        proposal = propose_route_timing(self.route, [original, duplicated, last])
+
+        self.assertTrue(proposal.route_reversed)
+        self.assertEqual(proposal.duplicate_count, 1)
+        self.assertEqual(len(proposal.anchors), 2)
+
+    def test_equal_time_and_coordinate_fallback_counts_once(self):
+        first = observation("first.jpeg", 0, 50.0, 7.005)
+        duplicate = observation("copy.jpeg", 0, 50.0, 7.005)
+        last = observation("last.jpeg", 20, 50.0, 7.025)
+
+        proposal = propose_route_timing(self.route, [first, duplicate, last])
+
+        self.assertEqual(proposal.duplicate_count, 1)
+        self.assertEqual(len(proposal.anchors), 2)
 
     def test_segment_gap_does_not_add_route_distance(self):
         route = [

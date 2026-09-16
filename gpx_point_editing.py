@@ -36,6 +36,62 @@ def qualified_like(element: ET.Element, name: str) -> str:
     return f"{{{namespace}}}{name}" if namespace else name
 
 
+def _extensions_element(element: ET.Element) -> ET.Element:
+    extensions = next(
+        (child for child in list(element) if local_name(child.tag) == "extensions"),
+        None,
+    )
+    if extensions is None:
+        extensions = ET.Element(qualified_like(element, "extensions"))
+        if local_name(element.tag) == "trk":
+            children = list(element)
+            insert_at = next(
+                (
+                    index
+                    for index, child in enumerate(children)
+                    if local_name(child.tag) == "trkseg"
+                ),
+                len(children),
+            )
+            element.insert(insert_at, extensions)
+        else:
+            element.append(extensions)
+    return extensions
+
+
+def set_point_time_origin(point: ET.Element, kind: str) -> None:
+    """Record whether a waypoint time is fixed manual input or generated."""
+    extensions = _extensions_element(point)
+    tag = f"{{{MYCAMINO_NAMESPACE}}}timeOrigin"
+    origin = next((child for child in list(extensions) if child.tag == tag), None)
+    if origin is None:
+        origin = ET.SubElement(extensions, tag)
+    origin.set("kind", str(kind))
+
+
+def point_time_origin(point: ET.Element) -> str:
+    tag = f"{{{MYCAMINO_NAMESPACE}}}timeOrigin"
+    for child in point.iter():
+        if child.tag == tag:
+            return str(child.attrib.get("kind", "")).casefold()
+    return ""
+
+
+def set_manual_track_start_time(track: ET.Element, value: datetime) -> None:
+    extensions = _extensions_element(track)
+    tag = f"{{{MYCAMINO_NAMESPACE}}}manualStartTime"
+    node = next((child for child in list(extensions) if child.tag == tag), None)
+    if node is None:
+        node = ET.SubElement(extensions, tag)
+    node.text = _format_time(value)
+
+
+def manual_track_start_time(track: ET.Element) -> datetime | None:
+    tag = f"{{{MYCAMINO_NAMESPACE}}}manualStartTime"
+    node = next((child for child in track.iter() if child.tag == tag), None)
+    return parse_time(node.text) if node is not None and node.text else None
+
+
 def track_segments(track: ET.Element) -> list[ET.Element]:
     return [element for element in list(track) if local_name(element.tag) == "trkseg"]
 

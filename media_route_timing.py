@@ -29,6 +29,7 @@ class MediaObservation:
     timestamp: datetime
     latitude: float
     longitude: float
+    content_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,34 @@ class MediaTimingProposal:
     ignored: tuple[tuple[MediaObservation, str], ...]
     fallback_speed_kmh: float
     extrapolation_speed_kmh: float
+    route_reversed: bool = False
+    duplicate_count: int = 0
+
+
+def deduplicate_media_observations(
+    observations: Iterable[MediaObservation],
+) -> tuple[list[MediaObservation], int]:
+    """Collapse duplicate steering evidence without removing slideshow media."""
+    unique = []
+    seen = set()
+    duplicates = 0
+    for observation in observations:
+        identity = str(observation.content_identity or "").strip().casefold()
+        if identity:
+            key = ("sha256", identity)
+        else:
+            key = (
+                "fallback",
+                observation.timestamp.isoformat(),
+                round(float(observation.latitude), 7),
+                round(float(observation.longitude), 7),
+            )
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        unique.append(observation)
+    return unique, duplicates
 
 
 @dataclass(frozen=True)
@@ -315,36 +344,139 @@ def propose_route_timing(
     *,
     maximum_distance_m: float = 100.0,
     fallback_speed_kmh: float = 3.5,
+    fixed_point_times: dict[int, datetime] | None = None,
+    manual_start_time: datetime | None = None,
+    allow_reverse: bool = True,
 ) -> MediaTimingProposal:
     """Return a geometry-preserving timestamp proposal for an untimed route."""
     points = list(route_points)
+    unique_observations, duplicate_count = deduplicate_media_observations(media)
     observations = sorted(
-        list(media), key=lambda item: (item.timestamp.timestamp(), str(item.path).casefold())
+        unique_observations,
+        key=lambda item: (item.timestamp.timestamp(), str(item.path).casefold()),
     )
     maximum_distance_m = max(1.0, float(maximum_distance_m))
     fallback_speed_kmh = max(0.01, float(fallback_speed_kmh))
-    vertices, edges = _route_geometry(points)
-    if not vertices or not observations or not edges:
-        return MediaTimingProposal((), (), tuple((item, "no route match") for item in observations), fallback_speed_kmh, fallback_speed_kmh)
-    cell_size, grid = _edge_grid(edges, maximum_distance_m)
-    candidates = [
-        _projection_candidates(item, edges, cell_size, grid, maximum_distance_m)
-        for item in observations
-    ]
-    anchors = _monotonic_anchors(observations, candidates)
-    accepted = {id(anchor.observation) for anchor in anchors}
-    ignored = []
-    for observation, members in zip(observations, candidates):
-        if id(observation) in accepted:
-            continue
-        ignored.append(
-            (observation, "farther than configured distance" if not members else "inconsistent route order")
+    fixed_point_times = dict(fixed_point_times or {})
+    def proposal_for(candidate_points, *, route_reversed=False):
+        vertices, edges = _route_geometry(candidate_points)
+        if not vertices or not observations or not edges:
+            return MediaTimingProposal(
+                (), (), tuple((item, "no route match") for item in observations),
+                fallback_speed_kmh, fallback_speed_kmh, route_reversed,
+                duplicate_count,
+            )
+        cell_size, grid = _edge_grid(edges, maximum_distance_m)
+        candidates = [
+            _projection_candidates(item, edges, cell_size, grid, maximum_distance_m)
+            for item in observations
+        ]
+        anchors = _monotonic_anchors(observations, candidates)
+        original_indexes = (
+            list(reversed(range(len(points))))
+            if route_reversed else list(range(len(points)))
         )
-    if not anchors:
-        return MediaTimingProposal((), (), tuple(ignored), fallback_speed_kmh, fallback_speed_kmh)
-    point_times, speed = _timeline(
-        [vertex.route_distance_m for vertex in vertices], anchors, fallback_speed_kmh
-    )
-    return MediaTimingProposal(
-        tuple(point_times), tuple(anchors), tuple(ignored), fallback_speed_kmh, speed
-    )
+        fixed = []
+        if manual_start_time is not None and vertices:
+            fixed.append((0.0, manual_start_time, "manual route start"))
+        for oriented_index, vertex in enumerate(vertices):
+            timestamp = fixed_point_times.get(original_indexes[oriented_index])
+            if timestamp is not None:
+                fixed.append((vertex.route_distance_m, timestamp, "manual waypoint"))
+        fixed.sort(key=lambda item: item[0])
+        if any(
+            later[1] <= earlier[1]
+            for earlier, later in zip(fixed, fixed[1:])
+            if later[0] > earlier[0] + 0.01
+        ):
+            return None
+        compatible_anchors = []
+        for anchor in anchors:
+            preceding = [item for item in fixed if item[0] <= anchor.route_distance_m]
+            following = [item for item in fixed if item[0] >= anchor.route_distance_m]
+            if preceding and anchor.observation.timestamp < preceding[-1][1]:
+                continue
+            if following and anchor.observation.timestamp > following[0][1]:
+                continue
+            compatible_anchors.append(anchor)
+        anchors = compatible_anchors
+        accepted = {id(anchor.observation) for anchor in anchors}
+        ignored = []
+        for observation, members in zip(observations, candidates):
+            if id(observation) in accepted:
+                continue
+            ignored.append(
+                (
+                    observation,
+                    "farther than configured distance"
+                    if not members else "inconsistent route order",
+                )
+            )
+        if not anchors:
+            return MediaTimingProposal(
+                (), (), tuple(ignored), fallback_speed_kmh,
+                fallback_speed_kmh, route_reversed, duplicate_count,
+            )
+        timeline_anchors = list(anchors)
+        for index, (distance, timestamp, label) in enumerate(fixed):
+            vertex = min(vertices, key=lambda item: abs(item.route_distance_m - distance))
+            timeline_anchors.append(
+                MediaRouteAnchor(
+                    MediaObservation(
+                        Path(f"<{label}-{index}>") ,
+                        timestamp,
+                        vertex.latitude,
+                        0.0,
+                    ),
+                    vertex.segment_index,
+                    0.0,
+                    distance,
+                    0.0,
+                )
+            )
+        timeline_anchors.sort(key=lambda item: item.route_distance_m)
+        point_times, speed = _timeline(
+            [vertex.route_distance_m for vertex in vertices], timeline_anchors, fallback_speed_kmh
+        )
+        return MediaTimingProposal(
+            tuple(point_times), tuple(anchors), tuple(ignored),
+            fallback_speed_kmh, speed, route_reversed, duplicate_count,
+        )
+
+    forward = proposal_for(points)
+    # Preserve segment boundaries while reversing their order.  Negating the
+    # original index is insufficient because segment zero would remain zero.
+    segment_indexes = []
+    for point in points:
+        if point.segment_index not in segment_indexes:
+            segment_indexes.append(point.segment_index)
+    reversed_segment_index = {
+        original: index for index, original in enumerate(reversed(segment_indexes))
+    }
+    reversed_points = [
+        RoutePoint(
+            point.latitude,
+            point.longitude,
+            reversed_segment_index[point.segment_index],
+        )
+        for point in reversed(points)
+    ]
+    backward = proposal_for(reversed_points, route_reversed=True) if allow_reverse else None
+
+    def direction_score(proposal):
+        if proposal is None:
+            return (-1, float("-inf"))
+        return (
+            len(proposal.anchors),
+            -sum(anchor.distance_from_route_m for anchor in proposal.anchors),
+        )
+
+    # Keep the authored GPX direction on ties. Reverse only when the media
+    # provide strictly stronger evidence for travel in the other direction.
+    chosen = backward if direction_score(backward) > direction_score(forward) else forward
+    if chosen is None:
+        return MediaTimingProposal(
+            (), (), tuple((item, "conflicts with manual timestamps") for item in observations),
+            fallback_speed_kmh, fallback_speed_kmh, False, duplicate_count,
+        )
+    return chosen

@@ -374,6 +374,11 @@ state; video events suspend timeline progress until playback completes.
 The main GUI reuses one retained Adventure Processing window across
 `assistant_metadata`, `automatic_maps`, manual map generation, control
 creation, and control update.
+Map-first processing separates required work from optional enrichment. Core
+metadata, derived tracks, maps, and the control file complete first. Weather
+then runs in priority-aware batches and reverse geocoding advances one sidecar
+at a time. Slideshow live-state changes reorder pending work to the current
+medium and ten following control rows; playback never waits for the result.
 `_continue_adventure_processing(...)` ends a phase without releasing the
 window or clearing its text; the next `_prepare_geolocations_window(...)`
 appends a heading and updates the title. Completed sidecars and maps remain

@@ -655,6 +655,20 @@ class UntimedTrackPromptTests(unittest.TestCase):
             {pending[0][2], pending[1][2]},
         )
 
+    def test_adventure_callback_receives_suppression_without_global_default(self):
+        pending = untimed_tracks_requiring_prompt([self.make_track()], set())
+        remembered = []
+
+        self.assertEqual(
+            apply_untimed_prompt_response(
+                1001,
+                pending,
+                remember_callback=lambda identities: remembered.extend(identities),
+            ),
+            ("suppress", None),
+        )
+        self.assertEqual(remembered, [pending[0][2]])
+
     def test_later_records_nothing(self):
         defaults = FakeDefaults()
         pending = untimed_tracks_requiring_prompt([self.make_track()], set())

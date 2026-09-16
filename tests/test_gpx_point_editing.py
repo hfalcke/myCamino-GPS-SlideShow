@@ -18,9 +18,13 @@ from gpx_point_editing import (
     point_from_values,
     media_paths_for_point,
     mark_track_media_timed,
+    manual_track_start_time,
     monotonic_route_matches,
     rewrite_local_media_links,
     serialized_points,
+    point_time_origin,
+    set_manual_track_start_time,
+    set_point_time_origin,
     translate_points_web_mercator,
 )
 
@@ -58,6 +62,21 @@ def coordinates(track):
 
 
 class PointEditingTests(unittest.TestCase):
+    def test_manual_time_provenance_round_trips_in_extensions(self):
+        value = datetime.fromisoformat("2026-01-01T10:00:00+00:00")
+        track = track_with_points(
+            [(50.0, 7.0, None, "2026-01-01T10:00:00Z")]
+        )
+        point = point_locations(track)[0][0]
+
+        set_point_time_origin(point, "manual")
+        set_manual_track_start_time(track, value)
+
+        self.assertEqual(point_time_origin(point), "manual")
+        self.assertEqual(manual_track_start_time(track), value)
+        children = [child.tag.rsplit("}", 1)[-1] for child in list(track)]
+        self.assertLess(children.index("extensions"), children.index("trkseg"))
+
     def test_media_timing_provenance_does_not_change_route_geometry(self):
         track = track_with_points(
             [(50.0, 7.0, None, None), (50.0, 7.01, None, None)]

@@ -12,6 +12,7 @@ from threading import RLock, local
 
 from application_metadata import APP_VERSION
 from runtime_distribution import external_runtime_tool_allowed
+from network_availability import network_availability
 
 
 _REQUEST_PATCH_LOCK = RLock()
@@ -287,6 +288,7 @@ def contextily_request_timeout(
                 "Cached OSM tiles are incomplete. No network request was sent"
                 + (f" for {url}." if url else ".")
             )
+        network_availability.wait_until_available()
         kwargs.setdefault("timeout", active_timeout)
         headers = dict(kwargs.get("headers") or {})
         headers["user-agent"] = MYCAMINO_USER_AGENT
@@ -299,7 +301,12 @@ def contextily_request_timeout(
                 if elapsed < active_interval:
                     time.sleep(active_interval - elapsed)
                 _LAST_REQUEST_BY_HOST[host] = time.monotonic()
-        response = _ORIGINAL_REQUEST_GET(*args, **kwargs)
+        try:
+            response = _ORIGINAL_REQUEST_GET(*args, **kwargs)
+        except Exception as exc:
+            network_availability.report_failure(exc)
+            raise
+        network_availability.report_success()
         if active_interval <= 0.0:
             with _REQUEST_CLOCK_LOCK:
                 _LAST_REQUEST_BY_HOST[host] = time.monotonic()

@@ -58,6 +58,7 @@ class AdventureParameterTests(unittest.TestCase):
         self.assertNotIn("reserved", dict(SPECS_BY_KEY["slideshow.header_background"].choices))
         self.assertEqual(defaults["audio.video_normalization_target_lufs"], -16.0)
         self.assertTrue(defaults["locations.add_place_names"])
+        self.assertFalse(defaults["locations.show_background_enrichment_progress"])
         self.assertTrue(defaults["timelapse.overview_as_media"])
         self.assertTrue(defaults["timelapse.overview_on_stage_map_dual"])
         self.assertEqual(defaults["gpx.horizontal_smoothing_distance_m"], 10.0)

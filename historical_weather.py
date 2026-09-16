@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from plot_metadata_utils import media_sidecar_path, parse_photo_datetime, validate_media_sidecar
+from network_availability import network_availability
 
 
 WEATHER_SCHEMA_VERSION = 1
@@ -263,8 +264,17 @@ def group_weather_candidates(candidates: Iterable[_WeatherCandidate], options: W
 
 def _default_request_json(url: str, timeout: float) -> Any:
     request = urllib.request.Request(url, headers={"User-Agent": "myCamino historical-weather/1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        network_availability.report_success()
+        raise
+    except (urllib.error.URLError, TimeoutError) as exc:
+        network_availability.report_failure(exc)
+        raise
+    network_availability.report_success()
+    return result
 
 
 def _retry_after_seconds(value: Any, *, fallback: float) -> float:
@@ -319,6 +329,8 @@ def _request_batch(
     last_rate_limit_delay = 0.0
     for attempt in range(4):
         if cancel_event is not None and cancel_event.is_set():
+            raise WeatherCancelled("Weather enrichment was cancelled.")
+        if not network_availability.wait_until_available(cancel_event):
             raise WeatherCancelled("Weather enrichment was cancelled.")
         try:
             response = request_json(url, max(1.0, float(options.timeout_seconds)))

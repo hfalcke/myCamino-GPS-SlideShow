@@ -124,6 +124,8 @@ from cocoa_native_menus import (
     menu_item,
 )
 from cocoa_application_news import install_application_news
+from network_availability import network_availability
+from media_import_utils import MediaImportResult, accepted_media_paths, import_media_files
 
 try:
     from AVFoundation import AVPlayer
@@ -186,6 +188,7 @@ from gpx_tracks_table import (
     parse_track_selection,
     parse_gpx_file,
     prepare_with_options,
+    execute_run_context,
     execute_map_variants_from_context,
     run_with_options as run_gpx_tracks_table_with_options,
     render_media_overview_map,
@@ -1161,6 +1164,119 @@ def missing_control_map_assets(control_text, trackimages_dir):
             if not path.is_file() and path.name not in missing:
                 missing.append(path.name)
     return missing
+
+
+def slideshow_dependency_issues(control_text, trackimages_dir, context):
+    """Return hard playback dependencies that do not match current GPX data."""
+    directory = Path(trackimages_dir)
+    map_issues = []
+    derived_issues = []
+    tracks = list(context.get("tracks", []))
+    track_by_map_name = {}
+    for track in tracks:
+        for key in (
+            "track_plot_image_filename",
+            "track_plot_time_lapse_image_filename",
+        ):
+            name = Path(str(track.get(key, ""))).name
+            if name:
+                track_by_map_name[name.casefold()] = track
+
+        sidecar_name = str(track.get("track_data_sidecar", "")).strip()
+        expected_data = str(track.get("track_data_fingerprint", "")).strip()
+        sidecar_path = directory / sidecar_name if sidecar_name else None
+        try:
+            metadata = read_plot_metadata(sidecar_path) if sidecar_path is not None else None
+        except Exception:
+            metadata = None
+        if (
+            not expected_data
+            or not isinstance(metadata, dict)
+            or str(metadata.get("track_data_fingerprint", "")) != expected_data
+        ):
+            label = sidecar_name or f"Track {track.get('table_number', '?')} derived data"
+            derived_issues.append(label)
+
+    expected_overview = [
+        str(track.get("track_geometry_fingerprint", "")) for track in tracks
+    ]
+    track_by_number = {
+        int(track["table_number"]): track
+        for track in tracks
+        if str(track.get("table_number", "")).isdigit()
+    }
+
+    def check_map(path, *, expected_kind):
+        if not path.is_file():
+            map_issues.append(path.name)
+            return
+        track = track_by_map_name.get(path.name.casefold())
+        if expected_kind == "other":
+            return
+        try:
+            metadata = read_plot_metadata(path.with_suffix(".json"))
+        except Exception:
+            metadata = None
+        if not isinstance(metadata, dict):
+            map_issues.append(path.name)
+            return
+        if expected_kind == "track":
+            if track is None:
+                try:
+                    track = track_by_number.get(int(metadata.get("track_number")))
+                except (TypeError, ValueError):
+                    track = None
+            if track is None:
+                saved = str(metadata.get("track_geometry_fingerprint", ""))
+                matches = [
+                    candidate
+                    for candidate in tracks
+                    if str(candidate.get("track_geometry_fingerprint", "")) == saved
+                ]
+                track = matches[0] if len(matches) == 1 else None
+            if track is None:
+                map_issues.append(path.name)
+                return
+            expected = str(track.get("track_geometry_fingerprint", ""))
+            if not expected or str(metadata.get("track_geometry_fingerprint", "")) != expected:
+                map_issues.append(path.name)
+        elif expected_kind == "overview" and [
+            str(value)
+            for value in metadata.get("source_track_geometry_fingerprints", [])
+        ] != expected_overview:
+            map_issues.append(path.name)
+
+    for raw_line in str(control_text).splitlines():
+        if not raw_line.strip():
+            continue
+        row = parse_slideshow_control_line(raw_line)
+        row_type = str(row.get("type", "")).upper()
+        if bool(row.get("disabled")) or row_type not in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+            continue
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        standard = Path(name).expanduser()
+        if not standard.is_absolute():
+            standard = directory / standard
+        expected_kind = (
+            "overview"
+            if row_type == "MAP"
+            else "track"
+            if row_type in {"TRK", "BEF", "AFT"}
+            else "other"
+        )
+        check_map(standard, expected_kind=expected_kind)
+        if row_type == "TRK":
+            check_map(
+                standard.with_name(time_lapse_track_map_name(standard.name)),
+                expected_kind="track",
+            )
+
+    return {
+        "maps": list(dict.fromkeys(map_issues)),
+        "derived": list(dict.fromkeys(derived_issues)),
+    }
 
 
 def normalize_control_row_type(value: str) -> str:
@@ -2407,6 +2523,7 @@ class GPXTrackerController(NSObject):
         self.audio_section_expanded = False
         self.parameters = default_parameters()
         self.weather_consent = "unasked"
+        self.untimed_prompt_suppressions = set()
         self.hosted_by_adventure_map = False
         self.adventure_map_host = None
         self.project_media_watcher = None
@@ -2416,6 +2533,8 @@ class GPXTrackerController(NSObject):
         self.discovered_media_generate_maps = True
         self.pending_map_provider_action = None
         self.pending_slideshow_after_map_generation = None
+        self.slideshow_dependency_preflight_running = False
+        self.slideshow_dependency_preflight_generation = 0
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
         self.slideshow_resume_history = []
@@ -2633,7 +2752,11 @@ class GPXTrackerController(NSObject):
         )
         self.plot_selection_result = None
         self.plot_selection_rows = []
+        self.network_state = network_availability.state
+        self.last_status_message = "Choose or create an adventure directory to begin."
         self._build_window()
+        network_availability.add_listener(self._network_state_changed)
+        self._apply_network_state(self.network_state)
         self.saved_project_payload = self._collect_project_payload()
         return self
 
@@ -3937,8 +4060,33 @@ class GPXTrackerController(NSObject):
         self.window.setFrameOrigin_(NSMakePoint(float(old_frame.origin.x), origin_y))
 
     def set_status(self, message: str):
-        self.status_label.setStringValue_(message)
+        self.last_status_message = str(message)
+        suffix = {
+            "offline": "Offline - online work paused",
+            "recovering": "Connection found - resuming shortly",
+        }.get(getattr(self, "network_state", "online"), "")
+        displayed = (
+            f"{self.last_status_message} | {suffix}"
+            if suffix and self.last_status_message
+            else suffix or self.last_status_message
+        )
+        self.status_label.setStringValue_(displayed)
         self.status_label.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _network_state_changed(self, state):
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "applyNetworkState:", str(state), False
+        )
+
+    @objc.IBAction
+    def applyNetworkState_(self, state):
+        self._apply_network_state(str(state))
+
+    @objc.python_method
+    def _apply_network_state(self, state):
+        self.network_state = str(state)
+        self.set_status(getattr(self, "last_status_message", ""))
 
     def set_progress(self, current=0.0, total=1.0):
         total = max(float(total), 1.0)
@@ -3970,6 +4118,30 @@ class GPXTrackerController(NSObject):
             host._clear_background_progress("advanced")
         self.layout_window()
 
+    def setOptionalEnrichmentProgress_(self, payload):
+        """Mirror optional background work without forcing the map indicator on."""
+        if self.geolocations_running:
+            return
+        phase, current, total = payload
+        self.processing_phase_title = str(phase)
+        total = max(1, int(total))
+        self.progress_bar.stopAnimation_(None)
+        self.progress_bar.setIndeterminate_(False)
+        self.progress_bar.setHidden_(False)
+        self.progress_bar.setMaxValue_(total)
+        self.progress_bar.setDoubleValue_(min(max(0, int(current)), total))
+        self.progress_bar.setNeedsDisplay_(True)
+        self.layout_window()
+
+    def clearOptionalEnrichmentProgress_(self, _sender):
+        if self.geolocations_running:
+            return
+        self.processing_phase_title = None
+        self.progress_bar.setDoubleValue_(0.0)
+        self.progress_bar.setHidden_(True)
+        self.progress_bar.setNeedsDisplay_(True)
+        self.layout_window()
+
     def setProgressFromWorker_(self, progress_pair):
         current, total = progress_pair
         self.set_progress(current, total)
@@ -3993,6 +4165,15 @@ class GPXTrackerController(NSObject):
             host.adventureComponentDidChange_("adventure")
         elif self.adventure_autosave_suspended == 0 and self.current_project_file is not None:
             self.schedule_adventure_autosave(immediate=immediate)
+
+    def remember_untimed_prompt_suppressions(self, identities):
+        """Keep the manual timestamp-prompt choice inside this Adventure."""
+        before = set(self.untimed_prompt_suppressions)
+        self.untimed_prompt_suppressions.update(
+            str(value) for value in identities if str(value).strip()
+        )
+        if self.untimed_prompt_suppressions != before:
+            self.mark_dirty()
 
     def mark_clean(self):
         self.project_dirty = False
@@ -4492,6 +4673,8 @@ class GPXTrackerController(NSObject):
             gpx_maximum_vertical_accuracy=self.parameters["gpx.maximum_vertical_accuracy_m"],
             gpx_maximum_hdop=self.parameters["gpx.maximum_hdop"],
             gpx_maximum_vdop=self.parameters["gpx.maximum_vdop"],
+            gpx_running_speed_window_distance=self.parameters["gpx.running_speed_window_distance_m"],
+            gpx_stationary_speed_threshold=self.parameters["gpx.stationary_speed_threshold_kmh"],
             fallback_walking_speed_kmh=self.parameters["gpx.fallback_walking_speed_kmh"],
             adventure_processing_parameters=self._track_summary_parameter_signature(),
             track_processing_callback=track_processing_callback,
@@ -5735,6 +5918,9 @@ class GPXTrackerController(NSObject):
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
             "parameters": parameter_payload(self.parameters),
             "weather_consent": self.weather_consent,
+            "untimed_prompt_suppressed_track_identities": sorted(
+                self.untimed_prompt_suppressions
+            ),
             "slideshow_resume_history": list(self.slideshow_resume_history),
             "media_identity_source_project": (
                 str(self.media_identity_source_project)
@@ -6165,6 +6351,7 @@ class GPXTrackerController(NSObject):
             self.title_image = None
             self.title_image_field.setStringValue_("")
             self.slideshow_resume_history = []
+            self.untimed_prompt_suppressions.clear()
             assistant_enabled = bool(self.workflow_assistant_state.get("enabled", True))
             self.workflow_assistant_state = normalize_assistant_state(
                 None, existing_adventure=False
@@ -6326,6 +6513,13 @@ class GPXTrackerController(NSObject):
             self.weather_consent = str(self.parameters.get("weather.access", "free")).casefold()
         else:
             self.weather_consent = "unasked"
+        self.untimed_prompt_suppressions = {
+            str(value)
+            for value in data.get(
+                "untimed_prompt_suppressed_track_identities", []
+            )
+            if str(value).strip()
+        }
         self._sync_legacy_parameter_controls()
         loaded_gpx_value = str(data["gpx_file"]).strip()
         loaded_gpx_path = self.current_project_dir / loaded_gpx_value
@@ -11683,46 +11877,60 @@ class GPXTrackerController(NSObject):
             self.reset_progress()
             return []
         copied = 0
+        renamed = 0
+        reused = 0
         imported_paths = []
-        skipped = []
         failed = []
         self.workflow_assistant_bubble.setHidden_(True)
         self.set_progress(0.0, len(media_files))
-        for index, source_path in enumerate(media_files, start=1):
-            target_name = source_path.stem + ".jpeg" if force_jpeg else source_path.name
-            target_path = project_dir / target_name
-            if target_path.exists():
-                skipped.append(target_name)
-                self.set_status(f"Skipping existing {index}/{len(media_files)}: {target_name}")
-                self.set_progress(index, len(media_files))
-                continue
-            self.set_status(f"Importing {index}/{len(media_files)}: {source_path.name}")
-            try:
-                if force_jpeg and source_path.suffix.lower() not in {".jpg", ".jpeg"}:
-                    convert_image_to_jpeg(source_path, target_path)
-                else:
-                    shutil.copy2(source_path, target_path)
-            except OSError as exc:
-                failed.append(f"{target_name}: {exc}")
-            if target_path.exists():
+        if force_jpeg:
+            import_results = []
+            with tempfile.TemporaryDirectory(prefix="mycamino-jpeg-import-") as temporary:
+                for source_index, source_path in enumerate(media_files):
+                    temporary_directory = Path(temporary) / str(source_index)
+                    temporary_directory.mkdir()
+                    temporary_path = temporary_directory / f"{source_path.stem}.jpeg"
+                    try:
+                        if source_path.suffix.lower() not in {".jpg", ".jpeg"}:
+                            convert_image_to_jpeg(source_path, temporary_path)
+                        else:
+                            shutil.copy2(source_path, temporary_path)
+                    except OSError as exc:
+                        import_results.append(
+                            MediaImportResult(source_path, None, "failed", str(exc))
+                        )
+                    else:
+                        import_results.extend(
+                            import_media_files([temporary_path], project_dir)
+                        )
+        else:
+            import_results = import_media_files(media_files, project_dir)
+        for index, item in enumerate(import_results, start=1):
+            self.set_status(f"Importing {index}/{len(media_files)}: {item.source.name}")
+            if item.action == "copied":
                 copied += 1
-                imported_paths.append(target_path.resolve(strict=False))
-            elif not any(item.startswith(f"{target_name}:") for item in failed):
-                failed.append(f"{target_name}: output was not created")
+            elif item.action == "renamed":
+                renamed += 1
+            elif item.action == "reused":
+                reused += 1
+            elif item.action == "failed":
+                failed.append(f"{item.source.name}: {item.error}")
             self.set_progress(index, len(media_files))
+        imported_paths = accepted_media_paths(import_results)
         self.last_picture_import_directory = source_paths[0].parent if source_paths else self.last_picture_import_directory
-        if imported_paths or skipped:
+        if imported_paths:
             self.workflow_assistant_state["media_confirmed"] = True
         self.mark_dirty()
         self.refresh_media_summary()
         self.set_status(
-            f"Imported {copied} file(s), skipped {len(skipped)} existing file(s), failed {len(failed)} file(s)."
+            f"Imported {copied} file(s), renamed {renamed} different same-name file(s), "
+            f"reused {reused} identical file(s), failed {len(failed)} file(s)."
         )
-        if skipped or failed:
-            lines = [f"Already present: {name}" for name in skipped] + failed
+        if failed:
+            lines = failed
             self._show_scrollable_list("Skipped Media", lines)
         self.refresh_workflow_assistant()
-        if imported_paths or skipped:
+        if imported_paths:
             self._start_automatic_media_metadata(imported_paths)
         return imported_paths
 
@@ -12638,6 +12846,7 @@ class GPXTrackerController(NSObject):
         cancel_event,
         output_writer=None,
         status_callback=None,
+        required_map_names=None,
     ):
         """Generate only missing/stale project maps through the shared stage plan."""
         project_dir = Path(project_dir).resolve(strict=False)
@@ -12649,6 +12858,11 @@ class GPXTrackerController(NSObject):
         gpx_path = None if media_only else self._current_single_gpx_path()
         failures = []
         created_paths = []
+        required_names = (
+            {Path(str(name)).name.casefold() for name in required_map_names}
+            if required_map_names is not None
+            else None
+        )
 
         def report(message):
             if output_writer is not None:
@@ -12735,6 +12949,22 @@ class GPXTrackerController(NSObject):
             if removed:
                 report(f"Removed {len(removed)} obsolete map file(s).")
             update_numbers = self._track_map_update_numbers(gpx_path, context)
+            if required_names is not None:
+                required_track_numbers = set()
+                for track in context.get("tracks", []):
+                    names = {
+                        Path(str(track.get("track_plot_image_filename", ""))).name.casefold(),
+                        Path(str(track.get("track_plot_time_lapse_image_filename", ""))).name.casefold(),
+                    }
+                    if names & required_names:
+                        required_track_numbers.add(int(track["table_number"]))
+                overview_required = Path(context["overview_path"]).name.casefold() in required_names
+                update_numbers = [
+                    number
+                    for number in update_numbers
+                    if (number == 0 and overview_required)
+                    or (number > 0 and number in required_track_numbers)
+                ]
             include_overview = 0 in update_numbers
             track_numbers = [number for number in update_numbers if number > 0]
             public_osm_automatic = (
@@ -12800,6 +13030,8 @@ class GPXTrackerController(NSObject):
                 },
             }
         )
+        if required_names is not None:
+            media_options["requested_filenames"] = required_names
         plan = project_map_plan_from_sidecars(
             project_dir,
             control_path,
@@ -12879,6 +13111,14 @@ class GPXTrackerController(NSObject):
 
         def run_task():
             try:
+                pending_request = getattr(
+                    self, "pending_slideshow_after_map_generation", None
+                )
+                required_map_names = (
+                    pending_request.get("required_map_names")
+                    if isinstance(pending_request, dict)
+                    else None
+                )
                 self.automatic_map_generation_result = (
                     self._generate_missing_project_maps_worker(
                         project_dir=project_dir,
@@ -12886,6 +13126,7 @@ class GPXTrackerController(NSObject):
                         cancel_event=cancel_event,
                         output_writer=output_writer,
                         status_callback=status_callback,
+                        required_map_names=required_map_names,
                     )
                 )
             except GeoLocationsCancelled:
@@ -13246,6 +13487,10 @@ class GPXTrackerController(NSObject):
         geolocation_options = self._geolocation_options()
         requested_places = bool(self.parameters.get("locations.add_place_names", True))
         requested_weather = bool(self.parameters.get("weather.enabled", False))
+        defer_optional_enrichment = bool(
+            getattr(self, "hosted_by_adventure_map", False)
+            and getattr(self, "adventure_map_host", None) is not None
+        )
         weather_media_paths = [Path(item["path"]) for item in self.project_media_items()]
         overwrite_requested_places = False
         self.workflow_assistant_state["place_names_requested"] = requested_places
@@ -13319,7 +13564,30 @@ class GPXTrackerController(NSObject):
                     cancel_event=cancel_event,
                     **geolocation_options,
                 )
-                if requested_weather:
+                if cancel_event.is_set():
+                    raise GeoLocationsCancelled("Aborted.")
+                missing_maps = missing_control_map_assets(
+                    staged_control.read_text(encoding="utf-8"),
+                    trackimages_dir,
+                )
+                if missing_maps:
+                    self.assistant_control_map_failures = [
+                        {
+                            "filename": name,
+                            "error": "required map asset is unavailable",
+                        }
+                        for name in missing_maps
+                    ]
+                    output_writer.write(
+                        "Required maps are incomplete; the control file was not installed.\n"
+                    )
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "geoLocationsRunFinished:", "success", True
+                    )
+                    return
+                os.replace(staged_control, control_path)
+                report_progress(3.5, "Installing control file...")
+                if requested_weather and not defer_optional_enrichment:
                     output_writer.write("\n=== Historical Weather ===\n")
                     self.geolocations_mode = "control_assets_weather"
                     self.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -13349,30 +13617,11 @@ class GPXTrackerController(NSObject):
                         self.performSelectorOnMainThread_withObject_waitUntilDone_(
                             "setWeatherSkipAvailable:", False, True
                         )
-                if cancel_event.is_set():
-                    raise GeoLocationsCancelled("Aborted.")
-                missing_maps = missing_control_map_assets(
-                    staged_control.read_text(encoding="utf-8"),
-                    trackimages_dir,
-                )
-                if missing_maps:
-                    self.assistant_control_map_failures = [
-                        {
-                            "filename": name,
-                            "error": "required map asset is unavailable",
-                        }
-                        for name in missing_maps
-                    ]
-                    output_writer.write(
-                        "Required maps are incomplete; the control file was not installed.\n"
-                    )
-                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                        "geoLocationsRunFinished:", "success", True
-                    )
-                    return
-                os.replace(staged_control, control_path)
-                report_progress(3.5, "Installing control file...")
-                if requested_places and tracks_summary_path is not None:
+                if (
+                    requested_places
+                    and tracks_summary_path is not None
+                    and not defer_optional_enrichment
+                ):
                     self.assistant_control_places_skipped = False
                     self.performSelectorOnMainThread_withObject_waitUntilDone_(
                         "setPlaceNameSkipAvailable:", True, True
@@ -15213,6 +15462,7 @@ class GPXTrackerController(NSObject):
         time_lapse: bool | None = None,
         continue_previous: bool = False,
         transient_resume_position=None,
+        assets_preflighted: bool = False,
     ):
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
@@ -15236,6 +15486,16 @@ class GPXTrackerController(NSObject):
         trackimages_dir = self._track_images_dir()
         if trackimages_dir is None:
             show_alert("Could not determine the map directory.")
+            return
+        if not assets_preflighted and self._current_single_gpx_path() is not None:
+            self._start_slideshow_dependency_preflight(
+                project_dir,
+                control_file_path,
+                trackimages_dir,
+                time_lapse=time_lapse,
+                continue_previous=continue_previous,
+                transient_resume_position=transient_resume_position,
+            )
             return
         try:
             missing_maps = missing_control_map_assets(
@@ -15345,6 +15605,158 @@ class GPXTrackerController(NSObject):
             f"{control_file_path.name}, and trackdir {trackimages_dir}."
         )
 
+    def _start_slideshow_dependency_preflight(
+        self,
+        project_dir,
+        control_file_path,
+        trackimages_dir,
+        *,
+        time_lapse=None,
+        continue_previous=False,
+        transient_resume_position=None,
+    ):
+        """Refresh cheap track data and validate map geometry off the UI thread."""
+        if self.slideshow_dependency_preflight_running:
+            self.set_status("Slide-show preparation is already checking the current tracks...")
+            return
+        gpx_path = self._current_single_gpx_path()
+        if gpx_path is None or not gpx_path.is_file():
+            self._start_slide_show(
+                time_lapse=time_lapse,
+                continue_previous=continue_previous,
+                transient_resume_position=transient_resume_position,
+                assets_preflighted=True,
+            )
+            return
+        try:
+            control_text = control_file_path.read_text(encoding="utf-8")
+            gpx_stat = gpx_path.stat()
+            control_stat = control_file_path.stat()
+        except OSError as exc:
+            show_alert("Could not validate slide-show maps.", str(exc))
+            return
+
+        self.slideshow_dependency_preflight_running = True
+        self.slideshow_dependency_preflight_generation += 1
+        generation = self.slideshow_dependency_preflight_generation
+        project_name = self._current_project_name() or gpx_path.stem
+        options = self._plot_common_options(project_name, trackimages_dir)
+        options.update({"plot_overview": False, "plot_tracks": None})
+        request = {
+            "time_lapse": time_lapse,
+            "continue_previous": bool(continue_previous),
+            "transient_resume_position": (
+                dict(transient_resume_position)
+                if isinstance(transient_resume_position, dict)
+                else None
+            ),
+            "project_dir": str(Path(project_dir).resolve(strict=False)),
+            "control_file_path": str(control_file_path.resolve(strict=False)),
+        }
+        source_signatures = {
+            "gpx": (int(gpx_stat.st_size), int(gpx_stat.st_mtime_ns)),
+            "control": (int(control_stat.st_size), int(control_stat.st_mtime_ns)),
+        }
+        self.set_status("Checking current track data and slide-show maps...")
+
+        def worker():
+            try:
+                context = prepare_with_options(str(gpx_path), **options)
+                execute_run_context(context, print_table_output=False, write_summary=True)
+                issues = slideshow_dependency_issues(
+                    control_text, trackimages_dir, context
+                )
+                current_gpx = gpx_path.stat()
+                current_control = control_file_path.stat()
+                current_signatures = {
+                    "gpx": (int(current_gpx.st_size), int(current_gpx.st_mtime_ns)),
+                    "control": (
+                        int(current_control.st_size),
+                        int(current_control.st_mtime_ns),
+                    ),
+                }
+                payload = {
+                    "generation": generation,
+                    "request": request,
+                    "issues": issues,
+                    "error": "",
+                    "retry": current_signatures != source_signatures,
+                }
+            except Exception as exc:
+                payload = {
+                    "generation": generation,
+                    "request": request,
+                    "issues": {"maps": [], "derived": []},
+                    "error": str(exc),
+                    "retry": False,
+                }
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "slideshowDependencyPreflightFinished:", payload, False
+            )
+
+        threading.Thread(
+            target=worker,
+            name="slideshow-dependency-preflight",
+            daemon=True,
+        ).start()
+
+    @objc.IBAction
+    def slideshowDependencyPreflightFinished_(self, payload):
+        if int(payload.get("generation", -1)) != self.slideshow_dependency_preflight_generation:
+            return
+        self.slideshow_dependency_preflight_running = False
+        request = payload.get("request", {})
+        current_project = self._resolve_project_directory(
+            allow_create=False, update_gpx_field=False
+        )
+        current_control = self._control_file_path()
+        if (
+            current_project is None
+            or current_control is None
+            or str(current_project.resolve(strict=False)) != request.get("project_dir")
+            or str(current_control.resolve(strict=False)) != request.get("control_file_path")
+        ):
+            self.set_status("Ignored an outdated slide-show preparation result.")
+            return
+        if bool(payload.get("retry")):
+            self._start_slideshow_dependency_preflight(
+                current_project,
+                current_control,
+                self._track_images_dir(),
+                time_lapse=request.get("time_lapse"),
+                continue_previous=bool(request.get("continue_previous", False)),
+                transient_resume_position=request.get("transient_resume_position"),
+            )
+            return
+        error = str(payload.get("error", ""))
+        if error:
+            show_alert("Could not check slide-show track data.", error)
+            self.set_status("Slide-show preparation failed before playback.")
+            return
+        issues = payload.get("issues", {})
+        maps = list(issues.get("maps", []))
+        derived = list(issues.get("derived", []))
+        if derived:
+            show_alert(
+                "Could not prepare current track data.",
+                "The slide show was not started because its route data is still outdated.",
+            )
+            return
+        if maps:
+            self._prepare_maps_then_start_slideshow(
+                maps,
+                time_lapse=request.get("time_lapse"),
+                continue_previous=bool(request.get("continue_previous", False)),
+                transient_resume_position=request.get("transient_resume_position"),
+            )
+            return
+        self._start_slide_show(
+            time_lapse=request.get("time_lapse"),
+            continue_previous=bool(request.get("continue_previous", False)),
+            transient_resume_position=request.get("transient_resume_position"),
+            assets_preflighted=True,
+        )
+
     def _prepare_maps_then_start_slideshow(
         self,
         missing_maps,
@@ -15357,13 +15769,13 @@ class GPXTrackerController(NSObject):
         missing = [str(name) for name in missing_maps]
         if len(missing) > 6 and not confirm_alert(
             f"Prepare {len(missing)} maps before starting?",
-            "The slide show needs these missing map files. myCamino can create only "
-            "the missing or outdated maps now and start the show automatically when "
+            "The slide show needs these missing or geometrically outdated map files. "
+            "myCamino can prepare only those required maps now and start the show when "
             "they are ready.",
             confirm_title="Prepare Maps and Start",
             cancel_title="Not Now",
         ):
-            self.set_status("Slide-show start cancelled; required maps are still missing.")
+            self.set_status("Slide-show start cancelled; required maps are not current.")
             return
 
         self.pending_slideshow_after_map_generation = {
@@ -15374,6 +15786,7 @@ class GPXTrackerController(NSObject):
                 if isinstance(transient_resume_position, dict)
                 else None
             ),
+            "required_map_names": missing,
         }
         provider = str(self.parameters.get("maps.output_provider", "osm")).casefold()
         if provider == "osm":
@@ -15538,6 +15951,9 @@ class GPXTrackerController(NSObject):
             return
         self.slideshow_live_state_sequence = sequence
         self.slideshow_live_state = state
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host.slideshowLiveStateDidChange_(state)
         request_sequence = int(state.get("request_sequence", 0) or 0)
         if (
             state.get("request") == "open_settings"
@@ -15553,6 +15969,9 @@ class GPXTrackerController(NSObject):
     def slideShowProcessFinished_(self, result):
         was_synchronized = self.control_table_sync_enabled
         active_process = self.slideshow_process
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host.slideshowDidFinishEnrichmentPriority_(None)
         if active_process is not None and active_process.pid == int(result.get("pid", -1)):
             self.slideshow_process = None
             self.slideshow_command_file = None
@@ -16989,6 +17408,8 @@ class GPXTrackerController(NSObject):
             "gpx.maximum_hdop",
             "gpx.maximum_vdop",
             "gpx.elevation_smoothing_distance_m",
+            "gpx.running_speed_window_distance_m",
+            "gpx.stationary_speed_threshold_kmh",
         )
         return parameter_subset(source, keys)
 
@@ -18036,6 +18457,12 @@ class GPXTrackerController(NSObject):
                 media_context={
                     "project_directory": str(self.current_project_dir or ""),
                     "control_file": str(self._control_file_path() or ""),
+                    "untimed_prompt_suppressed_track_identities": (
+                        self.untimed_prompt_suppressions
+                    ),
+                    "remember_untimed_prompt_suppressions": (
+                        self.remember_untimed_prompt_suppressions
+                    ),
                 },
             )
             if (
@@ -18292,6 +18719,7 @@ class GPXTrackerController(NSObject):
         self.mark_dirty()
 
     def shutdown(self):
+        network_availability.remove_listener(self._network_state_changed)
         self._stop_project_media_watcher()
         self.cancel_adventure_autosave()
         self.control_table_preview_shutdown = True

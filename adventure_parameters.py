@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 23
+PARAMETER_SCHEMA_VERSION = 24
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -148,6 +148,7 @@ PARAMETER_SPECS = (
     ParameterSpec("locations.timeout_seconds", "Locations", "Request timeout", 10.0, "float", "Maximum wait for one Apple reverse-geocoding request.", 1.0, 300.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_min_seconds", "Locations", "Minimum request spacing", 1.0, "float", "Minimum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
     ParameterSpec("locations.pacing_max_seconds", "Locations", "Maximum request spacing", 5.0, "float", "Maximum delay between reverse-geocoding requests.", 0.0, 60.0, advanced=True, unit="s"),
+    ParameterSpec("locations.show_background_enrichment_progress", "Locations", "Show background enrichment progress", False, "bool", "Show optional place-name and weather work in the Adventure Map progress indicator. Processing details and logs always include it."),
 
     ParameterSpec("weather.enabled", "Weather", "Add historical weather", False, "bool", "Send media coordinates and exposure times to Open-Meteo and store historical weather in media sidecars."),
     ParameterSpec("weather.access", "Weather", "Open-Meteo access", "free", "choice", "Use the non-commercial free endpoint or a paid customer historical endpoint.", choices=_choice(("free", "Free non-commercial"), ("customer", "Customer API"))),

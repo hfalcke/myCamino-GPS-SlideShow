@@ -159,12 +159,16 @@ from gpx_point_editing import (
     media_paths_for_point,
     mark_track_media_derived,
     mark_track_media_timed,
+    manual_track_start_time,
     monotonic_route_matches,
     move_rows as move_point_rows,
     point_from_values,
+    point_time_origin,
     rewrite_local_media_links,
     remove_rows,
     serialized_points,
+    set_manual_track_start_time,
+    set_point_time_origin,
     translate_points_web_mercator,
 )
 from media_route_timing import MediaObservation, RoutePoint, propose_route_timing
@@ -274,6 +278,9 @@ FILE_DRAG_TYPE = "NSFilenamesPboardType"
 POINT_PASTEBOARD_TYPE = "org.mycamino.gpx-track-points"
 UNTIMED_PROMPT_SUPPRESSION_KEY = "org.mycamino.gpx-editor.untimed-prompt-suppressed.v1"
 UNTIMED_PROMPT_SUPPRESSION_LIMIT = 2000
+ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD = (
+    "untimed_prompt_suppressed_track_identities"
+)
 APP_CACHE_DIR = Path.home() / "Library" / "Caches" / "myCamino-GPXEditor"
 TILE_CACHE_DIR = DEFAULT_TILE_CACHE_DIR
 MPL_CACHE_DIR = APP_CACHE_DIR / "matplotlib"
@@ -322,13 +329,20 @@ def untimed_tracks_requiring_prompt(tracks, suppressed: set[str]):
     return pending
 
 
-def apply_untimed_prompt_response(response: int, pending, defaults):
+def apply_untimed_prompt_response(
+    response: int,
+    pending,
+    defaults=None,
+    *,
+    remember_callback=None,
+):
     """Apply a three-button prompt response and return the resulting action."""
     if int(response) == 1001:
-        remember_untimed_track_identities(
-            defaults,
-            (identity for _row, _track, identity in pending),
-        )
+        identities = [identity for _row, _track, identity in pending]
+        if remember_callback is not None:
+            remember_callback(identities)
+        elif defaults is not None:
+            remember_untimed_track_identities(defaults, identities)
         return "suppress", None
     if int(response) == 1000 and pending:
         return "edit", pending[0][0]
@@ -1110,10 +1124,10 @@ class EditorTableDataSource(NSObject):
                 path for path in resolved_paths if path.suffix.casefold() == ".gpx"
             ]
             if gpx_paths:
-                self.controller.load_gpx_paths(
-                    gpx_paths,
-                    mark_dirty=True,
-                    offer_sort_after_drop=True,
+                self.controller.performSelector_withObject_afterDelay_(
+                    "loadDroppedGPXPaths:",
+                    [str(path) for path in gpx_paths],
+                    0.0,
                 )
                 return True
             if not 0 <= row < len(self.controller.tracks):
@@ -1124,7 +1138,9 @@ class EditorTableDataSource(NSObject):
             self.controller.media_context["_pending_media_paths"] = [
                 str(path) for path in resolved_paths
             ]
-            self.controller.addTracksFromPhotos_(None)
+            self.controller.performSelector_withObject_afterDelay_(
+                "addTracksFromPhotos:", None, 0.0
+            )
             return True
         text = str(info.draggingPasteboard().stringForType_(DRAG_TYPE) or "")
         indexes = [int(part) for part in text.split(",") if part.isdigit()]
@@ -1658,8 +1674,15 @@ class PlotView(NSView):
     def performDragOperation_(self, sender):
         paths = sender.draggingPasteboard().propertyListForType_(FILE_DRAG_TYPE)
         if self.adventure_workspace_delegate is not None:
-            self.adventure_workspace_delegate.performWorkspaceDrop_(list(paths or []))
-            return bool(paths)
+            deferred_paths = [str(path) for path in paths or []]
+            if not deferred_paths:
+                return False
+            # A modal Open panel cannot reliably receive mouse events while
+            # AppKit is still completing the drag session.
+            self.adventure_workspace_delegate.performSelector_withObject_afterDelay_(
+                "performWorkspaceDrop:", deferred_paths, 0.0
+            )
+            return True
         if self.mode != "track":
             return False
         resolved_paths = [
@@ -1668,10 +1691,10 @@ class PlotView(NSView):
         ]
         gpx_paths = [path for path in resolved_paths if path.suffix.casefold() == ".gpx"]
         if gpx_paths:
-            self.controller.load_gpx_paths(
-                gpx_paths,
-                mark_dirty=True,
-                offer_sort_after_drop=True,
+            self.controller.performSelector_withObject_afterDelay_(
+                "loadDroppedGPXPaths:",
+                [str(path) for path in gpx_paths],
+                0.0,
             )
             remaining = [path for path in resolved_paths if path not in gpx_paths]
             if remaining:
@@ -6314,6 +6337,11 @@ class TrackInspectorController(NSObject):
         if not points or points[0].time is None:
             return False
         get_or_create_track_time(self.track.element).text = format_gpx_time(points[0].time)
+        if (
+            points[0].element is not None
+            and point_time_origin(points[0].element) == "manual"
+        ):
+            set_manual_track_start_time(self.track.element, points[0].time)
         self.parent.invalidate_track_metrics(self.track)
         return True
 
@@ -6369,6 +6397,8 @@ class TrackInspectorController(NSObject):
                 )
                 self.undo()
                 return
+        if column == "time":
+            set_point_time_origin(point, "manual")
         self.parent.invalidate_track_metrics(self.track)
         if row == 0 and column == "time":
             self.sync_track_start_time_from_first_point()
@@ -8695,7 +8725,7 @@ class GPXEditorController(NSObject):
             return bool(self.tracks)
         if action == "estimateRouteTimesFromMedia:":
             selected = self.selected_tracks()
-            return len(selected) == 1 and self._fully_untimed_route(selected[0])
+            return len(selected) == 1 and self._media_timing_eligible_route(selected[0])
         if action == "undo:":
             return bool(self.undo_stack)
         if action == "redo:":
@@ -9138,9 +9168,12 @@ class GPXEditorController(NSObject):
             for point in points:
                 if point.time is not None:
                     get_or_create_point_time(point.element).text = format_gpx_time(point.time + offset)
+                    set_point_time_origin(point.element, "generated")
+            set_manual_track_start_time(track.element, new_time)
             self.invalidate_track_metrics(track)
             return
         self.assign_missing_timestamps(track, new_time)
+        set_manual_track_start_time(track.element, new_time)
         desc = get_or_create_child(track.element, "desc", {qname("name"), qname("cmt")})
         note = "Timestamp edited manually; original track had no usable point timestamps."
         desc.text = f"{desc.text or ''}\n{note}".strip()
@@ -9170,6 +9203,7 @@ class GPXEditorController(NSObject):
         for point, point_time in zip(raw_points, repaired_times):
             if point.element is not None:
                 get_or_create_point_time(point.element).text = format_gpx_time(point_time)
+                set_point_time_origin(point.element, "generated")
         get_or_create_track_time(track.element).text = format_gpx_time(start_time)
         self.invalidate_track_metrics(track)
 
@@ -9323,7 +9357,12 @@ class GPXEditorController(NSObject):
         return bool(points) and all(point.time is None for point in points)
 
     @objc.python_method
-    def _route_timing_proposal(self, track, prepared):
+    def _media_timing_eligible_route(self, track):
+        """Any non-empty selected route may be explicitly retimed by its user."""
+        return bool(track is not None and track.points())
+
+    @objc.python_method
+    def _route_timing_proposal(self, track, prepared, *, allow_reverse=True):
         raw_points = extract_raw_track_points(track.element)
         route = [
             RoutePoint(point.lat, point.lon, point.segment_index)
@@ -9339,12 +9378,21 @@ class GPXEditorController(NSObject):
                 or record.longitude is None
             ):
                 continue
+            raw_metadata = getattr(record, "raw_metadata", {})
+            source_identity = (
+                raw_metadata.get("source_file_identity", {})
+                if isinstance(raw_metadata, dict)
+                else {}
+            )
             observations.append(
                 MediaObservation(
                     item.path,
                     record.photo_datetime,
                     float(record.latitude),
                     float(record.longitude),
+                    str(source_identity.get("sha256", ""))
+                    if isinstance(source_identity, dict)
+                    else "",
                 )
             )
         proposal = propose_route_timing(
@@ -9354,15 +9402,30 @@ class GPXEditorController(NSObject):
             fallback_speed_kmh=float(
                 self.project_parameters["gpx.fallback_walking_speed_kmh"]
             ),
+            fixed_point_times={
+                index: point.time
+                for index, point in enumerate(raw_points)
+                if point.time is not None
+                and point.element is not None
+                and point_time_origin(point.element) == "manual"
+            },
+            manual_start_time=manual_track_start_time(track.element),
+            allow_reverse=allow_reverse,
         )
         return raw_points, observations, proposal
 
     @objc.python_method
-    def offer_route_timing_from_prepared(self, prepared, track=None):
+    def offer_route_timing_from_prepared(
+        self,
+        prepared,
+        track=None,
+        *,
+        confirmation_required=True,
+    ):
         if track is None:
             selected = self.selected_tracks()
             track = selected[0] if len(selected) == 1 else None
-        if not self._fully_untimed_route(track):
+        if not self._media_timing_eligible_route(track):
             return False
         raw_points, _observations, proposal = self._route_timing_proposal(track, prepared)
         if not proposal.anchors:
@@ -9371,7 +9434,10 @@ class GPXEditorController(NSObject):
                 f"of untimed track #{track.nr}; route timing was unchanged."
             )
             return False
-        ignored_count = max(0, len(prepared) - len(proposal.anchors))
+        ignored_count = max(
+            0,
+            len(prepared) - proposal.duplicate_count - len(proposal.anchors),
+        )
         start_text = format_datetime_local(proposal.point_times[0])
         end_text = format_datetime_local(proposal.point_times[-1])
         speed_note = (
@@ -9380,28 +9446,88 @@ class GPXEditorController(NSObject):
             if len(proposal.anchors) == 1
             else f"Extrapolation uses {proposal.extrapolation_speed_kmh:.1f} km/h."
         )
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_(f"Estimate times for {track.name}?")
-        alert.setInformativeText_(
-            f"{len(proposal.anchors)} of {len(prepared)} media file(s) provide monotonic "
-            f"timing anchors within {self.media_timing_max_distance_m:g} m; "
-            f"{ignored_count} will be ignored for timing but remain media.\n\n"
-            f"Estimated route: {start_text} to {end_text}. {speed_note}\n\n"
-            "Only timestamps on existing route points will change. Route coordinates "
-            "and segments remain untouched."
-        )
-        alert.addButtonWithTitle_("Estimate Route Times")
-        alert.addButtonWithTitle_("Not Now")
-        if int(alert.runModal()) != 1000:
-            self.set_status("Route timing was left unchanged.")
-            return False
+        if confirmation_required:
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(f"Estimate times for {track.name}?")
+            alert.setInformativeText_(
+                f"{len(proposal.anchors)} of {len(prepared) - proposal.duplicate_count} unique "
+                "media file(s) provide monotonic "
+                f"timing anchors within {self.media_timing_max_distance_m:g} m; "
+                f"{ignored_count} will be ignored for timing but remain media. "
+                f"{proposal.duplicate_count} identical timing observation(s) were counted once.\n\n"
+                f"Estimated route: {start_text} to {end_text}. {speed_note}\n\n"
+                "Only timestamps on existing route points will change. Route coordinates "
+                "and segments remain untouched."
+            )
+            alert.addButtonWithTitle_("Estimate Route Times")
+            alert.addButtonWithTitle_("Not Now")
+            if int(alert.runModal()) != 1000:
+                self.set_status("Route timing was left unchanged.")
+                return False
         if len(raw_points) != len(proposal.point_times):
             show_alert("Could not estimate route times.", "The route changed while media were analyzed.")
             return False
+        manual_start = manual_track_start_time(track.element)
+        if proposal.route_reversed and manual_start is not None:
+            direction_alert = NSAlert.alloc().init()
+            direction_alert.setMessageText_("Media indicate the opposite route direction")
+            direction_alert.setInformativeText_(
+                "The manually entered Track start time can move to the newly inferred "
+                "start, or myCamino can keep the current route direction and ignore "
+                "media that conflict with it."
+            )
+            direction_alert.addButtonWithTitle_("Use Media Direction")
+            direction_alert.addButtonWithTitle_("Keep Current Direction")
+            direction_alert.addButtonWithTitle_("Cancel")
+            direction_response = int(direction_alert.runModal())
+            if direction_response == 1002:
+                self.set_status("Route timing was left unchanged.")
+                return False
+            if direction_response == 1001:
+                raw_points, _observations, proposal = self._route_timing_proposal(
+                    track,
+                    prepared,
+                    allow_reverse=False,
+                )
+                if not proposal.anchors:
+                    self.set_status(
+                        "No media are compatible with the current direction and manual timestamps."
+                    )
+                    return False
         self.push_undo()
+        manual_values = {
+            point.element: point.time
+            for point in raw_points
+            if point.element is not None
+            and point.time is not None
+            and point_time_origin(point.element) == "manual"
+        }
+        if proposal.route_reversed:
+            segments = list(track.element.findall("gpx:trkseg", NS))
+            for segment in segments:
+                segment_points = list(segment.findall("gpx:trkpt", NS))
+                for point in segment_points:
+                    segment.remove(point)
+                for point in reversed(segment_points):
+                    segment.append(point)
+            for segment in segments:
+                track.element.remove(segment)
+            for segment in reversed(segments):
+                track.element.append(segment)
+            raw_points = track.points()
         for point, point_time in zip(raw_points, proposal.point_times):
             if point.element is not None:
                 get_or_create_point_time(point.element).text = format_gpx_time(point_time)
+                set_point_time_origin(point.element, "generated")
+        for point_element, point_time in manual_values.items():
+            get_or_create_point_time(point_element).text = format_gpx_time(point_time)
+            set_point_time_origin(point_element, "manual")
+        if raw_points and raw_points[0].element is not None:
+            first_time = parse_time(
+                get_or_create_point_time(raw_points[0].element).text
+            )
+            if first_time is not None:
+                get_or_create_track_time(track.element).text = format_gpx_time(first_time)
         mark_track_media_timed(
             track.element,
             maximum_distance_m=self.media_timing_max_distance_m,
@@ -9409,7 +9535,8 @@ class GPXEditorController(NSObject):
         )
         self.invalidate_track_metrics(track)
         self.mark_dirty(
-            f"Estimated track #{track.nr} timestamps from {len(proposal.anchors)} nearby media file(s)."
+            f"Estimated track #{track.nr} timestamps from {len(proposal.anchors)} nearby media file(s)"
+            + (" and aligned its direction with the media." if proposal.route_reversed else ".")
         )
         inspector = self.existing_inspector_for_track(track)
         if inspector is not None:
@@ -9425,7 +9552,7 @@ class GPXEditorController(NSObject):
 
         track_nr, raw_paths = payload
         track = next((item for item in self.tracks if item.nr == int(track_nr)), None)
-        if not self._fully_untimed_route(track):
+        if not self._media_timing_eligible_route(track):
             return
         paths = self._expanded_media_inputs(raw_paths)
         if not paths:
@@ -9438,8 +9565,8 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def estimateRouteTimesFromMedia_(self, _sender):
         selected_tracks = self.selected_tracks()
-        if len(selected_tracks) != 1 or not self._fully_untimed_route(selected_tracks[0]):
-            show_alert("Select one completely untimed route.")
+        if len(selected_tracks) != 1 or not self._media_timing_eligible_route(selected_tracks[0]):
+            show_alert("Select one untimed or previously media-timed route.")
             return
         panel = NSOpenPanel.openPanel()
         panel.setCanChooseFiles_(True)
@@ -9466,7 +9593,7 @@ class GPXEditorController(NSObject):
             self.set_status("Media will be checked against the route after GPX loading finishes.")
             return
         selected = self.selected_tracks()
-        if len(selected) == 1 and self._fully_untimed_route(selected[0]):
+        if len(selected) == 1 and self._media_timing_eligible_route(selected[0]):
             self.offerRouteTimingForPaths_((selected[0].nr, list(paths or [])))
             return
         self.media_context["_pending_media_paths"] = [str(path) for path in paths or []]
@@ -9806,6 +9933,18 @@ class GPXEditorController(NSObject):
             True,
         )
 
+    def loadDroppedGPXPaths_(self, raw_paths):
+        """Begin a file drop after AppKit has finished its drag session."""
+        paths = [
+            Path(str(path)).expanduser().resolve(strict=False)
+            for path in raw_paths or []
+        ]
+        self.load_gpx_paths(
+            paths,
+            mark_dirty=True,
+            offer_sort_after_drop=True,
+        )
+
     @objc.IBAction
     def loadNextTrack_(self, timer):
         if self.editor_close_finalized:
@@ -9957,10 +10096,35 @@ class GPXEditorController(NSObject):
 
     def offer_track_time_entry(self):
         """Offer, but never require, an absolute anchor for fully untimed tracks."""
-        defaults = NSUserDefaults.standardUserDefaults()
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        remember_callback = None
+        if workspace is not None and hasattr(
+            workspace, "untimed_prompt_suppressed_identities"
+        ):
+            suppressed = set(workspace.untimed_prompt_suppressed_identities())
+            remember_callback = workspace.remember_untimed_prompt_suppressions
+            defaults = None
+        else:
+            context_suppressions = self.media_context.get(
+                ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD
+            )
+            context_callback = self.media_context.get(
+                "remember_untimed_prompt_suppressions"
+            )
+            if context_suppressions is not None and callable(context_callback):
+                suppressed = {
+                    str(value)
+                    for value in context_suppressions
+                    if str(value).strip()
+                }
+                remember_callback = context_callback
+                defaults = None
+            else:
+                defaults = NSUserDefaults.standardUserDefaults()
+                suppressed = suppressed_untimed_track_identities(defaults)
         pending = untimed_tracks_requiring_prompt(
             self.tracks,
-            suppressed_untimed_track_identities(defaults),
+            suppressed,
         )
         if not pending:
             return
@@ -9984,7 +10148,12 @@ class GPXEditorController(NSObject):
         alert.addButtonWithTitle_("No — Don’t Ask Again")
         alert.addButtonWithTitle_("Later")
         response = int(alert.runModal())
-        action, row = apply_untimed_prompt_response(response, pending, defaults)
+        action, row = apply_untimed_prompt_response(
+            response,
+            pending,
+            defaults,
+            remember_callback=remember_callback,
+        )
         if action == "suppress":
             self.set_status(
                 f"Will not ask again about timestamps for {len(pending)} unchanged track(s)."
@@ -11785,7 +11954,11 @@ class GPXEditorController(NSObject):
         self.selected_nrs = []
         self.update_selection_field()
         self.mark_dirty(f"Deleted {len(selected)} selected {plural}.")
-        self.refresh_open_plot_views()
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "workspace_tracks_deleted"):
+            workspace.workspace_tracks_deleted(selected_numbers)
+        else:
+            self.refresh_open_plot_views()
 
     @objc.IBAction
     def joinTracks_(self, _sender):

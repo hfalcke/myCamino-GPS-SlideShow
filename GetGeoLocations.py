@@ -776,6 +776,79 @@ class KnownPlace:
     place_details: Optional[dict[str, Any]]
 
 
+class DeferredPlaceNameSession:
+    """Resolve sidecar place names incrementally without rescanning the project."""
+
+    def __init__(self, media_paths: Iterable[Path | str], distance_m: float):
+        self.distance_m = max(0.0, float(distance_m))
+        self.geocode_cache: dict[
+            tuple[float, float],
+            tuple[Optional[str], Optional[dict[str, Any]]],
+        ] = {}
+        self.known_places: list[KnownPlace] = []
+        for value in media_paths:
+            path = Path(value).expanduser().resolve(strict=False)
+            record = load_record_from_json(media_sidecar_path(path), path)
+            if (
+                record is not None
+                and record.latitude is not None
+                and record.longitude is not None
+                and record_place_matches_gps(record, self.distance_m)
+            ):
+                self.known_places.append(
+                    KnownPlace(
+                        latitude=float(record.latitude),
+                        longitude=float(record.longitude),
+                        place=str(record.place),
+                        place_details=record.place_details,
+                    )
+                )
+
+    def enrich(
+        self,
+        media_path: Path | str,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> tuple[str, bool]:
+        """Patch one sidecar and report its outcome and whether a request was made."""
+        path = Path(media_path).expanduser().resolve(strict=False)
+        record = load_record_from_json(media_sidecar_path(path), path)
+        if record is None:
+            return "missing or invalid metadata sidecar", False
+        if record.latitude is None or record.longitude is None:
+            return "no GPS coordinates", False
+        if record_place_matches_gps(record, self.distance_m):
+            return "already current", False
+        record = resolve_place_for_record(
+            record,
+            self.geocode_cache,
+            self.known_places,
+            self.distance_m,
+            True,
+            timeout_seconds,
+            0.0,
+            0.0,
+        )
+        geocode = (
+            record.debug_info.get("geocode", {})
+            if isinstance(record.debug_info, dict)
+            else {}
+        )
+        requested = bool(geocode.get("requested"))
+        if record.place_updated and is_resolved_place_name(record.place):
+            write_record_place_fields(record)
+            self.known_places.append(
+                KnownPlace(
+                    latitude=float(record.latitude),
+                    longitude=float(record.longitude),
+                    place=str(record.place),
+                    place_details=record.place_details,
+                )
+            )
+            return str(record.place), requested
+        return "place name unavailable", requested
+
+
 def collect_input_parameters(argv: list[str]) -> Params:
     """Parse and validate CLI arguments."""
     parser = argparse.ArgumentParser(
@@ -1916,18 +1989,32 @@ def reverse_geocode_location_details_with_debug(
         debug_info["status"] = "corelocation_unavailable"
         return None, None, debug_info
 
+    from network_availability import network_availability
+
+    network_availability.wait_until_available(RUNTIME_CANCEL_EVENT)
+
     location = CLLocation.alloc().initWithLatitude_longitude_(latitude, longitude)
     retry_delays = [0.4, 1.2, 2.5]
 
     for attempt_index in range(len(retry_delays) + 1):
+        if not network_availability.wait_until_available(RUNTIME_CANCEL_EVENT):
+            check_cancelled()
         geocoder = CLGeocoder.alloc().init()
         attempt_info: dict[str, Any] = {"attempt": attempt_index + 1}
-        state: dict[str, Any] = {"done": False, "place": None, "details": None, "error": None, "placemark_count": 0}
+        state: dict[str, Any] = {
+            "done": False,
+            "place": None,
+            "details": None,
+            "error": None,
+            "error_object": None,
+            "placemark_count": 0,
+        }
 
         def completion_handler(placemarks, error) -> None:
             try:
                 if error is not None:
                     state["error"] = str(error)
+                    state["error_object"] = error
                 if placemarks:
                     try:
                         state["placemark_count"] = len(placemarks)
@@ -1950,8 +2037,20 @@ def reverse_geocode_location_details_with_debug(
         if not state["done"]:
             geocoder.cancelGeocode()
             attempt_info["timeout"] = True
+            network_availability.report_failure(TimeoutError("Reverse geocoding timed out"))
         else:
             attempt_info["timeout"] = False
+            error_object = state.get("error_object")
+            error_code = None
+            if error_object is not None:
+                try:
+                    error_code = int(error_object.code())
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            if error_code == 2:  # kCLErrorNetwork
+                network_availability.report_failure(
+                    ConnectionError(str(state.get("error") or "Core Location network error"))
+                )
 
         attempt_info["error"] = state["error"]
         attempt_info["placemark_count"] = state["placemark_count"]
@@ -1960,6 +2059,7 @@ def reverse_geocode_location_details_with_debug(
         debug_info["attempts"].append(attempt_info)
 
         if state["place"]:
+            network_availability.report_success()
             debug_info["status"] = "success"
             debug_info["place"] = str(state["place"])
             debug_info["place_details"] = state["details"]
@@ -3777,8 +3877,15 @@ def render_media_map_specs(
             "adventure_render_parameters_by_layout",
             "adventure_overview_render_parameters",
             "only_missing_or_stale",
+            "requested_filenames",
         }
     }
+    requested_filenames = options.get("requested_filenames")
+    requested = (
+        {str(name).casefold() for name in requested_filenames}
+        if requested_filenames is not None
+        else None
+    )
     rendered = []
     failures = options.setdefault("map_failures", []) if options.get("continue_on_map_error") else None
     stop_after_failure = False
@@ -3788,6 +3895,8 @@ def render_media_map_specs(
         for map_layout in map_layouts:
             check_cancelled()
             output_name = media_map_output_filename(spec["filename"], map_layout)
+            if requested is not None and output_name.casefold() not in requested:
+                continue
             output_path = output_dir / output_name
             layout_options = dict(render_options)
             layout_options["map_layout"] = map_layout
@@ -3949,6 +4058,11 @@ def create_media_overview_for_records(
     output_dir.mkdir(parents=True, exist_ok=True)
     filename_base = str(options.get("filename_base") or sorted_output_path.stem.removesuffix("-sorted"))
     output_name = f"{filename_base}.png"
+    requested_filenames = options.get("requested_filenames")
+    if requested_filenames is not None and output_name.casefold() not in {
+        str(name).casefold() for name in requested_filenames
+    }:
+        return output_name
     if options.get("skip_rendering") or options.get("map_failures"):
         return output_name
     output_path = output_dir / output_name

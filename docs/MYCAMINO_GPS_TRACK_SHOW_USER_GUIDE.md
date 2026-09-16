@@ -1281,6 +1281,14 @@ icon and up to two selected values beside the speedometer. During Time-Lapse,
 the latest reached weather remains visible for up to one hour of track/media
 time. Weather data is an historical model estimate, not a camera measurement.
 
+Place names and weather are optional finishing work. myCamino first prepares
+metadata, track data, maps, and the control file, so playback can start without
+waiting for online enrichment. During a running show, the current and next ten
+media items receive priority. The show never pauses when optional information
+is late. **Show background enrichment progress** can show this work on the
+Adventure Map; it is off by default, while Adventure Processing and its log
+always retain the details.
+
 Weather data: [Open-Meteo](https://open-meteo.com/), licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 

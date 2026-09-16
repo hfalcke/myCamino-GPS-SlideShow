@@ -8,9 +8,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+import urllib.error
 from urllib.request import Request, urlopen
 
 from application_metadata import APP_VERSION
+from network_availability import network_availability
 
 
 NEWS_FEED_URL = "https://mycamino.heinofalcke.de/api/app-news/v1/"
@@ -97,13 +99,21 @@ def retrieve_news_feed(
             "Accept": "application/json",
         },
     )
-    with urlopen(request, timeout=timeout_seconds) as response:
-        if not str(response.geturl()).startswith("https://"):
-            raise ValueError("news endpoint redirected to an insecure connection")
-        content_type = str(response.headers.get("Content-Type", "")).casefold()
-        if "application/json" not in content_type:
-            raise ValueError("news endpoint did not return JSON")
-        payload = response.read(MAX_FEED_BYTES + 1)
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            if not str(response.geturl()).startswith("https://"):
+                raise ValueError("news endpoint redirected to an insecure connection")
+            content_type = str(response.headers.get("Content-Type", "")).casefold()
+            if "application/json" not in content_type:
+                raise ValueError("news endpoint did not return JSON")
+            payload = response.read(MAX_FEED_BYTES + 1)
+    except urllib.error.HTTPError:
+        network_availability.report_success()
+        raise
+    except Exception as exc:
+        network_availability.report_failure(exc)
+        raise
+    network_availability.report_success()
     return parse_news_feed(payload)
 
 

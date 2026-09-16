@@ -10,6 +10,7 @@ import copy
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -115,6 +116,7 @@ from control_media_inventory import (
     write_control_media_inventory,
 )
 from GPXEditor import (
+    ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD,
     FILE_DRAG_TYPE,
     GPXEditorController,
     bundled_resource_path,
@@ -124,6 +126,14 @@ from json_storage import atomic_write_json
 from interactive_tile_viewport import tile_zoom_for_viewport
 from license_resources import read_license_document
 from media_metadata_service import media_paths_from_control_file, prepare_media_records
+from media_import_utils import accepted_media_paths, import_media_files
+from media_enrichment_queue import (
+    AdaptiveGeocodePacing,
+    LOOKAHEAD_MEDIA_COUNT,
+    SlideshowAwareEnrichmentQueue,
+    control_media_priority,
+)
+from network_availability import network_availability
 from plot_metadata_utils import media_sidecar_freshness, media_sidecar_path, validate_media_sidecar
 from project_media_watcher import ProjectMediaWatcher
 
@@ -205,6 +215,7 @@ class AdventureMapController(NSObject):
         self.adventure_payload = None
         self.parameters = default_parameters()
         self.weather_consent = "unasked"
+        self.untimed_prompt_suppressions: set[str] = set()
         self.adventure_name = "Untitled Adventure"
         self.control_file = None
         self.control_rows = []
@@ -239,7 +250,17 @@ class AdventureMapController(NSObject):
         self.processing_total = 0
         self.processing_phase = ""
         self.background_progress = {}
+        self.network_state = network_availability.state
+        network_availability.add_listener(self._network_state_changed)
         self.pending_media: set[Path] = set()
+        self.enrichment_queue = SlideshowAwareEnrichmentQueue()
+        self.enrichment_active = False
+        self.enrichment_paused_by_cancel = False
+        self.enrichment_generation = 0
+        self.enrichment_cancel_event = threading.Event()
+        self.enrichment_weather_attempted: set[Path] = set()
+        self.enrichment_attempted_paths: set[Path] = set()
+        self.control_assets_pending = False
         self.auto_processed_paths: set[Path] = set()
         self.pending_start_after_processing = False
         self.pending_control_media: set[Path] = set()
@@ -264,6 +285,8 @@ class AdventureMapController(NSObject):
         self.workspace_autosave_generation = 0
         self.workspace_autosave_in_progress = False
         self.workspace_dirty_components: set[str] = set()
+        self.derived_track_data_future = None
+        self.derived_track_data_pending = False
         self.journal = ProcessingJournal(self.recovery.directory / "logs")
         self.journal_window = None
         self.journal_text = None
@@ -368,6 +391,17 @@ class AdventureMapController(NSObject):
         self.progress_label.setShadow_(progress_shadow)
         self.progress_label.setAutoresizingMask_(1 << 0 | 1 << 4)
         container.addSubview_(self.progress_label)
+        self.network_status_label = NSTextField.labelWithString_("")
+        self.network_status_label.setFrame_(
+            NSMakeRect(old_bounds.size.width - 330, old_bounds.size.height - 52, 294, 20)
+        )
+        self.network_status_label.setAlignment_(2)
+        self.network_status_label.setDrawsBackground_(False)
+        self.network_status_label.setBezeled_(False)
+        self.network_status_label.setTextColor_(NSColor.whiteColor())
+        self.network_status_label.setShadow_(progress_shadow)
+        self.network_status_label.setAutoresizingMask_(1 << 0 | 1 << 4)
+        container.addSubview_(self.network_status_label)
         window.setContentView_(container)
         window.setMinSize_(NSMakeSize(920, 560))
         window.makeFirstResponder_(view)
@@ -375,7 +409,38 @@ class AdventureMapController(NSObject):
         if view.interactive_tiles_active:
             view.schedule_interactive_tiles(immediate=True)
         self._refresh_progress_indicator()
+        self._apply_network_state(self.network_state)
         view.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _network_state_changed(self, state):
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "applyNetworkState:", str(state), False
+        )
+
+    @objc.IBAction
+    def applyNetworkState_(self, state):
+        self._apply_network_state(str(state))
+
+    @objc.python_method
+    def _apply_network_state(self, state):
+        previous = getattr(self, "network_state", "online")
+        self.network_state = str(state)
+        label = getattr(self, "network_status_label", None)
+        if label is not None:
+            messages = {
+                "offline": "Offline - online work paused",
+                "recovering": "Connection found - resuming shortly",
+            }
+            label.setStringValue_(messages.get(self.network_state, ""))
+        if previous != self.network_state and hasattr(self, "journal"):
+            if self.network_state == "offline":
+                self._journal(
+                    "Network",
+                    "Offline for at least 5 seconds; weather, place-name, and tile retrieval are paused.",
+                )
+            elif self.network_state == "online" and previous != "online":
+                self._journal("Network", "Connection is stable; paused online work is resuming.")
 
     @objc.python_method
     def _set_title(self):
@@ -623,6 +688,7 @@ class AdventureMapController(NSObject):
                 "Choose the folder again to renew myCamino's permission.",
             )
             return
+        self._reset_optional_enrichment()
         self._stop_media_watcher()
         self.startup_track_loading = False
         self.startup_media_scan_deferred = False
@@ -696,6 +762,7 @@ class AdventureMapController(NSObject):
         ):
             if not self._flush_workspace_autosave(show_errors=True):
                 return
+        self._reset_optional_enrichment()
         self._stop_media_watcher()
         self.startup_track_loading = False
         self.startup_media_scan_deferred = False
@@ -717,6 +784,13 @@ class AdventureMapController(NSObject):
         self.track_viewports.clear()
         self.auto_processed_paths.clear()
         self.adventure_payload = dict(record.payload)
+        self.untimed_prompt_suppressions = {
+            str(value)
+            for value in record.payload.get(
+                ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD, []
+            )
+            if str(value).strip()
+        }
         self.project_directory = record.path.parent
         self.adventure_name = record.project_name
         self.demo_mode = bool(record.payload.get("guided_demo", False))
@@ -867,6 +941,9 @@ class AdventureMapController(NSObject):
     def _queue_derived_track_data(self):
         if self.adventure_payload is None or self.project_directory is None:
             return
+        if self.derived_track_data_future is not None and not self.derived_track_data_future.done():
+            self.derived_track_data_pending = True
+            return
         gpx_path = self.project_directory / str(self.adventure_payload.get("gpx_file", ""))
         if not gpx_path.is_file():
             return
@@ -876,23 +953,86 @@ class AdventureMapController(NSObject):
         self._set_background_progress(
             "derived", "Updating track data", 0, len(self.gpx_controller.tracks)
         )
+
+        values = dict(self.parameters)
+        use_track_order = str(values.get("trackmaps.ordering", "track_number")) == "track_number"
+        output_base = str(
+            self.adventure_payload.get("track_map_base")
+            or filename_base(self.adventure_name)
+        )
+        processing_keys = (
+            "trackmaps.ordering",
+            "trackmaps.remove_name_prefix",
+            "gpx.fallback_walking_speed_kmh",
+            "gpx.horizontal_smoothing_distance_m",
+            "gpx.minimum_point_spacing_m",
+            "gpx.maximum_accuracy_m",
+            "gpx.maximum_vertical_accuracy_m",
+            "gpx.maximum_hdop",
+            "gpx.maximum_vdop",
+            "gpx.elevation_smoothing_distance_m",
+            "gpx.running_speed_window_distance_m",
+            "gpx.stationary_speed_threshold_kmh",
+        )
+        processing_signature = {
+            key: values.get(key) for key in processing_keys
+        }
+
         def work():
-            from gpx_tracks_table import upgrade_timed_track_sidecars
-            return upgrade_timed_track_sidecars(gpx_path, output_dir)
+            from gpx_tracks_table import run_with_options
+            return run_with_options(
+                gpx_path,
+                print_table_output=False,
+                plot_overview=False,
+                plot_tracks=None,
+                output_dir=str(output_dir),
+                output_base=output_base,
+                nojson=False,
+                pdf=False,
+                verbose=False,
+                sort_original=use_track_order,
+                sort_date=not use_track_order,
+                remove_prefix=values["trackmaps.remove_name_prefix"],
+                gpx_threshold_distance=values["gpx.minimum_point_spacing_m"],
+                gpx_threshold_accuracy=values["gpx.maximum_accuracy_m"],
+                gpx_horizontal_smoothing_distance=values["gpx.horizontal_smoothing_distance_m"],
+                gpx_elevation_smoothing_distance=values["gpx.elevation_smoothing_distance_m"],
+                gpx_maximum_vertical_accuracy=values["gpx.maximum_vertical_accuracy_m"],
+                gpx_maximum_hdop=values["gpx.maximum_hdop"],
+                gpx_maximum_vdop=values["gpx.maximum_vdop"],
+                gpx_running_speed_window_distance=values["gpx.running_speed_window_distance_m"],
+                gpx_stationary_speed_threshold=values["gpx.stationary_speed_threshold_kmh"],
+                fallback_walking_speed_kmh=values["gpx.fallback_walking_speed_kmh"],
+                adventure_processing_parameters=processing_signature,
+            )
         future = self.executor.submit(work)
+        self.derived_track_data_future = future
+
         def poll(timer):
             if not future.done():
                 return
             timer.invalidate()
+            if self.derived_track_data_future is future:
+                self.derived_track_data_future = None
             self._clear_background_progress("derived")
             try:
-                report = future.result()
+                result = future.result()
                 self._journal(
                     "Derived Track Data",
-                    f"Updated {len(report.get('updated', []))}; current {len(report.get('current', []))}; skipped {len(report.get('skipped', []))}.",
+                    f"Rebuilt current data for {len(result.get('tracks', []))} track(s); no maps were rendered.",
                 )
+                controller = self.full_gui_controller
+                if controller is not None:
+                    controller.start_async_project_status_refresh(
+                        "derived track data rebuilt"
+                    )
             except Exception as exc:
                 self._journal("Derived Track Data", f"Failed: {exc}")
+            if self.derived_track_data_pending:
+                self.derived_track_data_pending = False
+                self._queue_derived_track_data()
+            else:
+                self._start_optional_enrichment()
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.1, _BlockTimer.alloc().initWithBlock_(poll), "fire:", None, True
         )
@@ -937,6 +1077,7 @@ class AdventureMapController(NSObject):
             parameters = dict(self.parameters)
             result = []
             pending = []
+            enrichment = []
             for path in project_paths:
                 sidecar = media_sidecar_path(path)
                 status, validated, _reason = validate_media_sidecar(path, sidecar)
@@ -949,10 +1090,12 @@ class AdventureMapController(NSObject):
                     not isinstance(validated, dict) or not isinstance(validated.get("weather"), dict)
                 )
                 if path not in self.auto_processed_paths and (
-                    status != "available" or freshness == "changed" or needs_place or needs_weather
+                    status != "available" or freshness == "changed"
                 ):
                     pending.append(path)
-            return result, pending
+                elif needs_place or needs_weather:
+                    enrichment.append(path)
+            return result, pending, enrichment
         future = self.executor.submit(work)
         def poll(_timer):
             if not future.done():
@@ -962,7 +1105,7 @@ class AdventureMapController(NSObject):
                 return
             self._clear_background_progress("media_index")
             try:
-                self.media_items, pending = future.result()
+                self.media_items, pending, enrichment = future.result()
             except Exception as exc:
                 self._journal("Media index", f"Failed: {exc}")
                 return
@@ -972,6 +1115,7 @@ class AdventureMapController(NSObject):
                 self.selected_media_path = None
             if self.plot_view is not None:
                 self.plot_view.setNeedsDisplay_(True)
+            self._queue_optional_enrichment(enrichment, start=False)
             self._journal(
                 "Media index",
                 f"Indexed {len(self.media_items)} media file(s); "
@@ -1036,6 +1180,7 @@ class AdventureMapController(NSObject):
             if not self._request_initial_weather_choice():
                 return
         self.pending_media.update(path for path in added if path.is_file())
+        self.enrichment_paused_by_cancel = False
         if self.processing_active:
             return
         self._start_next_media_batch()
@@ -1049,6 +1194,7 @@ class AdventureMapController(NSObject):
                 # creating or reviewing the control file.
                 self._scan_project_media()
                 return
+            self._start_optional_enrichment()
             if self.pending_start_after_processing:
                 self.pending_start_after_processing = False
                 self.performSelector_withObject_afterDelay_("finishPendingStart:", None, 0.0)
@@ -1069,7 +1215,7 @@ class AdventureMapController(NSObject):
         def progress(current, total, name):
             phase_progress("Extracting coordinates", current, total, name)
         parameters = dict(self.parameters)
-        def prepare_and_enrich():
+        def prepare_core_metadata():
             summary_path = None
             if self.project_directory is not None:
                 candidate = (
@@ -1090,52 +1236,13 @@ class AdventureMapController(NSObject):
                 detail_callback=lambda message: self._journal("Metadata", message),
                 cancel_event=self.cancel_event,
             )
-            usable_paths = [item.path for item in prepared if item.record is not None]
-            if usable_paths and bool(parameters.get("weather.enabled", False)):
-                from historical_weather import WeatherOptions, enrich_media_weather
-                from map_provider_utils import read_provider_credential
-                access = str(parameters.get("weather.access", "free")).casefold()
-                credential = str(parameters.get("weather.credential_id", "default"))
-                self._journal("Historical Weather", f"Checking {len(usable_paths)} new media file(s).")
-                weather_report = enrich_media_weather(
-                    usable_paths,
-                    options=WeatherOptions(
-                        access="customer" if access == "customer" else "free",
-                        api_key=read_provider_credential("open-meteo", credential) if access == "customer" else "",
-                        timeout_seconds=float(parameters.get("weather.timeout_seconds", 20.0)),
-                        minimum_request_interval_seconds=0.2 if access == "customer" else 1.0,
-                    ),
-                    progress_callback=lambda current, total, name: phase_progress(
-                        "Historical weather", current, total, name
-                    ),
-                    detail_callback=lambda message: self._journal("Historical Weather", message),
-                    cancel_event=self.cancel_event,
-                )
-                self._journal(
-                    "Historical Weather",
-                    f"Complete: {weather_report.updated} downloaded, "
-                    f"{weather_report.reused} reused, {weather_report.current} already current, "
-                    f"{weather_report.failed + weather_report.unavailable} unavailable.",
-                )
-            if usable_paths and bool(parameters.get("locations.add_place_names", True)):
-                from GetGeoLocations import run_with_options
-                self._journal("Place Names", f"Checking {len(usable_paths)} new media file(s).")
-                run_with_options(
-                    self.project_directory,
-                    photolist=self.control_file or self.project_directory / "photos.lst",
-                    redo_reverse_geolocation=True,
-                    infer_gps_from_tracks=False,
-                    photonames=",".join(path.name for path in usable_paths),
-                    distance=float(parameters.get("locations.reuse_radius_m", 150.0)),
-                    progress_callback=lambda current, total, name: phase_progress(
-                        "Place names", current, total, name
-                    ),
-                    cancel_event=self.cancel_event,
-                    stdout=_JournalWriter(self.journal, "Place Names"),
-                    stderr=_JournalWriter(self.journal, "Place Names"),
-                )
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "offerPendingRouteTiming:",
+                (paths, prepared),
+                False,
+            )
             return prepared
-        future = self.executor.submit(prepare_and_enrich)
+        future = self.executor.submit(prepare_core_metadata)
         def poll(_timer):
             if not future.done():
                 return
@@ -1152,27 +1259,294 @@ class AdventureMapController(NSObject):
                     self._journal("Metadata", f"Skipped {item.path.name}: {item.error or item.action}")
                 else:
                     self._journal("Metadata", f"{item.action.title()} {item.path.name}")
-            timing_paths = self.pending_route_timing_media.intersection(paths)
-            timing_track = next(
-                (
-                    track
-                    for track in self.gpx_controller.tracks
-                    if track.nr == self.pending_route_timing_track_nr
-                ),
-                None,
+            self._queue_optional_enrichment(
+                [item.path for item in prepared if item.record is not None],
+                start=False,
             )
-            if timing_paths and timing_track is not None:
-                self.pending_route_timing_media.difference_update(timing_paths)
-                timing_records = [item for item in prepared if item.path in timing_paths]
-                self.gpx_controller.offer_route_timing_from_prepared(
-                    timing_records,
-                    timing_track,
-                )
-                self.pending_route_timing_track_nr = None
             self.auto_processed_paths.update(paths)
             self._scan_project_media()
             self._start_next_media_batch()
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.1, _BlockTimer.alloc().initWithBlock_(poll), "fire:", None, True)
+
+    def offerPendingRouteTiming_(self, payload):
+        """Offer route timing as soon as core media metadata is available."""
+        paths, _prepared = payload
+        timing_paths = self.pending_route_timing_media.intersection(paths)
+        timing_track = next(
+            (
+                track
+                for track in self.gpx_controller.tracks
+                if track.nr == self.pending_route_timing_track_nr
+            ),
+            None,
+        )
+        if not timing_paths or timing_track is None:
+            return
+        self.pending_route_timing_media.difference_update(timing_paths)
+        project_media = self._project_media_paths()
+        self._journal(
+            "Route Timing",
+            f"The new media metadata is ready. Checking all {len(project_media)} "
+            f"project media file(s) against track #{timing_track.nr}.",
+        )
+        self._prepare_route_timing_offer(
+            timing_track.nr,
+            project_media,
+            confirmation_required=False,
+        )
+
+    @objc.python_method
+    def _queue_optional_enrichment(self, paths, *, start=True):
+        candidates = [
+            Path(path).expanduser().resolve(strict=False)
+            for path in paths
+            if Path(path).is_file()
+            and Path(path).expanduser().resolve(strict=False)
+            not in self.enrichment_attempted_paths
+        ]
+        if not candidates:
+            return
+        self.enrichment_queue.add(candidates)
+        if start:
+            self._start_optional_enrichment()
+
+    @objc.python_method
+    def _reset_optional_enrichment(self):
+        self.enrichment_cancel_event.set()
+        self.enrichment_generation += 1
+        self.enrichment_active = False
+        self.enrichment_paused_by_cancel = False
+        self.enrichment_queue.clear()
+        self.enrichment_weather_attempted.clear()
+        self.enrichment_attempted_paths.clear()
+        self.control_assets_pending = False
+        self._clear_optional_enrichment_progress()
+
+    @objc.python_method
+    def _optional_enrichment_visible_on_map(self):
+        return bool(
+            self.parameters.get(
+                "locations.show_background_enrichment_progress",
+                False,
+            )
+        )
+
+    @objc.python_method
+    def _set_optional_enrichment_progress(self, phase, current, total):
+        if self._optional_enrichment_visible_on_map():
+            self._set_background_progress("enrichment", phase, current, total)
+        else:
+            self._clear_background_progress("enrichment")
+        controller = self.full_gui_controller
+        if controller is not None:
+            controller.setOptionalEnrichmentProgress_(
+                (str(phase), int(current), int(total))
+            )
+
+    @objc.IBAction
+    def applyOptionalEnrichmentProgress_(self, payload):
+        phase, current, total = payload
+        self._set_optional_enrichment_progress(phase, current, total)
+
+    @objc.python_method
+    def _clear_optional_enrichment_progress(self):
+        self._clear_background_progress("enrichment")
+        controller = self.full_gui_controller
+        if controller is not None:
+            controller.clearOptionalEnrichmentProgress_(None)
+
+    @objc.python_method
+    def _place_name_is_current(self, path):
+        from GetGeoLocations import load_record_from_json, record_place_matches_gps
+
+        resolved = Path(path).expanduser().resolve(strict=False)
+        record = load_record_from_json(media_sidecar_path(resolved), resolved)
+        return bool(
+            record is not None
+            and record_place_matches_gps(
+                record,
+                float(self.parameters.get("locations.reuse_radius_m", 150.0)),
+            )
+        )
+
+    @objc.python_method
+    def _start_optional_enrichment(self):
+        if (
+            self.enrichment_active
+            or self.enrichment_paused_by_cancel
+            or not self.enrichment_queue
+            or self.processing_active
+            or self.pending_media
+            or self.control_assets_pending
+            or (
+                self.derived_track_data_future is not None
+                and not self.derived_track_data_future.done()
+            )
+        ):
+            return
+        parameters = dict(self.parameters)
+        add_places = bool(parameters.get("locations.add_place_names", True))
+        add_weather = bool(parameters.get("weather.enabled", False))
+        if not add_places and not add_weather:
+            self.enrichment_queue.clear()
+            return
+        self.enrichment_active = True
+        self.enrichment_cancel_event.clear()
+        generation = self.enrichment_generation = self.enrichment_generation + 1
+        initial_total = len(self.enrichment_queue)
+        self._journal(
+            "Background Enrichment",
+            f"Queued {initial_total} media file(s); maps and playback need not wait.",
+        )
+
+        def report(phase, current, total):
+            if generation != self.enrichment_generation:
+                return
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "applyOptionalEnrichmentProgress_",
+                (phase, current, total),
+                False,
+            )
+
+        def work():
+            from GetGeoLocations import DeferredPlaceNameSession
+            from historical_weather import enrich_media_weather
+
+            session = DeferredPlaceNameSession(
+                self._project_media_paths(),
+                float(parameters.get("locations.reuse_radius_m", 150.0)),
+            )
+            pacing = AdaptiveGeocodePacing(
+                float(parameters.get("locations.pacing_min_seconds", 1.0)),
+                float(parameters.get("locations.pacing_max_seconds", 5.0)),
+            )
+            completed = 0
+            while self.enrichment_queue and not self.enrichment_cancel_event.is_set():
+                ordered = self.enrichment_queue.ordered()
+                if not ordered:
+                    break
+                if add_weather:
+                    weather_batch = [
+                        path for path in ordered[:100]
+                        if path not in self.enrichment_weather_attempted
+                    ]
+                    if weather_batch:
+                        report("Historical weather", completed, initial_total)
+                        try:
+                            weather_report = enrich_media_weather(
+                                weather_batch,
+                                options=self._historical_weather_options_from(parameters),
+                                detail_callback=lambda message: self._journal(
+                                    "Historical Weather", message
+                                ),
+                                cancel_event=self.enrichment_cancel_event,
+                            )
+                            self._journal(
+                                "Historical Weather",
+                                f"Background batch: {weather_report.updated} downloaded, "
+                                f"{weather_report.reused} reused, "
+                                f"{weather_report.current} already current.",
+                            )
+                        except Exception as exc:
+                            self._journal("Historical Weather", f"Background batch failed: {exc}")
+                        finally:
+                            self.enrichment_weather_attempted.update(weather_batch)
+                path = self.enrichment_queue.next()
+                if path is None:
+                    break
+                if add_places and not self.enrichment_cancel_event.is_set():
+                    report(f"Place names: {path.name}", completed, initial_total)
+                    try:
+                        outcome, requested = session.enrich(
+                            path,
+                            timeout_seconds=float(
+                                parameters.get("locations.timeout_seconds", 10.0)
+                            ),
+                        )
+                        self._journal("Place Names", f"{path.name}: {outcome}.")
+                        if requested:
+                            ready_ahead = self.enrichment_queue.ready_ahead(
+                                self._place_name_is_current,
+                                LOOKAHEAD_MEDIA_COUNT,
+                            )
+                            minimum, maximum = pacing.range_for(
+                                playback_active=self.enrichment_queue.playback_active,
+                                ready_ahead=ready_ahead,
+                            )
+                            delay = random.uniform(minimum, maximum)
+                            if self.enrichment_cancel_event.wait(delay):
+                                break
+                    except Exception as exc:
+                        self._journal("Place Names", f"{path.name}: failed: {exc}")
+                self.enrichment_attempted_paths.add(path)
+                self.enrichment_queue.discard(path)
+                completed += 1
+                report("Background enrichment", completed, max(initial_total, completed))
+            return completed
+
+        future = self.executor.submit(work)
+
+        def poll(timer):
+            if not future.done():
+                return
+            timer.invalidate()
+            if generation != self.enrichment_generation:
+                return
+            self.enrichment_active = False
+            self._clear_optional_enrichment_progress()
+            try:
+                completed = future.result()
+                self._journal(
+                    "Background Enrichment",
+                    f"Finished optional enrichment for {completed} media file(s).",
+                )
+            except Exception as exc:
+                self._journal("Background Enrichment", f"Failed: {exc}")
+            if self.enrichment_queue:
+                self._start_optional_enrichment()
+
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.1,
+            _BlockTimer.alloc().initWithBlock_(poll),
+            "fire:",
+            None,
+            True,
+        )
+
+    @objc.python_method
+    def _historical_weather_options_from(self, parameters):
+        from historical_weather import WeatherOptions
+        from map_provider_utils import read_provider_credential
+
+        access = str(parameters.get("weather.access", "free")).casefold()
+        credential = str(parameters.get("weather.credential_id", "default"))
+        return WeatherOptions(
+            access="customer" if access == "customer" else "free",
+            api_key=(
+                read_provider_credential("open-meteo", credential)
+                if access == "customer"
+                else ""
+            ),
+            timeout_seconds=float(parameters.get("weather.timeout_seconds", 20.0)),
+            minimum_request_interval_seconds=0.2 if access == "customer" else 1.0,
+        )
+
+    @objc.python_method
+    def untimed_prompt_suppressed_identities(self):
+        return set(self.untimed_prompt_suppressions)
+
+    @objc.python_method
+    def remember_untimed_prompt_suppressions(self, identities):
+        before = set(self.untimed_prompt_suppressions)
+        self.untimed_prompt_suppressions.update(
+            str(value) for value in identities if str(value).strip()
+        )
+        if self.untimed_prompt_suppressions != before:
+            if isinstance(getattr(self, "adventure_payload", None), dict):
+                self.adventure_payload[
+                    ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD
+                ] = sorted(self.untimed_prompt_suppressions)
+            self.adventureComponentDidChange_("adventure")
 
     @objc.IBAction
     def applyProgress_(self, value):
@@ -1755,6 +2129,19 @@ class AdventureMapController(NSObject):
             self.plot_view.setNeedsDisplay_(True)
             self.gpx_controller.refresh_elevation_profile_for_plot_view(self.plot_view)
 
+    @objc.python_method
+    def workspace_tracks_deleted(self, deleted_track_numbers):
+        """Discard deleted-track views and refit the remaining Adventure."""
+        deleted = {int(value) for value in deleted_track_numbers}
+        for number in deleted:
+            self.track_viewports.pop(number, None)
+        self.track_media_identity_cache.clear()
+        self.overview_viewport = None
+        self.focused_track_nr = None
+        self.selected_track_identity = ""
+        if self.plot_view is not None:
+            self.show_workspace_overview(remember_current=False)
+
     def handleWorkspaceKeyEvent_(self, event):
         key = str(event.charactersIgnoringModifiers() or event.characters() or "")
         flags = int(event.modifierFlags())
@@ -1930,6 +2317,7 @@ class AdventureMapController(NSObject):
             controller = self._ensure_full_gui(show_window=False)
             if controller is not None:
                 controller.reviewDiscoveredMediaPaths_(paths)
+            self._start_optional_enrichment()
             return
 
         base = filename_base(self.adventure_name)
@@ -1943,18 +2331,21 @@ class AdventureMapController(NSObject):
         controller.pending_imported_media_for_control_update = [str(path) for path in paths]
         controller.assistant_control_skip_maps = bool(self.demo_mode)
         controller.assistant_control_replace_without_confirmation = bool(self.demo_mode)
+        self.control_assets_pending = True
         self._journal("Maps", "Preparing all required maps before creating the control file.")
         controller._start_assistant_control_assets_creation()
 
     @objc.python_method
     def controlAssetsCreationDidFinish_success_(self, success):
         """Receive completion from the shared Maps-to-Control-File pipeline."""
+        self.control_assets_pending = False
         controller = self.full_gui_controller
         if not bool(success) or controller is None:
             self._journal(
                 "Control File",
                 "The control file was not created because required maps are unavailable.",
             )
+            self._start_optional_enrichment()
             return
         control_path = controller._control_file_path()
         if control_path is None or not control_path.is_file():
@@ -1963,6 +2354,7 @@ class AdventureMapController(NSObject):
         self.temporary_control_model = False
         self._load_control_rows()
         self.saveWorkspace_(None)
+        self._start_optional_enrichment()
         if self.demo_coordinator is not None:
             self.demo_coordinator.controlFileDidOpen()
 
@@ -2032,10 +2424,15 @@ class AdventureMapController(NSObject):
     @objc.python_method
     def _request_project_directory(self, source):
         panel = NSOpenPanel.openPanel()
-        panel.setCanChooseDirectories_(True)
         panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
         panel.setCanCreateDirectories_(True)
-        panel.setPrompt_("Use Adventure Folder")
+        panel.setTitle_("Choose an Adventure Folder")
+        panel.setMessage_(
+            "Choose the displayed folder, select another folder, or use New Folder to create one."
+        )
+        panel.setPrompt_("Choose Folder")
         if source is not None:
             directory = source if source.is_dir() else source.parent
             panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(directory)))
@@ -2050,22 +2447,32 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def _import_media_files(self, paths):
-        result = []
-        for source in paths:
-            if self.project_directory is None or source.parent == self.project_directory:
-                result.append(source); continue
-            target = self.project_directory / source.name
-            counter = 2
-            while target.exists() and not os.path.samefile(source, target):
-                target = self.project_directory / f"{source.stem}-{counter}{source.suffix}"
-                counter += 1
-            if not target.exists():
-                self._journal("Media Import", f"Copying {source.name} to the Adventure.")
-                shutil.copy2(source, target)
+        if self.project_directory is None:
+            return []
+        results = import_media_files(paths, self.project_directory)
+        counts = {action: 0 for action in ("copied", "renamed", "reused", "failed")}
+        for item in results:
+            counts[item.action] = counts.get(item.action, 0) + 1
+            if item.action == "reused":
+                self._journal(
+                    "Media Import",
+                    f"Reused identical Adventure file {item.target.name}.",
+                )
+            elif item.action == "renamed":
+                self._journal(
+                    "Media Import",
+                    f"Imported different same-name file as {item.target.name}.",
+                )
+            elif item.action == "copied":
+                self._journal("Media Import", f"Copied {item.source.name} to the Adventure.")
             else:
-                self._journal("Media Import", f"Using existing Adventure file {target.name}.")
-            result.append(target)
-        return result
+                self._journal("Media Import", f"Could not import {item.source.name}: {item.error}")
+        self._journal(
+            "Media Import",
+            f"Complete: {counts['copied']} copied, {counts['renamed']} renamed because different, "
+            f"{counts['reused']} identical reused, {counts['failed']} failed.",
+        )
+        return accepted_media_paths(results)
 
     @objc.python_method
     def _handle_media_drop(self, paths):
@@ -2081,6 +2488,41 @@ class AdventureMapController(NSObject):
         response = int(alert.runModal())
         if response == 1002:
             return
+        route_timing_track = None
+        attempt_route_timing = False
+        if response == 1000:
+            selected = self.gpx_controller.selected_tracks()
+            timing_candidates = [
+                track
+                for track in (selected or self.gpx_controller.tracks)
+                if self.gpx_controller._media_timing_eligible_route(track)
+            ]
+            if len(timing_candidates) == 1:
+                route_timing_track = timing_candidates[0]
+                timing_alert = NSAlert.alloc().init()
+                timing_alert.setMessageText_(
+                    f"Estimate times for {route_timing_track.name}?"
+                )
+                timing_alert.setInformativeText_(
+                    "The dropped media can provide timing anchors for this route. "
+                    "myCamino will first extract their dates and GPS coordinates, then "
+                    "add timestamps to existing route points using media within "
+                    f"{self.gpx_controller.media_timing_max_distance_m:g} m. "
+                    "The route geometry will not change, and other media remain in the "
+                    "slide show."
+                )
+                timing_alert.addButtonWithTitle_("Estimate Route Times")
+                timing_alert.addButtonWithTitle_("Not Now")
+                attempt_route_timing = int(timing_alert.runModal()) == 1000
+                self._journal(
+                    "Route Timing",
+                    (
+                        f"Will estimate timestamps for track #{route_timing_track.nr} "
+                        "after media GPS and dates are ready."
+                        if attempt_route_timing
+                        else f"Route timing was declined for track #{route_timing_track.nr}."
+                    ),
+                )
         if self.adventure_file is None and not self._create_adventure_for_media_drop():
             return
         # Resolve the first-drop privacy choice before copying anything.
@@ -2126,15 +2568,9 @@ class AdventureMapController(NSObject):
                 return
         if response == 1000:
             self.pending_control_media.update(imported)
-            selected = self.gpx_controller.selected_tracks()
-            timing_candidates = [
-                track
-                for track in (selected or self.gpx_controller.tracks)
-                if self.gpx_controller._fully_untimed_route(track)
-            ]
-            if len(timing_candidates) == 1:
+            if attempt_route_timing and route_timing_track is not None:
                 self.pending_route_timing_media.update(imported)
-                self.pending_route_timing_track_nr = timing_candidates[0].nr
+                self.pending_route_timing_track_nr = route_timing_track.nr
             if self.control_file is not None and self.control_file.is_file():
                 try:
                     mark_imported_media(self.control_file, imported)
@@ -2257,6 +2693,7 @@ class AdventureMapController(NSObject):
         self.workspace_autosave_in_progress = True
         failures = []
         saved_components = set()
+        gpx_saved = False
         try:
             self._set_background_progress("workspace-save", "Saving Adventure", 0, 1)
             controller = self.full_gui_controller
@@ -2330,6 +2767,7 @@ class AdventureMapController(NSObject):
                             f"Auto-saved {len(self.gpx_controller.tracks)} track(s) to {gpx_path}."
                         )
                     saved_components.add("gpx")
+                    gpx_saved = True
                 except OSError as exc:
                     failures.append(f"GPX file: {exc}")
 
@@ -2351,6 +2789,9 @@ class AdventureMapController(NSObject):
                 "parameters": parameter_payload(self.parameters),
                 "weather_consent": self.weather_consent,
                 "guided_demo": bool(self.demo_mode),
+                ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD: sorted(
+                    self.untimed_prompt_suppressions
+                ),
             })
             adventure_components = components - {"gpx", "control"}
             adventure_needs_save = (
@@ -2398,6 +2839,8 @@ class AdventureMapController(NSObject):
         finally:
             self.workspace_autosave_in_progress = False
             self._clear_background_progress("workspace-save")
+            if gpx_saved:
+                self._queue_derived_track_data()
             if self.workspace_dirty_components and generation != self.workspace_autosave_generation:
                 self.adventureComponentDidChange_(next(iter(self.workspace_dirty_components)))
 
@@ -3031,7 +3474,13 @@ class AdventureMapController(NSObject):
         self._prepare_route_timing_offer(track.nr, media_paths)
 
     @objc.python_method
-    def _prepare_route_timing_offer(self, track_nr, media_paths):
+    def _prepare_route_timing_offer(
+        self,
+        track_nr,
+        media_paths,
+        *,
+        confirmation_required=True,
+    ):
         """Prepare existing media off the AppKit thread, then show one offer."""
         paths = list(dict.fromkeys(Path(path).resolve(strict=False) for path in media_paths))
         if not paths:
@@ -3071,7 +3520,15 @@ class AdventureMapController(NSObject):
                 None,
             )
             if track is not None:
-                changed = self.gpx_controller.offer_route_timing_from_prepared(prepared, track)
+                changed = self.gpx_controller.offer_route_timing_from_prepared(
+                    prepared,
+                    track,
+                    confirmation_required=confirmation_required,
+                )
+                if changed:
+                    # Save the accepted direction before rebuilding derivatives
+                    # from the Adventure's on-disk GPX.
+                    self._flush_workspace_autosave(show_errors=False)
                 self._journal(
                     "Route Timing",
                     "Applied media-derived route timestamps."
@@ -3292,6 +3749,46 @@ class AdventureMapController(NSObject):
         if controller is not None:
             controller.editControlFile_(None)
 
+    @objc.python_method
+    def slideshowLiveStateDidChange_(self, state):
+        """Move pending enrichment to the current and upcoming control rows."""
+        if not isinstance(state, dict) or self.control_file is None:
+            return
+        try:
+            control_order, row_active_path = control_media_priority(
+                self.control_file,
+                MEDIA_EXTENSIONS,
+                state.get("active_row"),
+            )
+        except OSError:
+            return
+        active_path = row_active_path
+        display = state.get("display")
+        if isinstance(display, dict):
+            candidate = Path(str(display.get("asset_path") or ""))
+            if candidate.suffix.casefold() in MEDIA_EXTENSIONS:
+                active_path = candidate
+        if active_path is None:
+            active_row = state.get("active_media")
+            if isinstance(active_row, int):
+                try:
+                    lines = self.control_file.read_text(encoding="utf-8").splitlines()
+                    raw = lines[active_row].strip()
+                    if raw and not raw.startswith("#"):
+                        value = raw.split("|", 1)[0].strip().strip('"')
+                        candidate = Path(value).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = self.control_file.parent / candidate
+                        if candidate.suffix.casefold() in MEDIA_EXTENSIONS:
+                            active_path = candidate
+                except (IndexError, OSError):
+                    pass
+        self.enrichment_queue.set_playback_position(control_order, active_path)
+
+    @objc.python_method
+    def slideshowDidFinishEnrichmentPriority_(self, _state=None):
+        self.enrichment_queue.clear_playback_position()
+
     @objc.IBAction
     def startSlideShow_(self, _sender):
         if self.adventure_file is None or self.gpx_controller.dirty:
@@ -3389,6 +3886,7 @@ class AdventureMapController(NSObject):
     def discardGuidedDemoWorkspace(self):
         """Return to an empty map without retaining references to demo files."""
         self._stop_media_watcher()
+        self._reset_optional_enrichment()
         self.cancel_event.set()
         self.processing_generation += 1
         self.media_index_generation += 1
@@ -3431,6 +3929,7 @@ class AdventureMapController(NSObject):
         self.adventure_name = "Untitled"
         self.parameters = default_parameters()
         self.weather_consent = "unasked"
+        self.untimed_prompt_suppressions.clear()
         if self.gpx_controller.track_load_timer is not None:
             self.gpx_controller.on_initial_load_complete_callback = None
             self.gpx_controller.cancel_staged_track_loading()
@@ -3566,6 +4065,8 @@ class AdventureMapController(NSObject):
 
     def cancelCurrentOperation_(self, _sender=None):
         self.cancel_event.set()
+        self.enrichment_paused_by_cancel = True
+        self.enrichment_cancel_event.set()
         self._journal("Cancel", "Cancellation requested.")
 
     def revealLogFile_(self, _sender=None):
@@ -3581,6 +4082,8 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def shutdown(self):
+        network_availability.remove_listener(self._network_state_changed)
+        self._reset_optional_enrichment()
         self._stop_media_watcher()
         was_demo = bool(self.demo_mode)
         if self.workspace_autosave_timer is not None:

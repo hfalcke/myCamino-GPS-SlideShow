@@ -6,7 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from GPXEditor import GPXEditorController
+from GPXEditor import (
+    FILE_DRAG_TYPE,
+    EditorTableDataSource,
+    GPXEditorController,
+    PlotView,
+)
 from cocoa_adventure_map import (
     AdventureMapAppDelegate,
     AdventureMapController,
@@ -22,6 +27,7 @@ from GPSTrackShowGUI import (
     playlist_belongs_to_audio_directory,
     normalize_slideshow_resume_history,
     resolve_gui_startup_paths,
+    slideshow_dependency_issues,
     slideshow_settings_command_payload,
     style_control_table_cell,
     missing_control_map_assets,
@@ -30,6 +36,150 @@ from GPSTrackShowGUI import (
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_deleted_workspace_tracks_clear_old_extent_and_refit(self):
+        plot_view = object()
+        controller = SimpleNamespace(
+            track_viewports={2: {"extent": "old"}, 3: {"extent": "keep"}},
+            track_media_identity_cache={"old": "value"},
+            overview_viewport={"extent": "old overview"},
+            focused_track_nr=2,
+            selected_track_identity="2",
+            plot_view=plot_view,
+            show_workspace_overview=Mock(),
+        )
+
+        AdventureMapController.workspace_tracks_deleted(controller, {2})
+
+        self.assertNotIn(2, controller.track_viewports)
+        self.assertIn(3, controller.track_viewports)
+        self.assertEqual(controller.track_media_identity_cache, {})
+        self.assertIsNone(controller.overview_viewport)
+        self.assertIsNone(controller.focused_track_nr)
+        controller.show_workspace_overview.assert_called_once_with(
+            remember_current=False
+        )
+
+    def test_route_timing_offer_uses_all_project_media_after_new_metadata(self):
+        first = Path("/tmp/first.jpg")
+        second = Path("/tmp/second.jpg")
+        track = SimpleNamespace(nr=4)
+        prepared = [
+            SimpleNamespace(path=first),
+            SimpleNamespace(path=second),
+        ]
+        gpx_controller = SimpleNamespace(
+            tracks=[track],
+            offer_route_timing_from_prepared=Mock(return_value=True),
+        )
+        controller = SimpleNamespace(
+            pending_route_timing_media={first},
+            pending_route_timing_track_nr=4,
+            gpx_controller=gpx_controller,
+            _journal=Mock(),
+            _project_media_paths=Mock(return_value=[first, second]),
+            _prepare_route_timing_offer=Mock(),
+        )
+
+        AdventureMapController.offerPendingRouteTiming_.callable(
+            controller, ([first, second], prepared)
+        )
+
+        controller._prepare_route_timing_offer.assert_called_once_with(
+            4, [first, second], confirmation_required=False
+        )
+        self.assertEqual(controller.pending_route_timing_media, set())
+        self.assertEqual(controller.pending_route_timing_track_nr, 4)
+
+    def test_untimed_prompt_suppression_is_owned_by_one_adventure(self):
+        first = SimpleNamespace(
+            untimed_prompt_suppressions=set(),
+            adventureComponentDidChange_=Mock(),
+        )
+        second = SimpleNamespace(
+            untimed_prompt_suppressions=set(),
+            adventureComponentDidChange_=Mock(),
+        )
+
+        AdventureMapController.remember_untimed_prompt_suppressions(
+            first, ["same-route"]
+        )
+
+        self.assertEqual(first.untimed_prompt_suppressions, {"same-route"})
+        self.assertEqual(second.untimed_prompt_suppressions, set())
+        first.adventureComponentDidChange_.assert_called_once_with("adventure")
+
+    def test_workspace_drop_is_deferred_until_drag_session_finishes(self):
+        workspace = SimpleNamespace(
+            performWorkspaceDrop_=Mock(),
+            performSelector_withObject_afterDelay_=Mock(),
+        )
+        pasteboard = SimpleNamespace(
+            propertyListForType_=Mock(return_value=["/tmp/route.gpx"])
+        )
+        sender = SimpleNamespace(draggingPasteboard=lambda: pasteboard)
+        view = SimpleNamespace(adventure_workspace_delegate=workspace, mode="overview")
+
+        self.assertTrue(PlotView.performDragOperation_.callable(view, sender))
+
+        pasteboard.propertyListForType_.assert_called_once_with(FILE_DRAG_TYPE)
+        workspace.performWorkspaceDrop_.assert_not_called()
+        workspace.performSelector_withObject_afterDelay_.assert_called_once_with(
+            "performWorkspaceDrop:", ["/tmp/route.gpx"], 0.0
+        )
+
+    def test_standalone_map_defers_gpx_loading_until_drag_finishes(self):
+        controller = SimpleNamespace(
+            load_gpx_paths=Mock(),
+            performSelector_withObject_afterDelay_=Mock(),
+        )
+        pasteboard = SimpleNamespace(
+            propertyListForType_=Mock(return_value=["/tmp/route.gpx"])
+        )
+        sender = SimpleNamespace(draggingPasteboard=lambda: pasteboard)
+        view = SimpleNamespace(
+            adventure_workspace_delegate=None,
+            mode="track",
+            controller=controller,
+        )
+
+        self.assertTrue(PlotView.performDragOperation_.callable(view, sender))
+
+        controller.load_gpx_paths.assert_not_called()
+        controller.performSelector_withObject_afterDelay_.assert_called_once_with(
+            "loadDroppedGPXPaths:",
+            [str(Path("/tmp/route.gpx").resolve(strict=False))],
+            0.0,
+        )
+
+    def test_track_table_defers_media_dialog_until_drop_finishes(self):
+        track = SimpleNamespace(nr=7)
+        controller = SimpleNamespace(
+            tracks=[track],
+            selected_nrs=[],
+            media_context={},
+            highlight_selected_rows=Mock(),
+            update_selection_field=Mock(),
+            addTracksFromPhotos_=Mock(),
+            performSelector_withObject_afterDelay_=Mock(),
+        )
+        pasteboard = SimpleNamespace(
+            propertyListForType_=Mock(return_value=["/tmp/photo.jpg"]),
+            stringForType_=Mock(return_value=""),
+        )
+        info = SimpleNamespace(draggingPasteboard=lambda: pasteboard)
+        data_source = SimpleNamespace(controller=controller)
+
+        accepted = EditorTableDataSource.tableView_acceptDrop_row_dropOperation_.callable(
+            data_source, None, info, 0, 0
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(controller.selected_nrs, [7])
+        controller.addTracksFromPhotos_.assert_not_called()
+        controller.performSelector_withObject_afterDelay_.assert_called_once_with(
+            "addTracksFromPhotos:", None, 0.0
+        )
+
     def test_adventure_autosave_uses_recovery_then_real_file(self):
         self.assertEqual(adventure_autosave_delays(True), (1.0, 2.0))
         self.assertEqual(adventure_autosave_delays(False), (1.0, None))
@@ -45,6 +195,101 @@ class GUIStartupPathTests(unittest.TestCase):
                 root / "trackimages",
             )
             self.assertEqual(missing, ["missing.png"])
+
+    def test_slideshow_dependencies_reject_existing_maps_for_old_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            maps = Path(temporary_directory)
+            context = {
+                "overview_path": str(maps / "Trip.png"),
+                "tracks": [
+                    {
+                        "table_number": 1,
+                        "track_geometry_fingerprint": "new-geometry",
+                        "track_data_fingerprint": "new-data",
+                        "track_plot_image_filename": "0001_Stage_Trip.png",
+                        "track_plot_time_lapse_image_filename": "0001_Stage_Trip-timelapse.png",
+                        "track_data_sidecar": "Trip-trackdata/0001.json",
+                    }
+                ],
+            }
+            for name in (
+                "Trip.png",
+                "0001_Stage_Trip.png",
+                "0001_Stage_Trip-timelapse.png",
+            ):
+                (maps / name).write_bytes(b"png")
+                (maps / name).with_suffix(".json").write_text(
+                    json.dumps(
+                        {
+                            "track_geometry_fingerprint": "old-geometry",
+                            "source_track_geometry_fingerprints": ["old-geometry"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            derived = maps / "Trip-trackdata" / "0001.json"
+            derived.parent.mkdir()
+            derived.write_text(
+                json.dumps({"track_data_fingerprint": "old-data"}),
+                encoding="utf-8",
+            )
+
+            issues = slideshow_dependency_issues(
+                "#Overviewmap: Trip.png\n#Map: 0001_Stage_Trip.png\n",
+                maps,
+                context,
+            )
+
+            self.assertEqual(
+                issues["maps"],
+                [
+                    "Trip.png",
+                    "0001_Stage_Trip.png",
+                    "0001_Stage_Trip-timelapse.png",
+                ],
+            )
+            self.assertEqual(issues["derived"], ["Trip-trackdata/0001.json"])
+
+    def test_slideshow_dependencies_accept_current_geometry_despite_render_settings(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            maps = Path(temporary_directory)
+            context = {
+                "overview_path": str(maps / "Trip.png"),
+                "tracks": [
+                    {
+                        "table_number": 1,
+                        "track_geometry_fingerprint": "geometry",
+                        "track_data_fingerprint": "data",
+                        "track_plot_image_filename": "0001_Stage_Trip.png",
+                        "track_plot_time_lapse_image_filename": "0001_Stage_Trip-timelapse.png",
+                        "track_data_sidecar": "Trip-trackdata/0001.json",
+                    }
+                ],
+            }
+            metadata_by_name = {
+                "Trip.png": {"source_track_geometry_fingerprints": ["geometry"]},
+                "0001_Stage_Trip.png": {"track_geometry_fingerprint": "geometry"},
+                "0001_Stage_Trip-timelapse.png": {"track_geometry_fingerprint": "geometry"},
+            }
+            for name, metadata in metadata_by_name.items():
+                (maps / name).write_bytes(b"png")
+                metadata["adventure_render_parameters"] = {"maps.output_provider": "old"}
+                (maps / name).with_suffix(".json").write_text(
+                    json.dumps(metadata), encoding="utf-8"
+                )
+            derived = maps / "Trip-trackdata" / "0001.json"
+            derived.parent.mkdir()
+            derived.write_text(
+                json.dumps({"track_data_fingerprint": "data"}), encoding="utf-8"
+            )
+
+            issues = slideshow_dependency_issues(
+                "#Overviewmap: Trip.png\n#Map: 0001_Stage_Trip.png\n",
+                maps,
+                context,
+            )
+
+            self.assertEqual(issues, {"maps": [], "derived": []})
 
     def test_slideshow_missing_maps_start_automatic_hosted_repair(self):
         class RunningThread:

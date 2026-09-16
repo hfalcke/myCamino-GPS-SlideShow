@@ -277,6 +277,35 @@ class AdjacentDayAssignmentTests(unittest.TestCase):
             ["Trip-media-2024-07-12.png", "Trip-media-2024-07-12-timelapse.png"],
         )
 
+    def test_required_map_filter_does_not_render_unrelated_media_maps(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specs = [
+                {
+                    "date": date(2024, 7, day),
+                    "filename": f"Trip-media-2024-07-{day:02d}.png",
+                    "coordinates": [(50.0, 7.0)],
+                }
+                for day in (12, 13)
+            ]
+            with patch("GetGeoLocations.render_media_location_map") as render:
+                render_media_map_specs(
+                    specs,
+                    root / "Trip-sorted.lst",
+                    {
+                        "output_dir": root / "trackimages",
+                        "map_layouts": ("standard", "time-lapse"),
+                        "requested_filenames": {
+                            "Trip-media-2024-07-13-timelapse.png"
+                        },
+                    },
+                )
+        render.assert_called_once()
+        self.assertEqual(
+            render.call_args.args[2].name,
+            "Trip-media-2024-07-13-timelapse.png",
+        )
+
     def test_media_map_progress_uses_the_supplied_output_writer(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
