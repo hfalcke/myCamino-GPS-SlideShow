@@ -3151,10 +3151,12 @@ def _legacy_sidecar_matches_track(metadata, track):
     return True
 
 
-def upgrade_timed_track_sidecars(gpx_file, output_dir, **overrides):
+def upgrade_timed_track_sidecars(gpx_file, output_dir, *, prepared_context=None, **overrides):
     """Upgrade derived timing and speed data without regenerating map images."""
     fallback_walking_speed_kmh = float(overrides.get("fallback_walking_speed_kmh", 3.5))
-    context = prepare_with_options(gpx_file, output_dir=str(output_dir), **overrides)
+    context = prepared_context
+    if context is None:
+        context = prepare_with_options(gpx_file, output_dir=str(output_dir), **overrides)
     tracks_by_fingerprint = {
         track.get("track_fingerprint"): track
         for track in context["tracks"]

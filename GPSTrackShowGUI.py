@@ -202,6 +202,7 @@ from plot_metadata_utils import (
     read_table_data,
     validate_media_sidecar,
 )
+from slideshow_startup import file_signature, options_signature, validate_startup
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
 from video_audio_normalization import (
     GENERATED_DIRECTORY_NAMES,
@@ -2539,6 +2540,9 @@ class GPXTrackerController(NSObject):
         self.pending_slideshow_after_map_generation = None
         self.slideshow_dependency_preflight_running = False
         self.slideshow_dependency_preflight_generation = 0
+        self.slideshow_preflight_cache_key = None
+        self.slideshow_startup_started_at = None
+        self.slideshow_process_started_at = None
         self.time_lapse_media_min_fraction = self.parameters["timelapse.media_min_fraction"]
         self.track_map_edge_margin_fraction = self.parameters["trackmaps.edge_margin_fraction"]
         self.slideshow_resume_history = []
@@ -6621,6 +6625,11 @@ class GPXTrackerController(NSObject):
             if self.project_status_processing_gate.wait(0.05):
                 if int(generation) != self.status_refresh_generation:
                     raise ProjectStatusRefreshSuperseded()
+                # The hidden Advanced Interface's status scan must not compete
+                # with startup validation by processing the same tracks again.
+                if getattr(self, "slideshow_startup_started_at", None) is not None:
+                    time.sleep(0.05)
+                    continue
                 return
 
     def _pause_project_status_for_editor_startup(self):
@@ -15535,6 +15544,47 @@ class GPXTrackerController(NSObject):
         self.set_status("Restarting the running slide show at its current position.")
         return True
 
+    def _slideshow_startup_progress(self, message, current=0, total=0):
+        if getattr(self, "slideshow_startup_started_at", None) is None:
+            self.slideshow_startup_started_at = time.perf_counter()
+        self.set_status(message)
+        self.progress_bar.setHidden_(False)
+        self.progress_bar.setIndeterminate_(not bool(total))
+        if total:
+            self.progress_bar.stopAnimation_(None)
+            self.progress_bar.setMaxValue_(total)
+            self.progress_bar.setDoubleValue_(current)
+        else:
+            self.progress_bar.startAnimation_(None)
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host._set_background_progress("slideshow", message, current, total)
+
+    def _log_slideshow_startup(self, message):
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host._journal("Slideshow startup", message)
+        else:
+            print(f"[Slideshow startup] {message}", flush=True)
+
+    def _finish_slideshow_startup(self, message):
+        started = getattr(self, "slideshow_startup_started_at", None)
+        if started is not None:
+            self._log_slideshow_startup(f"{message} Preparation elapsed: {time.perf_counter() - started:.2f}s")
+        self.slideshow_startup_started_at = None
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            host._clear_background_progress("slideshow")
+        self.progress_bar.stopAnimation_(None)
+        self.progress_bar.setHidden_(True)
+        self.set_status(message)
+
+    def slideshowStartupProgress_(self, payload):
+        if (int(payload.get("generation", -1)) != self.slideshow_dependency_preflight_generation
+                or not self.slideshow_dependency_preflight_running):
+            return
+        self._slideshow_startup_progress(payload["phase"], payload["current"], payload["total"])
+
     def _start_slide_show(
         self,
         time_lapse: bool | None = None,
@@ -15542,12 +15592,17 @@ class GPXTrackerController(NSObject):
         transient_resume_position=None,
         assets_preflighted: bool = False,
     ):
+        if self.slideshow_dependency_preflight_running or self.pending_slideshow_after_map_generation:
+            self.set_status("Slide-show preparation is already in progress.")
+            return
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         if project_dir is None:
+            self._finish_slideshow_startup("Please choose a project directory first.")
             show_alert("Please choose a project directory first.")
             return
         control_file_path = self._control_file_path()
         if control_file_path is None or not control_file_path.exists():
+            self._finish_slideshow_startup("Slide show control file missing.")
             show_alert(
                 "Slide show control file does not exist.",
                 "Create it first in the Slide Show Control File section.",
@@ -15564,6 +15619,7 @@ class GPXTrackerController(NSObject):
         trackimages_dir = self._track_images_dir()
         if trackimages_dir is None:
             show_alert("Could not determine the map directory.")
+            self._finish_slideshow_startup("Could not determine the map directory.")
             return
         if not assets_preflighted and self._current_single_gpx_path() is not None:
             self._start_slideshow_dependency_preflight(
@@ -15581,6 +15637,7 @@ class GPXTrackerController(NSObject):
                 trackimages_dir,
             )
         except OSError as exc:
+            self._finish_slideshow_startup("Could not validate slide-show maps.")
             show_alert("Could not validate slide-show maps.", str(exc))
             return
         if missing_maps:
@@ -15592,7 +15649,8 @@ class GPXTrackerController(NSObject):
             )
             return
 
-        if not self._ensure_running_speed_sidecars_current(trackimages_dir):
+        # GPX-backed launches check/upgrade these on the preflight worker.
+        if not assets_preflighted and not self._ensure_running_speed_sidecars_current(trackimages_dir):
             return
 
         resume_position = (
@@ -15619,6 +15677,7 @@ class GPXTrackerController(NSObject):
         )
 
         if continue_previous and resume_position is None:
+            self._finish_slideshow_startup("No matching slide-show checkpoint is available.")
             show_alert(
                 "No saved slide-show position is available.",
                 "No current checkpoint matches this control file. Use Start to begin at the start.",
@@ -15631,10 +15690,13 @@ class GPXTrackerController(NSObject):
             state_file.unlink(missing_ok=True)
             command_file.unlink(missing_ok=True)
         except OSError as exc:
+            self._finish_slideshow_startup("Could not prepare slide-show communication files.")
             show_alert("Could not prepare slide-show communication files.", str(exc))
             return
 
         try:
+            self._slideshow_startup_progress("Opening slideshow and preparing the title screen…")
+            launch_started = time.perf_counter()
             command = self._slideshow_command(
                 project_dir,
                 control_file_path,
@@ -15657,6 +15719,8 @@ class GPXTrackerController(NSObject):
                 cwd=str(self.base_dir),
                 env=child_environment,
             )
+            self.slideshow_process_started_at = time.perf_counter()
+            self._log_slideshow_startup(f"Player launch: {time.perf_counter() - launch_started:.2f}s")
             self.slideshow_live_state = None
             self.slideshow_live_state_sequence = -1
             self.slideshow_settings_request_sequence = 0
@@ -15668,6 +15732,7 @@ class GPXTrackerController(NSObject):
             self.refresh_workflow_assistant()
             self._update_slideshow_continue_button()
         except Exception as exc:
+            self._finish_slideshow_startup("Slide show failed to start.")
             show_alert("Could not start slide show.", str(exc))
             self.set_status("Slide show failed to start.")
             return
@@ -15678,8 +15743,8 @@ class GPXTrackerController(NSObject):
         )
         watcher.start()
         style = str(self.parameters.get("slideshow.transition", "time_lapse")).replace("_", " ")
-        self.set_status(
-            f"Started slide show with {style} as the initial style, "
+        self._slideshow_startup_progress(
+            f"Opening slide show with {style} as the initial style, "
             f"{control_file_path.name}, and trackdir {trackimages_dir}."
         )
 
@@ -15708,9 +15773,8 @@ class GPXTrackerController(NSObject):
             return
         try:
             control_text = control_file_path.read_text(encoding="utf-8")
-            gpx_stat = gpx_path.stat()
-            control_stat = control_file_path.stat()
         except OSError as exc:
+            self._finish_slideshow_startup("Could not validate slide-show maps.")
             show_alert("Could not validate slide-show maps.", str(exc))
             return
 
@@ -15730,35 +15794,51 @@ class GPXTrackerController(NSObject):
             ),
             "project_dir": str(Path(project_dir).resolve(strict=False)),
             "control_file_path": str(control_file_path.resolve(strict=False)),
+            "gpx_path": str(gpx_path.resolve(strict=False)),
+            "options_signature": options_signature(options),
         }
-        source_signatures = {
-            "gpx": (int(gpx_stat.st_size), int(gpx_stat.st_mtime_ns)),
-            "control": (int(control_stat.st_size), int(control_stat.st_mtime_ns)),
-        }
-        self.set_status("Checking current track data and slide-show maps...")
+        self._slideshow_startup_progress("Checking current track data and slide-show maps…")
+        previous_key = self.slideshow_preflight_cache_key
+        prepared_hint = getattr(getattr(self, "adventure_map_host", None), "slideshow_prepared_hint", None)
+
+        def progress(phase, current, total):
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "slideshowStartupProgress:",
+                {"generation": generation, "phase": phase, "current": current, "total": total}, False
+            )
 
         def worker():
             try:
-                context = prepare_with_options(str(gpx_path), **options)
-                execute_run_context(context, print_table_output=False, write_summary=True)
-                issues = slideshow_dependency_issues(
-                    control_text, trackimages_dir, context
+                # Include absolute/parent-relative map references outside trackimages.
+                extra_assets = []
+                for line in control_text.splitlines():
+                    row = parse_slideshow_control_line(line)
+                    if row.get("disabled") or row.get("type") not in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+                        continue
+                    name = str(row.get("name", "")).strip()
+                    if not name:
+                        continue
+                    path = Path(name).expanduser()
+                    if not path.is_absolute():
+                        path = Path(trackimages_dir) / path
+                    variants = [path]
+                    if row.get("type") == "TRK":
+                        variants.append(path.with_name(time_lapse_track_map_name(path.name)))
+                    for variant in variants:
+                        extra_assets.extend((variant, variant.with_suffix(".json")))
+                result = validate_startup(
+                    gpx_path, control_file_path, trackimages_dir, options,
+                    previous_key=previous_key, extra_assets=extra_assets,
+                    prepare=prepare_with_options, execute=execute_run_context,
+                    check=slideshow_dependency_issues, read_metadata=read_plot_metadata,
+                    upgrade=upgrade_timed_track_sidecars, progress=progress,
+                    prepared_hint=prepared_hint,
                 )
-                current_gpx = gpx_path.stat()
-                current_control = control_file_path.stat()
-                current_signatures = {
-                    "gpx": (int(current_gpx.st_size), int(current_gpx.st_mtime_ns)),
-                    "control": (
-                        int(current_control.st_size),
-                        int(current_control.st_mtime_ns),
-                    ),
-                }
                 payload = {
+                    **result,
                     "generation": generation,
                     "request": request,
-                    "issues": issues,
                     "error": "",
-                    "retry": current_signatures != source_signatures,
                 }
             except Exception as exc:
                 payload = {
@@ -15794,9 +15874,30 @@ class GPXTrackerController(NSObject):
             or str(current_project.resolve(strict=False)) != request.get("project_dir")
             or str(current_control.resolve(strict=False)) != request.get("control_file_path")
         ):
-            self.set_status("Ignored an outdated slide-show preparation result.")
+            self._finish_slideshow_startup("Ignored an outdated slide-show preparation result.")
             return
+        current_gpx = self._current_single_gpx_path()
+        current_options = self._plot_common_options(
+            self._current_project_name() or (current_gpx.stem if current_gpx else ""),
+            self._track_images_dir(),
+        )
+        current_options.update({"plot_overview": False, "plot_tracks": None})
+        if (current_gpx is None
+                or str(current_gpx.resolve(strict=False)) != request.get("gpx_path")):
+            self._finish_slideshow_startup("Tracks changed during preparation; please start again.")
+            return
+        if (request.get("options_signature") != options_signature(current_options)
+                or (not payload.get("error") and payload.get("source_signatures") !=
+                    (file_signature(current_gpx), file_signature(current_control)))):
+            payload["retry"] = True
+        for stage, seconds in payload.get("timings", {}).items():
+            self._log_slideshow_startup(f"{stage}: {seconds:.2f}s")
+        if payload.get("reused"):
+            self._log_slideshow_startup("Reused unchanged, successfully validated preparation.")
+        if payload.get("reused_loaded_tracks"):
+            self._log_slideshow_startup("Reused track data from completed Adventure loading; skipped GPX reprocessing.")
         if bool(payload.get("retry")):
+            self.slideshow_preflight_cache_key = None
             self._start_slideshow_dependency_preflight(
                 current_project,
                 current_control,
@@ -15808,6 +15909,8 @@ class GPXTrackerController(NSObject):
             return
         error = str(payload.get("error", ""))
         if error:
+            self.slideshow_preflight_cache_key = None
+            self._finish_slideshow_startup(f"Slide-show preparation failed: {error}")
             show_alert("Could not check slide-show track data.", error)
             self.set_status("Slide-show preparation failed before playback.")
             return
@@ -15815,12 +15918,15 @@ class GPXTrackerController(NSObject):
         maps = list(issues.get("maps", []))
         derived = list(issues.get("derived", []))
         if derived:
+            self.slideshow_preflight_cache_key = None
+            self._finish_slideshow_startup("Slide-show preparation stopped: route data is still outdated.")
             show_alert(
                 "Could not prepare current track data.",
                 "The slide show was not started because its route data is still outdated.",
             )
             return
         if maps:
+            self.slideshow_preflight_cache_key = None
             self._prepare_maps_then_start_slideshow(
                 maps,
                 time_lapse=request.get("time_lapse"),
@@ -15828,6 +15934,7 @@ class GPXTrackerController(NSObject):
                 transient_resume_position=request.get("transient_resume_position"),
             )
             return
+        self.slideshow_preflight_cache_key = payload.get("cache_key")
         self._start_slide_show(
             time_lapse=request.get("time_lapse"),
             continue_previous=bool(request.get("continue_previous", False)),
@@ -15844,6 +15951,7 @@ class GPXTrackerController(NSObject):
         transient_resume_position=None,
     ):
         """Repair required maps and resume the exact requested slideshow launch."""
+        self._finish_slideshow_startup("Required maps need preparation before playback.")
         missing = [str(name) for name in missing_maps]
         if len(missing) > 6 and not confirm_alert(
             f"Prepare {len(missing)} maps before starting?",
@@ -16029,6 +16137,11 @@ class GPXTrackerController(NSObject):
             return
         self.slideshow_live_state_sequence = sequence
         self.slideshow_live_state = state
+        if getattr(self, "slideshow_startup_started_at", None) is not None:
+            launched = getattr(self, "slideshow_process_started_at", None)
+            if launched is not None:
+                self._log_slideshow_startup(f"Player to first display: {time.perf_counter() - launched:.2f}s")
+            self._finish_slideshow_startup("Slide show ready.")
         host = getattr(self, "adventure_map_host", None)
         if host is not None:
             host.slideshowLiveStateDidChange_(state)
@@ -16051,6 +16164,8 @@ class GPXTrackerController(NSObject):
         if host is not None:
             host.slideshowDidFinishEnrichmentPriority_(None)
         if active_process is not None and active_process.pid == int(result.get("pid", -1)):
+            if getattr(self, "slideshow_startup_started_at", None) is not None:
+                self._finish_slideshow_startup(str(result.get("message", "Slide show closed before its first display.")))
             self.slideshow_process = None
             self.slideshow_command_file = None
             self.slideshow_restore_after_settings_pending = False

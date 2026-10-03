@@ -1920,7 +1920,7 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             app._advance()
             self.assertEqual(calls, [expected])
 
-    def test_waiting_title_schedules_thirty_seconds_and_right_advances(self):
+    def test_waiting_title_schedules_ten_seconds_and_right_advances(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.stages = []
         app.playlist_index = 0
@@ -1940,7 +1940,7 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             (seconds, callback)
         )
         app._show_intro_phase(PlaybackPhase.INTRO_INFO)
-        self.assertEqual(scheduled[0][0], 30.0)
+        self.assertEqual(scheduled[0][0], 10.0)
         self.assertEqual(displayed[0].description, "Adventure introduction")
 
         calls = []

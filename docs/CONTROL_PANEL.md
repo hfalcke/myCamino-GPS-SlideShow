@@ -26,6 +26,14 @@ manage the panel. Closing the browser does not stop it. Set
   including uncommitted changes. The output is
   `dist/myCamino-GPS-Track-Show.dmg`. It replaces local build products without
   committing, pushing, changing the version, or publishing the download.
+  A progress page opens immediately, showing the current build stage, a
+  stage-based progress bar, elapsed time, and combined output/errors refreshed
+  every second. Stages are not equally long, so the bar is not a time estimate.
+  Turn off **Follow new output** to read earlier lines without auto-scrolling.
+  Closing or refreshing the page does not stop or repeat the build. Return via
+  **Recent local builds** on the home page. The panel retains the last ten
+  builds and the latest 250,000 output characters per build in memory for the
+  current panel session. Its permanent action log records only the outcome.
 - **Release App DMG to Website** asks for the version (`X.Y.Z`), release date,
   and commit message. It uses `release.sh` to update `application_metadata.py`,
   run tests, commit the exact source, build/verify the DMG, push Git, and publish
@@ -36,7 +44,8 @@ manage the panel. Closing the browser does not stop it. Set
   preserves the active and previous DMGs.
 
 These actions require confirmation and share the website deployment lock.
-Long builds return output when finished; keep the results tab open. A failure
+Local DMG builds have live progress; other operations return output when
+finished, so keep their results tab open. A failure
 stops later steps but does not undo a version edit or a completed local commit.
 A failed push preserves the commit; a failed upload may occur after the source
 has already been pushed. Check the result before retrying. Never force-push to
@@ -76,7 +85,8 @@ fields does not change the program version. Direct `release.sh` and
 - **Application news** supports drafts, editing, publishing, withdrawing, and
   slug-confirmed deletion. Publishing changes the live application news feed.
 
-Long operations return their result in the same page. Other pages remain
+Except for the live local-build page, long operations return their result in
+the same page. Other pages remain
 available while they run. Modifying operations are serialized across the panel
 and website-release CLI; wait for a running operation before starting another.
 Each operation has an explanation on the home page, confirmation page, and

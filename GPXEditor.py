@@ -1718,20 +1718,12 @@ class PlotView(NSView):
 
     def drawRect_(self, _rect):
         bounds = self.bounds()
+        workspace = self.adventure_workspace_delegate
         NSColor.windowBackgroundColor().setFill()
         NSBezierPath.fillRect_(bounds)
         self.draw_plot_image(bounds)
         tracks = self.display_tracks()
-        overview_point_limit = max(48, min(320, 16000 // max(len(tracks), 1)))
-        processed_tracks = [
-            (
-                track,
-                self.controller.display_track_geometry(track, overview_point_limit)
-                if self.mode == "overview"
-                else self.controller.display_processed_track(track),
-            )
-            for track in tracks
-        ]
+        processed_tracks = self.display_geometry_for_tracks(tracks)
         if not any(processed.points for _track, processed in processed_tracks):
             workspace = self.adventure_workspace_delegate
             if workspace is None:
@@ -1751,25 +1743,9 @@ class PlotView(NSView):
                 for point in processed.points
             ]
             transformer = self._point_transformer(points, bounds)
-        for _track, processed in processed_tracks:
-            for segment in processed.segments:
-                if self.plot_info.get("image") is None or self.interactive_tiles_active:
-                    color = NSColor.systemBlueColor()
-                    workspace = self.adventure_workspace_delegate
-                    if (
-                        (self.mode == "overview" or workspace is not None)
-                        and self.controller.selected_nrs
-                        and _track.nr not in self.controller.selected_nrs
-                    ):
-                        color = NSColor.colorWithSRGBRed_green_blue_alpha_(
-                            0.435, 0.659, 0.863, 1.0
-                        )
-                    draw_points = segment.points
-                    self.draw_track(draw_points, transformer, color, 3.5)
-                self.draw_segment_end_caps(segment.points, transformer)
+        self.draw_track_layers(processed_tracks, transformer)
         if self.mode == "overview" and self.show_endpoint_markers:
             self.draw_overview_track_endpoint_dots(transformer)
-        self.draw_selected_tracks_overlay(transformer)
         self.draw_selection_overlay(transformer)
         if self.mode == "overview":
             self.draw_overview_endpoint_markers(transformer)
@@ -2375,13 +2351,52 @@ class PlotView(NSView):
             path.setLineWidth_(1.25)
             path.stroke()
 
-    def draw_selected_tracks_overlay(self, transformer):
+    def display_geometry_for_tracks(self, tracks):
+        """Keep editable/selected geometry detailed; only overview context is coarse.
+
+        draw_track clips and simplifies in screen space on every repaint, so
+        zooming or resizing never reuses a fixed-budget selected-track outline.
+        """
+        selected = set(self.controller.selected_nrs)
+        overview_point_limit = max(48, min(320, 16000 // max(len(tracks), 1)))
+        return [
+            (
+                track,
+                self.controller.display_track_geometry(track, overview_point_limit)
+                if self.mode == "overview" and track.nr not in selected
+                else self.controller.display_processed_track(track),
+            )
+            for track in tracks
+        ]
+
+    def draw_track_layers(self, processed_tracks, transformer):
+        selected = set(self.controller.selected_nrs)
+        highlight_selection = self.mode == "overview" or self.adventure_workspace_delegate is not None
+        draw_base = self.plot_info.get("image") is None or self.interactive_tiles_active
+        for track, processed in processed_tracks:
+            # A selected track is drawn once, on top, using this same geometry.
+            # Do not leave a differently simplified blue line underneath it.
+            selected_overlay = highlight_selection and track.nr in selected
+            color = NSColor.systemBlueColor()
+            if highlight_selection and selected and not selected_overlay:
+                color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.435, 0.659, 0.863, 1.0)
+            for segment in processed.segments:
+                if draw_base and not selected_overlay:
+                    self.draw_track(segment.points, transformer, color, 3.5)
+                self.draw_segment_end_caps(segment.points, transformer)
+        self.draw_selected_tracks_overlay(transformer, processed_tracks)
+
+    def draw_selected_tracks_overlay(self, transformer, processed_tracks=None):
         if self.mode != "overview" and self.adventure_workspace_delegate is None:
             return
         selected = set(self.controller.selected_nrs)
         if not selected:
             return
         tracks = [track for track in self.controller.tracks if track.nr in selected and not track.hidden]
+        geometry_by_number = (
+            {track.nr: processed for track, processed in processed_tracks}
+            if processed_tracks is not None else None
+        )
         selected_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.25, 0.62, 1.0)
         for track in tracks:
             if (
@@ -2390,7 +2405,13 @@ class PlotView(NSView):
                 and track.display_geometry is None
             ):
                 continue
-            for segment in self.controller.display_track_geometry(track, 320).segments:
+            if geometry_by_number is not None:
+                processed = geometry_by_number.get(track.nr)
+                if processed is None:
+                    continue
+            else:
+                processed = self.controller.display_processed_track(track)
+            for segment in processed.segments:
                 self.draw_track(segment.points, transformer, selected_color, 6.0)
 
     def draw_overview_endpoint_markers(self, transformer):
@@ -3514,8 +3535,10 @@ class PlotView(NSView):
         )
 
     def add_view_context_items(self, menu):
-        if self.adventure_workspace_delegate is not None and self.waypoint_editing_enabled():
-            self._plot_context_item(menu, "Show Adventure Overview", "showAdventureOverview:")
+        if self.adventure_workspace_delegate is not None:
+            if self.mode == "track":
+                self._plot_context_item(menu, "Return to Adventure Overview", "showAdventureOverview:")
+            self._plot_context_item(menu, "Fit Entire Adventure", "fitEntireAdventure:")
         self._plot_context_item(menu, "Show Elevation Profile", "showElevationProfile:")
         self._plot_context_item(menu, "Center on Selected Waypoint", "centerContextPoint:", self.cursor is not None)
         self._plot_context_item(menu, "Zoom In", "zoomContextIn:")
@@ -4236,6 +4259,13 @@ class PlotView(NSView):
         workspace = self.adventure_workspace_delegate
         if workspace is not None:
             workspace.show_workspace_overview()
+
+    @objc.IBAction
+    def fitEntireAdventure_(self, _sender):
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None:
+            if workspace.show_workspace_overview(reset_viewport=True) is not None:
+                self.controller.set_status("Fitted the Adventure overview to all visible tracks.")
 
     @objc.IBAction
     def beginPointEditingLongPress_(self, _timer):
@@ -10083,6 +10113,7 @@ class GPXEditorController(NSObject):
 
     @objc.python_method
     def _fully_untimed_route(self, track):
+        """Offer automatic timing only when no point has a recorded time."""
         points = track.points() if track is not None else []
         return bool(points) and all(point.time is None for point in points)
 

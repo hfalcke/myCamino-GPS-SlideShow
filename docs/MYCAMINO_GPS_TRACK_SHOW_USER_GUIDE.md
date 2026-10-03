@@ -976,6 +976,13 @@ compact header row.
 The Start Slide Show section contains:
 
 - Start: launches from the beginning using the initial style saved in Settings.
+- Preparation progress appears in the Adventure Map (or the Advanced Interface
+  when used on its own), showing track checks, map checks, and player startup.
+  Completed Adventure loading can supply already prepared track data. Repeated
+  starts in the same session reuse successful checks while the tracks,
+  settings, control file, maps, and metadata remain unchanged. The first start
+  of a large Adventure can still require preparation. Startup timings are
+  recorded in the Adventure's processing log.
 - Continue: opens a table of up to twenty automatically saved checkpoints,
   newest first. The table shows the last playback time, image or map, place,
   media date, and availability. Select a valid entry and press Return,
@@ -1000,7 +1007,7 @@ The Start Slide Show section contains:
   hint is placed at the bottom and disappears after five seconds. The title information disappears without fading the
   unchanged background map through black, followed by the first Stage Map.
   Press Space or Right/Down to advance from the title immediately. Without a
-  key press, it advances automatically after 30 seconds. Continue does not
+  key press, it advances automatically after 10 seconds. Continue does not
   replay the introduction, while end-of-show loops do.
 - In one-window mode each Standard stage is Stage Map, marked Tour Overview,
   then media. Cursor navigation crosses stage boundaries in both directions;

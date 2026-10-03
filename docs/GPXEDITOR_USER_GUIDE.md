@@ -36,7 +36,11 @@ geometry is not changed and the media is not inserted as extra GPX points.
 More distant media remains available to the Adventure and slideshow but is
 ignored for timing. This offer also appears automatically when media is added
 to a selected untimed route, or when one untimed route is added to an Adventure
-that already contains media.
+that already contains media. The automatic offer only appears when all route
+points lack timestamps; recorded tracks, including the bundled demo, do not
+need this step. Choose **Not Now** to import the media without estimating route
+times. To deliberately retime a track that already has timestamps, use the
+**Estimate Route Times from Media** command explicitly.
 
 Media links are ordinary GPX `<link>` elements. They are relative when the
 media is below the saved GPX directory and file URLs otherwise. Map pins mark
@@ -320,6 +324,10 @@ Behavior:
 - Click a track on the map to select it in the table.
 - In the Adventure Map, double-click a track to open the Track Table, then
   double-click its row to open the waypoint table.
+- In the Adventure Map context menu, **Fit Entire Adventure** frames all visible
+  tracks, regardless of the current zoom. In a focused track view,
+  **Return to Adventure Overview** instead restores the overview's previous
+  zoom and position.
 
 Common keys:
 

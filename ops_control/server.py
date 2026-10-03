@@ -25,6 +25,7 @@ from .shared import (CheckResult, ControlAction, MYCAMINO_DOWNLOAD_PAGE_SIZE,
                      parse_mycamino_download_log, parse_mycamino_news_json)
 from .views import Views
 from .app_code import CODE_ACTIONS, action_arguments, read_metadata
+from .build_jobs import BuildJobs
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COOKIE = 'mycamino_control'
@@ -61,6 +62,7 @@ class ControlPanel(RemoteOperations):
         self.state_root = Path(os.environ.get('MYCAMINO_CONTROL_STATE',
                                             str(Path.home()/'.local/state/mycamino-control')))
         self.action_log_path = self.state_root/'actions.log'
+        self.build_jobs = BuildJobs(self.state_root, self.audit)
         self.ssh_host = os.environ.get('MYCAMINO_SSH_HOST', 'staging.fedipass.org')
         self.ssh_user = os.environ.get('MYCAMINO_SSH_USER', 'deploy')
         self.ssh_key = os.path.expanduser(os.environ.get('MYCAMINO_SSH_KEY',
@@ -165,6 +167,18 @@ class ControlPanel(RemoteOperations):
             return run_command(argv, timeout=action.timeout, env=env)
         return self.perform(key, execute, exclusive=action.mutating)
 
+    def start_build(self, confirmation):
+        action = self.actions()['build_mycamino_dmg']
+        if confirmation != action.confirmation:
+            return CheckResult(action.label, '', 2, '', 'Missing build confirmation.')
+        try:
+            return self.build_jobs.start(action_arguments(action.key, {}), cwd=REPO_ROOT,
+                                         timeout=action.timeout)
+        except BlockingIOError:
+            return CheckResult(action.label, '', 75, '', 'Another modifying operation is running. Wait for it to finish; no new build was started.')
+        except (OSError, RuntimeError) as error:
+            return CheckResult(action.label, '', 1, '', f'Could not start build: {error}')
+
 
 class RequestHandler(Views, BaseHTTPRequestHandler):
     server_version = 'myCaminoControl/1'
@@ -191,7 +205,7 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
         # Preserve our own origin without leaking referrers to external sites.
         self.send_header('Referrer-Policy', referrer_policy)
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -225,6 +239,22 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
             return self.reply(401, 'Open the control.sh launcher to sign in.')
         if url.path == '/style.css':
             return self.reply(200, (REPO_ROOT/'ops_control/style.css').read_text(), content_type='text/css')
+        if url.path == '/build-progress.js':
+            return self.reply(200, (REPO_ROOT/'ops_control/build-progress.js').read_text(), content_type='text/javascript; charset=utf-8')
+        if url.path in ('/build-progress', '/build-status'):
+            job_id = query.get('id', [''])[0]
+            job = self.panel.build_jobs.get(job_id) if re.fullmatch(r'[a-f0-9]{32}', job_id) else None
+            if job is None:
+                return self.reply(404, 'Build progress is unavailable (the panel may have restarted). Check the current build status before starting another build.')
+            if url.path == '/build-status':
+                try:
+                    cursor = int(query.get('cursor', ['0'])[0])
+                    if cursor < 0:
+                        raise ValueError
+                except ValueError:
+                    return self.reply(400, 'Invalid output cursor')
+                return self.reply(200, json.dumps(job.snapshot(cursor)), content_type='application/json; charset=utf-8')
+            return self.reply(200, self.build_progress_page(job.snapshot()))
         if url.path in ('/', '/actions'):
             return self.reply(200, self.home())
         if url.path == '/action-confirm':
@@ -239,7 +269,7 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
                 outgoing = run_command(['git', 'log', '--oneline', '@{upstream}..HEAD'])
                 content += '<h2>Current checkout</h2><pre>'+html.escape(status.stdout or status.stderr)+'</pre>'
                 content += '<h2>Pending commits</h2><pre>'+html.escape(outgoing.stdout or ('No pending commits.' if not outgoing.returncode else 'No upstream configured; check the current branch before pushing.'))+'</pre>'
-                content += '<p>Review these files and commits before confirming. Builds can take several minutes; keep this tab open for the result. A failed build or upload does not undo a completed commit or version update.</p>'
+                content += '<p>Review these files and commits before confirming. Local DMG builds open a live progress page; you can close it and return from the panel home page. Other operations return their result when finished. A failed build or upload does not undo a completed commit or version update.</p>'
             return self.reply(200, self.page(action.label, content))
         if url.path == '/mycamino-downloads':
             return self.reply(200, self.render_mycamino_downloads_page(query.get('page', ['1'])[0]))
@@ -287,6 +317,11 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
             action = self.panel.actions().get(key)
             if action is None:
                 return self.reply(404, 'Unknown action')
+            if key == 'build_mycamino_dmg':
+                result = self.panel.start_build(form.get('confirmation', [''])[0])
+                if not isinstance(result, CheckResult):
+                    return self.reply(303, '', headers={'Location': '/build-progress?id='+result.id})
+                return self.reply(200, self.page(action.label, '<h1>Build Local DMG</h1><p>'+html.escape(action.description)+'</p>'+self.render_check_result(result)+self.back_link()))
             if key in CODE_ACTIONS:
                 parameters = {name: form.get(name, [''])[0] for name in ('message', 'version', 'release_date')}
                 result = self.panel.run_action(key, form.get('confirmation', [''])[0], parameters=parameters)
@@ -310,6 +345,12 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
 
     def home(self):
         content = '<h1>myCamino Control</h1><p>Manage application code, DMG releases, the website, downloads, and beta feedback.</p><p><a class="button" href="http://127.0.0.1:8765/" target="_blank" rel="noopener">Open local preview</a> <a class="button" href="https://mycamino.heinofalcke.de/" target="_blank" rel="noopener">Open website</a></p>'
+        builds = self.panel.build_jobs.recent()
+        if builds:
+            content += '<section><h2>Recent local builds</h2><ul>'
+            for job in builds:
+                content += '<li><a href="/build-progress?id='+job['id']+'">Build Local DMG — '+html.escape(job['status'])+'</a> · '+html.escape(job['started_at'].replace('T', ' '))+' · '+html.escape(job['stage'])+'</li>'
+            content += '</ul></section>'
         for group, code in (('Code', True), ('Website and feedback', False)):
             content += f'<section><h2>{group}</h2><div class="operations">'
             for action in self.panel.actions().values():
@@ -319,6 +360,21 @@ class RequestHandler(Views, BaseHTTPRequestHandler):
                 content += f'<article class="operation-card"><a class="button" href="/action-confirm?action={action.key}">{html.escape(action.label)}</a><p class="operation-kind">{kind}</p><p>{html.escape(action.description)}</p></article>'
             content += '</div></section>'
         return self.page('Operations', content)
+
+    def build_progress_page(self, job):
+        status = 'Building…' if job['status'] == 'running' else ('Completed successfully' if job['status'] == 'succeeded' else f"Failed (exit {job['returncode']})")
+        content = '<h1>Build Local DMG</h1><section id="build-job" data-job="'+job['id']+'" data-cursor="'+str(job['cursor'])+'">'
+        content += '<p id="build-status" role="status">'+status+'</p><p id="build-stage">'+html.escape(job['stage'])+'</p>'
+        content += '<progress id="build-progress" aria-labelledby="build-stage" max="'+str(job['total'])+'" value="'+str(job['completed'])+'"></progress>'
+        content += '<p id="build-count">'+str(job['completed'])+' of '+str(job['total'])+' stages completed</p><p class="muted">Stage-based progress, not an estimate of time remaining. Packaging steps can take several minutes.</p>'
+        content += '<p id="build-elapsed">Elapsed: '+str(job['elapsed'])+' seconds</p><p id="build-connection" role="status"></p>'
+        content += '<label class="follow-output"><input id="build-follow" type="checkbox" checked> Follow new output</label>'
+        content += '<pre id="build-output" tabindex="0" aria-label="Live build output">'+html.escape(job['output'])+'</pre>'
+        content += '<p id="build-truncated" class="muted">'+('Showing the latest output; older lines have been trimmed.' if job['truncated'] else '')+'</p>'
+        content += '<p>You can leave this page and return using Recent local builds. Closing the tab does not stop the build. Recent output is kept for this panel session only.</p>'
+        content += '<p><a href="/build-progress?id='+job['id']+'">Refresh progress</a></p><noscript><p>Enable JavaScript for live updates, or use Refresh progress. Refreshing does not restart the build.</p></noscript></section>'
+        content += '<script src="/build-progress.js" defer></script>'+self.back_link()
+        return self.page('Build progress', content)
 
     def code_fields(self, key):
         fields = ''

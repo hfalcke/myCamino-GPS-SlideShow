@@ -138,6 +138,21 @@ with currently implemented behavior.
 The active source files are:
 
 - `GPSTrackShowGUI.py`: main Cocoa GUI for creating and managing an adventure.
+- `slideshow_startup.py`: UI-independent startup validation and file signatures.
+  The preflight worker reports per-track progress, refreshes derived/speed data,
+  validates maps, and records phase timings. Successful validation is cached
+  for the current controller session only, keyed by GPX/control-file identity,
+  processing/render options and map-directory/external-asset file signatures.
+  Changes during validation trigger a retry; missing/stale dependencies and
+  failures are never cached. Speed updates reuse the already prepared context.
+  Completed Adventure derived-data work retains only compact track identities,
+  not point arrays, for first-start reuse when the GPX, processing settings,
+  output base and summary signature still match; derived files are revalidated.
+  AppKit callbacks display startup progress in the visible Adventure Map until
+  the player's first live display state (or failure). The Advanced Interface's
+  background GPX status scan waits cooperatively during this preparation, so it
+  does not process the same tracks concurrently. The title-screen timer
+  advances after 10 seconds; ordinary slide and time-lapse durations are separate.
 - `cocoa_adventure_map.py`: default map-first application controller. It wraps
   the existing editable GPX controller and exposes asset drops, native macOS
   project menus, one retained overview/focused-track canvas, transparent map

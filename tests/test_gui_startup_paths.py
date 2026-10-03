@@ -682,6 +682,7 @@ class GUIStartupPathTests(unittest.TestCase):
             pending_slideshow_after_map_generation=None,
             pending_map_provider_action=None,
             geolocations_thread=None,
+            _finish_slideshow_startup=Mock(),
             set_status=Mock(),
             startAutomaticMapGeneration_=Mock(),
         )
@@ -709,6 +710,7 @@ class GUIStartupPathTests(unittest.TestCase):
 
     def test_slideshow_missing_maps_opens_osm_map_workflow(self):
         controller = SimpleNamespace(
+            _finish_slideshow_startup=Mock(),
             parameters={"maps.output_provider": "osm"},
             pending_slideshow_after_map_generation=None,
             set_status=Mock(),
@@ -725,6 +727,7 @@ class GUIStartupPathTests(unittest.TestCase):
 
     def test_large_slideshow_map_repair_can_be_declined(self):
         controller = SimpleNamespace(
+            _finish_slideshow_startup=Mock(),
             parameters={"maps.output_provider": "geoapify"},
             pending_slideshow_after_map_generation=None,
             set_status=Mock(),

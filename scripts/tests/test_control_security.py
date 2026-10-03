@@ -13,6 +13,7 @@ from http.server import ThreadingHTTPServer
 from ops_control.server import COOKIE, ControlPanel, RequestHandler, run_command
 from ops_control.shared import CheckResult
 from ops_control.app_code import CODE_ACTIONS
+from ops_control.build_jobs import BuildJob
 
 
 class PanelSecurityTests(unittest.TestCase):
@@ -73,6 +74,8 @@ class PanelSecurityTests(unittest.TestCase):
     def test_all_operations_accept_same_origin_forms_and_explain_the_action(self):
         home = self.request()[2]
         for action in self.panel.actions().values():
+            if action.key == 'build_mycamino_dmg':
+                continue  # Asynchronous build submission is covered separately below.
             with self.subTest(action=action.key):
                 self.assertIn(action.description, home)
                 _, headers, page = self.request('/action-confirm?action='+action.key)
@@ -92,6 +95,47 @@ class PanelSecurityTests(unittest.TestCase):
                             'message': '', 'version': '', 'release_date': ''})
                     else:
                         run.assert_called_once_with(action.key, action.confirmation)
+
+    def test_build_redirect_progress_authentication_and_safe_output(self):
+        job = BuildJob()
+        job.append('==> Building app icon\n<script>unsafe()</script>\n')
+        self.panel.build_jobs.jobs[job.id] = job
+        with patch.object(self.panel, 'start_build', return_value=job) as start:
+            data = {'csrf': self.panel.csrf, 'action': 'build_mycamino_dmg',
+                    'confirmation': 'BUILD MYCAMINO DMG'}
+            status, headers, _ = self.request('/action-run', 'POST', data)
+            self.assertEqual(status, 303)
+            self.assertEqual(headers['Location'], '/build-progress?id='+job.id)
+            status, headers, page = self.request(headers['Location'])
+            self.assertEqual(status, 200)
+            self.assertIn('<progress', page)
+            self.assertIn('&lt;script&gt;unsafe()', page)
+            self.assertNotIn('<script>unsafe()', page)
+            self.assertIn("script-src 'self'", headers['Content-Security-Policy'])
+            self.assertIn("connect-src 'self'", headers['Content-Security-Policy'])
+            start.assert_called_once_with('BUILD MYCAMINO DMG')
+        endpoint = '/build-status?id='+job.id
+        self.assertEqual(self.request(endpoint, authenticated=False)[0], 401)
+        status, headers, data = self.request(endpoint)
+        self.assertEqual(status, 200)
+        self.assertIn('application/json', headers['Content-Type'])
+        first = json.loads(data)
+        job.append('new output')
+        second = json.loads(self.request(endpoint+'&cursor='+str(first['cursor']))[2])
+        self.assertEqual(second['output'], 'new output')
+        self.assertEqual(self.request(endpoint+'&cursor=-1')[0], 400)
+        self.assertEqual(self.request('/build-status?id=../../etc/passwd')[0], 404)
+        self.assertIn('/build-progress?id='+job.id, self.request()[2])
+
+    def test_build_rejects_missing_confirmation_csrf_and_cross_site_submission(self):
+        with patch.object(self.panel.build_jobs, 'start') as start:
+            data = {'action': 'build_mycamino_dmg', 'confirmation': 'BUILD MYCAMINO DMG'}
+            self.assertEqual(self.request('/action-run', 'POST', data)[0], 403)
+            data['csrf'] = self.panel.csrf
+            self.assertEqual(self.request('/action-run', 'POST', data, {'Origin': 'https://evil.test'})[0], 403)
+            data['confirmation'] = ''
+            self.assertIn('Missing build confirmation', self.request('/action-run', 'POST', data)[2])
+            start.assert_not_called()
 
     def test_code_release_form_and_validated_dispatch(self):
         page = self.request('/action-confirm?action=release_mycamino_app')[2]

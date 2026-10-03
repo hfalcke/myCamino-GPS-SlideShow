@@ -73,7 +73,7 @@ class InspectorPointSelectionTests(unittest.TestCase):
             selected_nrs=[3],
             tracks=[track],
             track_load_timer=None,
-            display_track_geometry=Mock(
+            display_processed_track=Mock(
                 return_value=SimpleNamespace(segments=[segment])
             ),
         )

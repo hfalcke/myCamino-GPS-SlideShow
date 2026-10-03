@@ -107,6 +107,8 @@ from cocoa_application_news import install_application_news
 from cocoa_circular_progress import CircularProgressView
 from cocoa_guided_demo import GuidedDemoCoordinator, is_guided_demo_recovery
 from cocoa_gpx_recovery import recover_missing_adventure_gpx
+from cocoa_alerts import run_foreground_modal_alert
+from slideshow_startup import file_signature, prepared_track_hint
 from cocoa_help_document import show_help_document
 from cocoa_parameter_editor import CocoaParameterEditor
 from demo_resources import demo_prepared_render_parameters, install_demo_prepared_assets
@@ -404,6 +406,7 @@ class AdventureMapController(NSObject):
         self.workspace_dirty_components: set[str] = set()
         self.mutation_journal = MutationJournal()
         self.derived_track_data_future = None
+        self.slideshow_prepared_hint = None
         self.derived_track_data_pending = False
         self.journal = ProcessingJournal(self.recovery.directory / "logs")
         self.journal_window = None
@@ -414,6 +417,7 @@ class AdventureMapController(NSObject):
         self.startup_extent_applied = False
         self.startup_media_extent_pending = False
         self.pending_startup_gpx_path = None
+        self.slideshow_launch_queued = False
         self.startup_track_loading = False
         self.startup_media_scan_deferred = False
         self.startup_watcher_deferred = False
@@ -776,7 +780,8 @@ class AdventureMapController(NSObject):
         return inspector
 
     @objc.python_method
-    def show_workspace_overview(self, remember_current=True):
+    def show_workspace_overview(self, remember_current=True, *, reset_viewport=False):
+        """Restore the overview, or explicitly fit all visible tracks afresh."""
         if self.plot_view is None:
             return None
         if remember_current:
@@ -788,8 +793,11 @@ class AdventureMapController(NSObject):
         plot_info = self._fit_workspace_plot_info(
             plot_info,
             tracks,
-            self.overview_viewport,
+            None if reset_viewport else self.overview_viewport,
         )
+        if reset_viewport:
+            # Do not let a later return resurrect the old zoomed-in overview.
+            self.overview_viewport = None
         self.map_state = "overview"
         self.focused_track_nr = None
         self.plot_view.mode = "overview"
@@ -1205,7 +1213,8 @@ class AdventureMapController(NSObject):
 
         def work():
             from gpx_tracks_table import run_with_options
-            return run_with_options(
+            source_signature = file_signature(gpx_path)
+            result = run_with_options(
                 gpx_path,
                 print_table_output=False,
                 plot_overview=False,
@@ -1230,6 +1239,8 @@ class AdventureMapController(NSObject):
                 fallback_walking_speed_kmh=values["gpx.fallback_walking_speed_kmh"],
                 adventure_processing_parameters=processing_signature,
             )
+            result["slideshow_prepared_hint"] = prepared_track_hint(result, source_signature)
+            return result
         future = self.executor.submit(work)
         self.derived_track_data_future = future
 
@@ -1242,6 +1253,7 @@ class AdventureMapController(NSObject):
             self._clear_background_progress("derived")
             try:
                 result = future.result()
+                self.slideshow_prepared_hint = result.get("slideshow_prepared_hint")
                 self._journal(
                     "Derived Track Data",
                     f"Rebuilt current data for {len(result.get('tracks', []))} track(s); no maps were rendered.",
@@ -1815,7 +1827,9 @@ class AdventureMapController(NSObject):
     def _refresh_progress_indicator(self):
         if hasattr(self, "progress_indicator"):
             if self.background_progress:
-                phase, current, total = next(reversed(self.background_progress.values()))
+                phase, current, total = self.background_progress.get(
+                    "slideshow", next(reversed(self.background_progress.values()))
+                )
                 self.progress_indicator.setProgress_current_total_(True, current, total)
                 self.progress_label.setStringValue_(
                     f"{phase} {current}/{total}" if total else phase
@@ -3071,7 +3085,7 @@ class AdventureMapController(NSObject):
             timing_candidates = [
                 track
                 for track in (selected or self.gpx_controller.tracks)
-                if self.gpx_controller._media_timing_eligible_route(track)
+                if self.gpx_controller._fully_untimed_route(track)
             ]
             if len(timing_candidates) == 1:
                 route_timing_track = timing_candidates[0]
@@ -3080,12 +3094,13 @@ class AdventureMapController(NSObject):
                     f"Estimate times for {route_timing_track.name}?"
                 )
                 timing_alert.setInformativeText_(
-                    "The dropped media can provide timing anchors for this route. "
-                    "myCamino will first extract their dates and GPS coordinates, then "
-                    "add timestamps to existing route points using media within "
-                    f"{self.gpx_controller.media_timing_max_distance_m:g} m. "
-                    "The route geometry will not change, and other media remain in the "
-                    "slide show."
+                    "This route has no recorded times. Estimate them from your photographs? "
+                    "myCamino uses capture times and GPS locations from photographs and "
+                    "videos within "
+                    f"{self.gpx_controller.media_timing_max_distance_m:g} m of the route "
+                    "to estimate when you reached each point. The route's shape stays "
+                    "unchanged. Choose Not Now to import the media without changing "
+                    "route timing."
                 )
                 timing_alert.addButtonWithTitle_("Estimate Route Times")
                 timing_alert.addButtonWithTitle_("Not Now")
@@ -3775,7 +3790,7 @@ class AdventureMapController(NSObject):
         alert.addButtonWithTitle_("Recover")
         alert.addButtonWithTitle_("Not Now")
         alert.addButtonWithTitle_("Delete")
-        response = int(alert.runModal())
+        response = int(run_foreground_modal_alert(alert))
         if response == 1002:
             if not delete_recovery_session(newest):
                 self._alert(
@@ -4086,7 +4101,7 @@ class AdventureMapController(NSObject):
         self.adventureComponentDidChange_("adventure")
 
     @objc.python_method
-    def _ensure_full_gui(self, show_window=True):
+    def _ensure_full_gui(self, show_window=True, *, preparing_slideshow=False):
         try:
             if self.full_gui_controller is None:
                 controller_class = _main_gui_module().GPXTrackerController
@@ -4098,6 +4113,8 @@ class AdventureMapController(NSObject):
                 self.full_gui_controller = controller
                 controller.hosted_by_adventure_map = True
                 controller.adventure_map_host = self
+                if preparing_slideshow:
+                    controller.slideshow_startup_started_at = time.perf_counter()
                 controller.show()
                 if controller.parameters != self.parameters:
                     controller._apply_parameter_values(
@@ -4121,6 +4138,8 @@ class AdventureMapController(NSObject):
             NSApp().activateIgnoringOtherApps_(True)
             return self.full_gui_controller
         except Exception as exc:
+            if self.full_gui_controller is not None:
+                self.full_gui_controller.slideshow_startup_started_at = None
             self.full_gui_controller = None
             self._journal("Advanced Interface", f"Could not open: {exc}")
             self._alert("Could not open the Advanced Interface.", str(exc))
@@ -4656,25 +4675,51 @@ class AdventureMapController(NSObject):
 
     @objc.IBAction
     def startSlideShow_(self, _sender):
+        controller = self.full_gui_controller
+        if (self.slideshow_launch_queued or self.pending_start_after_processing
+                or (controller is not None and (
+                    controller.slideshow_dependency_preflight_running
+                    or controller.pending_slideshow_after_map_generation
+                    or (controller.slideshow_process is not None and controller.slideshow_process.poll() is None)
+                ))):
+            self._journal("Start", "Slide-show preparation or playback is already active.")
+            return
+        self.slideshow_launch_queued = True
+        self._set_background_progress("slideshow", "Preparing slideshow…", 0, 0)
+        # Let AppKit paint the feedback before any synchronous window setup/save.
+        self.performSelector_withObject_afterDelay_("beginSlideShowPreparation:", None, 0.05)
+
+    @objc.IBAction
+    def beginSlideShowPreparation_(self, _sender):
+        self.slideshow_launch_queued = False
         if self.adventure_file is None or self.gpx_controller.dirty:
-            self.saveWorkspace_(None)
+            if not self.saveWorkspace_(None):
+                self._clear_background_progress("slideshow")
+                return
         if self.processing_active or self.pending_media:
             self.pending_start_after_processing = True
             self._journal("Start", "Waiting for current metadata preparation before starting.")
+            self._set_background_progress("slideshow", "Waiting for media preparation…", 0, 0)
             self.showProcessingDetails_(None)
             return
         self.finishPendingStart_(None)
 
     @objc.IBAction
     def finishPendingStart_(self, _sender):
-        controller = self._ensure_full_gui(show_window=False)
+        self._set_background_progress("slideshow", "Preparing slideshow controls…", 0, 0)
+        started = time.perf_counter()
+        controller = self._ensure_full_gui(show_window=False, preparing_slideshow=True)
+        self._journal("Slideshow startup", f"Controller setup: {time.perf_counter() - started:.2f}s")
         if controller is None:
+            self._clear_background_progress("slideshow")
             return
+        self._clear_background_progress("slideshow")
         self._synchronize_control_file_from_full_gui()
         control_path = controller._control_file_path()
         if control_path is not None and control_path.is_file():
             controller.startSlideShow_(None)
         else:
+            controller._finish_slideshow_startup("Preparing maps and the initial control file before playback.")
             self._journal("Start", "Preparing maps and the initial control file before playback.")
             controller.makePlots_(None)
 
@@ -4715,7 +4760,7 @@ class AdventureMapController(NSObject):
                 "TRACKS\n\n"
                 "Click a track to select it. The selected track is dark blue; other tracks are light blue, and marked ranges are red.\n\n"
                 "Double-click a track to open the Track Table. Double-click it there to open its Waypoint Table. Right-click a track on the map to open either table, fit the view, or show the synchronized Elevation Profile.\n\n"
-                "Double-click empty map space, or press Command-0, to return to the complete Adventure overview. Drag the map or use two-finger scrolling to pan.\n\n"
+                "Double-click empty map space, or press Command-0, to return to the Adventure overview at its remembered zoom and position. Choose Fit Entire Adventure in the map context menu to fit all visible tracks. Drag the map or use two-finger scrolling to pan.\n\n"
                 "MEDIA\n\n"
                 "Crowded media are grouped and expand into thumbnails when enough room is available. Click a group to select it; Command-click adds or removes groups. Command-drag from empty map space draws a selection rectangle. Selected media have a red outline.\n\n"
                 "Right-click selected media to fit them to the map or create a track from their GPS positions. Double-click a thumbnail or group to open the media viewer. Previous and Next move through all media in the Adventure.\n\n"
@@ -5236,8 +5281,8 @@ class AdventureMapAppDelegate(NSObject):
         )
         self.main_menu = build_adventure_map_menu(self.controller)
         NSApp().setMainMenu_(self.main_menu)
-        self.controller.show()
         NSApp().activateIgnoringOtherApps_(True)
+        self.controller.show()
         self.demo_coordinator = GuidedDemoCoordinator.alloc().initWithWorkspaceController_(self.controller)
         self.controller.demo_coordinator = self.demo_coordinator
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(

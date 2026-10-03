@@ -314,7 +314,7 @@ WIPE_TRANSITION_MS = 1000
 WIPE_TRANSITION_STEPS = 100
 FIRST_STAGE_OVERVIEW_STARTUP_GRACE_SECONDS = 1.0
 FULLSCREEN_PLAYBACK_START_TIMEOUT_SECONDS = 3.0
-INTRO_AUTO_ADVANCE_SECONDS = 30.0
+INTRO_AUTO_ADVANCE_SECONDS = 10.0
 SLIDESHOW_CHECKPOINT_VERSION = 6
 MUSIC_RESUME_STATE_VERSION = 1
 DEFAULT_WINDOW_WIDTH = 1280
@@ -6073,7 +6073,7 @@ def create_startup_hint_overlay_image(
     lines = (
         [
             "Press Space or Right Arrow to continue",
-            "The title advances automatically after 30 seconds",
+            f"The title advances automatically after {INTRO_AUTO_ADVANCE_SECONDS:g} seconds",
             "Press h for help with keyboard controls",
         ]
         if wait_for_start

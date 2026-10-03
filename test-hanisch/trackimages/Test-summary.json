@@ -1,0 +1,93 @@
+{
+  "adventure_processing_parameters": {
+    "gpx.elevation_smoothing_distance_m": 50.0,
+    "gpx.fallback_walking_speed_kmh": 3.5,
+    "gpx.horizontal_smoothing_distance_m": 10.0,
+    "gpx.maximum_accuracy_m": 10.0,
+    "gpx.maximum_hdop": 20.0,
+    "gpx.maximum_vdop": 20.0,
+    "gpx.maximum_vertical_accuracy_m": 20.0,
+    "gpx.minimum_point_spacing_m": 10.0,
+    "gpx.running_speed_window_distance_m": 500.0,
+    "gpx.stationary_speed_threshold_kmh": 1.5,
+    "trackmaps.ordering": "track_number",
+    "trackmaps.remove_name_prefix": ""
+  },
+  "gpx_processing": {
+    "elevation_smoothing_distance_m": 50.0,
+    "horizontal_smoothing_distance_m": 10.0,
+    "maximum_hdop": 20.0,
+    "maximum_horizontal_accuracy_m": 10.0,
+    "maximum_vdop": 20.0,
+    "maximum_vertical_accuracy_m": 20.0,
+    "minimum_point_spacing_m": 10.0,
+    "running_speed_window_distance_m": 500.0,
+    "stationary_speed_threshold_kmh": 1.5
+  },
+  "source_gpx": "/Users/falcke/Dropbox/Documents/Python/trackit/test-hanisch/Test.gpx",
+  "tracks": [
+    {
+      "abstand_km": 0.0,
+      "ascent_m": 1188.8,
+      "dauer": "N/A",
+      "descent_m": 1188.8,
+      "end_point": {
+        "lat": 48.562811,
+        "lon": 12.161591
+      },
+      "end_time": "N/A",
+      "erstellungsdatum": "N/A",
+      "filtered_point_count": 2195,
+      "has_absolute_time": false,
+      "kumulativ_km": 109.6,
+      "laenge_km": 109.6,
+      "maximum_running_speed_kmh": null,
+      "moving_average_speed_kmh": null,
+      "nr": 1,
+      "original_sequence_number": 1,
+      "processing_options": {
+        "elevation_smoothing_distance_m": 50.0,
+        "horizontal_smoothing_distance_m": 10.0,
+        "maximum_hdop": 20.0,
+        "maximum_horizontal_accuracy_m": 10.0,
+        "maximum_vdop": 20.0,
+        "maximum_vertical_accuracy_m": 20.0,
+        "minimum_point_spacing_m": 10.0,
+        "running_speed_window_distance_m": 500.0,
+        "stationary_speed_threshold_kmh": 1.5
+      },
+      "raw_point_count": 2342,
+      "rejection_counts": {
+        "elevation": {
+          "not retained": 147,
+          "retained": 2195
+        },
+        "horizontal": {
+          "retained": 2195,
+          "smoothing only": 147
+        }
+      },
+      "source_structure": "track",
+      "start_point": {
+        "lat": 48.562836,
+        "lon": 12.161647
+      },
+      "start_time": "N/A",
+      "timing_status": "untimed",
+      "track_data_fingerprint": "26e182d3255efea27e93eae726dd7f0458039843c5b36dcf9233a02bc2be8a54",
+      "track_data_sidecar": "Test-trackdata/0001.json",
+      "track_extent_mercator": {
+        "max_x": 1383921.3491928047,
+        "max_y": 6227176.180180859,
+        "min_x": 1344121.2916505246,
+        "min_y": 6198028.252169284
+      },
+      "track_fingerprint": "26e182d3255efea27e93eae726dd7f0458039843c5b36dcf9233a02bc2be8a54",
+      "track_fingerprint_version": 2,
+      "track_geometry_fingerprint": "ffec62a52708d010fc70c8da8d1f8fc6cea21ccea4a86b2effa462d869717c41",
+      "track_name": "Neue Datei 1",
+      "track_plot_image_filename": "0001_Neue Datei 1_Test.png",
+      "track_plot_time_lapse_image_filename": "0001_Neue Datei 1_Test-timelapse.png"
+    }
+  ]
+}
