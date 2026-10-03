@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from AppKit import NSEventModifierFlagCommand, NSEventModifierFlagOption
+
 from GPXEditor import (
     FILE_DRAG_TYPE,
     EditorTableDataSource,
@@ -16,7 +18,10 @@ from cocoa_adventure_map import (
     AdventureMapAppDelegate,
     AdventureMapController,
     adventure_autosave_delays,
+    overview_arrow_direction,
+    suggested_adventure_name_for_gpx_drop,
 )
+from adventure_map_workspace import MediaMapItem
 from GPSTrackShowGUI import (
     GPXTrackerController,
     SLIDESHOW_CHECKPOINT_VERSION,
@@ -36,6 +41,379 @@ from GPSTrackShowGUI import (
 
 
 class GUIStartupPathTests(unittest.TestCase):
+    def test_overview_arrows_share_forward_and_backward_directions(self):
+        self.assertEqual(overview_arrow_direction("\uf702", 123), -1)
+        self.assertEqual(overview_arrow_direction("\uf700", 126), -1)
+        self.assertEqual(overview_arrow_direction("\uf703", 124), 1)
+        self.assertEqual(overview_arrow_direction("\uf701", 125), 1)
+        self.assertEqual(overview_arrow_direction("x", 7), 0)
+
+    def test_overview_arrow_promotes_next_media_in_control_order(self):
+        first = Path("/tmp/first.jpg").resolve(strict=False)
+        second = Path("/tmp/second.jpg").resolve(strict=False)
+        plot_view = SimpleNamespace(active_media_path=None, setNeedsDisplay_=Mock())
+        controller = SimpleNamespace(
+            show_media_icons=True,
+            selected_media_path=first,
+            selected_media_paths={first},
+            media_items=[
+                MediaMapItem(first, 1.0, 2.0),
+                MediaMapItem(second, 1.1, 2.1),
+            ],
+            control_rows=[
+                {"type": "IMG", "name": str(second)},
+                {"type": "IMG", "name": str(first)},
+            ],
+            project_directory=None,
+            plot_view=plot_view,
+            gpx_controller=SimpleNamespace(set_status=Mock()),
+            _ordered_workspace_media_icon_paths=lambda: [second, first],
+            _pan_workspace_coordinate_into_view=Mock(),
+        )
+
+        handled = AdventureMapController._navigate_workspace_media(
+            controller, 1
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(controller.selected_media_path, second)
+        self.assertEqual(controller.selected_media_paths, {second})
+        self.assertEqual(plot_view.active_media_path, second)
+        plot_view.setNeedsDisplay_.assert_called_once_with(True)
+        controller._pan_workspace_coordinate_into_view.assert_called_once_with(
+            1.1, 2.1
+        )
+
+    def test_overview_arrow_moves_waypoint_and_pans_if_needed(self):
+        points = [
+            SimpleNamespace(lat=50.0, lon=7.0),
+            SimpleNamespace(lat=50.1, lon=7.1),
+            SimpleNamespace(lat=50.2, lon=7.2),
+        ]
+        track = SimpleNamespace(nr=7, points=lambda: points)
+        plot_view = SimpleNamespace(
+            cursor=(0, points[0], track),
+            marker=None,
+            inspector=None,
+            active_media_path=Path("/tmp/photo.jpg"),
+            context_overlay_coordinate=(1.0, 2.0),
+            show_info=False,
+            info_overlay_dismissed=False,
+            sync_inspector_selection=Mock(),
+            update_window_title=Mock(),
+            setNeedsDisplay_=Mock(),
+        )
+        gpx_controller = SimpleNamespace(
+            visible_tracks=lambda: [track],
+            selected_tracks=lambda: [track],
+            selected_nrs=[],
+            update_selection_field=Mock(),
+            highlight_selected_rows=Mock(),
+            refresh_elevation_profile_for_plot_view=Mock(),
+            set_status=Mock(),
+        )
+        controller = SimpleNamespace(
+            plot_view=plot_view,
+            gpx_controller=gpx_controller,
+            selected_track_identity="",
+            selected_media_path=None,
+            selected_media_paths=set(),
+            _pan_workspace_coordinate_into_view=Mock(),
+        )
+
+        handled = AdventureMapController._navigate_workspace_waypoint(
+            controller, 1
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(plot_view.cursor, (1, points[1], track))
+        self.assertEqual(gpx_controller.selected_nrs, [7])
+        self.assertEqual(controller.selected_track_identity, "7")
+        self.assertIsNone(plot_view.active_media_path)
+        plot_view.sync_inspector_selection.assert_called_once_with()
+        plot_view.setNeedsDisplay_.assert_called_once_with(True)
+        controller._pan_workspace_coordinate_into_view.assert_called_once_with(
+            50.1, 7.1
+        )
+
+    def test_selection_pan_preserves_zoom_and_does_nothing_when_visible(self):
+        extent = {"min_x": 0.0, "max_x": 100.0, "min_y": 0.0, "max_y": 100.0}
+        plot_view = SimpleNamespace(
+            current_extent=Mock(return_value=extent),
+            current_tile_zoom=Mock(return_value=11),
+            set_interactive_viewport=Mock(),
+        )
+        controller = SimpleNamespace(plot_view=plot_view)
+
+        with patch(
+            "cocoa_adventure_map.lonlat_to_web_mercator",
+            return_value=(50.0, 50.0),
+        ):
+            moved = AdventureMapController._pan_workspace_coordinate_into_view(
+                controller, 1.0, 2.0
+            )
+
+        self.assertFalse(moved)
+        plot_view.set_interactive_viewport.assert_not_called()
+
+        with patch(
+            "cocoa_adventure_map.lonlat_to_web_mercator",
+            return_value=(150.0, 50.0),
+        ):
+            moved = AdventureMapController._pan_workspace_coordinate_into_view(
+                controller, 1.0, 2.0
+            )
+
+        self.assertTrue(moved)
+        next_extent, zoom = plot_view.set_interactive_viewport.call_args.args
+        self.assertEqual(zoom, 11)
+        self.assertEqual(next_extent["max_x"] - next_extent["min_x"], 100.0)
+
+    def test_command_arrow_selects_next_visible_track_and_fits_it(self):
+        first = SimpleNamespace(nr=1, name="First")
+        second = SimpleNamespace(nr=2, name="Second")
+        gpx_controller = SimpleNamespace(
+            visible_tracks=lambda: [first, second],
+            selected_tracks=lambda: [first],
+            set_status=Mock(),
+        )
+        controller = SimpleNamespace(
+            gpx_controller=gpx_controller,
+            focused_track_nr=first.nr,
+            selected_media_path=Path("/tmp/photo.jpg"),
+            selected_media_paths={Path("/tmp/photo.jpg")},
+            focus_workspace_track=Mock(),
+        )
+
+        handled = AdventureMapController._navigate_workspace_track(
+            controller, 1
+        )
+
+        self.assertTrue(handled)
+        controller.focus_workspace_track.assert_called_once_with(
+            second, reset_viewport=True
+        )
+        self.assertIsNone(controller.selected_media_path)
+        self.assertEqual(controller.selected_media_paths, set())
+
+    def test_fitting_workspace_track_also_selects_its_table_row(self):
+        first = SimpleNamespace(nr=1)
+        second = SimpleNamespace(nr=2)
+        plot_info = {"metadata": {}}
+        plot_view = SimpleNamespace(
+            mode="overview",
+            track_index=0,
+            replace_plot_info=Mock(),
+            setNeedsDisplay_=Mock(),
+        )
+        gpx_controller = SimpleNamespace(
+            tracks=[first, second],
+            selected_nrs=[],
+            update_selection_field=Mock(),
+            highlight_selected_rows=Mock(),
+            interactive_plot_info=Mock(return_value=plot_info),
+        )
+        controller = SimpleNamespace(
+            plot_view=plot_view,
+            gpx_controller=gpx_controller,
+            _remember_workspace_viewport=Mock(),
+            _fit_workspace_plot_info=Mock(return_value=plot_info),
+            track_viewports={},
+            map_state="overview",
+            focused_track_nr=None,
+            selected_track_identity="",
+            _set_title=Mock(),
+            window=None,
+        )
+
+        result = AdventureMapController.focus_workspace_tracks(
+            controller,
+            [second],
+            mode="track",
+            reset_viewport=True,
+        )
+
+        self.assertIs(result, plot_view)
+        self.assertEqual(gpx_controller.selected_nrs, [2])
+        gpx_controller.update_selection_field.assert_called_once_with()
+        gpx_controller.highlight_selected_rows.assert_called_once_with()
+        self.assertEqual(controller.selected_track_identity, "2")
+        self.assertEqual(plot_view.mode, "track")
+
+    def test_option_arrow_remains_available_for_map_panning(self):
+        event = SimpleNamespace(
+            charactersIgnoringModifiers=Mock(return_value="\uf703"),
+            characters=Mock(return_value="\uf703"),
+            keyCode=Mock(return_value=124),
+            modifierFlags=Mock(return_value=NSEventModifierFlagOption),
+        )
+        controller = SimpleNamespace(
+            _navigate_workspace_track=Mock(),
+            _navigate_workspace_selection=Mock(),
+        )
+
+        handled = AdventureMapController.handleWorkspaceKeyEvent_.callable(
+            controller, event
+        )
+
+        self.assertFalse(handled)
+        controller._navigate_workspace_track.assert_not_called()
+        controller._navigate_workspace_selection.assert_not_called()
+
+    def test_command_arrow_uses_track_navigation(self):
+        event = SimpleNamespace(
+            charactersIgnoringModifiers=Mock(return_value="\uf702"),
+            characters=Mock(return_value="\uf702"),
+            keyCode=Mock(return_value=123),
+            modifierFlags=Mock(return_value=NSEventModifierFlagCommand),
+        )
+        controller = SimpleNamespace(
+            _navigate_workspace_track=Mock(return_value=True),
+            _navigate_workspace_selection=Mock(),
+        )
+
+        handled = AdventureMapController.handleWorkspaceKeyEvent_.callable(
+            controller, event
+        )
+
+        self.assertTrue(handled)
+        controller._navigate_workspace_track.assert_called_once_with(-1)
+        controller._navigate_workspace_selection.assert_not_called()
+
+    def test_gpx_drop_name_prefers_document_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "route.gpx"
+            path.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+                <gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
+                  <metadata><name>A Walk Along the Rhine</name></metadata>
+                  <trk><name>Stage 1</name><trkseg/></trk>
+                </gpx>""",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                suggested_adventure_name_for_gpx_drop([path]),
+                "A Walk Along the Rhine",
+            )
+
+    def test_gpx_drop_name_uses_filename_for_placeholder_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Ahr Valley Route.gpx"
+            path.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+                <gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
+                  <metadata><name>Untitled</name></metadata>
+                  <trk><trkseg/></trk>
+                </gpx>""",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                suggested_adventure_name_for_gpx_drop([path]),
+                "Ahr Valley Route",
+            )
+
+    def test_pending_new_adventure_is_saved_after_tracks_finish_loading(self):
+        track = SimpleNamespace(nr=1)
+        controller = SimpleNamespace(
+            pending_create_after_gpx_load=True,
+            adventure_file=Path("/tmp/My Walk.adv"),
+            saveWorkspace_=Mock(return_value=True),
+            _journal=Mock(),
+            _alert=Mock(),
+            gpx_controller=SimpleNamespace(
+                _fully_untimed_route=Mock(return_value=False),
+            ),
+        )
+
+        AdventureMapController.workspace_tracks_did_load(controller, [track])
+
+        self.assertFalse(controller.pending_create_after_gpx_load)
+        controller.saveWorkspace_.assert_called_once_with(None)
+        controller._alert.assert_not_called()
+
+    def test_existing_adventure_drop_rejects_folder_without_adventure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = SimpleNamespace(
+                _choose_adventure_or_project_path=Mock(
+                    return_value=Path(directory)
+                ),
+                _alert=Mock(),
+                pending_workspace_drop_after_adventure_load=[],
+            )
+
+            opened = AdventureMapController._open_existing_adventure_for_pending_drop(
+                controller,
+                [Path("/tmp/route.gpx")],
+                Path("/tmp/route.gpx"),
+            )
+
+        self.assertFalse(opened)
+        controller._alert.assert_called_once()
+        self.assertEqual(controller.pending_workspace_drop_after_adventure_load, [])
+
+    def test_workspace_media_icons_can_be_hidden_and_shown_without_changing_data(self):
+        plot_view = SimpleNamespace(
+            show_media_markers=True,
+            photo_thumbnail_hit_targets=["thumbnail"],
+            setNeedsDisplay_=Mock(),
+        )
+        gpx_controller = SimpleNamespace(set_status=Mock())
+        controller = SimpleNamespace(
+            show_media_icons=True,
+            plot_view=plot_view,
+            media_clusters=["cluster"],
+            media_hit_targets=["target"],
+            gpx_controller=gpx_controller,
+        )
+
+        AdventureMapController.toggleWorkspaceMediaIcons_.callable(controller, None)
+
+        self.assertFalse(controller.show_media_icons)
+        self.assertFalse(plot_view.show_media_markers)
+        self.assertEqual(controller.media_clusters, [])
+        self.assertEqual(controller.media_hit_targets, [])
+        self.assertEqual(plot_view.photo_thumbnail_hit_targets, [])
+        gpx_controller.set_status.assert_called_with("All media icons are hidden.")
+
+        AdventureMapController.toggleWorkspaceMediaIcons_.callable(controller, None)
+
+        self.assertTrue(controller.show_media_icons)
+        self.assertTrue(plot_view.show_media_markers)
+        gpx_controller.set_status.assert_called_with("Showing all media icons.")
+
+    def test_media_only_startup_applies_extent_once(self):
+        extent = {"min_x": 1.0, "max_x": 5.0, "min_y": 2.0, "max_y": 8.0}
+        fitted = {"min_x": 0.0, "max_x": 6.0, "min_y": 2.0, "max_y": 8.0}
+        plot_view = SimpleNamespace(
+            bounds=lambda: SimpleNamespace(
+                size=SimpleNamespace(width=1200.0, height=800.0)
+            ),
+            set_interactive_viewport=Mock(),
+        )
+        gpx_controller = SimpleNamespace(
+            maximum_map_zoom=19,
+            fit_extent_to_aspect=Mock(return_value=fitted),
+            effective_tile_zoom=Mock(return_value=(9, {})),
+        )
+        controller = SimpleNamespace(
+            startup_media_extent_pending=True,
+            plot_view=plot_view,
+            gpx_controller=gpx_controller,
+            overview_viewport=None,
+            _journal=Mock(),
+        )
+
+        applied = AdventureMapController._apply_startup_media_extent(
+            controller, extent
+        )
+
+        self.assertTrue(applied)
+        self.assertFalse(controller.startup_media_extent_pending)
+        self.assertEqual(controller.overview_viewport, {"extent": fitted, "zoom": 9})
+        plot_view.set_interactive_viewport.assert_called_once_with(fitted, 9)
+
     def test_deleted_workspace_tracks_clear_old_extent_and_refit(self):
         plot_view = object()
         controller = SimpleNamespace(
@@ -181,7 +559,9 @@ class GUIStartupPathTests(unittest.TestCase):
         )
 
     def test_adventure_autosave_uses_recovery_then_real_file(self):
-        self.assertEqual(adventure_autosave_delays(True), (1.0, 2.0))
+        self.assertEqual(adventure_autosave_delays(True), (1.0, 60.0))
+        self.assertEqual(adventure_autosave_delays(True, 120.0), (1.0, 120.0))
+        self.assertEqual(adventure_autosave_delays(True, 2.0), (1.0, 15.0))
         self.assertEqual(adventure_autosave_delays(False), (1.0, None))
 
     def test_control_map_validation_reports_unavailable_maps(self):

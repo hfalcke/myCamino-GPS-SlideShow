@@ -7,7 +7,9 @@ screen. Press **h** there for its complete keyboard help.
 ## Build an Adventure
 
 1. Drop an existing Adventure file or project folder onto the Adventure Map,
-   or drop one or more GPX files to begin a new Adventure.
+   or drop one or more GPX files to begin a new Adventure. With no Adventure
+   open, myCamino explains what will be created and lets you name the Adventure,
+   choose or create its folder, or open an existing Adventure instead.
 2. Drop photographs and videos onto the map. Choose **Add to Slide Show** to
    copy them into the Adventure and prepare their metadata. Choose **Create or
    Extend Track** when the media locations should instead become GPX points.

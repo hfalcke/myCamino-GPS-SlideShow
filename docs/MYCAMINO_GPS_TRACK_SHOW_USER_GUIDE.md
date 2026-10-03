@@ -58,21 +58,39 @@ to select it and double-click it to open the Track Table. From there,
 double-click its row to open the Waypoint Table; the map context menu can open
 either table directly. Nearby tracks remain visible but subdued. Double-click empty map space or press
 `Cmd-0` to return to the complete overview. The map preserves geographic
-proportions while resizing; black margins are used instead of stretching map
-tiles when the window and map have different shapes.
+proportions while resizing. The complete square world projection is surrounded
+by an ocean-colored background in a wide window instead of stretching map
+tiles; the added background is decorative and has no map coordinates. During
+zooming, panning, track fitting, and Adventure loading, already loaded map tiles
+remain visible at their correct geographic positions until sharper or broader
+tiles replace them. The map therefore does not pass through a black frame while
+the replacement tiles are loading.
 
 Click a numbered media group to select all media in it. Command-click adds or
 removes another group. Command-drag from empty map space to draw a black selection
 rectangle and add the enclosed groups or thumbnails; a simple empty-map click
 clears the selection. Selected media have a red outline. Right-click a media
 group to fit all selected media to the map or create a new track from their
-GPS positions. Ordinary dragging and two-finger scrolling pan the map.
+GPS positions. The map context menu can hide all media icons and show them
+again without changing the control file or media selection. Ordinary dragging
+and two-finger scrolling pan the map. The four arrow keys move backward or
+forward through whichever waypoint or media icon is selected; a newly selected
+medium is drawn on top. If the destination is outside the current viewport, the
+map pans just enough to reveal it without changing scale. Command-arrow selects
+the previous or next visible track and fits it to the window. Option-arrow
+continues to pan the map directly.
 
 You may also drop GPX tracks, photos, videos, audio, a control file, or a media
 folder. Fast media metadata preparation runs in the background and never
 regenerates map images. The small activity indicator shows the current phase;
 click it for the complete processing journal. Work that has not yet
 been saved is regularly placed in temporary crash-recovery snapshots.
+
+If no Adventure is open when GPX files are dropped, myCamino first explains
+that a project folder is needed. You can name a new Adventure and select or
+create its folder, open an existing Adventure instead, or cancel without
+changing anything. The normal GPX import, autosave, and recovery mechanisms are
+then used; this step does not create a separate kind of project.
 
 myCamino also checks the active Adventure at startup and while it remains open.
 After a newly copied photo or video has stopped changing, metadata is prepared
@@ -115,11 +133,13 @@ items and shows a small line with the last successful server connection; a
 temporary unavailable indication appears there after a failed manual check.
 
 The map itself has no permanent button strip. Its transparent startup message
-also reminds you that `h` opens help. Keyboard shortcuts are `Cmd-G`, `Cmd-E`,
-`Cmd-L`, `Cmd-S`, Space, and `h`; `Cmd-Q` quits. Two-finger scrolling moves the
-map in the same direction as your fingers, while dragging continues to grab
-and move the map directly. Experts who prefer the former control-first startup
-can pass `--full-gui`.
+also reminds you that `h` opens a scrollable list of all Adventure Map and map
+editing keys. The main shortcuts include `Cmd-O`, `Cmd-G`, `Cmd-E`, `Cmd-L`,
+`Cmd-S`, `Cmd-,`, `Cmd-0`, Space, and `h`. A plain `q` closes the map and quits
+when it is the last window; `Cmd-Q` always quits myCamino. Two-finger scrolling
+moves the map in the same direction as your fingers, while dragging continues
+to grab and move the map directly. Experts who prefer the former control-first
+startup can pass `--full-gui`.
 
 After installation, start the application by clicking the
 **myCamino GPS Track Show** icon in Applications. Because the beta is unsigned,
@@ -1238,6 +1258,12 @@ order. Hidden tracks remain part of that order, but appear gray and are not
 included in the bold summary row's visible-track count. If existing generated
 maps match by track fingerprint, myCamino relinks their numbered filenames and
 metadata without downloading tiles or rendering the images again.
+
+The **Show** column is a checkbox. Clicking it changes visibility immediately
+without changing the track selection. Adventure edits are checkpointed at the
+fixed **Autosave interval** in Settings, which defaults to one minute. Manual
+Save, starting the slideshow, changing projects, and quitting still save
+immediately.
 
 ## What Files Are in a Finished Project Directory
 

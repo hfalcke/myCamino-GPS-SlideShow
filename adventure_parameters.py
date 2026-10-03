@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 24
+PARAMETER_SCHEMA_VERSION = 25
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -40,6 +40,7 @@ def _choice(*items: tuple[str, str]) -> tuple[tuple[str, str], ...]:
 
 
 PARAMETER_SPECS = (
+    ParameterSpec("adventure.autosave_interval_seconds", "Adventure", "Autosave interval", 60.0, "float", "Save changed Adventure files at this fixed interval. Immediate Save, slideshow launch, project switching, and quitting still save at once.", 15.0, 600.0, unit="s"),
     ParameterSpec("slideshow.media_duration_seconds", "Slide Show", "Media duration", 3.0, "float", "Minimum display time for a photo in automatic playback.", 0.1, 3600.0, unit="s"),
     ParameterSpec("slideshow.transition", "Slide Show", "Initial style", "time_lapse", "choice", "Initial playback style. Use t/T during playback to cycle through all styles.", choices=_choice(("time_lapse", "Time-Lapse"), ("blend", "Blend"), ("fade", "Fade"), ("switch", "Switch"), ("expand", "Expand"), ("collage", "Collage"), ("quad", "Quad"), ("random", "Random"))),
     ParameterSpec("slideshow.transition_duration_ms", "Slide Show", "Transition duration", 700, "int", "Duration of animated image transitions.", 0, 10000, advanced=True, unit="ms"),

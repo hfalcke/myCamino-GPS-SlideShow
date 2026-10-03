@@ -3,6 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/ops/mycamino_env.sh"
+if [[ "${MYCAMINO_LOCK_HELD:-0}" != "1" ]]; then
+  exec python3 -m ops_control.operation_lock bash "$ROOT_DIR/build_dmg.sh" "$@"
+fi
 
 PYTHON="${PYTHON:-./.venv/bin/python}"
 PYINSTALLER="${PYINSTALLER:-./.venv/bin/pyinstaller}"

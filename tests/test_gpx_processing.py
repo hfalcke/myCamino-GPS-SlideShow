@@ -16,6 +16,7 @@ from gpx_processing import (
     geometry_fingerprint_from_segments,
     process_raw_points,
     process_track_element,
+    processing_input_fingerprint,
     processing_cache_info,
     raw_track_geometry_fingerprint,
     semantic_track_fingerprint,
@@ -234,6 +235,35 @@ class SharedGpxProcessingTests(unittest.TestCase):
         self.assertEqual(semantic_track_fingerprint(track), original)
         editor.set("order_number", "42")
         self.assertEqual(semantic_track_fingerprint(track), original)
+
+    def test_processing_fingerprint_ignores_editor_metadata(self):
+        track = track_xml(
+            [[
+                {"lat": 50.0, "lon": 7.0, "ele": 100, "time": "2026-01-01T10:00:00Z"},
+                {"lat": 50.1, "lon": 7.1, "ele": 110, "time": "2026-01-01T11:00:00Z"},
+            ]]
+        )
+        original = processing_input_fingerprint(track)
+        ET.SubElement(track, f"{{{GPX_NAMESPACE}}}name").text = "Renamed"
+        extensions = ET.SubElement(track, f"{{{GPX_NAMESPACE}}}extensions")
+        ET.SubElement(
+            extensions,
+            "mycamino_gpx_editor",
+            {"hidden": "yes", "order_number": "42"},
+        )
+        self.assertEqual(processing_input_fingerprint(track), original)
+
+    def test_processing_fingerprint_detects_relevant_point_changes(self):
+        track = track_xml(
+            [[
+                {"lat": 50.0, "lon": 7.0, "ele": 100, "time": "2026-01-01T10:00:00Z"},
+                {"lat": 50.1, "lon": 7.1, "ele": 110, "time": "2026-01-01T11:00:00Z"},
+            ]]
+        )
+        original = processing_input_fingerprint(track)
+        point = track.find(f".//{{{GPX_NAMESPACE}}}trkpt")
+        point.set("lat", "50.2")
+        self.assertNotEqual(processing_input_fingerprint(track), original)
 
     def test_raw_geometry_fingerprint_ignores_metadata_but_preserves_segments(self):
         track = track_xml(
@@ -486,6 +516,8 @@ class SharedGpxProcessingTests(unittest.TestCase):
             )
             document = load_gpx_document(path)
         self.assertEqual(document.report.converted_routes, 1)
+        self.assertEqual(document.document_name, "route")
+        self.assertFalse(document.document_name_is_explicit)
         self.assertTrue(document.tracks[0].tag.endswith("}trk"))
         self.assertEqual(
             len(document.tracks[0].findall(".//{http://www.topografix.com/GPX/1/1}trkpt")),
@@ -512,6 +544,8 @@ class SharedGpxProcessingTests(unittest.TestCase):
             )
             document = load_gpx_document(path)
         self.assertEqual(document.report.converted_waypoint_tracks, 1)
+        self.assertEqual(document.document_name, "Stops")
+        self.assertTrue(document.document_name_is_explicit)
         points = document.tracks[0].findall(
             ".//{http://www.topografix.com/GPX/1/1}trkpt"
         )

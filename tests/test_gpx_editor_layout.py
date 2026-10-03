@@ -2,6 +2,7 @@ import copy
 import unittest
 import xml.etree.ElementTree as ET
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from datetime import timedelta
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from unittest.mock import Mock, patch
 from interactive_tile_viewport import visible_tiles, zoomed_extent
 
 from GPXEditor import (
+    EditorTableDataSource,
     GPXEditorController,
     PlotView,
     TRACK_SORT_CRITERIA,
@@ -34,6 +36,7 @@ from GPXEditor import (
     remember_untimed_track_identities,
     renumber_track_records,
     reordered_selected_items,
+    resolved_gpx_document_name,
     sampled_polyline_points,
     selected_tracks_export_filename,
     suppressed_untimed_track_identities,
@@ -62,6 +65,162 @@ class FakeDefaults:
 
 
 class InspectorPointSelectionTests(unittest.TestCase):
+    def test_adventure_fitted_track_view_keeps_selected_track_overlay(self):
+        point = object()
+        segment = SimpleNamespace(points=[point])
+        track = SimpleNamespace(nr=3, hidden=False)
+        controller = SimpleNamespace(
+            selected_nrs=[3],
+            tracks=[track],
+            track_load_timer=None,
+            display_track_geometry=Mock(
+                return_value=SimpleNamespace(segments=[segment])
+            ),
+        )
+        view = SimpleNamespace(
+            mode="track",
+            adventure_workspace_delegate=object(),
+            controller=controller,
+            draw_track=Mock(),
+        )
+
+        PlotView.draw_selected_tracks_overlay(view, Mock())
+
+        view.draw_track.assert_called_once()
+        self.assertEqual(view.draw_track.call_args.args[0], [point])
+        self.assertEqual(view.draw_track.call_args.args[3], 6.0)
+
+    def test_retained_tile_store_keeps_current_targets_when_pruning(self):
+        first = object()
+        protected = object()
+        newest = object()
+        plot = SimpleNamespace(
+            interactive_tiles=OrderedDict(
+                [
+                    ((2, 0, 0), first),
+                    ((12, 100, 100), protected),
+                ]
+            ),
+            interactive_tile_target_keys={(12, 100, 100)},
+        )
+
+        with patch("GPXEditor.INTERACTIVE_TILE_MEMORY_LIMIT", 2):
+            PlotView.remember_interactive_tile(plot, (12, 101, 100), newest)
+
+        self.assertNotIn((2, 0, 0), plot.interactive_tiles)
+        self.assertIs(plot.interactive_tiles[(12, 100, 100)], protected)
+        self.assertIs(plot.interactive_tiles[(12, 101, 100)], newest)
+
+    def test_changing_provider_clears_retained_tiles(self):
+        provider = {"key": "osm"}
+        plot = SimpleNamespace(
+            interactive_tiles=OrderedDict([((2, 0, 0), object())]),
+            interactive_tile_target_keys={(2, 0, 0)},
+            interactive_tile_store_provider_key="osm",
+            interactive_world_ocean_provider_key="osm",
+            interactive_world_ocean_samples=[(0.1, 0.2, 0.3)],
+            interactive_tile_provider_cache_key=lambda: provider["key"],
+        )
+
+        self.assertEqual(
+            PlotView.ensure_interactive_tile_store_provider(plot),
+            "osm",
+        )
+        self.assertTrue(plot.interactive_tiles)
+
+        provider["key"] = "esri"
+        self.assertEqual(
+            PlotView.ensure_interactive_tile_store_provider(plot),
+            "esri",
+        )
+        self.assertEqual(plot.interactive_tiles, {})
+        self.assertEqual(plot.interactive_tile_target_keys, set())
+        self.assertEqual(plot.interactive_world_ocean_samples, [])
+
+    def test_viewport_change_retains_previous_tiles_until_replacements_arrive(self):
+        old_image = object()
+        plot = SimpleNamespace(
+            interactive_tiles=OrderedDict([((2, 2, 2), old_image)]),
+            interactive_tile_target_keys={(2, 2, 2)},
+            plot_info={
+                "metadata": {
+                    "extent_mercator": {
+                        "min_x": 0.0,
+                        "max_x": 1000.0,
+                        "min_y": 0.0,
+                        "max_y": 1000.0,
+                    }
+                },
+                "tile_zoom_level": 2,
+            },
+            controller=SimpleNamespace(
+                effective_tile_zoom=Mock(return_value=(8, {})),
+            ),
+            interactive_tiles_active=True,
+            interactive_tile_generation=4,
+            interactive_provider_failed_generation=None,
+            zoom=3.0,
+            ensure_interactive_tile_store_provider=Mock(return_value="osm"),
+            current_tile_zoom=lambda: 2,
+            cancel_interactive_tile_requests=Mock(),
+            setNeedsDisplay_=Mock(),
+            schedule_interactive_tiles=Mock(),
+        )
+        destination = {
+            "min_x": 100.0,
+            "max_x": 200.0,
+            "min_y": 100.0,
+            "max_y": 200.0,
+        }
+
+        PlotView.set_interactive_viewport(plot, destination, 8)
+
+        self.assertIs(plot.interactive_tiles[(2, 2, 2)], old_image)
+        self.assertEqual(plot.interactive_tile_target_keys, {(2, 2, 2)})
+        self.assertEqual(plot.plot_info["tile_zoom_level"], 8)
+        plot.schedule_interactive_tiles.assert_called_once_with()
+
+    def test_hidden_track_media_markers_do_not_start_thumbnail_work(self):
+        view = SimpleNamespace(
+            cursor=None,
+            show_media_markers=False,
+            photo_thumbnail_hit_targets=["old"],
+            linked_media_for_track=Mock(),
+        )
+
+        PlotView.draw_media_markers(view, object(), None, None)
+
+        self.assertEqual(view.photo_thumbnail_hit_targets, [])
+        view.linked_media_for_track.assert_not_called()
+
+    def test_adventure_name_replaces_only_missing_or_placeholder_document_name(self):
+        path = Path("/tmp/original-route.gpx")
+        missing = SimpleNamespace(
+            document_name="original-route",
+            document_name_is_explicit=False,
+        )
+        placeholder = SimpleNamespace(
+            document_name="Untitled",
+            document_name_is_explicit=True,
+        )
+        named = SimpleNamespace(
+            document_name="Historic Camino",
+            document_name_is_explicit=True,
+        )
+
+        self.assertEqual(
+            resolved_gpx_document_name(missing, path, "My Adventure"),
+            ("My Adventure", True),
+        )
+        self.assertEqual(
+            resolved_gpx_document_name(placeholder, path, "My Adventure"),
+            ("My Adventure", True),
+        )
+        self.assertEqual(
+            resolved_gpx_document_name(named, path, "My Adventure"),
+            ("Historic Camino", False),
+        )
+
     def test_selected_track_export_filename_includes_selection_count(self):
         tracks = [
             SimpleNamespace(name="Coast / Mountain"),
@@ -803,17 +962,121 @@ class TrackBatchOrderTests(unittest.TestCase):
         hidden.set_hidden(True)
         controller = SimpleNamespace(
             selected_tracks=lambda: [visible, hidden],
-            push_undo=Mock(),
-            mark_dirty=Mock(),
-            refresh_open_plot_views=Mock(),
+            ensure_track_mutations_available=Mock(return_value=True),
+            push_visibility_undo=Mock(),
+            mark_visibility_changed=Mock(),
         )
 
         GPXEditorController._set_selected_tracks_hidden(controller, True)
 
         self.assertTrue(visible.hidden)
         self.assertTrue(hidden.hidden)
-        controller.push_undo.assert_called_once_with()
-        controller.mark_dirty.assert_called_once_with("Hidden 1 selected track(s).")
+        controller.push_visibility_undo.assert_called_once_with(
+            {1: False}, {1: True}
+        )
+        controller.mark_visibility_changed.assert_called_once_with(
+            {1}, "Hidden 1 selected track(s)."
+        )
+
+    def test_visibility_refresh_uses_cached_rows_without_recalculation(self):
+        controller = SimpleNamespace(
+            dirty=False,
+            _rebuild_table_rows_from_cached_metrics=Mock(),
+            _reload_visibility_rows=Mock(),
+            set_status=Mock(),
+            track_table=SimpleNamespace(displayIfNeeded=Mock()),
+            _notify_workspace_mutation=Mock(),
+            redraw_open_plot_views=Mock(),
+            recalculate=Mock(),
+        )
+
+        GPXEditorController.mark_visibility_changed(
+            controller, {4}, "Track shown."
+        )
+
+        self.assertTrue(controller.dirty)
+        controller._rebuild_table_rows_from_cached_metrics.assert_called_once_with(
+            reload_table=False
+        )
+        controller.recalculate.assert_not_called()
+        controller.track_table.displayIfNeeded.assert_called_once_with()
+
+    def test_show_column_row_selection_never_changes_visibility(self):
+        track = self.make_track(1, "Visible", "one.gpx")
+        controller = SimpleNamespace(
+            tracks=[track],
+            edit_table_value=Mock(),
+        )
+        data_source = SimpleNamespace(controller=controller)
+
+        show_column = SimpleNamespace(identifier=lambda: "show")
+        table = SimpleNamespace(
+            clickedColumn=lambda: 0,
+            tableColumns=lambda: [show_column],
+        )
+        selected = EditorTableDataSource.tableView_shouldSelectRow_.callable(
+            data_source, table, 0
+        )
+
+        self.assertFalse(selected)
+        self.assertFalse(track.hidden)
+        controller.edit_table_value.assert_not_called()
+
+    def test_non_checkbox_click_still_selects_track_row(self):
+        track = self.make_track(1, "Visible", "one.gpx")
+        controller = SimpleNamespace(tracks=[track])
+        data_source = SimpleNamespace(controller=controller)
+        name_column = SimpleNamespace(identifier=lambda: "name")
+        table = SimpleNamespace(
+            clickedColumn=lambda: 0,
+            tableColumns=lambda: [name_column],
+        )
+
+        selected = EditorTableDataSource.tableView_shouldSelectRow_.callable(
+            data_source, table, 0
+        )
+
+        self.assertTrue(selected)
+
+    def test_show_checkbox_is_not_styled_as_a_text_cell(self):
+        track = self.make_track(1, "Visible", "one.gpx")
+        controller = SimpleNamespace(
+            tracks=[track],
+            track_mutations_enabled=True,
+            table_font=Mock(side_effect=AssertionError("text styling was requested")),
+        )
+        checkbox = SimpleNamespace(setEnabled_=Mock())
+        column = SimpleNamespace(identifier=lambda: "show")
+        data_source = SimpleNamespace(controller=controller)
+
+        EditorTableDataSource.tableView_willDisplayCell_forTableColumn_row_.callable(
+            data_source, Mock(), checkbox, column, 0
+        )
+
+        checkbox.setEnabled_.assert_called_once_with(True)
+        controller.table_font.assert_not_called()
+
+    def test_escape_cancels_active_track_field_edit_without_dirtying(self):
+        track = self.make_track(7, "Original", "one.gpx")
+        table = Mock()
+        table.columnWithIdentifier_.return_value = 3
+        controller = SimpleNamespace(
+            tracks=[track],
+            active_table_edit={"track_nr": 7, "column": "name", "value": "Original"},
+            canceling_table_edit=False,
+            track_table=table,
+            set_status=Mock(),
+            dirty=False,
+            undo_stack=[],
+        )
+
+        GPXEditorController.cancel_active_table_edit(controller)
+
+        table.abortEditing.assert_called_once_with()
+        table.reloadDataForRowIndexes_columnIndexes_.assert_called_once()
+        self.assertIsNone(controller.active_table_edit)
+        self.assertFalse(controller.dirty)
+        self.assertEqual(controller.undo_stack, [])
 
     def test_visible_track_count_excludes_hidden_rows(self):
         tracks = [
@@ -864,6 +1127,7 @@ class TrackBatchOrderTests(unittest.TestCase):
             update_sort_descriptor=Mock(),
             refresh_open_plot_views=Mock(),
             update_selection_field=Mock(),
+            ensure_track_mutations_available=Mock(return_value=True),
         )
 
         GPXEditorController.sort_by_column(

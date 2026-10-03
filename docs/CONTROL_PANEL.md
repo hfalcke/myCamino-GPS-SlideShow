@@ -14,6 +14,47 @@ manage the panel. Closing the browser does not stop it. Set
 
 ## Operations
 
+### Code
+
+- **Commit and Push myCamino Code** asks for a commit message, runs application
+  tests, stages all non-ignored repository changes, commits them, and pushes the
+  current branch to GitHub. This includes existing staged files, new files,
+  documentation, website changes, and any earlier pending commits. Review the
+  checkout and pending-commit lists before confirming. It does not build a DMG
+  or deploy the website.
+- **Build Local DMG** runs `build_dmg.sh` against the current notebook source,
+  including uncommitted changes. The output is
+  `dist/myCamino-GPS-Track-Show.dmg`. It replaces local build products without
+  committing, pushing, changing the version, or publishing the download.
+- **Release App DMG to Website** asks for the version (`X.Y.Z`), release date,
+  and commit message. It uses `release.sh` to update `application_metadata.py`,
+  run tests, commit the exact source, build/verify the DMG, push Git, and publish
+  the download with matching version/date metadata. Both app version constants
+  are updated together. The form shows the current version and defaults the
+  date to today; edit the version for a new numbered release. This changes the
+  live download, not the website's application container. Release retention
+  preserves the active and previous DMGs.
+
+These actions require confirmation and share the website deployment lock.
+Long builds return output when finished; keep the results tab open. A failure
+stops later steps but does not undo a version edit or a completed local commit.
+A failed push preserves the commit; a failed upload may occur after the source
+has already been pushed. Check the result before retrying. Never force-push to
+work around a rejected push.
+
+The release script can also update the version from the terminal:
+
+```bash
+./release.sh --version 0.9.2 --date 2026-10-03 -m "Prepare version 0.9.2"
+```
+
+Without the new flags it keeps the existing metadata, as before. `--version`
+without `--date` uses today's date. Merely opening the panel or changing form
+fields does not change the program version. Direct `release.sh` and
+`build_dmg.sh` invocations also share the operation lock.
+
+### Website and feedback
+
 - **Release myCamino Website (All Steps)** checks and publishes website and
   operator code, waits for the matching GitHub image build, then deploys and
   smoke-tests only the website service. It does not rebuild the desktop app.
@@ -41,7 +82,7 @@ and website-release CLI; wait for a running operation before starting another.
 Each operation has an explanation on the home page, confirmation page, and
 results page. Read-only checks are identified separately from modifying actions.
 
-Desktop application releases continue to use `./release.sh`. Website publishing
+The Code release action uses `./release.sh`. Website publishing
 does not stage desktop application files or the user guides automatically.
 It refuses already-staged changes and refuses to push existing outgoing commits
 that contain application work. Review and publish those commits separately when

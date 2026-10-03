@@ -1,25 +1,99 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import io
 import unittest
+
+from PIL import Image
 
 from interactive_tile_viewport import (
     TileCoordinate,
     WEB_MERCATOR_HALF_WORLD_M,
     aspect_preserving_rect,
     clamp_extent_to_web_mercator,
+    is_complete_world_extent,
+    panned_extent_to_include_point,
+    retained_tile_draw_order,
+    sample_world_ocean_rgb_from_png,
     shifted_extent,
     scroll_pan_deltas,
     tile_bounds_mercator,
-    tile_coverage_complete,
+    tile_intersects_extent,
     tile_zoom_after_scale,
     tile_zoom_for_viewport,
     visible_tiles,
+    world_ocean_sample_pixels,
     mouse_wheel_zoom_factor,
     zoomed_extent,
 )
 
 
 class InteractiveTileViewportTests(unittest.TestCase):
+    def test_complete_world_extent_is_distinguished_from_a_zoomed_view(self):
+        limit = WEB_MERCATOR_HALF_WORLD_M
+        world = {
+            "min_x": -limit,
+            "max_x": limit,
+            "min_y": -limit,
+            "max_y": limit,
+        }
+        self.assertTrue(is_complete_world_extent(world))
+        self.assertFalse(
+            is_complete_world_extent({**world, "min_x": -limit * 0.95})
+        )
+
+    def test_ocean_samples_use_only_world_edge_tiles_near_equator(self):
+        self.assertTrue(world_ocean_sample_pixels(TileCoordinate(2, 0, 1), 256, 256))
+        self.assertTrue(world_ocean_sample_pixels(TileCoordinate(2, 3, 2), 256, 256))
+        self.assertEqual(
+            world_ocean_sample_pixels(TileCoordinate(2, 1, 1), 256, 256),
+            [],
+        )
+        self.assertEqual(
+            world_ocean_sample_pixels(TileCoordinate(2, 0, 0), 256, 256),
+            [],
+        )
+
+    def test_zoom_zero_samples_both_antimeridian_edges(self):
+        self.assertEqual(
+            world_ocean_sample_pixels(TileCoordinate(0, 0, 0), 256, 256),
+            [(2, 128), (253, 128)],
+        )
+
+    def test_ocean_color_is_sampled_from_candidate_png_only(self):
+        output = io.BytesIO()
+        Image.new("RGB", (16, 16), (51, 128, 204)).save(output, format="PNG")
+
+        samples = sample_world_ocean_rgb_from_png(
+            output.getvalue(),
+            TileCoordinate(0, 0, 0),
+        )
+
+        self.assertEqual(len(samples), 2)
+        for sample in samples:
+            self.assertAlmostEqual(sample[0], 0.2)
+            self.assertAlmostEqual(sample[1], 128 / 255.0)
+            self.assertAlmostEqual(sample[2], 0.8)
+        self.assertEqual(
+            sample_world_ocean_rgb_from_png(
+                output.getvalue(),
+                TileCoordinate(2, 1, 1),
+            ),
+            [],
+        )
+
+        transparent = io.BytesIO()
+        Image.new("RGBA", (16, 16), (51, 128, 204, 0)).save(
+            transparent,
+            format="PNG",
+        )
+        self.assertEqual(
+            sample_world_ocean_rgb_from_png(
+                transparent.getvalue(),
+                TileCoordinate(0, 0, 0),
+            ),
+            [],
+        )
+
     def test_mouse_wheel_uses_one_stable_zoom_step(self):
         self.assertAlmostEqual(mouse_wheel_zoom_factor(1.0), 2.0 ** 0.25)
         self.assertAlmostEqual(mouse_wheel_zoom_factor(-1.0), 2.0 ** -0.25)
@@ -104,11 +178,38 @@ class InteractiveTileViewportTests(unittest.TestCase):
             {(x, y) for x in range(4) for y in range(4)},
         )
 
-    def test_transition_fallback_retires_only_after_complete_coverage(self):
-        expected = {(12, 1, 2), (12, 2, 2), (12, 1, 3)}
-        self.assertFalse(tile_coverage_complete(expected, {(12, 1, 2), (12, 2, 2)}))
-        self.assertTrue(tile_coverage_complete(expected, expected))
-        self.assertTrue(tile_coverage_complete(set(), set()))
+    def test_retained_tiles_are_drawn_coarse_to_exact_target(self):
+        target = tile_bounds_mercator(TileCoordinate(4, 8, 8))
+        keys = {
+            (2, 2, 2),
+            (4, 8, 8),
+            (6, 32, 32),
+            (4, 0, 0),
+        }
+
+        ordered = retained_tile_draw_order(keys, target, 4)
+
+        self.assertEqual(ordered, [(2, 2, 2), (6, 32, 32), (4, 8, 8)])
+
+    def test_retained_tile_intersection_excludes_unrelated_regions(self):
+        extent = tile_bounds_mercator(TileCoordinate(3, 4, 4))
+
+        self.assertTrue(tile_intersects_extent(TileCoordinate(2, 2, 2), extent))
+        self.assertTrue(tile_intersects_extent(TileCoordinate(4, 8, 8), extent))
+        self.assertFalse(tile_intersects_extent(TileCoordinate(3, 0, 0), extent))
+
+    def test_point_navigation_pans_only_when_target_leaves_safe_view(self):
+        extent = {"min_x": 0.0, "max_x": 100.0, "min_y": 0.0, "max_y": 50.0}
+
+        self.assertEqual(
+            panned_extent_to_include_point(extent, 50.0, 25.0),
+            extent,
+        )
+        shifted = panned_extent_to_include_point(extent, 130.0, -20.0)
+        self.assertEqual(shifted["max_x"] - shifted["min_x"], 100.0)
+        self.assertEqual(shifted["max_y"] - shifted["min_y"], 50.0)
+        self.assertEqual(shifted["max_x"], 140.0)
+        self.assertEqual(shifted["min_y"], -25.0)
 
     def test_shifted_extent_uses_viewport_fraction(self):
         extent = {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 500.0}

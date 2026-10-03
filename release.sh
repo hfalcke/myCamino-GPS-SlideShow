@@ -3,12 +3,18 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/ops/mycamino_env.sh"
+if [[ "${MYCAMINO_LOCK_HELD:-0}" != "1" ]]; then
+  exec python3 -m ops_control.operation_lock bash "$ROOT_DIR/release.sh" "$@"
+fi
 
 PYTHON="${PYTHON:-./.venv/bin/python}"
 REMOTE="${REMOTE:-origin}"
 DMG_PATH="dist/myCamino-GPS-Track-Show.dmg"
 COMMIT_MESSAGE=""
 ASSUME_YES=0
+NEW_VERSION=""
+NEW_RELEASE_DATE=""
 
 usage() {
   cat <<'EOF'
@@ -17,10 +23,13 @@ Build, commit, and publish a myCamino release.
 Usage:
   ./release.sh -m "Commit message"
   ./release.sh --yes -m "Commit message"
+  ./release.sh --version 0.9.2 --date 2026-10-03 -m "Prepare 0.9.2"
 
 Options:
   -m, --message TEXT  Required Git commit message.
   -y, --yes           Run without the confirmation prompt.
+  --version X.Y.Z    Update the app and website release version before building.
+  --date YYYY-MM-DD  Release date (defaults to today with --version).
   -h, --help          Show this help.
 
 Environment overrides:
@@ -47,6 +56,11 @@ while [[ $# -gt 0 ]]; do
       ASSUME_YES=1
       shift
       ;;
+    --version|--date)
+      [[ $# -ge 2 ]] || { echo "Error: $1 requires a value." >&2; exit 2; }
+      if [[ "$1" == "--version" ]]; then NEW_VERSION="$2"; else NEW_RELEASE_DATE="$2"; fi
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -69,9 +83,17 @@ done
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Error: not inside a Git worktree." >&2; exit 1; }
 git remote get-url "$REMOTE" >/dev/null 2>&1 || { echo "Error: Git remote '$REMOTE' does not exist." >&2; exit 1; }
 
-RELEASE_LABEL="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import full_version_label; print(full_version_label())')"
-RELEASE_DATE="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import APP_RELEASE_DATE; print(APP_RELEASE_DATE)')"
-BUNDLE_VERSION="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import APP_BUNDLE_VERSION; print(APP_BUNDLE_VERSION)')"
+if [[ -n "$NEW_VERSION" ]]; then
+  NEW_RELEASE_DATE="${NEW_RELEASE_DATE:-$(date +%F)}"
+  RELEASE_LABEL="$(python3 -m ops_control.app_code version --check --version "$NEW_VERSION" --date "$NEW_RELEASE_DATE")"
+  RELEASE_DATE="$NEW_RELEASE_DATE"
+  BUNDLE_VERSION="$NEW_VERSION"
+else
+  [[ -z "$NEW_RELEASE_DATE" ]] || { echo "Error: --date requires --version." >&2; exit 2; }
+  RELEASE_LABEL="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import full_version_label; print(full_version_label())')"
+  RELEASE_DATE="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import APP_RELEASE_DATE; print(APP_RELEASE_DATE)')"
+  BUNDLE_VERSION="$(PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON" -c 'from application_metadata import APP_BUNDLE_VERSION; print(APP_BUNDLE_VERSION)')"
+fi
 
 BRANCH="$(git branch --show-current)"
 [[ -n "$BRANCH" ]] || { echo "Error: cannot release from a detached HEAD." >&2; exit 1; }
@@ -81,6 +103,9 @@ for state_ref in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
     echo "Error: an unfinished Git operation is active ($state_ref). Finish or abort it first." >&2
     exit 1
   fi
+done
+for state_dir in rebase-merge rebase-apply; do
+  [[ ! -d "$(git rev-parse --git-path "$state_dir")" ]] || { echo "Error: finish the active rebase first." >&2; exit 1; }
 done
 
 echo "Release summary"
@@ -102,8 +127,14 @@ if [[ "$ASSUME_YES" -ne 1 ]]; then
   esac
 fi
 
+if [[ -n "$NEW_VERSION" ]]; then
+  echo "==> Updating authoritative application version and release date"
+  python3 -m ops_control.app_code version --version "$NEW_VERSION" --date "$NEW_RELEASE_DATE"
+fi
+
 echo "==> Checking patch formatting"
 git --no-pager diff --check
+git --no-pager diff --cached --check
 
 echo "==> Running test suite"
 "$PYTHON" -m unittest discover -s tests
@@ -112,7 +143,7 @@ echo "==> Staging all repository changes"
 git add --all
 
 if git diff --cached --quiet; then
-  echo "==> No source changes to commit; the DMG was built successfully."
+  echo "==> No source changes to commit; building the existing revision."
 else
   git --no-pager diff --cached --check
   git status --short

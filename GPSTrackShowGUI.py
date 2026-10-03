@@ -236,6 +236,8 @@ from adventure_parameters import (
 )
 from cocoa_parameter_editor import CocoaParameterEditor
 from cocoa_map_provider_setup import configure_hosted_provider, run_map_provider_setup
+from cocoa_gpx_recovery import recover_missing_adventure_gpx
+from gpx_adventure_identity import build_gpx_identity
 from json_storage import atomic_write_json
 from adventure_files import (
     ADVENTURE_FORMAT_VERSION,
@@ -2502,6 +2504,7 @@ class GPXTrackerController(NSObject):
         self.current_project_file = None
         self.current_control_file = None
         self.track_map_base = ""
+        self.gpx_identity = None
         self.adventure_records = []
         self.adventure_templates = []
         self.adventure_combo_entries = []
@@ -2527,6 +2530,7 @@ class GPXTrackerController(NSObject):
         self.hosted_by_adventure_map = False
         self.adventure_map_host = None
         self.project_media_watcher = None
+        self.project_gpx_watcher = None
         self.project_media_watch_seen_paths = set()
         self.pending_discovered_media = set()
         self.discovered_media_retry_scheduled = False
@@ -4189,19 +4193,29 @@ class GPXTrackerController(NSObject):
     def schedule_adventure_autosave(self, immediate=False):
         if self.adventure_autosave_suspended or self.current_project_file is None:
             return
-        self.cancel_adventure_autosave()
-        delay = 0.0 if immediate else 0.5
+        if immediate:
+            self.performAdventureAutosave_(None)
+            return
+        if self.adventure_autosave_timer is not None:
+            return
+        interval = max(
+            15.0,
+            min(
+                600.0,
+                float(self.parameters.get("adventure.autosave_interval_seconds", 60.0)),
+            ),
+        )
         self.adventure_autosave_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            delay,
+            interval,
             self,
             "performAdventureAutosave:",
             None,
-            False,
+            True,
         )
 
     def performAdventureAutosave_(self, _timer):
-        self.adventure_autosave_timer = None
-        self._write_project_configuration(status_prefix="Auto-saved adventure")
+        if self.project_payload_changed():
+            self._write_project_configuration(status_prefix="Auto-saved adventure")
 
     def flush_adventure_autosave(self):
         self.cancel_adventure_autosave()
@@ -4387,8 +4401,7 @@ class GPXTrackerController(NSObject):
     def _gpx_field_basename(self):
         text = str(self.gpx_field.stringValue()).strip()
         if not text:
-            default_path = self._default_gpx_path()
-            return default_path.name if default_path is not None else ""
+            return ""
         first = text.split(";")[0].strip()
         return Path(first).name
 
@@ -5906,13 +5919,14 @@ class GPXTrackerController(NSObject):
         self.refresh_workflow_assistant()
 
     def _collect_project_payload(self):
-        return {
+        payload = {
             "adventure_format_version": ADVENTURE_FORMAT_VERSION,
             "project_name": str(self.title_field.stringValue()).strip(),
             "project_directory": str(self.current_project_dir) if self.current_project_dir else "",
             "description": self._description_string(),
             "title_image": self._stored_optional_project_path(self.title_image),
             "gpx_file": self._gpx_field_basename(),
+            "gpx_identity": self.gpx_identity,
             "control_file": self._control_file_path().name if self._control_file_path() is not None else "",
             "track_map_base": self.track_map_base or project_filename_base(self._current_project_name()),
             "last_picture_import_directory": str(self.last_picture_import_directory) if self.last_picture_import_directory else "",
@@ -5933,6 +5947,9 @@ class GPXTrackerController(NSObject):
             "ui": {"audio_section_expanded": bool(self.audio_section_expanded)},
             "workflow_assistant": dict(self.workflow_assistant_state),
         }
+        if self.gpx_identity is None:
+            payload.pop("gpx_identity", None)
+        return payload
 
     def _stored_optional_project_path(self, value):
         """Store project-contained optional paths relatively and external paths absolutely."""
@@ -6332,6 +6349,7 @@ class GPXTrackerController(NSObject):
             self.committed_adventure_name = ""
             self._set_adventure_name_editing(True)
             self.track_map_base = suggested
+            self.gpx_identity = None
             self._set_gpx_field_value(f"{suggested}.gpx", manual=False)
             self.current_control_file = resolved / f"{suggested}-sorted.lst"
             self.control_file_field.setStringValue_(self.current_control_file.name)
@@ -6473,6 +6491,7 @@ class GPXTrackerController(NSObject):
         self.title_field.setStringValue_(str(data.get("project_name", "") or ""))
         self.committed_adventure_name = str(data.get("project_name", "") or "")
         self.track_map_base = str(data["track_map_base"])
+        self.gpx_identity = data.get("gpx_identity")
         self.description_text.setString_(str(data.get("description", "") or ""))
         self.title_image = self._resolve_optional_project_path(
             data.get("title_image")
@@ -6960,12 +6979,18 @@ class GPXTrackerController(NSObject):
     def load_project_configuration(self, adv_path, flush_current=True):
         if flush_current and self.current_project_file is not None and not self.flush_adventure_autosave():
             return False
+        recovery_review_requested = False
         try:
             record = load_adventure(adv_path)
-            data = record.payload
+            data = dict(record.payload)
         except AdventureFormatError as exc:
             show_alert("Could not load adventure.", str(exc))
             return False
+        referenced_gpx = str(data.get("gpx_file", "")).strip()
+        if referenced_gpx and not (record.path.parent / referenced_gpx).is_file():
+            recovery = recover_missing_adventure_gpx(record.path, data)
+            data = recovery.payload
+            recovery_review_requested = bool(recovery.review_requested)
 
         self._stop_project_media_watcher()
         old_audio_details_visible = bool(
@@ -7004,6 +7029,9 @@ class GPXTrackerController(NSObject):
             self.saved_project_payload = dict(data)
             self.mark_dirty(immediate=True)
         self._start_project_media_watcher()
+        if recovery_review_requested:
+            self.pending_control_update_offer_after_status = []
+            self.performSelector_withObject_afterDelay_("makePlots:", None, 0.0)
         return True
 
     def confirm_close(self):
@@ -7090,6 +7118,12 @@ class GPXTrackerController(NSObject):
         )
         if changed:
             self.mark_dirty(immediate=True)
+            if (
+                "adventure.autosave_interval_seconds" in changed
+                and getattr(self, "adventure_map_host", None) is None
+            ):
+                self.cancel_adventure_autosave()
+                self.schedule_adventure_autosave()
             sent_live = self._send_running_slideshow_settings(
                 changed,
                 restore_display=restore_slideshow_display,
@@ -8782,6 +8816,11 @@ class GPXTrackerController(NSObject):
         ):
             show_alert("The detected GPX file is no longer available.", str(path))
             return False
+        try:
+            self.gpx_identity = build_gpx_identity(path)
+        except (OSError, ValueError) as exc:
+            show_alert("Could not identify the selected GPX file.", str(exc))
+            return False
         self._set_gpx_field_value(path.name, manual=True)
         self._select_gpx_journey_source()
         self.gpx_ready_cache = None
@@ -10157,6 +10196,10 @@ class GPXTrackerController(NSObject):
         self.project_media_watcher = None
         if watcher is not None:
             watcher.stop()
+        watcher = self.project_gpx_watcher
+        self.project_gpx_watcher = None
+        if watcher is not None:
+            watcher.stop()
 
     def _start_project_media_watcher(self):
         self._stop_project_media_watcher()
@@ -10189,6 +10232,42 @@ class GPXTrackerController(NSObject):
             stability_seconds=1.0,
         )
         self.project_media_watcher.start()
+
+        def discovered_gpx(paths, initial):
+            if initial:
+                return
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "handleProjectGPXDiscovery:", [str(path) for path in paths], False
+            )
+
+        self.project_gpx_watcher = ProjectMediaWatcher(
+            self.current_project_dir,
+            discovered_gpx,
+            extensions={".gpx"},
+            excluded_directories=GENERATED_DIRECTORY_NAMES | {
+                "audio", "narration", "trackimages", ".mycamino", "cache", "caches",
+            },
+            reconciliation_seconds=60.0,
+            stability_seconds=1.0,
+        )
+        self.project_gpx_watcher.start()
+
+    def handleProjectGPXDiscovery_(self, raw_paths):
+        if self.current_project_file is None or self.current_project_dir is None:
+            return
+        referenced = self._gpx_field_basename()
+        if not referenced or (self.current_project_dir / referenced).is_file():
+            return
+        paths = [Path(value).resolve(strict=False) for value in raw_paths]
+        if not paths:
+            return
+        recovery = recover_missing_adventure_gpx(
+            self.current_project_file,
+            self._collect_project_payload(),
+            preferred_candidate=paths[0],
+        )
+        if recovery.action == "accepted":
+            self.load_project_configuration(self.current_project_file, flush_current=False)
 
     def _included_control_media_names(self):
         control_path = self._control_file_path()
@@ -12250,8 +12329,7 @@ class GPXTrackerController(NSObject):
     def _gpx_paths(self):
         text = str(self.gpx_field.stringValue()).strip()
         if not text:
-            default_path = self._default_gpx_path()
-            return [default_path] if default_path is not None else []
+            return []
         paths = []
         for part in text.split(";"):
             item = part.strip()
@@ -18328,6 +18406,10 @@ class GPXTrackerController(NSObject):
                 return False
             generated_activation_confirmed = True
             self._set_gpx_field_value(returned_path.name, manual=not self._is_default_gpx_path(returned_path))
+            try:
+                self.gpx_identity = build_gpx_identity(returned_path)
+            except (OSError, ValueError):
+                self.gpx_identity = None
             self.mark_dirty()
             self._refresh_project_file_menus()
             if returned_path.exists():

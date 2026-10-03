@@ -20,6 +20,7 @@ EARTH_RADIUS_KM = 6371.0088
 DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M = 500.0
 DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH = 1.5
 TRACK_FINGERPRINT_VERSION = 2
+PROCESSING_INPUT_FINGERPRINT_VERSION = 1
 
 HORIZONTAL_ACCURACY_NAMES = {
     "accuracy",
@@ -336,6 +337,52 @@ def semantic_track_fingerprint(track_element: ET.Element) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
+def processing_input_fingerprint(track_element: ET.Element) -> str:
+    """Hash only GPX values that can affect processed track results.
+
+    Editor metadata such as visibility, names, descriptions, and persistent row
+    numbers deliberately does not participate. This lets the startup cache
+    survive presentation-only edits while still invalidating for every point,
+    timing, elevation, segment, or quality-input change.
+    """
+    digest = hashlib.sha256()
+    digest.update(
+        f"track-processing-input-v{PROCESSING_INPUT_FINGERPRINT_VERSION}\n".encode(
+            "ascii"
+        )
+    )
+    for segment in track_element.findall(f"{{{GPX_NAMESPACE}}}trkseg"):
+        digest.update(b"segment\n")
+        for point in segment.findall(f"{{{GPX_NAMESPACE}}}trkpt"):
+            try:
+                latitude = float(point.attrib["lat"])
+                longitude = float(point.attrib["lon"])
+            except (KeyError, TypeError, ValueError):
+                digest.update(b"invalid-point\n")
+                continue
+            elevation = _child_float(point, "ele")
+            time_value = parse_time(
+                point.findtext("gpx:time", default="", namespaces=GPX_NS)
+            )
+            quality = _quality_values(point)
+            satellites = _child_float(point, "sat")
+            fix = point.findtext("gpx:fix", default="", namespaces=GPX_NS).strip()
+            quality_text = "|".join(
+                f"{name}={','.join(_fingerprint_value(value, 6) for value in values)}"
+                for name, values in sorted(quality.items())
+            )
+            digest.update(
+                (
+                    f"{_fingerprint_value(latitude)}\t"
+                    f"{_fingerprint_value(longitude)}\t"
+                    f"{_fingerprint_value(elevation, 6)}\t"
+                    f"{time_value.isoformat() if time_value is not None else ''}\t"
+                    f"{quality_text}\t{_fingerprint_value(satellites, 0)}\t{fix}\n"
+                ).encode("utf-8")
+            )
+    return digest.hexdigest()
+
+
 def _fingerprint_value(value: float | None, precision: int = 9) -> str:
     if value is None:
         return ""
@@ -487,7 +534,7 @@ def process_track_element(
 ) -> ProcessedTrack:
     normalized = (options or ProcessingOptions()).normalized()
     signature = tuple(normalized.as_dict().items())
-    cache_key = (fingerprint or semantic_track_fingerprint(track_element), signature)
+    cache_key = (fingerprint or processing_input_fingerprint(track_element), signature)
     with _PROCESSING_CACHE_LOCK:
         cached = _PROCESSING_CACHE.get(cache_key)
         if cached is not None:

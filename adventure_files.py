@@ -110,6 +110,8 @@ def validate_adventure_payload(payload: object, adv_path: Path | None = None) ->
         raise AdventureFormatError("Adventure filename stem must match project_name")
     for field, suffix in (("gpx_file", ".gpx"), ("control_file", ".lst")):
         reference = str(payload.get(field, ""))
+        if field == "gpx_file" and not reference.strip():
+            continue
         if Path(reference).is_absolute():
             raise AdventureFormatError(f"{field} must be project-relative")
         local_reference(project_directory, reference, suffix)
@@ -379,7 +381,8 @@ def rename_or_copy_adventure(
     target_adv = (project_dir / f"{target_base}.adv").resolve(strict=False)
     old_name = str(current["project_name"])
     old_map_base = str(current["track_map_base"])
-    source_gpx = local_reference(project_dir, current["gpx_file"], ".gpx")
+    gpx_reference = str(current.get("gpx_file", "")).strip()
+    source_gpx = local_reference(project_dir, gpx_reference, ".gpx") if gpx_reference else None
     source_control = local_reference(project_dir, current["control_file"], ".lst")
 
     mapping: dict[Path, Path] = {source_adv: target_adv}
@@ -413,7 +416,7 @@ def rename_or_copy_adventure(
                 )
         target_gpx = (project_dir / f"{target_base}.gpx").resolve(strict=False)
         target_control = (project_dir / f"{target_base}-sorted.lst").resolve(strict=False)
-        if source_gpx.exists():
+        if source_gpx is not None and source_gpx.exists():
             mapping[source_gpx] = target_gpx
         if source_control.exists():
             mapping[source_control] = target_control
@@ -455,7 +458,7 @@ def rename_or_copy_adventure(
                     )
                 except ValueError:
                     target_payload["narration_playlist"] = str(target_narration_playlist)
-        target_payload["gpx_file"] = target_gpx.name
+        target_payload["gpx_file"] = target_gpx.name if source_gpx is not None else ""
         target_payload["control_file"] = target_control.name
         target_payload["track_map_base"] = target_base
 

@@ -13,6 +13,7 @@ from adventure_map_workspace import (
     discover_recovery_sessions,
     media_cluster_belongs_to_track,
     extent_from_track_summary,
+    extent_from_media_items,
     normalized_screen_rectangle,
     ordered_media_viewer_paths,
     pixel_simplify_segments,
@@ -51,6 +52,27 @@ class AdventureMapWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(extent)
         self.assertLess(extent["min_x"], extent["max_x"])
         self.assertLess(extent["min_y"], extent["max_y"])
+
+    def test_media_coordinates_provide_startup_extent(self):
+        extent = extent_from_media_items(
+            [
+                MediaMapItem(Path("a.jpg"), 50.0, 7.0),
+                MediaMapItem(Path("b.jpg"), 42.9, -8.5),
+                MediaMapItem(Path("missing.jpg")),
+            ]
+        )
+
+        self.assertIsNotNone(extent)
+        self.assertLess(extent["min_x"], extent["max_x"])
+        self.assertLess(extent["min_y"], extent["max_y"])
+
+    def test_single_media_coordinate_gets_usable_minimum_extent(self):
+        extent = extent_from_media_items(
+            [MediaMapItem(Path("a.jpg"), 50.0, 7.0)]
+        )
+
+        self.assertGreaterEqual(extent["max_x"] - extent["min_x"], 1000.0)
+        self.assertGreaterEqual(extent["max_y"] - extent["min_y"], 1000.0)
 
     def test_media_selection_replaces_or_command_toggles_groups(self):
         first = Path("first.jpg")

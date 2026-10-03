@@ -342,13 +342,17 @@ The GUI saves and loads them with:
 `adventure_files.py` validates and discovers format-2 files, sorts them by
 modification time, and implements transactional rename/copy operations. An
 empty directory remains active without an Adventure until its suggested or
-typed name is committed. In map-first Adventure mode, one workspace coordinator
-coalesces GPX, control-file, playlist, and parameter changes for two seconds.
-It saves changed referenced documents first and the `.adv` payload last; a
-one-second recovery snapshot protects the interval before the real-file save.
-The hosted Advanced Interface delegates its former 500 ms `.adv` autosave to
-that coordinator. Standalone GPX and control editors retain explicit Save and
-Revert behavior. `atomic_write_json(...)` and the GPX writer use temporary
+typed name is committed. In map-first Adventure mode, `workspace_mutations.py`
+classifies GPX, control-file, playlist, and parameter changes by their actual
+impact. A fixed, configurable checkpoint timer defaults to 60 seconds; edits do
+not continually restart it. GPX serialization and identity calculation run on
+the workspace worker. Changed referenced documents are installed before the
+`.adv` payload, while a one-second recovery snapshot protects the interval.
+The hosted Advanced Interface delegates autosave to that coordinator, and its
+standalone Adventure mode uses the same fixed interval. Manual Save, project
+switching, slideshow launch, and quit still flush immediately. Standalone GPX
+and control editors retain explicit Save and Revert behavior.
+`atomic_write_json(...)` and the GPX writer use temporary
 siblings followed by `os.replace(...)`. `current_project_file`, `gpx_file`, `control_file`, and
 `track_map_base` are authoritative. Adventure-name edits are never autosaved
 as ordinary text changes; committing them invokes Rename/Copy/Cancel.
@@ -645,6 +649,18 @@ raises `TileCacheMissError` before any uncached request. A cache miss preserves
 completed images and offers provider setup or the previous selection. GPX
 Editor viewport plots are interactive and intentionally remain separate from
 this project-map safeguard.
+
+Interactive GPX and Adventure Map navigation uses one retained XYZ tile store
+rather than a special startup transition image. `PlotView` keeps a bounded
+least-recently-used set of decoded tiles for the active provider. Every viewport
+change redraws intersecting retained tiles at their true Web Mercator bounds:
+lower-zoom parents provide an immediate cropped preview while zooming in, and
+higher-zoom children form a temporary mosaic while zooming out. Exact target
+tiles are drawn last as they arrive. Only the currently visible target tiles are
+requested from the provider, and changing providers clears the retained store.
+This policy applies equally to world, overview, fitted-track, wheel, pinch, and
+pan transitions and prevents black intermediate frames without distorting or
+stretching the old map.
 
 **Mark Selected Up to Date** records a bounded
 `accepted_render_signatures` list in eligible map sidecars. Freshness accepts

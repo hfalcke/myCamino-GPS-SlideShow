@@ -18,6 +18,7 @@ from map_provider_utils import (
 
 WEB_MERCATOR_HALF_WORLD_M = 20037508.342789244
 WEB_MERCATOR_WORLD_M = WEB_MERCATOR_HALF_WORLD_M * 2.0
+DEFAULT_WORLD_OCEAN_RGB = (170 / 255.0, 211 / 255.0, 223 / 255.0)
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,81 @@ class TileCoordinate:
     zoom: int
     x: int
     y: int
+
+
+def is_complete_world_extent(
+    extent: dict[str, float],
+    *,
+    tolerance_fraction: float = 1e-7,
+) -> bool:
+    """Return whether an extent represents the finite Web Mercator world."""
+    try:
+        values = (
+            float(extent["min_x"]),
+            float(extent["max_x"]),
+            float(extent["min_y"]),
+            float(extent["max_y"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    tolerance = WEB_MERCATOR_WORLD_M * max(float(tolerance_fraction), 0.0)
+    expected = (
+        -WEB_MERCATOR_HALF_WORLD_M,
+        WEB_MERCATOR_HALF_WORLD_M,
+        -WEB_MERCATOR_HALF_WORLD_M,
+        WEB_MERCATOR_HALF_WORLD_M,
+    )
+    return all(abs(value - target) <= tolerance for value, target in zip(values, expected))
+
+
+def world_ocean_sample_pixels(
+    tile: TileCoordinate,
+    pixel_width: int,
+    pixel_height: int,
+) -> list[tuple[int, int]]:
+    """Choose antimeridian samples that are normally open ocean."""
+    width = max(int(pixel_width), 1)
+    height = max(int(pixel_height), 1)
+    count = 1 << max(0, int(tile.zoom))
+    if count == 1:
+        return [
+            (min(2, width - 1), height // 2),
+            (max(width - 3, 0), height // 2),
+        ]
+    equator_rows = {count // 2 - 1, count // 2}
+    if tile.x not in {0, count - 1} or tile.y not in equator_rows:
+        return []
+    sample_x = min(2, width - 1) if tile.x == 0 else max(width - 3, 0)
+    return [
+        (sample_x, max(0, min(height - 1, int(height * fraction))))
+        for fraction in (0.35, 0.5, 0.65)
+    ]
+
+
+def sample_world_ocean_rgb_from_png(
+    png_data: bytes,
+    tile: TileCoordinate,
+) -> list[tuple[float, float, float]]:
+    """Sample open-ocean colors without decoding non-candidate tiles."""
+    if not world_ocean_sample_pixels(tile, 256, 256):
+        return []
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(png_data)) as source:
+            image = source.convert("RGBA")
+            positions = world_ocean_sample_pixels(tile, image.width, image.height)
+            samples = []
+            for position in positions:
+                red, green, blue, alpha = image.getpixel(position)
+                if alpha < 192:
+                    continue
+                samples.append(
+                    tuple(float(component) / 255.0 for component in (red, green, blue))
+                )
+            return samples
+    except (OSError, TypeError, ValueError):
+        return []
 
 
 def aspect_preserving_rect(
@@ -82,6 +158,89 @@ def tile_bounds_mercator(tile: TileCoordinate) -> dict[str, float]:
     }
 
 
+def tile_intersects_extent(
+    tile: TileCoordinate,
+    extent: dict[str, float],
+) -> bool:
+    """Return whether a tile overlaps a Web Mercator viewport."""
+    bounds = tile_bounds_mercator(tile)
+    return not (
+        bounds["max_x"] <= float(extent["min_x"])
+        or bounds["min_x"] >= float(extent["max_x"])
+        or bounds["max_y"] <= float(extent["min_y"])
+        or bounds["min_y"] >= float(extent["max_y"])
+    )
+
+
+def panned_extent_to_include_point(
+    extent: dict[str, float],
+    point_x: float,
+    point_y: float,
+    *,
+    margin_fraction: float = 0.10,
+) -> dict[str, float]:
+    """Pan without changing scale until a point lies inside a safe margin."""
+    current = {
+        key: float(extent[key])
+        for key in ("min_x", "max_x", "min_y", "max_y")
+    }
+    span_x = max(current["max_x"] - current["min_x"], 1.0)
+    span_y = max(current["max_y"] - current["min_y"], 1.0)
+    margin = max(0.0, min(float(margin_fraction), 0.45))
+    inner_min_x = current["min_x"] + span_x * margin
+    inner_max_x = current["max_x"] - span_x * margin
+    inner_min_y = current["min_y"] + span_y * margin
+    inner_max_y = current["max_y"] - span_y * margin
+    shift_x = min(0.0, float(point_x) - inner_min_x) + max(
+        0.0, float(point_x) - inner_max_x
+    )
+    shift_y = min(0.0, float(point_y) - inner_min_y) + max(
+        0.0, float(point_y) - inner_max_y
+    )
+    if shift_x == 0.0 and shift_y == 0.0:
+        return current
+    return clamp_extent_to_web_mercator(
+        {
+            "min_x": current["min_x"] + shift_x,
+            "max_x": current["max_x"] + shift_x,
+            "min_y": current["min_y"] + shift_y,
+            "max_y": current["max_y"] + shift_y,
+        }
+    )
+
+
+def retained_tile_draw_order(
+    keys,
+    extent: dict[str, float],
+    target_zoom: int,
+) -> list[tuple[int, int, int]]:
+    """Order reusable tiles so exact target tiles replace coarse substitutes."""
+    target_zoom = max(0, int(target_zoom))
+    candidates = []
+    for raw_key in keys:
+        try:
+            key = tuple(int(value) for value in raw_key)
+            tile = TileCoordinate(*key)
+        except (TypeError, ValueError):
+            continue
+        if len(key) != 3 or not tile_intersects_extent(tile, extent):
+            continue
+        if tile.zoom < target_zoom:
+            priority = (0, tile.zoom)
+        elif tile.zoom > target_zoom:
+            priority = (1, tile.zoom)
+        else:
+            priority = (2, tile.zoom)
+        candidates.append((priority, key))
+    return [
+        key
+        for _priority, key in sorted(
+            candidates,
+            key=lambda item: (item[0], item[1][2], item[1][1]),
+        )
+    ]
+
+
 def visible_tiles(extent: dict[str, float], zoom: int) -> list[TileCoordinate]:
     """Return visible tiles ordered from the viewport center outwards."""
     zoom = max(0, int(zoom))
@@ -109,14 +268,6 @@ def visible_tiles(extent: dict[str, float], zoom: int) -> list[TileCoordinate]:
         tiles,
         key=lambda tile: ((tile.x - center_x) ** 2 + (tile.y - center_y) ** 2, tile.y, tile.x),
     )
-
-
-def tile_coverage_complete(
-    expected_keys: set[tuple[int, int, int]],
-    loaded_keys,
-) -> bool:
-    """Return whether every tile in the current viewport has been loaded."""
-    return expected_keys.issubset(set(loaded_keys))
 
 
 def shifted_extent(

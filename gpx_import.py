@@ -174,6 +174,8 @@ class NormalizedGpxDocument:
     report: GpxImportReport
     source_path: Path
     metadata: ET.Element | None = None
+    document_name: str = ""
+    document_name_is_explicit: bool = False
 
 
 def sanitize_track_element(
@@ -238,6 +240,16 @@ def _document_name(root: ET.Element, source_path: Path) -> str:
     if legacy_name is not None and (legacy_name.text or "").strip():
         return legacy_name.text.strip()
     return source_path.stem
+
+
+def _has_document_name(root: ET.Element) -> bool:
+    metadata = _core_child(root, "metadata")
+    if metadata is not None:
+        name = _core_child(metadata, "name")
+        if name is not None and (name.text or "").strip():
+            return True
+    legacy_name = _core_child(root, "name")
+    return legacy_name is not None and bool((legacy_name.text or "").strip())
 
 
 def load_gpx_document(path: str | Path) -> NormalizedGpxDocument:
@@ -313,6 +325,8 @@ def load_gpx_document(path: str | Path) -> NormalizedGpxDocument:
             if canonical_document
             else _normalize_element(metadata) if metadata is not None else None
         ),
+        document_name=fallback_name,
+        document_name_is_explicit=_has_document_name(root),
     )
 
 

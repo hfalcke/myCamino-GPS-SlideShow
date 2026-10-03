@@ -104,6 +104,63 @@ def extent_from_track_summary(summary) -> dict | None:
     )
 
 
+def extent_from_media_items(
+    media_items: Iterable[object],
+    *,
+    padding_fraction: float = 0.08,
+    minimum_span_m: float = 1000.0,
+) -> dict | None:
+    """Build a padded Web Mercator extent from media with valid GPS positions."""
+    radius = 6378137.0
+    projected = []
+    for item in media_items:
+        if isinstance(item, dict):
+            latitude = item.get("latitude")
+            longitude = item.get("longitude")
+        else:
+            latitude = getattr(item, "latitude", None)
+            longitude = getattr(item, "longitude", None)
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90.0 <= latitude <= 90.0
+            or not -180.0 <= longitude <= 180.0
+        ):
+            continue
+        latitude = max(-85.05112878, min(85.05112878, latitude))
+        projected.append(
+            (
+                radius * math.radians(longitude),
+                radius
+                * math.log(
+                    math.tan(math.pi / 4.0 + math.radians(latitude) / 2.0)
+                ),
+            )
+        )
+    if not projected:
+        return None
+    xs = [point[0] for point in projected]
+    ys = [point[1] for point in projected]
+    span_x = max(max(xs) - min(xs), float(minimum_span_m))
+    span_y = max(max(ys) - min(ys), float(minimum_span_m))
+    padding = max(0.0, float(padding_fraction))
+    center_x = (min(xs) + max(xs)) / 2.0
+    center_y = (min(ys) + max(ys)) / 2.0
+    return validated_mercator_extent(
+        {
+            "min_x": center_x - span_x * (0.5 + padding),
+            "max_x": center_x + span_x * (0.5 + padding),
+            "min_y": center_y - span_y * (0.5 + padding),
+            "max_y": center_y + span_y * (0.5 + padding),
+        }
+    )
+
+
 @dataclass(frozen=True)
 class MediaMapItem:
     path: Path

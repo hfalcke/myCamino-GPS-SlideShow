@@ -44,6 +44,35 @@ def adventure_payload(directory: Path, name: str) -> dict:
 
 
 class AdventureFileTests(unittest.TestCase):
+    def test_explicitly_empty_gpx_reference_is_valid_for_media_only_adventure(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            payload = adventure_payload(directory, "Media Only")
+            payload["gpx_file"] = ""
+            (directory / "Media Only-sorted.lst").write_text("", encoding="utf-8")
+            path = directory / "Media Only.adv"
+            atomic_write_json(path, payload)
+
+            self.assertEqual(load_adventure(path).payload["gpx_file"], "")
+
+    def test_media_only_adventure_can_be_renamed_with_related_files(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            payload = adventure_payload(directory, "Media Only")
+            payload["gpx_file"] = ""
+            control = directory / "Media Only-sorted.lst"
+            control.write_text("", encoding="utf-8")
+            source = directory / "Media Only.adv"
+            atomic_write_json(source, payload)
+
+            target, renamed = rename_or_copy_adventure(
+                source, payload, "Renamed", "rename", include_related=True
+            )
+
+            self.assertEqual(target.name, "Renamed.adv")
+            self.assertEqual(renamed["gpx_file"], "")
+            self.assertFalse((directory / "Renamed.gpx").exists())
+
     def test_discovery_separates_copied_templates_from_invalid_files(self):
         with TemporaryDirectory() as temporary, TemporaryDirectory() as original:
             directory = Path(temporary)

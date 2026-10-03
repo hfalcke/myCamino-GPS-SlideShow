@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 from http.server import ThreadingHTTPServer
 from ops_control.server import COOKIE, ControlPanel, RequestHandler, run_command
 from ops_control.shared import CheckResult
+from ops_control.app_code import CODE_ACTIONS
 
 
 class PanelSecurityTests(unittest.TestCase):
@@ -86,7 +87,37 @@ class PanelSecurityTests(unittest.TestCase):
                     self.assertEqual(status, 200)
                     self.assertIn(action.description, content)
                     self.assertIn('Synthetic command failure', content)
-                    run.assert_called_once_with(action.key, action.confirmation)
+                    if action.key in CODE_ACTIONS:
+                        run.assert_called_once_with(action.key, action.confirmation, parameters={
+                            'message': '', 'version': '', 'release_date': ''})
+                    else:
+                        run.assert_called_once_with(action.key, action.confirmation)
+
+    def test_code_release_form_and_validated_dispatch(self):
+        page = self.request('/action-confirm?action=release_mycamino_app')[2]
+        for field in ('csrf', 'version', 'release_date', 'message'):
+            self.assertIn(f'name="{field}"', page)
+        self.assertIn('<h2>Code</h2>', self.request()[2])
+        data = {'action': 'release_mycamino_app', 'csrf': self.panel.csrf,
+                'confirmation': 'RELEASE MYCAMINO APP', 'message': 'Release "safe" <text>',
+                'version': '0.9.2', 'release_date': '2026-10-03'}
+        with patch('ops_control.server.run_command', return_value=CheckResult('test','',0,'done','')) as command:
+            response = self.request('/action-run', 'POST', data)
+            self.assertEqual(response[0], 200)
+            argv = command.call_args.args[0]
+            self.assertEqual(argv[1:4], ['-m', 'ops_control.app_code', 'release'])
+            self.assertIn(data['message'], argv)
+            self.assertIn('0.9.2', argv)
+            self.assertEqual(command.call_args.kwargs['env']['MYCAMINO_LOCK_HELD'], '1')
+            command.reset_mock()
+            data['version'] = '0.9.2; touch /tmp/unsafe'
+            response = self.request('/action-run', 'POST', data)
+            self.assertIn('Version must contain', response[2])
+            command.assert_not_called()
+            data['version'] = '0.9.2'
+            data['confirmation'] = ''
+            self.assertIn('missing confirmation', self.request('/action-run', 'POST', data)[2])
+            command.assert_not_called()
 
     def test_unknown_action_is_never_executed(self):
         with patch.object(self.panel, 'run_action') as run:
@@ -123,6 +154,10 @@ class PanelSecurityTests(unittest.TestCase):
             result=self.panel.perform('deploy', lambda: called.append(True), exclusive=True)
             self.assertEqual(result.returncode, 75)
             self.assertEqual(called, [])
+            with patch('ops_control.server.run_command') as command:
+                result = self.panel.run_action('build_mycamino_dmg', 'BUILD MYCAMINO DMG')
+                self.assertEqual(result.returncode, 75)
+                command.assert_not_called()
         self.panel.perform('news', lambda: CheckResult('private','secret command',0,'private@example.org','secret'))
         log=self.panel.action_log_path.read_text()
         self.assertNotIn('private@example.org',log)
