@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import date
 
 
-APP_VERSION = "0.9.1"
-APP_BUNDLE_VERSION = "0.9.1"
-APP_RELEASE_DATE = "2026-08-30"
+APP_VERSION = "0.9.5"
+APP_BUNDLE_VERSION = "0.9.5"
+APP_RELEASE_DATE = "2026-10-03"
 
 
 def release_date() -> date:
