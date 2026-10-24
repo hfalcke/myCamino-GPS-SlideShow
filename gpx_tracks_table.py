@@ -764,6 +764,8 @@ def parse_label_text(value):
         raise argparse.ArgumentTypeError("LABELTEXT must not be empty.")
     if text.casefold() == "none":
         return []
+    if text.casefold() == "automatic":
+        return [["AUTOMATIC"]]
     allowed = {"TRACKNAME", "TRACKNUMBER", "DATE", "LENGTH", "DURATION"}
     lines = []
     for line_text in text.split(","):
@@ -1473,6 +1475,9 @@ def render_track_plot(
     map_cache_only=False,
 ):
     """Render one overview or one single-track plot."""
+    automatic_overview_labels = overview_label_items == [["AUTOMATIC"]]
+    if automatic_overview_labels:
+        overview_label_items = [["LENGTH"], ["TRACKNAME"], ["DATE"]]
     try:
         import contextily as cx
     except ImportError as exc:
@@ -1728,6 +1733,13 @@ def render_track_plot(
             f"Could not download the {provider_name} basemap. "
             "Please check the internet connection or try again later; the map server may have timed out."
         ) from exc
+    if overview_mode and automatic_overview_labels:
+        from map_label_layout import automatic_labels_visible
+
+        labels = ["\n".join(overview_label_lines(track, overview_label_items)) for track in tracks]
+        segments = [segment for track_segments in projected_track_segments for segment in track_segments]
+        if not automatic_labels_visible(ax, labels, segments, actual_font_size):
+            overview_label_items = []
     if media_map_date is None and not background_only:
         for track_segments in projected_track_segments:
             for projected_points in track_segments:
@@ -2196,8 +2208,8 @@ def build_argument_parser():
         "--print-Labels",
         dest="print_labels",
         type=parse_label_text,
-        default=[["LENGTH"], ["TRACKNAME"], ["DATE"]],
-        help="Overview label lines: use commas for new lines and colons for one shared line. Keywords: TRACKNUMBER, TRACKNAME, DATE, LENGTH, DURATION, or none.",
+        default=[["AUTOMATIC"]],
+        help="Overview labels: automatic (70% route-length limit), none, or lines separated by commas. Keywords: TRACKNUMBER, TRACKNAME, DATE, LENGTH, DURATION; colons join fields.",
     )
     parser.add_argument(
         "--header",

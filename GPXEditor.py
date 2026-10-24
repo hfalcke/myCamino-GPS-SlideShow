@@ -36,6 +36,11 @@ from gpx_pdf_summary import (
     SummaryOptions, SummarySnapshot, check_cancelled, export_summary_pdf,
     report_name, reusable_map_background, select_summary_tracks, summary_track,
 )
+from gpx_pdf_details import PDFMediaIndex, build_checkpoints
+from gpx_pdf_enrichment import enrich_checkpoints
+from gpx_pdf_layout import (
+    continuation_figures, draw_checkpoint_markers, draw_panel, measure_panel, report_title, track_statistics,
+)
 
 import objc
 from AppKit import (
@@ -695,7 +700,7 @@ def confirm(message: str, informative: str = "") -> bool:
     return alert.runModal() == 1000
 
 
-def request_provider_api_key(provider: str, credential_id: str) -> bool:
+def request_provider_api_key(provider: str, credential_id: str, *, remember_output_provider=True) -> bool:
     preference = load_map_provider_preference()
     if (
         read_provider_credential(provider, credential_id)
@@ -708,6 +713,7 @@ def request_provider_api_key(provider: str, credential_id: str) -> bool:
         provider,
         credential_id,
         initial_key=read_provider_credential(provider, credential_id),
+        remember_output_provider=remember_output_provider,
     )
     return bool(result and result.get("action") == "configured")
 
@@ -1923,8 +1929,9 @@ class PlotView(NSView):
             self.setNeedsDisplay_(True)
 
     def display_tracks(self) -> list[TrackRecord]:
+        show_hidden = bool(getattr(self.adventure_workspace_delegate, "show_hidden_tracks", False))
         if self.mode == "overview":
-            tracks = self.controller.visible_tracks()
+            tracks = list(self.controller.tracks) if show_hidden else self.controller.visible_tracks()
             if (
                 self.adventure_workspace_delegate is not None
                 and self.controller.track_load_timer is not None
@@ -1936,7 +1943,7 @@ class PlotView(NSView):
                 ]
             return tracks
         if self.adventure_workspace_delegate is not None:
-            return self.controller.visible_tracks()
+            return list(self.controller.tracks) if show_hidden else self.controller.visible_tracks()
         sequence = self.track_sequence()
         if not sequence:
             return []
@@ -2417,6 +2424,8 @@ class PlotView(NSView):
             color = NSColor.systemBlueColor()
             if highlight_selection and selected and not selected_overlay:
                 color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.435, 0.659, 0.863, 1.0)
+            if track.hidden:
+                color = NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1)
             for segment in processed.segments:
                 if draw_base and not selected_overlay:
                     self.draw_track(segment.points, transformer, color, 3.5)
@@ -2429,7 +2438,8 @@ class PlotView(NSView):
         selected = set(self.controller.selected_nrs)
         if not selected:
             return
-        tracks = [track for track in self.controller.tracks if track.nr in selected and not track.hidden]
+        show_hidden = bool(getattr(self.adventure_workspace_delegate, "show_hidden_tracks", False))
+        tracks = [track for track in self.controller.tracks if track.nr in selected and (show_hidden or not track.hidden)]
         geometry_by_number = (
             {track.nr: processed for track, processed in processed_tracks}
             if processed_tracks is not None else None
@@ -2449,7 +2459,8 @@ class PlotView(NSView):
             else:
                 processed = self.controller.display_processed_track(track)
             for segment in processed.segments:
-                self.draw_track(segment.points, transformer, selected_color, 6.0)
+                color = NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1) if track.hidden else selected_color
+                self.draw_track(segment.points, transformer, color, 6.0)
 
     def draw_overview_endpoint_markers(self, transformer):
         if self.mode != "overview":
@@ -2480,7 +2491,9 @@ class PlotView(NSView):
             points = self.controller.display_track_geometry(track, 64).points
             if not points:
                 continue
-            if track.nr in selected:
+            if track.hidden:
+                stroke_color = NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1)
+            elif track.nr in selected:
                 stroke_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.25, 0.62, 1.0)
             elif selected:
                 stroke_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.435, 0.659, 0.863, 1.0)
@@ -3734,6 +3747,9 @@ class PlotView(NSView):
                 else "Show All Media Icons"
             )
             self._plot_context_item(menu, title, "toggleWorkspaceMediaIcons:")
+            self._plot_context_item(menu,
+                "Hide Hidden Tracks" if getattr(workspace, "show_hidden_tracks", False) else "Show Hidden Tracks",
+                "toggleWorkspaceHiddenTracks:")
         elif self.waypoint_editing_enabled():
             title = (
                 "Hide All Media Icons"
@@ -3787,6 +3803,12 @@ class PlotView(NSView):
         workspace = self.adventure_workspace_delegate
         if workspace is not None and hasattr(workspace, "toggleWorkspaceMediaIcons_"):
             workspace.toggleWorkspaceMediaIcons_(None)
+
+    @objc.IBAction
+    def toggleWorkspaceHiddenTracks_(self, _sender):
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None:
+            workspace.toggleWorkspaceHiddenTracks_(None)
 
     def prepare_context_point(self, track, index, create_inspector=True):
         inspector = self.controller.existing_inspector_for_track(track)
@@ -4967,7 +4989,8 @@ class PlotView(NSView):
             tracks = self.controller.selected_tracks()
             if not tracks:
                 tracks = self.controller.visible_tracks()
-            tracks = [track for track in tracks if not track.hidden]
+            tracks = [track for track in tracks if not track.hidden or
+                      getattr(self.adventure_workspace_delegate, "show_hidden_tracks", False)]
             extent = self.controller.extent_for_track_records(tracks)
             self.render_extent(extent, status="Zoomed overview to selected tracks.")
             return
@@ -5437,6 +5460,8 @@ class ElevationProfileView(NSView):
 
     def profile_tracks(self):
         if self.shows_all_tracks():
+            if getattr(getattr(self.plot_view, "adventure_workspace_delegate", None), "show_hidden_tracks", False):
+                return self.plot_view.display_tracks()
             return self.controller.visible_tracks()
         # Map-first views also draw neighbouring tracks. The single-track
         # profile must follow the active subject, not that background list.
@@ -5751,6 +5776,8 @@ class ElevationProfileView(NSView):
         workspace_selection = self.plot_view.adventure_workspace_delegate is not None
 
         def track_color(track):
+            if track.hidden:
+                return NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1)
             if (
                 not self.shows_all_tracks()
                 and not workspace_selection
@@ -7885,6 +7912,13 @@ class GPXEditorPdfSummaryWindowDelegate(NSObject):
         self.controller.pdf_summary_delegate = None
 
 
+def export_prepared_summary_pdf(path, snapshot, renderer, cancel, progress):
+    if renderer is not None:
+        renderer.prepare_checkpoint_data()
+    return export_summary_pdf(path, snapshot, map_pages=renderer.write_pages if renderer else None,
+                              cancel=cancel, progress=progress)
+
+
 class PDFMapRenderer:
     """Reuse PDF map rendering with detached tracks and no Cocoa objects."""
 
@@ -7895,10 +7929,10 @@ class PDFMapRenderer:
         "cached_tile_urls", "missing_map_tile_count", "add_basemap_with_timeout",
         "make_pdf_map_figure", "draw_pdf_elevation_profile", "draw_pdf_profile_time_ticks",
         "pdf_distance_at_elapsed", "profile_time_tick_step", "profile_short_elapsed_label",
-        "draw_pdf_profile_scale_bar", "draw_pdf_start_end_labels",
+        "draw_pdf_profile_scale_bar", "draw_pdf_start_end_labels", "draw_pdf_overview_labels",
     })
 
-    def __init__(self, source, tracks, options, cancel, progress):
+    def __init__(self, source, tracks, options, cancel, progress, checkpoint_sidecar_path=None):
         self.options, self.cancel, self.progress = options, cancel, progress
         self.processing_settings = source.processing_options()
         self.project_parameters = dict(source.project_parameters)
@@ -7918,11 +7952,33 @@ class PDFMapRenderer:
         self.cached_map_tile_urls = None
         map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
         self.map_cache_only = self.output_map_provider == "osm" and map_count > 1
-        self.overview_numbers = source.pdf_overview_show_track_numbers()
+        self.overview_numbers = False  # Labels come from saved formatting, not an open map window.
         self.overview_dots = source.pdf_overview_show_endpoint_dots()
         self.track_dots = source.pdf_track_show_endpoint_dots()
         directories = {Path(track.source_file).parent / "trackimages" for track in tracks if track.source_file}
         media_context = getattr(source, "media_context", {}) or {}
+        self.media_directories = tuple({Path(track.source_file).parent for track in tracks if track.source_file})
+        self.media_control_file = media_context.get("control_file")
+        if media_context.get("project_directory"):
+            self.media_directories = (Path(media_context["project_directory"]),)
+        self.media_index = None
+        self.checkpoint_cache = {}
+        self.checkpoint_sidecar_path = checkpoint_sidecar_path
+        self.page_continuation = None
+        self.track_context = {}
+        cumulative, previous = 0.0, None
+        for item in getattr(source, "tracks", tracks):
+            if not item.hidden:
+                length = item.metrics.get("length_km")
+                cumulative = cumulative + float(length) if cumulative is not None and length is not None else None
+            gap = None
+            if previous is not None:
+                coords = (previous.metrics.get("last_lat"), previous.metrics.get("last_lon"),
+                          item.metrics.get("first_lat"), item.metrics.get("first_lon"))
+                if all(value is not None for value in coords):
+                    gap = haversine_km(*coords)
+            self.track_context[item.nr] = (cumulative, gap)
+            previous = item
         if media_context.get("project_directory"):
             directories.add(Path(media_context["project_directory"]) / "trackimages")
         self.background_directories = tuple(sorted(directories))
@@ -7938,7 +7994,8 @@ class PDFMapRenderer:
             )
             name = record.element.find("gpx:name", NS)
             if name is not None:
-                name.text = report_name(track.name, options.name_prefix)
+                name.text = report_name(report_name(track.name, options.name_prefix),
+                                        self.project_parameters.get("trackmaps.remove_name_prefix", ""))
             self.tracks.append(record)
 
     def __getattr__(self, name):
@@ -7971,6 +8028,53 @@ class PDFMapRenderer:
         length = sum(track.metrics.get("length_km", 0) for track in visible)
         duration = sum((track.metrics.get("duration") or timedelta() for track in visible), timedelta())
         return f"{len(tracks)} track(s) | Length {length:.1f} km | Duration {format_total_duration(duration)}"
+
+    def checkpoints_for_track(self, track):
+        if not self.project_parameters.get("pdf.checkpoints", True):
+            return ()
+        if track.nr not in self.checkpoint_cache:
+            self.set_status(f"Preparing checkpoints and breaks for track #{track.nr}.")
+            markers = build_checkpoints(self.processed_track(track), self.project_parameters)
+            if self.project_parameters.get("pdf.track_info", True) and (
+                self.project_parameters.get("pdf.checkpoint_weather", True)
+                or self.project_parameters.get("pdf.checkpoint_places", True)
+            ):
+                if self.media_index is None:
+                    self.set_status("Reading existing place and weather sidecars for the PDF (no lookups).")
+                    self.media_index = PDFMediaIndex(self.media_directories, self.media_control_file, self.cancel)
+                markers = self.media_index.enrich(markers, self.project_parameters)
+            self.checkpoint_cache[track.nr] = markers
+        return self.checkpoint_cache[track.nr]
+
+    def track_panel(self, track, figure, width_inches):
+        if not self.project_parameters.get("pdf.track_info", True):
+            return None
+        statistics = track_statistics(track, *self.track_context.get(track.nr, (None, None))) \
+            if self.project_parameters.get("pdf.track_statistics", True) else ()
+        return measure_panel(figure, width_inches, statistics, self.checkpoints_for_track(track), self.project_parameters)
+
+    def prepare_checkpoint_data(self):
+        if (self.checkpoint_sidecar_path is None or not self.options.include_track_maps
+                or not self.project_parameters.get("pdf.track_info", True)
+                or not self.project_parameters.get("pdf.checkpoints", True)
+                or not (self.project_parameters.get("pdf.checkpoint_places", True)
+                        or self.project_parameters.get("pdf.checkpoint_weather", True))):
+            return
+        markers, counts = [], []
+        for track in self.tracks:
+            values = self.checkpoints_for_track(track)
+            counts.append((track.nr, len(values)))
+            markers.extend(values)
+        if not markers:
+            return
+        def key():
+            return read_provider_credential("open-meteo", str(self.project_parameters.get("weather.credential_id", "default")))
+        result = enrich_checkpoints(markers, self.media_index, self.project_parameters, self.checkpoint_sidecar_path,
+                                    cancel=self.cancel, progress=self.set_status, weather_key=key)
+        offset = 0
+        for number, count in counts:
+            self.checkpoint_cache[number] = tuple(result[offset:offset + count])
+            offset += count
 
     def reuse_pdf_background(self, ax, mode, tracks, extent, pixel_size, tile_zoom=None):
         if self.output_map_provider == "custom":
@@ -8014,6 +8118,7 @@ class PDFMapRenderer:
         if self.options.include_track_maps:
             jobs.extend(("track", [track], f"Track #{track.nr}: {track.name}") for track in self.tracks)
         for index, (mode, tracks, title) in enumerate(jobs, 1):
+            self.page_continuation = None
             self.set_status(f"Rendering map page {index} of {len(jobs)}: {title}")
             figure = self.make_pdf_map_figure(size, mode, tracks, title, self.options.orientation, options, Figures)
             try:
@@ -8023,6 +8128,14 @@ class PDFMapRenderer:
             finally:
                 if figure is not None:
                     figure.clear()
+            if self.page_continuation is not None:
+                layout, first_row = self.page_continuation
+                for extra in continuation_figures(size, title, layout, first_row):
+                    try:
+                        check_cancelled(self.cancel)
+                        pdf.savefig(extra, dpi=self.pdf_document_dpi)
+                    finally:
+                        extra.clear()
 
 
 class GPXEditorController(NSObject):
@@ -8466,10 +8579,11 @@ class GPXEditorController(NSObject):
         credential_id = str(updated.get("maps.credential_id", "default"))
         for key in ("maps.interactive_provider", "maps.output_provider", "pdf.map_provider"):
             provider = str(updated.get(key, "osm"))
-            if provider_requires_credential(provider) and not request_provider_api_key(
-                provider, credential_id
-            ):
-                return False
+            if provider_requires_credential(provider):
+                if not ({key, "maps.credential_id"} & changed_editor_keys) and read_provider_credential(provider, credential_id):
+                    continue
+                if not request_provider_api_key(provider, credential_id, remember_output_provider=key == "maps.output_provider"):
+                    return False
         output_provider = str(updated.get("maps.output_provider", "osm"))
         provider_preference = load_map_provider_preference()
         try:
@@ -8537,17 +8651,22 @@ class GPXEditorController(NSObject):
 
     def _manage_map_provider_from_settings(self, draft):
         credential_id = str(draft.get("maps.credential_id", "default"))
+        key = draft.get("_provider_setting", "maps.output_provider")
+        preferred = draft.get(key, "osm")
+        if preferred == "output":
+            preferred = draft.get("maps.output_provider", "osm")
         result = run_map_provider_setup(
-            preferred_provider=str(draft.get("maps.output_provider", "geoapify")),
+            preferred_provider=str(preferred),
             credential_id=credential_id,
             timeout_seconds=float(draft.get("maps.request_timeout_seconds", 12.0)),
+            remember_output_provider=key == "maps.output_provider",
         )
         if str(result.get("action", "cancel")) == "cancel":
             return None
-        provider = str(result.get("provider", draft.get("maps.output_provider", "osm")))
+        provider = str(result.get("provider", preferred))
         if result.get("action") == "settings" and provider == "custom":
             self.settings_controller.show_advanced = True
-        return {"maps.output_provider": provider}
+        return {key: provider}
 
     def _build_window(self):
         style = (
@@ -12061,6 +12180,14 @@ class GPXEditorController(NSObject):
         path = path.with_suffix(".pdf").resolve()
         if path.exists() and not confirm("Replace existing PDF?", str(path)):
             return
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if (workspace is not None and getattr(workspace, "weather_consent", "disabled") == "unasked"
+                and options.include_track_maps and self.project_parameters.get("pdf.track_info", True)
+                and self.project_parameters.get("pdf.checkpoints", True)
+                and self.project_parameters.get("pdf.checkpoint_weather", True)
+                and self.project_parameters.get("pdf.retrieve_checkpoint_data", True)):
+            workspace._request_initial_weather_choice(purpose="PDF checkpoints")
+            self.sync_pdf_project_settings()
         map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
         try:
             snapshot = SummarySnapshot(
@@ -12069,7 +12196,8 @@ class GPXEditorController(NSObject):
                 options,
             )
             cancel = threading.Event()
-            renderer = PDFMapRenderer(self, tracks, options, cancel, self._pdf_worker_progress) if map_count else None
+            renderer = PDFMapRenderer(self, tracks, options, cancel, self._pdf_worker_progress,
+                checkpoint_sidecar_path=path.with_name(path.stem + "-checkpoints.json")) if map_count else None
         except Exception as exc:
             show_alert("Could not prepare PDF summary.", str(exc))
             return
@@ -12085,9 +12213,7 @@ class GPXEditorController(NSObject):
         self.pdf_summary_open_button.setHidden_(True)
         self.pdf_summary_reveal_button.setHidden_(True)
         self.pdf_summary_future = PDF_EXPORT_EXECUTOR.submit(
-            export_summary_pdf, path, snapshot,
-            map_pages=renderer.write_pages if renderer is not None else None,
-            cancel=cancel, progress=self._pdf_worker_progress,
+            export_prepared_summary_pdf, path, snapshot, renderer, cancel, self._pdf_worker_progress,
         )
 
     def confirm_pdf_osm_downloads(self):
@@ -12110,10 +12236,10 @@ class GPXEditorController(NSObject):
     def show_pdf_map_settings(self):
         workspace = getattr(self, "adventure_workspace_delegate", None)
         if workspace is not None:
-            workspace.open_shared_settings("PDF Export")
+            workspace.open_shared_settings("Map Service")
         else:
             self.showSettings_(None)
-            self.settings_controller.current_section = "PDF Export"
+            self.settings_controller.current_section = "Map Service"
             self.settings_controller.show()
 
     @objc.python_method
@@ -12221,8 +12347,10 @@ class GPXEditorController(NSObject):
         snapshot = SummarySnapshot(self.project_name or PROGRAM_TITLE, tuple(
             summary_track(track, index) for index, track in enumerate(self.tracks, 1) if track in tracks
         ), options)
-        renderer = PDFMapRenderer(self, tracks, options, threading.Event(), lambda _message: None) if options.include_overview or options.include_track_maps else None
-        return export_summary_pdf(path, snapshot, map_pages=renderer.write_pages if renderer is not None else None)
+        cancel = threading.Event()
+        renderer = PDFMapRenderer(self, tracks, options, cancel, lambda _message: None,
+            checkpoint_sidecar_path=Path(path).with_name(Path(path).stem + "-checkpoints.json")) if options.include_overview or options.include_track_maps else None
+        return export_prepared_summary_pdf(path, snapshot, renderer, cancel, lambda _message: None)
 
     @objc.python_method
     @serialized_plotting
@@ -12236,10 +12364,18 @@ class GPXEditorController(NSObject):
         fig = plt.figure(figsize=page_size, dpi=self.pdf_document_dpi)
         fig.patch.set_facecolor("white")
         page_w, page_h = page_size
+        checkpoints = ()
+        if mode == "track" and callable(getattr(self, "checkpoints_for_track", None)):
+            checkpoints = self.checkpoints_for_track(tracks[0])
         left_inches = 0.72 if options.get("elevation_profile") else 0.42
         left = left_inches / page_w
         right = 0.25 / page_w
+        displayed_title = report_title(fig, title, (1 - left - right) * page_w, 15 if mode == "track" else 13)
         top_summary_h = 0.78 / page_h
+        recording_time = (tracks[0].metrics.get("time") or tracks[0].metrics.get("start_time")) if mode == "track" else None
+        if mode == "track":
+            top_summary_h = (6 + 18 * (displayed_title.count('\n') + 1)
+                             + (15 if recording_time else 0) + 12) / (72 * page_h)
         bottom = 0.28 / page_h
         profile_h = 0.0
         # Leave room for profile tick labels and its distance-axis title.
@@ -12250,12 +12386,41 @@ class GPXEditorController(NSObject):
         map_rect = [left, bottom, 1.0 - left - right, max(0.25, available_h)]
         if options.get("rotate_maps"):
             map_rect = [left, bottom, 1.0 - left - right, max(0.25, available_h)]
+        panel = None
+        if mode == "track" and callable(getattr(self, "track_panel", None)):
+            panel = self.track_panel(tracks[0], fig, (1 - left - right) * page_w)
+        if panel is not None and panel.height:
+            # Reserve readable information space; keep at least 42% of the page for the map.
+            title_h = top_summary_h
+            profile_h = .10 if options.get("elevation_profile") else 0
+            gap = .32 / page_h if profile_h else 0
+            panel_h = min(panel.height / (72 * page_h),
+                          1 - title_h - bottom - profile_h - gap - .015 - .42)
+            if panel.rows:
+                minimum = panel.summary_height + panel.header_height + panel.row_heights[0] + (13 if "Weather" in panel.columns else 2)
+                if panel_h * page_h * 72 < minimum:
+                    panel_h = panel.summary_height / (page_h * 72)
+            panel_top = 1 - title_h
+            first_row = draw_panel(fig, [left, panel_top - panel_h, 1 - left - right, panel_h], panel)
+            if first_row < len(panel.rows):
+                self.page_continuation = (panel, first_row)
+            map_rect[3] = max(.42, panel_top - panel_h - bottom - profile_h - gap - .015)
+            top_summary_h = title_h
         summary = self.pdf_track_summary_text(mode, tracks, title)
-        ax_text = fig.add_axes([left, 1.0 - top_summary_h + 0.01, 1.0 - left - right, top_summary_h - 0.02])
+        ax_text = fig.add_axes([left, 1.0 - top_summary_h, 1.0 - left - right, top_summary_h])
         ax_text.axis("off")
-        ax_text.text(0.0, 0.92, title, ha="left", va="top", fontsize=11, fontweight="bold", color="#1f2933")
-        ax_text.text(0.0, 0.58, summary, ha="left", va="top", fontsize=7.8, color="#38424d", linespacing=1.25)
+        title_y = 1 - 6 / (top_summary_h * page_h * 72) if mode == "track" else .92
+        ax_text.text(0.0, title_y, displayed_title, ha="left", va="top", fontsize=15 if mode == "track" else 13,
+                     fontweight="bold", color="#173b5e", wrap=True)
+        if recording_time is not None:
+            height_points = top_summary_h * page_h * 72
+            y = title_y - (18 * (displayed_title.count('\n') + 1) + 3) / height_points
+            ax_text.text(0, y, recording_time.astimezone().strftime("%d %B %Y"),
+                         fontsize=9.5, color="#52667a", va="top")
+        if mode == "overview":
+            ax_text.text(0.0, 0.48, summary, ha="left", va="top", fontsize=9.5, color="#38424d", linespacing=1.25)
         summary_done = time.perf_counter()
+        ax_profile = None
         if profile_h:
             profile_rect = [left, bottom + map_rect[3] + gap, 1.0 - left - right, profile_h]
             ax_profile = fig.add_axes(profile_rect)
@@ -12356,14 +12521,12 @@ class GPXEditorController(NSObject):
                     size = endpoint_size if endpoint_size > 0 else (26 if mode == "overview" else 38)
                     ax.scatter([xs[0], xs[-1]], [ys[0], ys[-1]], s=size, c=endpoint_color, edgecolors=color, linewidths=1.2, zorder=4)
         if route_mode == "line":
-            self.draw_pdf_start_end_labels(ax, tracks, mode)
-        if mode == "overview" and self.pdf_overview_show_track_numbers():
-            for track in tracks:
-                points = self.processed_track(track).points
-                if points:
-                    point = points[len(points) // 2]
-                    x, y = lonlat_to_web_mercator(point.lon, point.lat)
-                    ax.text(x, y, str(track.nr), ha="center", va="center", fontsize=7, color="white", bbox=dict(boxstyle="round,pad=0.25", facecolor="black", alpha=0.75, edgecolor="none"), zorder=5)
+            if not checkpoints:
+                self.draw_pdf_start_end_labels(ax, tracks, mode)
+        if checkpoints:
+            draw_checkpoint_markers(ax, ax_profile, checkpoints)
+        if mode == "overview" and route_mode == "line":
+            self.draw_pdf_overview_labels(ax, tracks)
         ax.axis("off")
         if options.get("rotate_maps"):
             # Keep the page layout simple: rotate the axes contents visually by using the print aspect,
@@ -12443,7 +12606,11 @@ class GPXEditorController(NSObject):
         ax.tick_params(labelsize=6, length=2)
         ax.grid(axis="y", linestyle="--", alpha=0.35)
         base_done = time.perf_counter()
-        self.draw_pdf_profile_time_ticks(ax, rows)
+        checkpoint_reader = getattr(self, "checkpoints_for_track", None)
+        has_clock_markers = mode == "track" and callable(checkpoint_reader) and any(
+            marker.timestamp is not None for marker in checkpoint_reader(tracks[0]))
+        if not has_clock_markers:
+            self.draw_pdf_profile_time_ticks(ax, rows)
         ticks_done = time.perf_counter()
         self.draw_pdf_profile_scale_bar(ax, y_min, y_max)
         scale_done = time.perf_counter()
@@ -12594,6 +12761,34 @@ class GPXEditorController(NSObject):
             edge = "black" if mode == "track" else "blue"
             ax.scatter([x], [y], s=42, c="white", edgecolors=edge, linewidths=1.3, zorder=6)
             ax.text(x, y, f" {label} ", ha="left", va="bottom", fontsize=7, color="white", bbox=dict(boxstyle="round,pad=0.25", facecolor="black", alpha=0.75, edgecolor="none"), zorder=7)
+
+    def draw_pdf_overview_labels(self, ax, tracks):
+        from map_label_layout import automatic_labels_visible
+
+        mode = self.project_parameters.get("trackmaps.overview_labels", "automatic")
+        if mode == "none":
+            return
+        labels, segments, anchors = [], [], []
+        size = max(6, min(16, 7.5 * float(self.project_parameters.get("trackmaps.font_factor", 2.2)) / 2.2))
+        for track in tracks:
+            processed = self.processed_track(track)
+            if not processed.points:
+                continue
+            name = report_name(track.name, self.project_parameters.get("trackmaps.remove_name_prefix", ""))
+            date = track.metrics.get("time") or processed.start_time
+            details = [date.astimezone().strftime("%d.%m.%Y") if date else "", f"{processed.length_km:.1f} km"]
+            labels.append(name + "\n" + " · ".join(item for item in details if item))
+            anchor = processed.points[len(processed.points) // 2]
+            anchors.append(lonlat_to_web_mercator(anchor.lon, anchor.lat))
+            segments.extend([lonlat_to_web_mercator(point.lon, point.lat) for point in segment.points]
+                            for segment in processed.segments)
+        if mode == "automatic" and not automatic_labels_visible(ax, labels, segments, size):
+            return
+        for text, (x, y) in zip(labels, anchors):
+            ax.annotate(text, (x, y), xytext=(5, 7), textcoords="offset points", fontsize=size,
+                        color=self.project_parameters.get("trackmaps.route_color", "#0000FF"),
+                        ha="center", zorder=7,
+                        bbox=dict(boxstyle="round,pad=.2", facecolor="white", edgecolor="none", alpha=.85))
 
     def pdf_overview_show_track_numbers(self) -> bool:
         existing = self.existing_plot_view("overview")
@@ -13531,6 +13726,7 @@ class GPXEditorController(NSObject):
         self,
         mode: str,
         tracks_override: list[TrackRecord] | None = None,
+        include_hidden: bool = False,
     ) -> dict | None:
         """Build a lightweight plot model; PlotView fills tiles asynchronously."""
         axes = {"left": 0.0, "bottom": 0.0, "width": 1.0, "height": 1.0}
@@ -13563,8 +13759,9 @@ class GPXEditorController(NSObject):
         if mode == "overview":
             tracks = [
                 track
-                for track in (tracks_override or self.visible_tracks())
-                if not track.hidden
+                for track in (tracks_override if tracks_override is not None else
+                              self.tracks if include_hidden else self.visible_tracks())
+                if include_hidden or not track.hidden
             ]
             zoom = self.overview_zoom_for_tracks(tracks, self.overview_zoom)
             return entry_for(tracks, zoom)

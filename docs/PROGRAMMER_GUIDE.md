@@ -1042,6 +1042,57 @@ AppKit calls. AppKit polls progress and completion on the main thread; closing
 the panel cancels work and stops its polling timer. Export never writes GPX
 or Adventure data. Table-only reports need no geometry processing or tiles.
 
+`gpx_pdf_details.py` builds frozen checkpoints and detects breaks on accepted
+raw observations, so spacing/smoothing cannot erase stationary periods. Break
+candidates are scanned once; raw-to-processed distance mapping is linear and
+performed only when needed. Markers and interval moving-speed integrals use
+canonical processed geometry and thresholds without mutating it. Start/end
+markers are retained, longest breaks are prioritized, and their count never
+exceeds half the final markers. UTC elapsed intervals avoid DST arithmetic
+errors; display labels use local clock time and day offsets.
+
+The export-scoped `PDFMediaIndex` uses the canonical sidecar validator, reads
+each distinct related sidecar once, and spatially indexes existing place and
+weather records. Its PDF-only radius defaults to 1 km, with the weather time
+window is thirty minutes. Reuse also checks original query coordinates to avoid
+chaining spatial matches beyond the radius. The index itself remains read-only.
+
+`gpx_pdf_enrichment.py` prepares missing checkpoint data before the serialized
+plotting phase. It reuses `resolve_place_for_coordinate` with configured jitter
+and explicit cancellation, and `enrich_weather_sidecars` with the media service's
+same batching/sampling/backoff. Weather consent/settings and Keychain accounts
+are unchanged. The versioned `<PDF name>-checkpoints.json` stores only retrieved
+checkpoint data, keyed by coordinates and UTC timestamp, preserving unknown
+fields. Writes are atomic and coalesced during fast batches, flushed on normal
+return and cancellation. Media/GPX files are never written. Offline exports use
+cached data and remain retryable; future unknown cache versions are not replaced.
+`export_prepared_summary_pdf` runs enrichment outside `PLOT_RENDER_LOCK`; map,
+profile and table rendering retain the existing serialized path.
+
+`gpx_pdf_layout.py` measures a four-column/two-row summary and attached
+compact checkpoint table. It shortens locality and weather text, measures numeric
+columns and bold headers, and wraps only enrichment when necessary. Overflow
+uses continuation pages. Map/profile markers share immutable checkpoints and
+clock labels (inside the profile's upper edge), not printed checkpoint numbers.
+Labels stay inside the axes and use additional lanes only when needed to avoid
+overlap. The location cell can append a measured street/landmark detail without
+wrapping; missing names fall back to other stored place fields or coordinates.
+Compact weather omits humidity, pressure, cloud percentage and the Celsius C.
+`weather_symbols.py` shares WMO categories with the slideshow and draws vector
+PDF icons without relying on installed weather-symbol fonts.
+
+Adventure Map's `show_hidden_tracks` is session-only display state. It includes
+hidden tracks in vector overlays and explicit Fit Entire Adventure extents,
+using orange strokes, without changing GPX visibility, totals, or dirty state.
+
+Provider controls reside only in Map Service, preserving the existing
+`pdf.map_provider`/`pdf.geoapify_style` storage keys. PDF Export links navigate
+the retained settings draft. The Keychain account label is shared, but service
+names remain provider-specific. Shared Map Generation formatting is available
+in standalone editor settings too. `map_label_layout.py` compares padded label
+widths with clipped, segment-preserving route length in display pixels for both
+PNG and PDF Automatic overview labels; it must not use endpoint separation.
+
 `plot_rendering.py` selects the noninteractive backend before plotting imports,
 creates explicit `FigureCanvasAgg` figures, and supplies the reentrant lock
 shared by PDF and PNG render jobs. Do not switch Matplotlib backends in a worker

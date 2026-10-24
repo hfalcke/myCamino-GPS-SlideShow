@@ -124,15 +124,19 @@ The project name is stored in GPX metadata when saved.
 
 ## Settings
 
-The gear button opens **GPX Editor Settings** with three sections:
+The gear button opens **GPX Editor Settings** with four sections:
 
 - GPX Processing: separate horizontal and elevation smoothing, retained-point
   spacing, horizontal/vertical error and HDOP/VDOP limits, timestamp fallback,
   running-speed window and stationary threshold, recovery interval, and
   interactive map behavior. The table shows both overall and moving average
   speed; the point inspector shows the local running mean.
-- PDF Export: document/map resolution, zoom, and tile limits.
-- Map Service: OpenStreetMap, Esri, or a custom tile service.
+- PDF Export: resolution, zoom, tile limits, track information, timed checkpoints,
+  and break detection. Links lead to the shared provider and formatting settings.
+- Map Service: separate interactive, slideshow-map, and PDF provider choices,
+  Geoapify PDF style, and Keychain credential account name.
+- Map Generation: shared route colors/widths, endpoints, name prefixes, and
+  overview labels. These formatting choices also apply to PDF maps.
 
 Numerical values can be typed or changed with the adjacent up/down stepper.
 Each row has a reset arrow, and Reset All resets only these editor sections.
@@ -483,11 +487,56 @@ PDF Summary:
   entire Adventure. Small selections can use the PDF Track zoom; large areas
   automatically lower the zoom to respect Maximum PDF map tiles. A higher
   Overview zoom can request extra detail, still within that tile limit.
-- **Settings > PDF Export > PDF map provider** can override the map-generation
+- **Settings > Map Service > PDF provider** can override the slideshow-map
   provider for PDFs only. For Geoapify, choose **OSM Bright** or **OSM Carto**.
   Interactive maps and generated slideshow maps keep their own provider settings.
   Both Geoapify styles use the existing Keychain credential; changing style needs
   different cached tiles on the first export.
+- The Credential name is an account label, not one shared API key. Each provider
+  has its own Keychain secret; PDFs and slideshow maps using that provider and
+  account can reuse it. OSM needs no credential. The separate setup buttons
+  change only the selected interactive, slideshow, or PDF provider.
+- Individual track pages include a compact four-column, two-row statistics panel,
+  with the recording date below the title, and an attached checkpoint table.
+  Start/end and roughly hourly markers share clock labels between the map,
+  elevation profile's upper interior, and table, without checkpoint numbering.
+  The table shows cumulative
+  track distance, elevation, and average/moving speeds **since the previous
+  checkpoint**; the first checkpoint has no interval speed.
+- Defaults are 10 markers including endpoints, 60-minute spacing, a 100 m
+  stationary radius, and breaks longer than 30 minutes. Adjust them under
+  **PDF Export**. Breaks have amber double-circle markers, arrival/departure
+  time ranges; the longest breaks take priority and occupy no more than
+  half the markers. Untimed tracks have endpoints but no invented clock times.
+- Short locality names and compact weather values with the slideshow's condition
+  symbols appear on checkpoint rows, without separate Start/End/Break labels.
+  Weather shows temperature in degrees, wind and precipitation; pressure,
+  humidity and numerical cloud cover are omitted. Streets or landmarks are
+  added where the location column has room. Without a locality, available
+  district, street or landmark information is used; without a matching place
+  record, the checkpoint's coordinates are printed rather than an invented name.
+  PDF checkpoints reuse stored places and weather within **1 km**. Weather must
+  also be within **30 minutes**; this does not loosen media-sidecar freshness.
+  **PDF Export > Retrieve missing checkpoint information** fills gaps before
+  rendering, following the Locations and Weather settings and weather consent.
+  An undecided Adventure asks about weather on its first such PDF export.
+  Results are saved only in **`<PDF name>-checkpoints.json`**, beside the report,
+  for reuse on later exports. GPX and media sidecars remain unchanged. Keep this
+  companion file to avoid repeating lookups. Disable retrieval for cache-only
+  export, or disable either kind of enrichment in PDF Export.
+  Offline and unavailable values remain unresolved rather than invented; completed
+  lookups survive cancellation and can be continued by exporting again.
+  Long checkpoint tables continue on
+  additional pages instead of crowding the map. Map markers show time of day;
+  day offsets identify midnight crossings without repeating the date.
+- On Adventure Map, **Show Hidden Tracks / Hide Hidden Tracks** in the context
+  menu displays hidden tracks in orange without changing their saved visibility
+  or totals. Fit Entire Adventure includes their extents while they are displayed.
+- **Map Generation > Overview labels** controls generated and PDF overviews.
+  Automatic is the default for an unset choice: labels appear only when their
+  combined measured width is at most 70% of the displayed routes' combined
+  length. Closed tracks and separate segments count correctly. Explicit saved
+  None or Track/date/length choices are preserved.
 - Multi-map exports using public OpenStreetMap first try existing backgrounds
   and cached tiles without downloading. If tiles are missing, choose another
   provider, cancel, or explicitly proceed at your own responsibility. The

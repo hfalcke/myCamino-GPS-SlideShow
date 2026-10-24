@@ -13,7 +13,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 25
+PARAMETER_SCHEMA_VERSION = 26
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -116,7 +116,7 @@ PARAMETER_SPECS = (
     ParameterSpec("trackmaps.background_color", "Map Generation", "Background color", "#000000", "color", "Background outside the map axes."),
     ParameterSpec("trackmaps.title_color", "Map Generation", "Title color", "#FFFFFF", "color", "Track map title and subtitle color."),
     ParameterSpec("trackmaps.font_factor", "Map Generation", "Font factor", 2.2, "float", "Multiplier for automatically selected map label sizes.", 0.1, 10.0),
-    ParameterSpec("trackmaps.overview_labels", "Map Generation", "Overview labels", "none", "choice", "Labels printed on the overview map.", choices=_choice(("none", "None"), ("default", "Track, date, length"))),
+    ParameterSpec("trackmaps.overview_labels", "Map Generation", "Overview labels", "automatic", "choice", "Shared by generated and PDF overviews. Automatic shows labels only when their total width is at most 70% of the displayed route length.", choices=_choice(("none", "None"), ("default", "Track, date, length"), ("automatic", "Automatic"))),
     ParameterSpec("trackmaps.remove_name_prefix", "Map Generation", "Remove name prefix", "", "text", "Remove this prefix from track names when displaying them."),
     ParameterSpec("trackmaps.edge_margin_fraction", "Map Generation", "Time-Lapse edge margin", 0.05, "fraction", "Minimum route distance from the plotting-area edge.", 0.0, 0.49, advanced=True, unit="%"),
 
@@ -138,8 +138,17 @@ PARAMETER_SPECS = (
     ParameterSpec("gpx.elevation_headroom_fraction", "GPX Processing", "Elevation headroom", 0.08, "fraction", "Vertical headroom above and below elevation profiles.", 0.0, 1.0, unit="%"),
     ParameterSpec("gpx.maximum_map_tiles", "GPX Processing", "Maximum interactive tiles", 48, "int", "Lower zoom automatically when an interactive map would exceed this tile count.", 1, 1000, advanced=True),
 
-    ParameterSpec("pdf.map_provider", "PDF Export", "PDF map provider", "output", "choice", "Choose a provider for PDF maps only, or use the map-generation provider. Interactive and slideshow maps are unchanged.", choices=_choice(("output", "Use map-generation provider"), ("osm", "OpenStreetMap (public)"), ("geoapify", "Geoapify"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
-    ParameterSpec("pdf.geoapify_style", "PDF Export", "Geoapify PDF style", "osm-bright", "choice", "Geoapify tile style for PDF maps. Different styles use separate cached tiles.", choices=_choice(("osm-bright", "OSM Bright"), ("osm-carto", "OSM Carto"))),
+    ParameterSpec("pdf.track_info", "PDF Export", "Track information box", True, "bool", "Show detailed information below each track title."),
+    ParameterSpec("pdf.track_statistics", "PDF Export", "Track statistics", True, "bool", "Include recording time, distances, speeds, elevation statistics, and point count."),
+    ParameterSpec("pdf.checkpoints", "PDF Export", "Timed checkpoints", True, "bool", "Mark checkpoints and breaks on individual track maps and profiles and list their details."),
+    ParameterSpec("pdf.checkpoint_weather", "PDF Export", "Checkpoint weather", True, "bool", "Reuse nearby weather. Missing weather may be retrieved when historical weather is enabled and checkpoint retrieval is allowed."),
+    ParameterSpec("pdf.checkpoint_places", "PDF Export", "Checkpoint places", True, "bool", "Reuse nearby places, adding street or landmark detail when space permits."),
+    ParameterSpec("pdf.retrieve_checkpoint_data", "PDF Export", "Retrieve missing checkpoint information", True, "bool", "Retrieve missing places and weather before rendering, following Locations and Weather consent/settings. Store results only in a separate PDF checkpoint sidecar."),
+    ParameterSpec("pdf.checkpoint_reuse_radius_m", "PDF Export", "Checkpoint reuse radius", 1000.0, "float", "Reuse place/weather records within this radius for PDFs only. Weather must also be within thirty minutes. Media freshness rules remain unchanged.", 0.0, 100000.0, unit="m"),
+    ParameterSpec("pdf.maximum_markers", "PDF Export", "Maximum checkpoint markers", 10, "int", "Includes start and end. Breaks use no more than half the final markers.", 2, 100),
+    ParameterSpec("pdf.marker_interval_minutes", "PDF Export", "Preferred checkpoint spacing", 60.0, "float", "Increase spacing automatically when the marker limit is reached.", 1.0, 10080.0, unit="min"),
+    ParameterSpec("pdf.break_duration_minutes", "PDF Export", "Minimum break duration", 30.0, "float", "A stationary run must last longer than this duration to count as a break.", 1.0, 10080.0, unit="min"),
+    ParameterSpec("pdf.break_radius_m", "PDF Export", "Break radius", 100.0, "float", "Positions must remain within this distance of a break's arrival position.", 1.0, 10000.0, unit="m"),
     ParameterSpec("pdf.document_dpi", "PDF Export", "Document DPI", 200, "int", "Rendering resolution for PDF pages.", 72, 1200),
     ParameterSpec("pdf.map_dpi", "PDF Export", "Embedded map DPI", 600, "int", "Pixel density used for embedded PDF maps.", 72, 2400),
     ParameterSpec("pdf.overview_zoom", "PDF Export", "Overview zoom", 8, "int", "Detail ceiling for PDF overview maps, automatically raised to at least the PDF track zoom for small areas. The tile limit lowers zoom to fit the exported extent.", 0, 22),
@@ -159,8 +168,10 @@ PARAMETER_SPECS = (
     ParameterSpec("weather.timeout_seconds", "Weather", "Request timeout", 20.0, "float", "Maximum wait for one historical-weather request.", 1.0, 300.0, advanced=True, unit="s"),
 
     ParameterSpec("maps.interactive_provider", "Map Service", "Interactive provider", "osm", "choice", "Provider used for interactive GPX Editor maps. Public OpenStreetMap is suitable for this use.", choices=_choice(("osm", "OpenStreetMap (public)"), ("geoapify", "Geoapify"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
-    ParameterSpec("maps.output_provider", "Map Service", "Map-generation provider", "osm", "choice", "Provider used for generated PNG and PDF maps. Public OpenStreetMap is restricted to manually selected individual maps.", choices=_choice(("osm", "OpenStreetMap (manual only)"), ("geoapify", "Geoapify (recommended)"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
-    ParameterSpec("maps.credential_id", "Map Service", "Credential name", "default", "text", "Name of the API credential stored in the macOS Keychain. The API key itself is never stored in the Adventure file."),
+    ParameterSpec("maps.output_provider", "Map Service", "Slideshow-map provider", "osm", "choice", "Provider for generated slideshow PNGs, and PDFs when they inherit this provider.", choices=_choice(("osm", "OpenStreetMap (manual only)"), ("geoapify", "Geoapify (recommended)"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
+    ParameterSpec("pdf.map_provider", "Map Service", "PDF provider", "output", "choice", "Override the provider for PDFs only, or inherit the slideshow-map provider.", choices=_choice(("output", "Use slideshow-map provider"), ("osm", "OpenStreetMap (public)"), ("geoapify", "Geoapify"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
+    ParameterSpec("pdf.geoapify_style", "Map Service", "Geoapify PDF style", "osm-bright", "choice", "PDFs only: each tile style has its own cache. Slideshow maps keep their existing style.", choices=_choice(("osm-bright", "OSM Bright"), ("osm-carto", "OSM Carto"))),
+    ParameterSpec("maps.credential_id", "Map Service", "Credential name", "default", "text", "Keychain account label, not an API key. Each provider has a separate secret under this name; PDF and slideshow maps can reuse it. OSM needs none."),
     ParameterSpec("maps.custom_url", "Map Service", "Custom URL template", "", "text", "HTTPS tile URL containing {z}, {x}, and {y}.", advanced=True),
     ParameterSpec("maps.custom_attribution", "Map Service", "Custom attribution", "", "text", "Required map attribution for a custom provider.", advanced=True),
     ParameterSpec("maps.maximum_zoom", "Map Service", "Maximum provider zoom", 19, "int", "Maximum supported tile zoom.", 0, 30),
@@ -171,7 +182,7 @@ PARAMETER_SPECS = (
 
 SPECS_BY_KEY = {spec.key: spec for spec in PARAMETER_SPECS}
 SECTION_ORDER = tuple(dict.fromkeys(spec.section for spec in PARAMETER_SPECS))
-EDITOR_PARAMETER_SECTIONS = ("GPX Processing", "PDF Export", "Map Service")
+EDITOR_PARAMETER_SECTIONS = ("GPX Processing", "PDF Export", "Map Service", "Map Generation")
 EDITOR_PARAMETER_KEYS = tuple(
     spec.key for spec in PARAMETER_SPECS if spec.section in EDITOR_PARAMETER_SECTIONS
 )

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from runtime_distribution import external_runtime_tool_allowed
+from weather_symbols import weather_condition_symbol
 from plot_metadata_utils import (
     coordinate_to_pixel,
     extract_coordinate_point,
@@ -2231,23 +2232,6 @@ def retained_weather_at_time(
     aligned = align_datetime_timezone(current_time, source_time)
     age = (aligned - source_time).total_seconds()
     return weather if 0.0 <= age <= float(maximum_age_seconds) else None
-
-
-def weather_condition_symbol(weather_code: object) -> str:
-    """Map WMO weather codes to compact offline symbols."""
-    try:
-        code = int(float(weather_code))
-    except (TypeError, ValueError):
-        return "\u2601\ufe0e"
-    if code == 0:
-        return "\u2600\ufe0e"
-    if code in {1, 2, 3, 45, 48}:
-        return "\u2601\ufe0e"
-    if code in {71, 73, 75, 77, 85, 86}:
-        return "\u2744\ufe0e"
-    if code in {95, 96, 99}:
-        return "\u26a1\ufe0e"
-    return "\u2614\ufe0e"
 
 
 def format_weather_value(weather: Optional[dict], field_name: str) -> str:

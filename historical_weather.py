@@ -62,6 +62,7 @@ class WeatherOptions:
     group_time_seconds: float = 600.0
     batch_size: int = 100
     minimum_request_interval_seconds: float = 1.0
+    wait_for_network: bool = True
 
 
 @dataclass
@@ -330,7 +331,9 @@ def _request_batch(
     for attempt in range(4):
         if cancel_event is not None and cancel_event.is_set():
             raise WeatherCancelled("Weather enrichment was cancelled.")
-        if not network_availability.wait_until_available(cancel_event):
+        if not options.wait_for_network and network_availability.offline:
+            raise ConnectionError("Offline; historical weather can be completed on the next export.")
+        if options.wait_for_network and not network_availability.wait_until_available(cancel_event):
             raise WeatherCancelled("Weather enrichment was cancelled.")
         try:
             response = request_json(url, max(1.0, float(options.timeout_seconds)))
@@ -509,6 +512,58 @@ def enrich_media_weather(
             _WeatherCandidate(media_path, media_sidecar_path(media_path), payload, timestamp, latitude, longitude)
         )
 
+    return _enrich_weather_candidates(
+        pending, current_payloads, report, options, progress_callback, detail_callback,
+        cancel_event, request_json, lambda candidate, updated: _atomic_write_json(candidate.sidecar_path, updated),
+    )
+
+
+def enrich_weather_sidecars(
+    payloads: dict[Path, dict[str, Any]],
+    *,
+    options: WeatherOptions = WeatherOptions(),
+    detail_callback=None,
+    progress_callback=None,
+    cancel_event=None,
+    request_json=None,
+    write_payload=None,
+    retry_action="retry this operation later",
+) -> WeatherUpdateReport:
+    """Enrich coordinate/time sidecars without pretending that they are media files.
+
+    Callers own these records and their storage; sampling, batching, retries and
+    attribution are identical to the media workflow.
+    """
+    report = WeatherUpdateReport(total=len(payloads))
+    pending, current = [], []
+    for path, payload in payloads.items():
+        if cancel_event is not None and cancel_event.is_set():
+            raise WeatherCancelled("Weather enrichment was cancelled.")
+        path = Path(path)
+        try:
+            latitude, longitude = float(payload["latitude"]), float(payload["longitude"])
+            if not math.isfinite(latitude) or not math.isfinite(longitude) or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError("Invalid coordinates")
+            timestamp = _aware_utc(payload["datetime_iso"])
+        except (KeyError, ValueError, TypeError, OverflowError):
+            report.invalid_sidecar += 1
+            continue
+        if weather_is_current(payload, distance_m=options.group_distance_m, time_seconds=options.group_time_seconds):
+            current.append((path, payload))
+            report.current += 1
+        else:
+            pending.append(_WeatherCandidate(path, path, payload, timestamp, latitude, longitude))
+    save = write_payload or _atomic_write_json
+    return _enrich_weather_candidates(
+        pending, current, report, options, progress_callback, detail_callback, cancel_event,
+        request_json or _default_request_json, lambda candidate, updated: save(candidate.sidecar_path, updated),
+        retry_action=retry_action,
+    )
+
+
+def _enrich_weather_candidates(pending, current_payloads, report, options, progress_callback,
+                               detail_callback, cancel_event, request_json, save_payload,
+                               retry_action="run Update Metadata later"):
     unresolved: list[_WeatherCandidate] = []
     for candidate in pending:
         match = next(
@@ -525,7 +580,7 @@ def enrich_media_weather(
         source_path, weather = match
         updated = dict(candidate.payload)
         updated["weather"] = _copy_weather_for_candidate(weather, candidate, source_path.name)
-        _atomic_write_json(candidate.sidecar_path, updated)
+        save_payload(candidate, updated)
         current_payloads.append((candidate.media_path, updated))
         report.reused += 1
         if detail_callback is not None:
@@ -567,8 +622,8 @@ def enrich_media_weather(
             )
             message = (
                 "Open-Meteo is still rate-limiting requests after automatic backoff. "
-                "Weather already added has been saved; run Update Metadata "
-                "later to continue with the remaining media."
+                f"Weather already added has been saved; {retry_action} "
+                "to continue with the remaining records."
             )
             report.warnings.append(message)
             if detail_callback is not None:
@@ -588,7 +643,7 @@ def enrich_media_weather(
                     weather = _weather_payload(candidate, group, response)
                     updated = dict(candidate.payload)
                     updated["weather"] = weather
-                    _atomic_write_json(candidate.sidecar_path, updated)
+                    save_payload(candidate, updated)
                     report.updated += 1
                     if detail_callback is not None:
                         temperature = weather["values"].get("temperature_2m")
@@ -601,5 +656,5 @@ def enrich_media_weather(
             if progress_callback is not None:
                 progress_callback(completed_groups, max(len(groups), 1), group.members[0].media_path.name)
     if progress_callback is not None:
-        progress_callback(len(paths), max(len(paths), 1), "")
+        progress_callback(report.total, max(report.total, 1), "")
     return report

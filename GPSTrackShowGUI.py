@@ -767,7 +767,7 @@ def confirm_alert(message: str, informative: str = "", confirm_title: str = "Pro
     return int(alert.runModal()) == 1000
 
 
-def request_provider_api_key(provider: str, credential_id: str) -> bool:
+def request_provider_api_key(provider: str, credential_id: str, *, remember_output_provider=True) -> bool:
     """Prompt once and store a hosted-provider API key in macOS Keychain."""
     preference = load_map_provider_preference()
     if (
@@ -781,6 +781,7 @@ def request_provider_api_key(provider: str, credential_id: str) -> bool:
         provider,
         credential_id,
         initial_key=read_provider_credential(provider, credential_id),
+        remember_output_provider=remember_output_provider,
     )
     return bool(result and result.get("action") == "configured")
 
@@ -7100,10 +7101,13 @@ class GPXTrackerController(NSObject):
         credential_id = str(new_parameters.get("maps.credential_id", "default"))
         for key in ("maps.interactive_provider", "maps.output_provider", "pdf.map_provider"):
             provider = str(new_parameters.get(key, "osm"))
-            if provider_requires_credential(provider) and not request_provider_api_key(
-                provider, credential_id
-            ):
-                return False
+            if provider_requires_credential(provider):
+                unchanged = (new_parameters.get(key) == old_parameters.get(key)
+                             and credential_id == old_parameters.get("maps.credential_id", "default"))
+                if unchanged and read_provider_credential(provider, credential_id):
+                    continue
+                if not request_provider_api_key(provider, credential_id, remember_output_provider=key == "maps.output_provider"):
+                    return False
         if (
             bool(new_parameters.get("weather.enabled", False))
             and not bool(old_parameters.get("weather.enabled", False))
@@ -8698,18 +8702,23 @@ class GPXTrackerController(NSObject):
 
     def _manage_map_provider_from_settings(self, draft):
         credential_id = str(draft.get("maps.credential_id", "default"))
+        key = draft.get("_provider_setting", "maps.output_provider")
+        preferred = draft.get(key, "osm")
+        if preferred == "output":
+            preferred = draft.get("maps.output_provider", "osm")
         result = run_map_provider_setup(
-            preferred_provider=str(draft.get("maps.output_provider", "geoapify")),
+            preferred_provider=str(preferred),
             credential_id=credential_id,
             timeout_seconds=float(draft.get("maps.request_timeout_seconds", 12.0)),
+            remember_output_provider=key == "maps.output_provider",
         )
         action = str(result.get("action", "cancel"))
         if action == "cancel":
             return None
-        provider = str(result.get("provider", draft.get("maps.output_provider", "osm")))
+        provider = str(result.get("provider", preferred))
         if action == "settings" and provider == "custom":
             self.parameter_editor_controller.show_advanced = True
-        return {"maps.output_provider": provider}
+        return {key: provider}
 
     def _parameter_editor_cancelled(self):
         if self.pending_map_provider_action is not None:
@@ -17732,7 +17741,8 @@ class GPXTrackerController(NSObject):
         values = self.parameters if parameter_values is None else parameter_values
         if use_track_order is None:
             use_track_order = self._use_track_order()
-        labels = "none" if values["trackmaps.overview_labels"] == "none" else None
+        label_mode = values["trackmaps.overview_labels"]
+        labels = label_mode if label_mode in {"none", "automatic"} else None
         maximum_zoom = int(values["maps.maximum_zoom"])
         resolved_output_base = output_base
         if not resolved_output_base and parameter_values is None:

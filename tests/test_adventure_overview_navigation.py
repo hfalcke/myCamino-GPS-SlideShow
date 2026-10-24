@@ -35,6 +35,57 @@ class AdventureOverviewNavigationTests(unittest.TestCase):
                 self.assertNotIn("Fit Entire Adventure", items)
                 self.assertNotIn("Return to Adventure Overview", items)
 
+    def test_hidden_track_menu_reflects_display_policy(self):
+        self.assertEqual(self.menu_entries('overview', SimpleNamespace(show_hidden_tracks=False))['Show Hidden Tracks'],
+                         'toggleWorkspaceHiddenTracks:')
+        self.assertEqual(self.menu_entries('track', SimpleNamespace(show_hidden_tracks=True))['Hide Hidden Tracks'],
+                         'toggleWorkspaceHiddenTracks:')
+        self.assertNotIn('Show Hidden Tracks', self.menu_entries('overview', None))
+
+    def test_hidden_track_toggle_only_redraws_existing_vector_views(self):
+        tracks = [SimpleNamespace(nr=1, hidden=False), SimpleNamespace(nr=2, hidden=True)]
+        workspace = SimpleNamespace(show_hidden_tracks=False,
+            plot_view=SimpleNamespace(setNeedsDisplay_=Mock()),
+            gpx_controller=SimpleNamespace(tracks=tracks, visible_tracks=lambda: tracks[:1],
+                refresh_elevation_profile_for_plot_view=Mock(), set_status=Mock(), mark_dirty=Mock()))
+        self.assertEqual(AdventureMapController.workspace_display_tracks(workspace), tracks[:1])
+        toggle = AdventureMapController.toggleWorkspaceHiddenTracks_.callable
+        toggle(workspace, None)
+        self.assertEqual(AdventureMapController.workspace_display_tracks(workspace), tracks)
+        self.assertEqual([track.hidden for track in tracks], [False, True])
+        workspace.gpx_controller.mark_dirty.assert_not_called()
+        workspace.plot_view.setNeedsDisplay_.assert_called_once_with(True)
+        workspace.gpx_controller.refresh_elevation_profile_for_plot_view.assert_called_once_with(workspace.plot_view)
+        toggle(workspace, None)
+        self.assertEqual(AdventureMapController.workspace_display_tracks(workspace), tracks[:1])
+
+    def test_plot_display_includes_hidden_only_when_requested(self):
+        tracks = [SimpleNamespace(nr=1, hidden=False), SimpleNamespace(nr=2, hidden=True)]
+        workspace = SimpleNamespace(show_hidden_tracks=False)
+        view = SimpleNamespace(mode='overview', adventure_workspace_delegate=workspace,
+            controller=SimpleNamespace(tracks=tracks, visible_tracks=lambda: tracks[:1], track_load_timer=None))
+        self.assertEqual(PlotView.display_tracks(view), tracks[:1])
+        workspace.show_hidden_tracks = True
+        self.assertEqual(PlotView.display_tracks(view), tracks)
+        view.mode = 'track'
+        self.assertEqual(PlotView.display_tracks(view), tracks)
+
+    def test_hidden_routes_are_orange_without_changing_blue_visible_routes(self):
+        tracks = [SimpleNamespace(nr=1, hidden=False), SimpleNamespace(nr=2, hidden=False),
+                  SimpleNamespace(nr=3, hidden=True)]
+        geometry = SimpleNamespace(segments=[SimpleNamespace(points=[object(), object()])])
+        view = SimpleNamespace(mode='overview', adventure_workspace_delegate=object(),
+            controller=SimpleNamespace(selected_nrs=[1]), plot_info={'image': None},
+            draw_track=Mock(), draw_segment_end_caps=Mock(), draw_selected_tracks_overlay=Mock())
+        PlotView.draw_track_layers(view, [(track, geometry) for track in tracks], Mock())
+        colors = [call.args[2] for call in view.draw_track.call_args_list]
+        self.assertEqual(len(colors), 2)
+        self.assertAlmostEqual(colors[0].redComponent(), .435)
+        self.assertAlmostEqual(colors[0].blueComponent(), .863)
+        self.assertAlmostEqual(colors[1].redComponent(), .84)
+        self.assertAlmostEqual(colors[1].greenComponent(), .42)
+        self.assertAlmostEqual(colors[1].blueComponent(), 0)
+
     def make_workspace(self, state):
         view = SimpleNamespace(
             mode=state, track_index=1, replace_plot_info=Mock(), setNeedsDisplay_=Mock(),
@@ -85,6 +136,15 @@ class AdventureOverviewNavigationTests(unittest.TestCase):
         )
         self.assertIs(workspace.overview_viewport, saved)
         self.assertEqual(workspace.track_viewports[2]["zoom"], 14)
+
+    def test_fit_includes_hidden_extents_only_when_display_enabled(self):
+        workspace, _ = self.make_workspace('overview')
+        workspace.show_hidden_tracks = True
+        workspace.gpx_controller.tracks = [SimpleNamespace(nr=1), SimpleNamespace(nr=2, hidden=True)]
+        AdventureMapController.show_workspace_overview(workspace, reset_viewport=True)
+        workspace.gpx_controller.interactive_plot_info.assert_called_once_with(
+            'overview', tracks_override=workspace.gpx_controller.tracks, include_hidden=True)
+        self.assertEqual(workspace._fit_workspace_plot_info.call_args.args[1], workspace.gpx_controller.tracks)
 
     def test_no_plot_model_does_not_clear_saved_overview(self):
         workspace, _ = self.make_workspace("track")

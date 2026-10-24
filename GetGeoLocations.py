@@ -177,17 +177,18 @@ def detect_local_timezone() -> Optional[object]:
     return current_tz
 
 
-def check_cancelled() -> None:
+def check_cancelled(cancel_event=None) -> None:
     """Raise when the current in-process run has been cancelled."""
-    if RUNTIME_CANCEL_EVENT is not None and RUNTIME_CANCEL_EVENT.is_set():
+    event = cancel_event if cancel_event is not None else RUNTIME_CANCEL_EVENT
+    if event is not None and event.is_set():
         raise ProcessingCancelled("Aborted.")
 
 
-def sleep_with_cancel(seconds: float) -> None:
+def sleep_with_cancel(seconds: float, cancel_event=None) -> None:
     """Sleep in short intervals so cancellation remains responsive."""
     remaining = max(0.0, float(seconds))
     while remaining > 0.0:
-        check_cancelled()
+        check_cancelled(cancel_event)
         chunk = min(0.1, remaining)
         time.sleep(chunk)
         remaining -= chunk
@@ -1977,9 +1978,10 @@ def reverse_geocode_location_details_with_debug(
     latitude: float,
     longitude: float,
     timeout_seconds: float = 10.0,
+    *, cancel_event=None, wait_for_network=True,
 ) -> tuple[Optional[str], Optional[dict[str, Any]], dict[str, Any]]:
     """Reverse-geocode one coordinate pair into place text/details with debug details."""
-    check_cancelled()
+    check_cancelled(cancel_event)
     debug_info: dict[str, Any] = {
         "latitude": latitude,
         "longitude": longitude,
@@ -1991,14 +1993,17 @@ def reverse_geocode_location_details_with_debug(
 
     from network_availability import network_availability
 
-    network_availability.wait_until_available(RUNTIME_CANCEL_EVENT)
+    event = cancel_event if cancel_event is not None else RUNTIME_CANCEL_EVENT
 
     location = CLLocation.alloc().initWithLatitude_longitude_(latitude, longitude)
     retry_delays = [0.4, 1.2, 2.5]
 
     for attempt_index in range(len(retry_delays) + 1):
-        if not network_availability.wait_until_available(RUNTIME_CANCEL_EVENT):
-            check_cancelled()
+        if not wait_for_network and network_availability.offline:
+            debug_info["status"] = "offline"
+            return None, None, debug_info
+        if wait_for_network and not network_availability.wait_until_available(event):
+            check_cancelled(cancel_event)
         geocoder = CLGeocoder.alloc().init()
         attempt_info: dict[str, Any] = {"attempt": attempt_index + 1}
         state: dict[str, Any] = {
@@ -2031,7 +2036,11 @@ def reverse_geocode_location_details_with_debug(
 
         deadline = time.monotonic() + timeout_seconds
         while not state["done"] and time.monotonic() < deadline:
-            check_cancelled()
+            try:
+                check_cancelled(cancel_event)
+            except ProcessingCancelled:
+                geocoder.cancelGeocode()
+                raise
             NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.05))
 
         if not state["done"]:
@@ -2066,7 +2075,7 @@ def reverse_geocode_location_details_with_debug(
             return str(state["place"]), state["details"], debug_info
 
         if attempt_index < len(retry_delays):
-            sleep_with_cancel(retry_delays[attempt_index])
+            sleep_with_cancel(retry_delays[attempt_index], cancel_event)
 
     debug_info["status"] = "failed"
     return None, None, debug_info
@@ -2076,9 +2085,13 @@ def reverse_geocode_location_details(
     latitude: float,
     longitude: float,
     timeout_seconds: float = 10.0,
+    *, cancel_event=None, wait_for_network=True,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Reverse-geocode one coordinate pair into place text and structured fields."""
-    place, details, _ = reverse_geocode_location_details_with_debug(latitude, longitude, timeout_seconds=timeout_seconds)
+    place, details, _ = reverse_geocode_location_details_with_debug(
+        latitude, longitude, timeout_seconds=timeout_seconds,
+        **({"cancel_event": cancel_event, "wait_for_network": wait_for_network}
+           if cancel_event is not None or not wait_for_network else {}))
     return place, details
 
 
@@ -3244,9 +3257,10 @@ def resolve_place_for_coordinate(
     geocode_timeout_seconds: float = 10.0,
     geocode_pacing_min_seconds: float = GEOCODE_PACING_MIN_SECONDS,
     geocode_pacing_max_seconds: float = GEOCODE_PACING_MAX_SECONDS,
+    *, cancel_event=None, wait_for_network=True,
 ) -> tuple[Optional[str], Optional[dict[str, Any]], dict[str, Any]]:
     """Resolve one coordinate using the same cache and radius policy as media."""
-    check_cancelled()
+    check_cancelled(cancel_event)
     cache_key = (
         round(float(latitude), GEOCODE_ROUND_DIGITS),
         round(float(longitude), GEOCODE_ROUND_DIGITS),
@@ -3278,6 +3292,8 @@ def resolve_place_for_coordinate(
                         float(latitude),
                         float(longitude),
                         timeout_seconds=geocode_timeout_seconds,
+                        **({"cancel_event": cancel_event, "wait_for_network": wait_for_network}
+                           if cancel_event is not None or not wait_for_network else {}),
                     )
                 )
                 debug_info.update({"requested": True, **request_debug})
@@ -3286,12 +3302,14 @@ def resolve_place_for_coordinate(
                     float(latitude),
                     float(longitude),
                     timeout_seconds=geocode_timeout_seconds,
+                    **({"cancel_event": cancel_event, "wait_for_network": wait_for_network}
+                       if cancel_event is not None or not wait_for_network else {}),
                 )
             geocode_cache[cache_key] = (place, place_details)
-            sleep_between_geocode_requests(
-                geocode_pacing_min_seconds,
-                geocode_pacing_max_seconds,
-            )
+            if cancel_event is None:
+                sleep_between_geocode_requests(geocode_pacing_min_seconds, geocode_pacing_max_seconds)
+            else:
+                sleep_with_cancel(random.uniform(float(geocode_pacing_min_seconds), float(geocode_pacing_max_seconds)), cancel_event)
     else:
         debug_info.update(
             {

@@ -335,6 +335,7 @@ class AdventureMapController(NSObject):
         self.media_clusters = []
         self.media_hit_targets = []
         self.show_media_icons = True
+        self.show_hidden_tracks = False
         self.expanded_media_group = frozenset()
         self.selected_media_path = None
         self.selected_media_paths: set[Path] = set()
@@ -789,8 +790,11 @@ class AdventureMapController(NSObject):
             return None
         if remember_current:
             self._remember_workspace_viewport()
-        tracks = self.gpx_controller.visible_tracks()
-        plot_info = self.gpx_controller.interactive_plot_info("overview")
+        tracks = AdventureMapController.workspace_display_tracks(self)
+        if getattr(self, "show_hidden_tracks", False):
+            plot_info = self.gpx_controller.interactive_plot_info("overview", tracks_override=tracks, include_hidden=True)
+        else:
+            plot_info = self.gpx_controller.interactive_plot_info("overview")
         if plot_info is None:
             return None
         plot_info = self._fit_workspace_plot_info(
@@ -2315,6 +2319,11 @@ class AdventureMapController(NSObject):
         )
         item.setTarget_(self)
         menu.addItem_(item)
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Hide Hidden Tracks" if self.show_hidden_tracks else "Show Hidden Tracks",
+            "toggleWorkspaceHiddenTracks:", "")
+        item.setTarget_(self)
+        menu.addItem_(item)
         return menu
 
     @objc.IBAction
@@ -2332,6 +2341,20 @@ class AdventureMapController(NSObject):
             if self.show_media_icons
             else "All media icons are hidden."
         )
+
+    @objc.python_method
+    def workspace_display_tracks(self):
+        return list(self.gpx_controller.tracks) if getattr(self, "show_hidden_tracks", False) else self.gpx_controller.visible_tracks()
+
+    @objc.IBAction
+    def toggleWorkspaceHiddenTracks_(self, _sender):
+        self.show_hidden_tracks = not getattr(self, "show_hidden_tracks", False)
+        if self.plot_view is not None:
+            self.plot_view.setNeedsDisplay_(True)
+            self.gpx_controller.refresh_elevation_profile_for_plot_view(self.plot_view)
+        self.gpx_controller.set_status(
+            "Hidden tracks are shown in orange; they remain excluded from totals."
+            if self.show_hidden_tracks else "Hidden tracks are no longer displayed.")
 
     @objc.IBAction
     def showMediaInControlFile_(self, _sender):
@@ -2497,7 +2520,7 @@ class AdventureMapController(NSObject):
             return False
         cursor = view.cursor
         track = cursor[2] if cursor is not None else None
-        visible_tracks = self.gpx_controller.visible_tracks()
+        visible_tracks = AdventureMapController.workspace_display_tracks(self)
         if track not in visible_tracks:
             selected = [
                 candidate
@@ -2543,7 +2566,7 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def _navigate_workspace_track(self, direction):
-        tracks = self.gpx_controller.visible_tracks()
+        tracks = AdventureMapController.workspace_display_tracks(self)
         if not tracks:
             return False
         selected = self.gpx_controller.selected_tracks()
@@ -2751,11 +2774,11 @@ class AdventureMapController(NSObject):
         self.adventureComponentDidChange_("adventure")
 
     @objc.python_method
-    def _request_initial_weather_choice(self):
+    def _request_initial_weather_choice(self, purpose="media"):
         alert = NSAlert.alloc().init()
-        alert.setMessageText_("Add historical weather to media?")
+        alert.setMessageText_(f"Add historical weather to {purpose}?")
         alert.setInformativeText_(
-            "Weather lookup sends media coordinates and exposure times to Open-Meteo. "
+            "Weather lookup sends coordinates and timestamps to Open-Meteo. "
             "Free non-commercial access needs no account or API key. Customer access "
             "requires an Open-Meteo account, a suitable paid plan, and an API key. "
             "Open-Meteo attribution is required for either choice. "
@@ -3868,14 +3891,19 @@ class AdventureMapController(NSObject):
 
     @objc.python_method
     def _manage_map_provider_from_settings(self, draft):
+        key = draft.get("_provider_setting", "maps.output_provider")
+        preferred = draft.get(key, "osm")
+        if preferred == "output":
+            preferred = draft.get("maps.output_provider", "osm")
         result = run_map_provider_setup(
-            preferred_provider=str(draft.get("maps.output_provider", "geoapify")),
+            preferred_provider=str(preferred),
             credential_id=str(draft.get("maps.credential_id", "default")),
             timeout_seconds=float(draft.get("maps.request_timeout_seconds", 12.0)),
+            remember_output_provider=key == "maps.output_provider",
         )
         if str(result.get("action", "cancel")) == "cancel":
             return None
-        return {"maps.output_provider": str(result.get("provider", "osm"))}
+        return {key: str(result.get("provider", "osm"))}
 
     @objc.python_method
     def _apply_workspace_parameters(self, values, changed):
@@ -4808,6 +4836,7 @@ class AdventureMapController(NSObject):
                 "Drop an Adventure, project folder, GPX tracks, photos, videos, or audio onto the map.\n\n"
                 "TRACKS\n\n"
                 "Click a track to select it. The selected track is dark blue; other tracks are light blue, and marked ranges are red.\n\n"
+                "Choose Show Hidden Tracks in the map context menu to display hidden tracks in orange. This does not change their saved visibility or include them in totals. Choose Hide Hidden Tracks to hide them again.\n\n"
                 "Double-click a track to open the Track Table. Double-click it there to open its Waypoint Table. Right-click a track on the map to open either table, fit the view, or show the synchronized Elevation Profile.\n\n"
                 "Double-click empty map space, or press Command-0, to return to the Adventure overview at its remembered zoom and position. Choose Fit Entire Adventure in the map context menu to fit all visible tracks. Drag the map or use two-finger scrolling to pan.\n\n"
                 "MEDIA\n\n"

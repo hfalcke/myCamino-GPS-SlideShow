@@ -109,6 +109,7 @@ def configure_hosted_provider(
     timeout_seconds: float = 12.0,
     *,
     initial_key: str = "",
+    remember_output_provider: bool = True,
 ):
     definition = PROVIDERS_BY_ID[provider]
     entered_key = str(initial_key or "")
@@ -147,7 +148,8 @@ def configure_hosted_provider(
         if validation.valid:
             try:
                 store_provider_credential(provider, entered_key, credential_id)
-                save_map_provider_preference(provider, credential_id, credential_verified=True)
+                if remember_output_provider:
+                    save_map_provider_preference(provider, credential_id, credential_verified=True)
             except (OSError, ValueError) as exc:
                 _show_message("Could not store the API key", str(exc))
                 continue
@@ -166,7 +168,8 @@ def configure_hosted_provider(
             if offline_response == 1000:
                 try:
                     store_provider_credential(provider, entered_key, credential_id)
-                    save_map_provider_preference(provider, credential_id, credential_verified=False)
+                    if remember_output_provider:
+                        save_map_provider_preference(provider, credential_id, credential_verified=False)
                 except (OSError, ValueError) as exc:
                     _show_message("Could not store the API key", str(exc))
                     continue
@@ -182,6 +185,7 @@ def run_map_provider_setup(
     preferred_provider: str = "geoapify",
     credential_id: str = "default",
     timeout_seconds: float = 12.0,
+    remember_output_provider: bool = True,
 ):
     """Run first-use setup and return the requested caller action."""
     while True:
@@ -193,7 +197,8 @@ def run_map_provider_setup(
             return {"action": "settings", "provider": provider}
         if provider == "osm":
             try:
-                save_map_provider_preference("osm", credential_id, credential_verified=True)
+                if remember_output_provider:
+                    save_map_provider_preference("osm", credential_id, credential_verified=True)
             except OSError as exc:
                 _show_message("Could not remember the map-provider preference", str(exc))
             return {"action": "limited", "provider": "osm", "verified": True}
@@ -202,6 +207,7 @@ def run_map_provider_setup(
             credential_id,
             timeout_seconds,
             initial_key=read_provider_credential(provider, credential_id),
+            remember_output_provider=remember_output_provider,
         )
         if result is not None:
             return result
