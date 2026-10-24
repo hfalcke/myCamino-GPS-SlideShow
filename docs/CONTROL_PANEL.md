@@ -6,15 +6,23 @@ From the myCamino repository, run:
 ./control.sh
 ```
 
-The launcher starts or reopens the authenticated panel at
-`http://127.0.0.1:8788/`. It runs independently of FediOps (port 8787).
-Use `./control.sh status`, `./control.sh stop`, or `./control.sh restart` to
-manage the panel. Closing the browser does not stop it. Set
+The launcher stops any existing panel process, starts the current code, and
+opens the authenticated panel at `http://127.0.0.1:8788/`. This ensures local
+panel changes are loaded rather than reusing an older process. It runs
+independently of FediOps (port 8787). Use `./control.sh start` to reopen an
+already-running panel without restarting it; `./control.sh status`,
+`./control.sh stop`, and `./control.sh restart` remain available. A restart is
+refused while a modifying operation is running. Closing the browser does not
+stop the panel. Set
 `MYCAMINO_CONTROL_NO_OPEN=1` to start without opening a browser.
 
 ## Operations
 
 ### Code
+
+The **Code** link in the panel header opens a separate page for application
+source and DMG operations. The main page is reserved for website and feedback
+operations.
 
 - **Commit and Push myCamino Code** asks for a commit message, runs application
   tests, stages all non-ignored repository changes, commits them, and pushes the
@@ -27,13 +35,14 @@ manage the panel. Closing the browser does not stop it. Set
   `dist/myCamino-GPS-Track-Show.dmg`. It replaces local build products without
   committing, pushing, changing the version, or publishing the download.
   A progress page opens immediately, showing the current build stage, a
-  stage-based progress bar, elapsed time, and combined output/errors refreshed
+  milestone-based progress bar, elapsed time, and combined output/errors refreshed
   every second. Stages are not equally long, so the bar is not a time estimate.
   Turn off **Follow new output** to read earlier lines without auto-scrolling.
   Closing or refreshing the page does not stop or repeat the build. Return via
-  **Recent local builds** on the home page. The panel retains the last ten
-  builds and the latest 250,000 output characters per build in memory for the
-  current panel session. Its permanent action log records only the outcome.
+  **Recent code operations** on the Code page. The panel retains the last ten
+  operations and the latest 250,000 output characters per operation in memory
+  for the current panel session. Its permanent action log records only the
+  outcome.
 - **Release App DMG to Website** asks for the version (`X.Y.Z`), release date,
   and commit message. It uses `release.sh` to update `application_metadata.py`,
   run tests, commit the exact source, build/verify the DMG, push Git, and publish
@@ -41,11 +50,13 @@ manage the panel. Closing the browser does not stop it. Set
   are updated together. The form shows the current version and defaults the
   date to today; edit the version for a new numbered release. This changes the
   live download, not the website's application container. Release retention
-  preserves the active and previous DMGs.
+  preserves the active and previous DMGs. The release opens the same live
+  progress view as a local build, including its release milestones, elapsed
+  time, and continuously updated combined output and errors.
 
 These actions require confirmation and share the website deployment lock.
-Local DMG builds have live progress; other operations return output when
-finished, so keep their results tab open. A failure
+Local DMG builds and app releases have live progress; other operations return
+output when finished, so keep their results tab open. A failure
 stops later steps but does not undo a version edit or a completed local commit.
 A failed push preserves the commit; a failed upload may occur after the source
 has already been pushed. Check the result before retrying. Never force-push to
@@ -85,11 +96,11 @@ fields does not change the program version. Direct `release.sh` and
 - **Application news** supports drafts, editing, publishing, withdrawing, and
   slug-confirmed deletion. Publishing changes the live application news feed.
 
-Except for the live local-build page, long operations return their result in
-the same page. Other pages remain
+Except for the live local-build and app-release page, long operations return
+their result in the same page. Other pages remain
 available while they run. Modifying operations are serialized across the panel
 and website-release CLI; wait for a running operation before starting another.
-Each operation has an explanation on the home page, confirmation page, and
+Each operation has an explanation on its listing page, confirmation page, and
 results page. Read-only checks are identified separately from modifying actions.
 
 The Code release action uses `./release.sh`. Website publishing

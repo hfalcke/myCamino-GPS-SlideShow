@@ -20,7 +20,7 @@
       const response = await fetch("/build-status?id=" + encodeURIComponent(job.dataset.job) + "&cursor=" + cursor,
         {credentials: "same-origin", cache: "no-store", signal: controller.signal});
       if (response.status === 401 || response.status === 403) {
-        connection.textContent = "Session expired. Reopen myCamino Control to reconnect; do not start another build.";
+        connection.textContent = "Session expired. Reopen myCamino Control to reconnect; do not start another operation.";
         finished = true;
         return;
       }
@@ -38,20 +38,20 @@
       progress.max = data.total;
       progress.value = data.completed;
       document.getElementById("build-stage").textContent = data.stage;
-      document.getElementById("build-count").textContent = data.completed + " of " + data.total + " stages completed";
+      document.getElementById("build-count").textContent = data.completed + " of " + data.total + " milestones completed";
       const minutes = Math.floor(data.elapsed / 60);
       document.getElementById("build-elapsed").textContent = "Elapsed: " + minutes + "m " + (data.elapsed % 60) + "s";
       document.getElementById("build-truncated").textContent = data.truncated ? "Showing the latest output; older lines have been trimmed." : "";
       connection.textContent = "";
       finished = data.status !== "running";
-      const statusText = !finished ? "Building… live updates every second" :
-        (data.status === "succeeded" ? "Completed successfully — DMG saved in dist/myCamino-GPS-Track-Show.dmg" : "Build failed (exit " + data.returncode + "). See the output below.");
+      const statusText = !finished ? data.running_message :
+        (data.status === "succeeded" ? data.success_message : data.label + " failed (exit " + data.returncode + "). See the output below.");
       if (status.textContent !== statusText) status.textContent = statusText;
       status.className = !finished ? "" : (data.status === "succeeded" ? "status-ok" : "status-bad");
       progress.classList.toggle("build-failed", data.status === "failed");
       if (follow.checked) output.scrollTop = output.scrollHeight;
     } catch (_) {
-      connection.textContent = "Connection interrupted. Reconnecting… The build may still be running; do not start it again.";
+      connection.textContent = "Connection interrupted. Reconnecting… The operation may still be running; do not start it again.";
     } finally {
       clearTimeout(timeout);
       if (!finished) setTimeout(poll, 1000);

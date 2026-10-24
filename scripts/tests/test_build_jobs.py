@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 
-from ops_control.build_jobs import BuildJob, BuildJobs, OUTPUT_LIMIT, STAGES
+from ops_control.build_jobs import BuildJob, BuildJobs, OUTPUT_LIMIT, RELEASE_STAGES, STAGES
 
 
 class BuildJobsTests(unittest.TestCase):
@@ -102,6 +102,28 @@ class BuildJobsTests(unittest.TestCase):
             if stage.startswith(('Building myCamino', 'Creating dist/', 'Verifying dist/', 'Done:')):
                 continue  # These messages interpolate shell variables.
             self.assertIn('==> '+stage, source)
+
+        release_source = (Path(__file__).resolve().parents[2]/'release.sh').read_text()
+        for stage in RELEASE_STAGES:
+            if stage in STAGES or stage.startswith(('Building and verifying DMG from',
+                                                    'Pushing ')):
+                continue
+            self.assertIn('==> '+stage, release_source)
+
+    def test_release_job_uses_release_identity_messages_and_audit_key(self):
+        job = self.jobs.start(
+            [sys.executable, '-c', "print('==> Publishing verified DMG to mycamino.heinofalcke.de')"],
+            cwd=self.root, timeout=5, key='release_mycamino_app',
+            label='Release App DMG to Website', stages=RELEASE_STAGES,
+            running_message='Releasing… live updates every second',
+            success_message='Release completed successfully.')
+        job.thread.join(5)
+        data = job.snapshot()
+        self.assertEqual(data['key'], 'release_mycamino_app')
+        self.assertEqual(data['label'], 'Release App DMG to Website')
+        self.assertEqual(data['success_message'], 'Release completed successfully.')
+        self.assertEqual(data['total'], len(RELEASE_STAGES))
+        self.assertEqual(self.audits, [('release_mycamino_app', 0)])
 
 
 if __name__ == '__main__':

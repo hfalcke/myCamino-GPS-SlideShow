@@ -122,6 +122,7 @@ from cocoa_native_menus import (
     add_menu,
     configure_mycamino_branding,
     menu_item,
+    retire_owned_windows,
 )
 from cocoa_application_news import install_application_news
 from network_availability import network_availability
@@ -2039,11 +2040,9 @@ class SlideShowMediaViewerDelegate(NSObject):
         self.controller = controller
         return self
 
-    def windowWillClose_(self, _notification):
-        self.controller.stop_media_viewer_video()
-        self.controller.media_viewer_window = None
-        self.controller.media_viewer_view = None
-        self.controller.media_viewer_delegate = None
+    def windowShouldClose_(self, _sender):
+        self.controller.close_media_viewer()
+        return False
 
 
 class SlideShowMediaViewerView(NSView):
@@ -2493,6 +2492,8 @@ class GPXTrackerController(NSObject):
         if self is None:
             return None
         self.base_dir = Path(__file__).resolve().parent
+        self.lifecycle_retired = False
+        self.lifecycle_status_threads = []
         self.current_project_dir = None
         self.startup_project_directory = None
         self.startup_project_file = None
@@ -3483,7 +3484,7 @@ class GPXTrackerController(NSObject):
         self.slideshow_choose_button.setToolTip_(
             "Open the control-file editor, choose an exact row, and use Start Slide Show Here."
         )
-        self.pdf_summary_button.setToolTip_("Export a PDF summary of the current GPX tracks using the GPX Editor PDF options.")
+        self.pdf_summary_button.setToolTip_("Create a printable track summary, with optional maps and elevation profiles.")
         self.music_label.setToolTip_("The active playlist inside the project's fixed audio folder.")
         self.music_field.setToolTip_(
             "Shows the selected .playlist file. Without a selected playlist, "
@@ -4068,6 +4069,8 @@ class GPXTrackerController(NSObject):
         self.window.setFrameOrigin_(NSMakePoint(float(old_frame.origin.x), origin_y))
 
     def set_status(self, message: str):
+        if getattr(self, "lifecycle_retired", False):
+            return
         self.last_status_message = str(message)
         suffix = {
             "offline": "Offline - online work paused",
@@ -4089,6 +4092,8 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def applyNetworkState_(self, state):
+        if getattr(self, "lifecycle_retired", False):
+            return
         self._apply_network_state(str(state))
 
     @objc.python_method
@@ -4127,6 +4132,8 @@ class GPXTrackerController(NSObject):
         self.layout_window()
 
     def setOptionalEnrichmentProgress_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         """Mirror optional background work without forcing the map indicator on."""
         if self.geolocations_running:
             return
@@ -4142,6 +4149,8 @@ class GPXTrackerController(NSObject):
         self.layout_window()
 
     def clearOptionalEnrichmentProgress_(self, _sender):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if self.geolocations_running:
             return
         self.processing_phase_title = None
@@ -4151,10 +4160,14 @@ class GPXTrackerController(NSObject):
         self.layout_window()
 
     def setProgressFromWorker_(self, progress_pair):
+        if getattr(self, "lifecycle_retired", False):
+            return
         current, total = progress_pair
         self.set_progress(current, total)
 
     def setStatusFromWorker_(self, message):
+        if getattr(self, "lifecycle_retired", False):
+            return
         text = str(message)
         self.set_status(text)
         if (
@@ -4167,6 +4180,8 @@ class GPXTrackerController(NSObject):
             )
 
     def mark_dirty(self, immediate=False):
+        if getattr(self, "lifecycle_retired", False):
+            return
         self.project_dirty = True
         host = getattr(self, "adventure_map_host", None)
         if host is not None:
@@ -5406,6 +5421,8 @@ class GPXTrackerController(NSObject):
 
     def derivedTrackUpdateFinished_(self, result):
         """Install status from one background derived-data refresh."""
+        if getattr(self, "lifecycle_retired", False):
+            return
         if not isinstance(result, dict):
             return
         error = result.get("error")
@@ -6851,6 +6868,8 @@ class GPXTrackerController(NSObject):
         return result
 
     def start_async_project_status_refresh(self, reason=""):
+        if getattr(self, "lifecycle_retired", False):
+            return
         self.status_refresh_generation += 1
         generation = self.status_refresh_generation
         project_dir = self.current_project_dir
@@ -6876,9 +6895,14 @@ class GPXTrackerController(NSObject):
                 return
             self.performSelectorOnMainThread_withObject_waitUntilDone_("applyAsyncProjectStatus:", result, True)
 
-        threading.Thread(target=run_task, name="project-status-refresh", daemon=True).start()
+        thread = threading.Thread(target=run_task, name="project-status-refresh", daemon=True)
+        self.lifecycle_status_threads = [item for item in self.lifecycle_status_threads if item.is_alive()]
+        self.lifecycle_status_threads.append(thread)
+        thread.start()
 
     def applyAsyncProjectStatus_(self, result):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if int(result.get("generation", -1)) != self.status_refresh_generation:
             return
         self.project_status_pending = False
@@ -7074,7 +7098,7 @@ class GPXTrackerController(NSObject):
         )
         new_parameters = normalize_parameters(values)
         credential_id = str(new_parameters.get("maps.credential_id", "default"))
-        for key in ("maps.interactive_provider", "maps.output_provider"):
+        for key in ("maps.interactive_provider", "maps.output_provider", "pdf.map_provider"):
             provider = str(new_parameters.get(key, "osm"))
             if provider_requires_credential(provider) and not request_provider_api_key(
                 provider, credential_id
@@ -7308,6 +7332,8 @@ class GPXTrackerController(NSObject):
         return True
 
     def resumePendingMapProviderAction_(self, _payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         pending = self.pending_map_provider_action
         self.pending_map_provider_action = None
         if not pending:
@@ -7373,7 +7399,7 @@ class GPXTrackerController(NSObject):
             "8. Press Edit to review the slide-show list. You can move, copy, delete, and edit rows, then save the list again. Unsaved table edits are regularly backed up and can be restored after an interruption.\n"
             "9. For later additions or corrections, press Update Control File instead of recreating the complete list. It checks map references, inventories all project media, and finds imported, newly discovered, missing, invalid, legacy, and changed items. The review keeps Add, Metadata, and Move as separate choices. Recommended additions start selected, other unclassified files remain unchecked, and unchecked absent files are remembered as deliberately excluded. Use the filters to reveal excluded files and add them later. Map images themselves are rendered in Map Generation. Choose Other Media deliberately rechecks otherwise current files; changed GPS can trigger a targeted place-name update.\n"
             "11. Audio is optional and new Adventures start with No Audio selected, which disables both music and narration. Use the +/− button to expand or collapse the remembered Audio details. Music uses the fixed audio folder; narration uses the fixed narration folder. Both playlist rows provide Choose, Create, Update, Edit, and folder controls. MUS rows control persistent music transport, PLY rows play a finite music selection and then resume the interrupted title, and NAR rows play finite narration sequences while the visuals continue. Narration can leave music unchanged, reduce it, or fade and pause it through Settings > Audio. Insert CTL rows for slide-show flow and timing. The a key toggles all audio. Normalize Video Audio remains available independently.\n"
-            "12. Use PDF Summary near Start if you want a printable GPX track table and optional map pages.\n"
+            "12. Adventure > PDF Summary creates a printable track report with optional map pages. The Advanced Interface also has a PDF Summary button near Start.\n"
             "13. Update Metadata can add readable place names and, when selected, historical Open-Meteo weather. Weather is stored in sidecars and reused without repeating EXIF extraction or place lookup. During Time-Lapse the latest reached weather remains visible for up to one media-time hour.\n"
             "14. Press Start to begin at the start, or Continue to choose from up to twenty automatically saved checkpoints. The Continue table shows when playback stopped, the active medium or map, place, media date, and whether the entry is still usable. A checkpoint restores its stage, phase, Time-Lapse progress, and exact background-music title and position when those assets still exist. In Settings, At end chooses a black final slide, one complete replay, or continuous looping; Loop forever is the default and every replay begins with the title slide. The initial style is selected in Settings and defaults to Time-Lapse. During playback, t cycles forward and Shift-t backward through Time-Lapse, Blend, Fade, Switch, Expand, Collage, Quad, and Random.\n"
             "15. In the control-file editor, use the row-type filter or Reset Filter. The Previews popup offers Off, Small, Medium, and Large; thumbnails load progressively without blocking scrolling. Right-click photos or videos to Hide/Unhide them. CAPTION rows label the immediately following medium; FONT rows change following caption and header fonts. Press Choose in Start Slide Show to open this editor, then use Start Slide Show Here at the bottom or in the context menu to launch from an exact row. Jump to Show selects the latest player row and follows playback. While following, selecting one row jumps the running show there; editing a cell or selecting multiple rows stops following.\n"
@@ -7701,6 +7727,8 @@ class GPXTrackerController(NSObject):
         self.preserve_processing_output_next = True
 
     def appendGeoLocationsOutputLine_(self, line):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if self.geolocations_text_view is None:
             return
         addition = NSAttributedString.alloc().initWithString_(f"{line}\n")
@@ -7709,6 +7737,8 @@ class GPXTrackerController(NSObject):
         self.geolocations_text_view.scrollRangeToVisible_((storage.length(), 0))
 
     def _finish_geolocations_run(self, status_text, status_message):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if self.geolocations_cancel_button is not None:
             self.geolocations_cancel_button.setEnabled_(False)
         if self.geolocations_close_button is not None:
@@ -7773,6 +7803,8 @@ class GPXTrackerController(NSObject):
         self.geolocations_temp_paths = []
 
     def geoLocationsRunFinished_(self, status_text):
+        if getattr(self, "lifecycle_retired", False):
+            return
         status = str(status_text)
         mode = self.geolocations_mode
         if status == "place_names_skipped":
@@ -8638,6 +8670,9 @@ class GPXTrackerController(NSObject):
 
     def _show_parameter_editor_section(self, section=None, *, draft_overrides=None, show_advanced=None):
         """Open Adventure Settings, optionally selecting one section."""
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            return host.open_shared_settings(section, draft_overrides=draft_overrides, show_advanced=show_advanced)
         if self.parameter_editor_controller is None:
             self.parameter_editor_controller = CocoaParameterEditor.alloc().init()
             self.parameter_editor_controller.configure(
@@ -8648,8 +8683,10 @@ class GPXTrackerController(NSObject):
                 manage_map_provider_callback=self._manage_map_provider_from_settings,
                 cancel_callback=self._parameter_editor_cancelled,
             )
-        else:
+        elif not self.parameter_editor_controller.window.isVisible():
             self.parameter_editor_controller.update_values(self.parameters)
+        else:
+            self.parameter_editor_controller._capture_controls()
         if section in SECTION_ORDER:
             self.parameter_editor_controller.current_section = section
         if show_advanced is not None:
@@ -8707,7 +8744,7 @@ class GPXTrackerController(NSObject):
     def parameterValueChanged_(self, _sender):
         key = self.parameter_tag_to_key.get(int(_sender.tag()))
         self._capture_parameter_controls()
-        if key in {"maps.interactive_provider", "maps.output_provider"}:
+        if key in {"maps.interactive_provider", "maps.output_provider", "pdf.map_provider"}:
             self.performSelector_withObject_afterDelay_("refreshParameterSection:", None, 0.0)
 
     def refreshParameterSection_(self, _payload):
@@ -9019,6 +9056,8 @@ class GPXTrackerController(NSObject):
         self.geolocations_thread.start()
 
     def videoNormalizationProgress_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         current = int(payload.get("current", 0))
         total = max(1, int(payload.get("total", 1)))
         name = str(payload.get("name", ""))
@@ -9029,6 +9068,8 @@ class GPXTrackerController(NSObject):
             )
 
     def videoNormalizationFinished_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         status = str(payload.get("status", "error"))
         if status == "error":
             self._finish_geolocations_run(
@@ -9743,6 +9784,8 @@ class GPXTrackerController(NSObject):
 
     @objc.IBAction
     def controlPreviewReady_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         cache_key = str(payload.get("cache_key", ""))
         request = self.control_table_preview_pending.get(cache_key)
         if request is None:
@@ -11051,7 +11094,7 @@ class GPXTrackerController(NSObject):
             self.media_viewer_hint_timer = None
         if self.media_viewer_window is not None:
             self.stop_media_viewer_video()
-            self.media_viewer_window.close()
+            self.media_viewer_window.orderOut_(None)
 
     def show_previous_control_media(self):
         if not self.media_viewer_items:
@@ -15580,6 +15623,8 @@ class GPXTrackerController(NSObject):
         self.set_status(message)
 
     def slideshowStartupProgress_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if (int(payload.get("generation", -1)) != self.slideshow_dependency_preflight_generation
                 or not self.slideshow_dependency_preflight_running):
             return
@@ -15852,14 +15897,17 @@ class GPXTrackerController(NSObject):
                 "slideshowDependencyPreflightFinished:", payload, False
             )
 
-        threading.Thread(
+        self.slideshow_preflight_thread = threading.Thread(
             target=worker,
             name="slideshow-dependency-preflight",
             daemon=True,
-        ).start()
+        )
+        self.slideshow_preflight_thread.start()
 
     @objc.IBAction
     def slideshowDependencyPreflightFinished_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if int(payload.get("generation", -1)) != self.slideshow_dependency_preflight_generation:
             return
         self.slideshow_dependency_preflight_running = False
@@ -16067,14 +16115,17 @@ class GPXTrackerController(NSObject):
         if gpx_path is None or not gpx_path.exists():
             show_alert("Please select exactly one existing GPX file first.")
             return
-        controller = self._open_gpx_editor(
-            input_paths=[gpx_path],
-            output_path=gpx_path,
-            open_pdf_summary=True,
-            project_name=self._current_project_name() or project_dir.name,
-        )
+        host = getattr(self, "adventure_map_host", None)
+        controller = getattr(host, "gpx_controller", None)
         if controller is not None:
-            self.set_status("Opened GPXEditor and PDF Summary options.")
+            controller.open_pdf_summary_window()
+        else:
+            self._open_gpx_editor(
+                input_paths=[gpx_path], output_path=gpx_path,
+                open_pdf_summary=True,
+                project_name=self._current_project_name() or project_dir.name,
+            )
+        self.set_status("PDF Summary options are open.")
 
     def _watch_slideshow_process(self, process, state_file, command_file):
         last_signature = None
@@ -16126,6 +16177,8 @@ class GPXTrackerController(NSObject):
         )
 
     def slideShowLiveStateUpdated_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         active_process = self.slideshow_process
         if active_process is None or active_process.pid != int(payload.get("pid", -1)):
             return
@@ -16158,6 +16211,8 @@ class GPXTrackerController(NSObject):
         self._apply_slideshow_live_state()
 
     def slideShowProcessFinished_(self, result):
+        if getattr(self, "lifecycle_retired", False):
+            return
         was_synchronized = self.control_table_sync_enabled
         active_process = self.slideshow_process
         host = getattr(self, "adventure_map_host", None)
@@ -16480,6 +16535,8 @@ class GPXTrackerController(NSObject):
         )
 
     def mediaImportPanelFinished_(self, response):
+        if getattr(self, "lifecycle_retired", False):
+            return
         panel = self.media_import_panel
         prepare_existing = self.media_import_prepare_existing_on_cancel
         self.media_import_panel = None
@@ -17209,6 +17266,8 @@ class GPXTrackerController(NSObject):
         return (result, result_context) if analyzing else result
 
     def plotSelectionAnalysisProgress_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         token, current, total, label = payload
         if int(token) != self.plot_selection_analysis_token or self.plot_selection_window is None:
             return
@@ -17220,6 +17279,8 @@ class GPXTrackerController(NSObject):
             self.plot_selection_progress.setDoubleValue_(float(min(int(current), maximum)))
 
     def plotSelectionAnalysisFinished_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         token, status, result = payload
         if int(token) != self.plot_selection_analysis_token or self.plot_selection_window is None:
             return
@@ -17522,6 +17583,8 @@ class GPXTrackerController(NSObject):
         self.plot_selection_analysis_thread.start()
 
     def plotSelectionAcceptanceFinished_(self, result):
+        if getattr(self, "lifecycle_retired", False):
+            return
         if (
             int(result.get("token", -1)) != self.plot_selection_analysis_token
             or self.plot_selection_window is None
@@ -18296,6 +18359,8 @@ class GPXTrackerController(NSObject):
             self.set_status("Cancelling plot creation after the current image...")
 
     def plotImageCreated_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         path_text, title = payload
         image_path = Path(str(path_text)).resolve(strict=False)
         if image_path not in self.plot_creation_image_paths:
@@ -18303,6 +18368,8 @@ class GPXTrackerController(NSObject):
         self.show_plot_viewer(self.plot_creation_image_paths, str(title), start_index=len(self.plot_creation_image_paths) - 1)
 
     def plotCreationFinished_(self, payload):
+        if getattr(self, "lifecycle_retired", False):
+            return
         status, created_count, trackimages_dir = payload
         self.gpx_cancel_plots_button.setHidden_(True)
         self.gpx_cancel_plots_button.setEnabled_(True)
@@ -18438,23 +18505,56 @@ class GPXTrackerController(NSObject):
             if not self._confirm_shared_asset_change("gpx_file", gpx_name, "GPX file"):
                 return
 
-        existing_controller = self.gpx_editor_controller
-        existing_window = getattr(existing_controller, "window", None) if existing_controller is not None else None
-        if existing_window is not None and existing_window.isVisible():
+        host = getattr(self, "adventure_map_host", None)
+        if host is not None:
+            # The map already owns the editable document, its Undo history and
+            # save callbacks. Revealing it must not parse a second copy.
+            existing_controller = host.gpx_controller
+            self.gpx_editor_controller = existing_controller
             existing_controller.apply_project_parameters(self.parameters)
-            existing_window.makeKeyAndOrderFront_(None)
-            existing_window.orderFrontRegardless()
-            NSApp().activateIgnoringOtherApps_(True)
+            loaded_paths = {
+                Path(track.source_file).resolve(strict=False)
+                for track in existing_controller.tracks if track.source_file
+            }
+            current_output = existing_controller.current_output_path()
+            if current_output is not None:
+                loaded_paths.add(Path(current_output).resolve(strict=False))
+            new_paths = [Path(path).resolve(strict=False) for path in input_paths or []
+                         if Path(path).resolve(strict=False) not in loaded_paths]
+            if new_paths:
+                existing_controller.load_gpx_paths(new_paths, mark_dirty=True)
+            if output_path is not None:
+                existing_controller.set_output_path(Path(output_path).resolve(strict=False))
             if project_name:
                 existing_controller.project_name = str(project_name)
                 existing_controller.project_field.setStringValue_(str(project_name))
             if open_pdf_summary:
-                existing_controller.exportPdf_(None)
+                existing_controller.open_pdf_summary_window()
+            else:
+                host.openTrackEditor_(None)
+            if open_media_points:
+                existing_controller.addTracksFromPhotos_(None)
+            return existing_controller
+
+        existing_controller = self.gpx_editor_controller
+        existing_window = getattr(existing_controller, "window", None) if existing_controller is not None else None
+        if existing_window is not None and not existing_controller.editor_close_finalized:
+            existing_controller.apply_project_parameters(self.parameters)
+            if not open_pdf_summary:
+                existing_controller.pdf_only_loading = False
+                existing_window.makeKeyAndOrderFront_(None)
+                existing_window.orderFrontRegardless()
+                NSApp().activateIgnoringOtherApps_(True)
+            if project_name:
+                existing_controller.project_name = str(project_name)
+                existing_controller.project_field.setStringValue_(str(project_name))
+            if open_pdf_summary:
+                existing_controller.open_pdf_summary_window()
             if open_media_points:
                 existing_controller.addTracksFromPhotos_(None)
             self.set_status("GPXEditor is already open.")
             return existing_controller
-        if existing_window is not None and not existing_window.isVisible():
+        if existing_window is not None and existing_controller.editor_close_finalized:
             self.gpx_editor_controller = None
 
         expected_output_path = Path(output_path).expanduser().resolve(strict=False) if output_path is not None else None
@@ -18651,6 +18751,8 @@ class GPXTrackerController(NSObject):
                 on_settings_change=self._apply_embedded_editor_parameters,
                 on_initial_load_complete=handle_initial_editor_load_complete,
                 settings=self.parameters,
+                show_window=not open_pdf_summary,
+                open_pdf_summary=open_pdf_summary,
                 media_context={
                     "project_directory": str(self.current_project_dir or ""),
                     "control_file": str(self._control_file_path() or ""),
@@ -18676,12 +18778,6 @@ class GPXTrackerController(NSObject):
         if project_name:
             self.gpx_editor_controller.project_name = str(project_name)
             self.gpx_editor_controller.project_field.setStringValue_(str(project_name))
-        if open_pdf_summary:
-            if self.gpx_editor_controller.track_load_timer is not None:
-                self.gpx_editor_controller.pending_pdf_export_after_load = True
-                self.gpx_editor_controller.set_status("Loading GPX tracks before opening PDF Summary...")
-            else:
-                self.gpx_editor_controller.exportPdf_(None)
         if expected_output_path is not None:
             suffix = f" with {input_count} input file(s)" if input_count else " with 0 input files"
             if input_names:
@@ -18915,6 +19011,74 @@ class GPXTrackerController(NSObject):
     def textDidChange_(self, _notification):
         self.mark_dirty()
 
+    @objc.python_method
+    def retire_for_workspace(self):
+        """Make an old project inert without releasing a live native callback graph."""
+        if self.lifecycle_retired:
+            return
+        # The map owns this shared document, so it must not be retired here.
+        self.gpx_editor_controller = None
+        self.lifecycle_retired_windows = retire_owned_windows(self)
+        self.lifecycle_retired = True
+        self.adventure_map_host = None
+        self._stop_project_media_watcher()
+        self.cancel_adventure_autosave()
+        network_availability.remove_listener(self._network_state_changed)
+        if self.notification_center is not None:
+            self.notification_center.removeObserver_(self)
+        NSObject.cancelPreviousPerformRequestsWithTarget_(self)
+        for name, value in list(vars(self).items()):
+            if isinstance(value, NSTimer):
+                value.invalidate()
+            elif name.endswith("cancel_event") and value is not None:
+                value.set()
+        self.status_refresh_generation += 1
+        self.plot_selection_analysis_token += 1
+        self.slideshow_dependency_preflight_generation += 1
+        self.project_status_processing_gate.set()
+        self.control_table_preview_shutdown = True
+        self._invalidate_control_preview_requests(clear_memory=True)
+        self.control_table_preview_executor.shutdown(wait=False, cancel_futures=True)
+        self.close_media_viewer()
+        if self.slideshow_process is not None and self.slideshow_process.poll() is None:
+            self.slideshow_process.terminate()
+        if NSApp().modalWindow() in self.lifecycle_retired_windows:
+            NSApp().abortModal()
+        # Stop Demo can be called by a button in this graph. Always cross an
+        # event-loop boundary before detaching its old contents.
+        self.performSelector_withObject_afterDelay_("releaseRetiredModels:", None, 0.25)
+
+    def releaseRetiredModels_(self, _sender):
+        if not self.lifecycle_retired:
+            return
+        threads = list(self.lifecycle_status_threads)
+        threads.extend(value for name, value in vars(self).items()
+                       if name.endswith("_thread") and isinstance(value, threading.Thread))
+        if any(thread.is_alive() for thread in threads):
+            self.performSelector_withObject_afterDelay_("releaseRetiredModels:", None, 0.25)
+            return
+        # Keep native wrappers/delegates for PyObjC close safety, but discard
+        # project models, image caches and the retired windows' contents.
+        for value in vars(self).values():
+            if isinstance(value, NSTableView):
+                value.setDataSource_(None)
+                value.setDelegate_(None)
+            elif isinstance(value, NSImageView):
+                value.setImage_(None)
+        for window in self.lifecycle_retired_windows:
+            window.setContentView_(NSView.alloc().initWithFrame_(window.contentView().bounds()))
+        for name, value in list(vars(self).items()):
+            if name.endswith(("_cache", "_rows", "_items", "_undo_stack", "_redo_stack")) or name == "rows":
+                if hasattr(value, "clear"):
+                    value.clear()
+        self.plot_selection_context = None
+        self.media_update_plan = None
+        self.control_file_update_plan = None
+        self.media_update_pending_plan = None
+        if self.geolocations_text_view is not None:
+            self.geolocations_text_view.setString_("")
+        self.lifecycle_status_threads = []
+
     def shutdown(self):
         network_availability.remove_listener(self._network_state_changed)
         self._stop_project_media_watcher()
@@ -19052,9 +19216,11 @@ class GPXTrackerController(NSObject):
             self.plot_viewer_window.orderOut_(None)
             self._release_plot_viewer_references(self.plot_viewer_window)
 
-    def show(self):
-        self.window.center()
-        self.window.makeKeyAndOrderFront_(None)
+    @objc.python_method
+    def show(self, present_window=True):
+        if present_window:
+            self.window.center()
+            self.window.makeKeyAndOrderFront_(None)
         if self.startup_project_file is not None and self.startup_project_file.exists():
             startup_file = self.startup_project_file.resolve()
             records, templates, _errors = discover_adventure_candidates(
@@ -19097,6 +19263,7 @@ def build_full_gui_menu(controller, window_menu_coordinator=None):
 
     adventure_menu = add_menu(main_menu, "Adventure")
     adventure_menu.addItem_(menu_item("Adventure Properties…", "showAdventureProperties:", controller))
+    adventure_menu.addItem_(menu_item("PDF Summary…", "exportPdfSummary:", controller))
 
     track_menu = add_menu(main_menu, "Track")
     track_menu.addItem_(menu_item("Choose GPX Files…", "selectGPXFile:", controller))
@@ -19162,12 +19329,12 @@ def build_full_gui_menu(controller, window_menu_coordinator=None):
     slideshow_menu.addItem_(menu_item("Start", "startSelectedSlideShow:", controller))
     slideshow_menu.addItem_(menu_item("Continue…", "continueSelectedSlideShow:", controller))
     slideshow_menu.addItem_(menu_item("Choose Start Position…", "editControlFile:", controller))
-    slideshow_menu.addItem_(menu_item("PDF Summary…", "exportPdfSummary:", controller))
     slideshow_menu.addItem_(NSMenuItem.separatorItem())
     slideshow_menu.addItem_(menu_item("Slide Show Settings…", "showSlideShowSettingsMenu:", controller))
 
     window_menu = add_menu(main_menu, "Window")
     coordinator = window_menu_coordinator or WindowMenuCoordinator.alloc().init()
+    coordinator.owner = controller
     coordinator.status_provider = controller.window_status_for_window
     coordinator.attach(window_menu)
     controller.native_window_menu_coordinator = coordinator

@@ -212,7 +212,8 @@ Important behavior:
 - If multiple rows are selected, sorting reorders only the selected rows.
 - Drag selected rows to reorder tracks manually.
 - Backspace/Delete deletes selected tracks after confirmation.
-- Double-click a track row to open its waypoint table. In the map-first
+- Double-click a track row to open its waypoint table and fit that track in
+  the map, just like pressing Plot. The waypoint table stays in front. In the map-first
   Adventure Map, double-click a track to open this Track Table first; its
   context menu can open either table directly.
 - **Save Selected Tracks As…** in the Track menu or row context menu writes the
@@ -258,6 +259,12 @@ Buttons:
 - Save: save to the current output file.
 - Save & Exit: save and close the editor.
 - Quit: ask whether to save unsaved changes.
+
+In Adventure Map, `q` or the close button hides the map while another editor is
+open. Closing the final map window or choosing Quit asks **Save / Don't Save /
+Cancel** when tracks or the Adventure have unsaved changes. Cancel, cancelling
+the save dialog, or a failed save keeps the application open. Don't Save skips
+the final autosave; it does not undo changes already saved earlier.
 
 If the output file already exists, the editor creates a `.bak` backup before
 overwriting it.
@@ -332,13 +339,15 @@ Behavior:
 Common keys:
 
 - `i`: toggle point information overlay.
+- `I` (Shift-I): interpolate height across the selected point range.
 - `h`: show help.
 - `a`: set anchor at current cursor point.
 - `+` / `-`: zoom in/out.
 - Cmd-+ / Cmd--: zoom two steps in or out.
 - `c`: center on cursor.
 - `z`: zoom to current selection.
-- Shift-`Z`: reset to full map extent.
+- Shift-`Z`: fit the complete current track.
+- `A` (Shift-A): show all visible Adventure tracks.
 - `p`: toggle linked-photo thumbnail display on a track map.
 - `s`: save the current map or profile as PNG.
 - `u`: clear plot selection.
@@ -365,12 +374,17 @@ Behavior:
 
 Track editing keys:
 
-- `m` or Shift-click: set a marker.
+- `m` or Shift-click: set a square marker, the same size as the round cursor.
+- `M` (Shift-M): swap the marker and cursor, keeping the selected range.
+- Click another point in the selected track to move the range end, including
+  points already inside the red range. Holding the range still allows dragging it.
+- Holding a point or marked range shows grab feedback without making an edit;
+  releasing without movement does not add an Undo step or save the GPX.
 - `m` does not open the point information overlay.
 - Delete/Backspace: delete the point range from marker to cursor after
   confirmation.
 - `x`: cut the track after the cursor after confirmation.
-- `a`, `i`, `h`, `+`, `-`, `c`, `z`, Shift-`Z`, `p`, `e`, `q`: same general behavior
+- `a`, `A`, `i`, `h`, `+`, `-`, `c`, `z`, Shift-`Z`, `p`, `e`, `q`: same general behavior
   as the overview plot.
 
 When points are deleted or a track is cut, the table and open plots are updated.
@@ -385,13 +399,32 @@ The profile shows elevation versus distance and follows the current plot cursor
 and selection. It can also open the waypoint inspector by double-clicking when
 appropriate.
 
-Press `h` to open the separate elevation-profile key reference. It closes a
-few seconds after the key is released. The profile supports the same cursor,
+Press `h` to open the separate elevation-profile key reference. It remains
+open until you close it, and closes automatically with its parent profile.
+In track view, the profile follows the active track, not the neighbouring
+tracks retained on the Adventure Map. The profile supports the same cursor,
 selection, editing, track-navigation, PNG export, undo, and redo controls as
 the track plot. In addition, `y` fits the height axis to the elevations in the
 currently visible distance range with five percent headroom above and below.
 Press `0` to restore the zero-based default height axis; this does not change
 the current distance zoom.
+
+In both map and profile, `z` fits the current selection, Shift-`Z` fits the
+complete current track, and `A` (Shift-A) shows all visible Adventure tracks.
+The profile's All Tracks view is independent of the map viewport; Shift-`Z`
+returns it to the current track. Lowercase `a` remains the map anchor command.
+
+To correct an unnatural elevation spike, mark the range around it with `m`
+or Shift-click, then move the cursor to the range's other end. Press `I`
+(Shift-I), or choose **Interpolate Height** from the profile or marked-range
+context menu. Heights between the first and last selected points become a
+straight line over route distance; the endpoint heights remain unchanged.
+Coordinates and timestamps are untouched. Separate GPX segments and disjoint
+waypoint-table selections are handled independently, each requiring valid
+endpoint heights. Coincident points use evenly spaced interpolation when
+the entire selected range has zero length. The action is one Undo step and
+does not change the map zoom. It is also available in the waypoint table's
+context menu.
 
 When the editor closes, plot and elevation windows close with it. Closing a
 track plot also closes its associated elevation profile, and closing an
@@ -428,15 +461,40 @@ PNG:
 - Saves the current plot.
 - If a multi-track plot is active, the editor can save multiple track PNGs.
 
-PDF:
+PDF Summary:
 
-- Exports the track table.
-- Lets you choose included columns.
-- Can include overview and track map pages.
-- Can include elevation profiles.
-- Supports orientation and map rotation options.
-- The main GPS Track Show GUI exposes the same export panel as `PDF Summary`
-  next to the Start button.
+- Creates a printable track report with optional overview maps, individual track
+  maps, and elevation profiles. Open it with **PDF Summary** or **File > PDF
+  Summary** in standalone GPX Editor, or **Adventure > PDF Summary** in myCamino.
+- **Tracks: Visible / All / Selected** controls the entire report. Choose
+  **Select Tracks** to open the track table when you want a custom selection.
+- Hidden tracks appear in gray text and orange on the overview, and never
+  contribute to totals, averages, or cumulative distance.
+- All columns except Row, NPoints, and Show are initially enabled. Separate
+  Total and Average rows summarize visible tracks; speed columns show averages.
+- **Remove name prefix** shortens names in the report only; GPX names stay intact.
+- Export runs in the background and can be cancelled. The completed PDF opens
+  in the default viewer; **Open PDF** and **Show in Finder** remain available.
+- Closing PDF Summary leaves the main map and editor open. Compatible saved
+  backgrounds and cached tiles are reused without lowering print resolution.
+  If a required map fails, the previous PDF is kept rather than replaced with
+  a report containing missing-map error pages.
+- Overview detail adapts to the exported tracks' extent, not the size of the
+  entire Adventure. Small selections can use the PDF Track zoom; large areas
+  automatically lower the zoom to respect Maximum PDF map tiles. A higher
+  Overview zoom can request extra detail, still within that tile limit.
+- **Settings > PDF Export > PDF map provider** can override the map-generation
+  provider for PDFs only. For Geoapify, choose **OSM Bright** or **OSM Carto**.
+  Interactive maps and generated slideshow maps keep their own provider settings.
+  Both Geoapify styles use the existing Keychain credential; changing style needs
+  different cached tiles on the first export.
+- Multi-map exports using public OpenStreetMap first try existing backgrounds
+  and cached tiles without downloading. If tiles are missing, choose another
+  provider, cancel, or explicitly proceed at your own responsibility. The
+  warning explains that bulk downloading is prohibited by the OSM tile policy;
+  confirmation is not permission from OSM. It applies only to this export, and
+  server blocks are never bypassed. After changing provider settings, click
+  Export again; your report options remain unchanged.
 
 View File:
 

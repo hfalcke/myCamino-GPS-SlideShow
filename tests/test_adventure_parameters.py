@@ -23,6 +23,17 @@ from adventure_parameters import (
 
 
 class AdventureParameterTests(unittest.TestCase):
+    def test_pdf_provider_settings_are_independent_of_generated_map_freshness(self):
+        values = default_parameters()
+        values.update({'pdf.map_provider': 'geoapify', 'pdf.geoapify_style': 'osm-carto'})
+        restored = normalize_parameters(parameter_payload(values))
+        self.assertEqual(restored, values)
+        self.assertEqual(restored['maps.interactive_provider'], 'osm')
+        self.assertEqual(restored['maps.output_provider'], 'osm')
+        self.assertFalse({'pdf.map_provider', 'pdf.geoapify_style'} & map_affecting_parameter_keys())
+        visible = {spec.key for spec in visible_specs_for_section('Map Service', restored)}
+        self.assertIn('maps.credential_id', visible)
+
     def test_defaults_are_complete_and_versioned(self):
         defaults = default_parameters()
         self.assertEqual(set(defaults), set(SPECS_BY_KEY))

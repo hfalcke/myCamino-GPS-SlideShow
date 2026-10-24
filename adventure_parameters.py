@@ -138,9 +138,11 @@ PARAMETER_SPECS = (
     ParameterSpec("gpx.elevation_headroom_fraction", "GPX Processing", "Elevation headroom", 0.08, "fraction", "Vertical headroom above and below elevation profiles.", 0.0, 1.0, unit="%"),
     ParameterSpec("gpx.maximum_map_tiles", "GPX Processing", "Maximum interactive tiles", 48, "int", "Lower zoom automatically when an interactive map would exceed this tile count.", 1, 1000, advanced=True),
 
+    ParameterSpec("pdf.map_provider", "PDF Export", "PDF map provider", "output", "choice", "Choose a provider for PDF maps only, or use the map-generation provider. Interactive and slideshow maps are unchanged.", choices=_choice(("output", "Use map-generation provider"), ("osm", "OpenStreetMap (public)"), ("geoapify", "Geoapify"), ("thunderforest", "Thunderforest"), ("stadia", "Stadia Maps"), ("esri", "Esri World Street Map"), ("custom", "Custom XYZ"))),
+    ParameterSpec("pdf.geoapify_style", "PDF Export", "Geoapify PDF style", "osm-bright", "choice", "Geoapify tile style for PDF maps. Different styles use separate cached tiles.", choices=_choice(("osm-bright", "OSM Bright"), ("osm-carto", "OSM Carto"))),
     ParameterSpec("pdf.document_dpi", "PDF Export", "Document DPI", 200, "int", "Rendering resolution for PDF pages.", 72, 1200),
     ParameterSpec("pdf.map_dpi", "PDF Export", "Embedded map DPI", 600, "int", "Pixel density used for embedded PDF maps.", 72, 2400),
-    ParameterSpec("pdf.overview_zoom", "PDF Export", "Overview zoom", 8, "int", "Tile zoom for PDF overview maps.", 0, 22),
+    ParameterSpec("pdf.overview_zoom", "PDF Export", "Overview zoom", 8, "int", "Detail ceiling for PDF overview maps, automatically raised to at least the PDF track zoom for small areas. The tile limit lowers zoom to fit the exported extent.", 0, 22),
     ParameterSpec("pdf.track_zoom", "PDF Export", "Track zoom", 14, "int", "Tile zoom for PDF track maps.", 0, 22),
     ParameterSpec("pdf.maximum_map_tiles", "PDF Export", "Maximum PDF map tiles", 24, "int", "Maximum tile count for one embedded PDF map.", 1, 1000, advanced=True),
 
@@ -198,6 +200,7 @@ def visible_specs_for_section(
     providers = {
         values.get("maps.interactive_provider", "osm"),
         values.get("maps.output_provider", "osm"),
+        values.get("pdf.map_provider", "output"),
     }
     custom_provider = "custom" in providers
     keyed_provider = bool(providers & {"geoapify", "thunderforest", "stadia"})

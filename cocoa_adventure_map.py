@@ -32,6 +32,7 @@ from AppKit import (
     NSColor,
     NSCompositingOperationSourceOver,
     NSEventModifierFlagCommand,
+    NSEventModifierFlagControl,
     NSEventModifierFlagOption,
     NSFont,
     NSFontAttributeName,
@@ -51,6 +52,8 @@ from AppKit import (
     NSShadowAttributeName,
     NSTextField,
     NSTextView,
+    NSTerminateCancel,
+    NSTerminateNow,
     NSView,
     NSViewHeightSizable,
     NSViewWidthSizable,
@@ -940,6 +943,8 @@ class AdventureMapController(NSObject):
             self.workspace_autosave_in_progress = False
         self.workspace_dirty_components.clear()
         self.recovery_dirty = False
+        if self.adventure_file != record.path:
+            self._retire_full_gui()
         self.adventure_file = record.path
         self.overview_viewport = None
         self.track_viewports.clear()
@@ -2581,6 +2586,11 @@ class AdventureMapController(NSObject):
             self.openAdventureGUI_(None); return True
         if command and key.casefold() == "e":
             self.openTrackEditor_(None); return True
+        if key.casefold() == "t" and not (
+            command or option or flags & NSEventModifierFlagControl
+        ):
+            self.openTrackEditor_(None)
+            return True
         if command and key.casefold() == "l":
             self.openControlFile_(None); return True
         if command and key.casefold() == "s":
@@ -2592,6 +2602,25 @@ class AdventureMapController(NSObject):
         if key.casefold() == "h":
             self.showHelp_(None); return True
         return False
+
+    def hideWorkspaceMapIfOtherWindowsRemain_(self, window):
+        if window is not self.window or self.gpx_controller.closing_auxiliary_windows:
+            return False
+        # The shared controller still owns this map while its tables are open.
+        # Hide, rather than dispose, the reusable view and its worker pools.
+        profile = self.gpx_controller.existing_elevation_profile_for_plot_view(self.plot_view)
+        owned_windows = [window]
+        if profile is not None:
+            profile_window, profile_view = profile
+            owned_windows.extend([profile_window, profile_view.profile_help_window])
+        others = [candidate for candidate in NSApp().windows()
+                  if candidate not in owned_windows and candidate.isVisible()]
+        if not others:
+            return False
+        self.gpx_controller.close_elevation_profile_for_plot_view(self.plot_view)
+        self.plot_view.cancel_interactive_tile_requests(shutdown=False)
+        window.orderOut_(None)
+        return True
 
     def workspaceMapWindowWillClose_(self, window):
         if window is not self.window:
@@ -3316,6 +3345,8 @@ class AdventureMapController(NSObject):
 
     @objc.IBAction
     def performWorkspaceAutosave_(self, _sender):
+        if getattr(self, "discard_workspace_on_quit", False):
+            return
         if not (self.workspace_dirty_components or self.gpx_controller.dirty):
             return
         if "gpx" in self.workspace_dirty_components or self.gpx_controller.dirty:
@@ -3891,6 +3922,11 @@ class AdventureMapController(NSObject):
 
     @objc.IBAction
     def showSettings_(self, _sender):
+        self.open_shared_settings()
+
+    @objc.python_method
+    def open_shared_settings(self, section=None, *, draft_overrides=None, show_advanced=None):
+        """All Adventure tools edit one retained Settings draft."""
         if self.parameter_editor_controller is None:
             self.parameter_editor_controller = CocoaParameterEditor.alloc().init()
             self.parameter_editor_controller.configure(
@@ -3899,17 +3935,31 @@ class AdventureMapController(NSObject):
                 values=self.parameters,
                 apply_callback=self._apply_workspace_parameters,
                 manage_map_provider_callback=self._manage_map_provider_from_settings,
+                cancel_callback=self._shared_settings_cancelled,
             )
-        else:
+        elif not self.parameter_editor_controller.window.isVisible():
             self.parameter_editor_controller.update_values(self.parameters)
-        self.parameter_editor_controller.show()
+        editor = self.parameter_editor_controller
+        if editor.window.isVisible():
+            editor._capture_controls()
+        if section in SECTION_ORDER:
+            editor.current_section = section
+        if show_advanced is not None:
+            editor.show_advanced = bool(show_advanced)
+        editor.show()
+        if draft_overrides:
+            editor.draft.update(draft_overrides)
+            editor._render_section()
+        return editor
+
+    @objc.python_method
+    def _shared_settings_cancelled(self):
+        if self.full_gui_controller is not None:
+            self.full_gui_controller._parameter_editor_cancelled()
 
     @objc.python_method
     def _show_settings_section(self, section):
-        self.showSettings_(None)
-        if section in SECTION_ORDER:
-            self.parameter_editor_controller.current_section = section
-            self.parameter_editor_controller._render_section()
+        self.open_shared_settings(section)
 
     @objc.IBAction
     def showMediaSettings_(self, _sender):
@@ -4115,7 +4165,8 @@ class AdventureMapController(NSObject):
                 controller.adventure_map_host = self
                 if preparing_slideshow:
                     controller.slideshow_startup_started_at = time.perf_counter()
-                controller.show()
+                controller.gpx_editor_controller = self.gpx_controller
+                controller.show(present_window=show_window)
                 if controller.parameters != self.parameters:
                     controller._apply_parameter_values(
                         self.parameters, propagate_to_editor=True
@@ -4129,8 +4180,6 @@ class AdventureMapController(NSObject):
                     ]
                     controller._save_recent_adventures()
                     controller._refresh_recent_adventure_menu()
-                if not show_window:
-                    controller.window.orderOut_(None)
             window = self.full_gui_controller.window
             if show_window:
                 window.makeKeyAndOrderFront_(None)
@@ -4606,7 +4655,7 @@ class AdventureMapController(NSObject):
 
     @objc.IBAction
     def exportPDFSummary_(self, _sender):
-        self._invoke_full_gui("exportPdfSummary_", None)
+        self.gpx_controller.open_pdf_summary_window()
 
     @objc.IBAction
     def showControlDirectiveHelp_(self, _sender):
@@ -4768,6 +4817,7 @@ class AdventureMapController(NSObject):
                 "Command-O    Open an Adventure or project\n"
                 "Command-G    Advanced Interface\n"
                 "Command-E    Track Editor\n"
+                "t            Open Track Table\n"
                 "Command-L    Control File\n"
                 "Command-S    Save\n"
                 "Command-,    Adventure Settings\n"
@@ -4778,13 +4828,15 @@ class AdventureMapController(NSObject):
                 "Command-Q    Quit myCamino\n\n"
                 "MAP KEYS\n\n"
                 "i            Show or hide point information\n"
+                "I (Shift-I)  Interpolate height across the selected point range\n"
                 "e            Open the synchronized Elevation Profile\n"
                 "a            Set the current point as anchorpoint\n"
                 "+ / -        Zoom around the selected point or map center\n"
                 "Command-+/-  Zoom by a larger step\n"
                 "c            Center on the current point\n"
                 "z            Zoom to the current selection\n"
-                "Shift-Z      Fit the complete map or track\n"
+                "Shift-Z      Fit the complete current track\n"
+                "A (Shift-A)  Show all Adventure tracks\n"
                 "Arrows       Previous / next waypoint or media; pan if needed\n"
                 "Command-Arrows Previous / next visible track and fit it\n"
                 "Option-Arrows Pan the map by 20 percent\n"
@@ -4792,6 +4844,7 @@ class AdventureMapController(NSObject):
                 "d            Show or hide track start/end markers\n"
                 "n            Show or hide track numbers in the overview\n"
                 "m            Start a marked range at the current point\n"
+                "M (Shift-M)  Swap the square marker and round cursor\n"
                 "Delete       Delete the marked range or, on a track map, the current waypoint\n"
                 "x            Cut the track connection after the cursor on a track map\n"
                 "p            Change photo-thumbnail display on a track map\n"
@@ -4822,6 +4875,15 @@ class AdventureMapController(NSObject):
         self.demo_coordinator.start()
 
     @objc.python_method
+    def _retire_full_gui(self):
+        controller = self.full_gui_controller
+        if controller is None:
+            return
+        controller.retire_for_workspace()
+        self.retired_full_gui_controllers.append(controller)
+        self.full_gui_controller = None
+
+    @objc.python_method
     def discardGuidedDemoWorkspace(self):
         """Return to an empty map without retaining references to demo files."""
         self._stop_media_watcher()
@@ -4844,23 +4906,7 @@ class AdventureMapController(NSObject):
                 pass
             self.workspace_autosave_future = None
             self.workspace_autosave_context = None
-        if self.full_gui_controller is not None:
-            retired = self.full_gui_controller
-            retired.adventure_map_host = None
-            try:
-                retired._stop_project_media_watcher()
-                retired.cancel_adventure_autosave()
-                if retired.geolocations_cancel_event is not None:
-                    retired.geolocations_cancel_event.set()
-                retired.window.orderOut_(None)
-            except Exception:
-                pass
-            # Do not release a PyObjC window graph from inside the Stop Demo
-            # button callback. AppKit and worker callbacks may still have it on
-            # their stacks; retaining it until process exit avoids native use-
-            # after-free crashes.
-            self.retired_full_gui_controllers.append(retired)
-            self.full_gui_controller = None
+        self._retire_full_gui()
         self.workspace_dirty_components.clear()
         self.mutation_journal.clear()
         self.workspace_autosave_in_progress = False
@@ -5035,7 +5081,38 @@ class AdventureMapController(NSObject):
         alert.runModal()
 
     @objc.python_method
+    def confirm_quit(self):
+        if getattr(self, "quit_approved", False):
+            return True
+        gui = self.full_gui_controller
+        dirty = bool(
+            self.gpx_controller.dirty
+            or self.workspace_dirty_components
+            or (gui is not None and (gui.project_dirty or gui.control_table_dirty))
+            or (self.recovery_dirty and self._has_recoverable_workspace_content())
+        )
+        if not dirty:
+            return True
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Save changes before quitting?")
+        alert.setInformativeText_("Your tracks or Adventure have unsaved changes.")
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Don't Save")
+        alert.addButtonWithTitle_("Cancel")
+        response = int(alert.runModal())
+        if response == 1000:
+            if not self.saveWorkspace_(None):
+                return False
+        elif response == 1001:
+            self.discard_workspace_on_quit = True
+        else:
+            return False
+        self.quit_approved = True
+        return True
+
+    @objc.python_method
     def shutdown(self):
+        discard = bool(getattr(self, "discard_workspace_on_quit", False))
         network_availability.remove_listener(self._network_state_changed)
         self._reset_optional_enrichment()
         self._stop_media_watcher()
@@ -5043,6 +5120,9 @@ class AdventureMapController(NSObject):
         if self.workspace_autosave_timer is not None:
             self.workspace_autosave_timer.invalidate()
             self.workspace_autosave_timer = None
+        if self.recovery_debounce_timer is not None:
+            self.recovery_debounce_timer.invalidate()
+            self.recovery_debounce_timer = None
         if self.workspace_autosave_future is not None:
             try:
                 self.workspace_autosave_future.result()
@@ -5050,7 +5130,7 @@ class AdventureMapController(NSObject):
                 pass
             self._finish_background_gpx_checkpoint()
         save_failed = False
-        if self.adventure_file is not None and (
+        if not discard and self.adventure_file is not None and (
             self.workspace_dirty_components
             or self.gpx_controller.dirty
             or (
@@ -5080,7 +5160,9 @@ class AdventureMapController(NSObject):
             self.recovery_write_future = None
         if self.demo_coordinator is not None and was_demo:
             self.demo_coordinator.suspendForShutdown()
-        if not save_failed and was_demo:
+        if discard:
+            self.recovery.discard()
+        elif not save_failed and was_demo:
             self.recovery.discard()
         elif not save_failed and (self.recovery_dirty or self.gpx_controller.dirty) and self._has_recoverable_workspace_content():
             self.recovery_dirty = True
@@ -5166,6 +5248,7 @@ def build_adventure_map_menu(controller):
 
     adventure_menu = add_menu(main_menu, "Adventure")
     adventure_menu.addItem_(menu_item("Adventure Properties…", "showAdventureProperties:", controller))
+    adventure_menu.addItem_(menu_item("PDF Summary…", "exportPDFSummary:", controller))
     adventure_menu.addItem_(menu_item("Advanced Interface", "openAdventureGUI:", controller, "g", NSEventModifierFlagCommand))
     adventure_menu.addItem_(NSMenuItem.separatorItem())
     adventure_menu.addItem_(menu_item("Show Adventure Overview", "showAdventureOverview:", controller, "0", NSEventModifierFlagCommand))
@@ -5244,12 +5327,12 @@ def build_adventure_map_menu(controller):
     slideshow_menu.addItem_(menu_item("Start", "startSlideShow:", controller))
     slideshow_menu.addItem_(menu_item("Continue…", "continueSlideShow:", controller))
     slideshow_menu.addItem_(menu_item("Choose Start Position…", "chooseSlideShowStart:", controller))
-    slideshow_menu.addItem_(menu_item("PDF Summary…", "exportPDFSummary:", controller))
     slideshow_menu.addItem_(NSMenuItem.separatorItem())
     slideshow_menu.addItem_(menu_item("Slide Show Settings…", "showSlideShowSettings:", controller))
 
     window_menu = add_menu(main_menu, "Window")
     coordinator = WindowMenuCoordinator.alloc().init()
+    coordinator.owner = controller
     coordinator.status_provider = controller.window_status_for_window
     coordinator.attach(window_menu)
     controller.window_menu_coordinator = coordinator
@@ -5288,6 +5371,12 @@ class AdventureMapAppDelegate(NSObject):
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.35, self.demo_coordinator, "offerAtStartup:", None, False
         )
+
+    def applicationShouldTerminate_(self, _application):
+        controller = getattr(self, "controller", None)
+        if controller is not None and not controller.confirm_quit():
+            return NSTerminateCancel
+        return NSTerminateNow
 
     def applicationWillTerminate_(self, _notification):
         if getattr(self, "controller", None) is not None:

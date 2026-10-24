@@ -47,6 +47,7 @@ from adventure_parameters import (
     visible_specs_for_section,
 )
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
+from window_lifecycle import WINDOW_REGISTRY
 
 
 class ParameterEditorWindowDelegate(NSObject):
@@ -439,10 +440,13 @@ class CocoaParameterEditor(NSObject):
         return errors
 
     def show(self):
-        self.draft = dict(self.values)
+        if not self.window.isVisible():
+            self.draft = dict(self.values)
         self.advanced_checkbox.setState_(NSControlStateValueOn if self.show_advanced else NSControlStateValueOff)
         self._render_section()
         self.window.makeKeyAndOrderFront_(None)
+        WINDOW_REGISTRY.register(self.window, owner=self, role="settings")
+        WINDOW_REGISTRY.presented(self.window)
         NSApp().activateIgnoringOtherApps_(True)
 
     def update_values(self, values):
@@ -454,6 +458,7 @@ class CocoaParameterEditor(NSObject):
     def close(self):
         if self.window is None:
             return
+        WINDOW_REGISTRY.retire_owner(self)
         self.window.setDelegate_(None)
         self.window.orderOut_(None)
         self.window.close()
@@ -478,7 +483,7 @@ class CocoaParameterEditor(NSObject):
     def valueChanged_(self, sender):
         key = self.tag_to_key.get(int(sender.tag()))
         self._capture_controls()
-        if key in {"maps.interactive_provider", "maps.output_provider"}:
+        if key in {"maps.interactive_provider", "maps.output_provider", "pdf.map_provider"}:
             self.performSelector_withObject_afterDelay_("refreshSection:", None, 0.0)
 
     def controlTextDidChange_(self, _notification):

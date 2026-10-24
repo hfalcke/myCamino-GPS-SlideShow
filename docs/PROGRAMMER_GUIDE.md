@@ -677,6 +677,21 @@ This policy applies equally to world, overview, fitted-track, wheel, pinch, and
 pan transitions and prevents black intermediate frames without distorting or
 stretching the old map.
 
+Tile requests belong to settled viewports, not mouse-interaction flags. Gesture
+previews cancel the pending request timer; gesture completion or an explicit
+zoom schedules a new request in the main run loop's common modes. Obsolete
+timer callbacks are ignored. A leftover pan flag must never discard a settled
+request. Tile and thumbnail workers live until an explicit plot-window close
+(including bulk editor cleanup), not a temporary view detachment/reparenting.
+Keyboard zoom also cancels pending wheel and pinch completion callbacks.
+
+Closing the shared Adventure Map while another editor is visible hides its one
+retained window without shutting down its workers. Both `q` and the close button
+go through `windowShouldClose:`. Opening a track restores that same live map;
+closing the Track Table restores it too if necessary. An actual plot disposal
+sets `plot_closed` before shutting down workers, so late draws, thumbnail
+requests, and tile/thumbnail completions cannot revive the disposed view.
+
 **Mark Selected Up to Date** records a bounded
 `accepted_render_signatures` list in eligible map sidecars. Freshness accepts
 either the actual `adventure_render_parameters` or one matching acceptance;
@@ -1009,10 +1024,47 @@ updates the GPX field, refreshes GPX statistics, regenerates the track summary
 JSON, refreshes Map Generation status, and refreshes the control-file track-map
 sync status.
 
-The main GUI's `PDF Summary` button calls
-`export_pdf_summary_from_paths(...)`. That function creates a temporary editor
-controller, loads the current GPX file, and opens the same PDF save panel and
-accessory options used by the GPX Editor's own PDF button.
+PDF Summary reuses the active GPX controller, including unsaved edits, without
+raising its editor window. Adventure Map calls that controller directly; the
+hosted Advanced Interface shares it. A standalone Advanced Interface creates a
+hidden controller only when none is available.
+`export_pdf_summary_from_paths(...)` returns a retained nonmodal controller,
+opens the report options immediately, and loads GPX data asynchronously.
+The embedding helpers accept `show_window=False, open_pdf_summary=True` to
+reuse the normal load/save callbacks while keeping the track table hidden.
+
+`gpx_pdf_summary.py` owns frozen report options and numerical snapshots, scope
+selection, visible-only aggregate calculation, glyph-measured table layout,
+and atomic PDF installation. A single process-wide export worker serializes
+reports. `PDFMapRenderer` detaches XML and settings before using the existing
+map/profile renderer, with progress and cancellation callbacks instead of
+AppKit calls. AppKit polls progress and completion on the main thread; closing
+the panel cancels work and stops its polling timer. Export never writes GPX
+or Adventure data. Table-only reports need no geometry processing or tiles.
+
+`plot_rendering.py` selects the noninteractive backend before plotting imports,
+creates explicit `FigureCanvasAgg` figures, and supplies the reentrant lock
+shared by PDF and PNG render jobs. Do not switch Matplotlib backends in a worker
+or call pyplot's global figure/draw/close functions. Contextily's automatic
+attribution calls global `pyplot.draw()`, so `add_headless_basemap()` disables
+that path and draws the same attribution on the explicit axes instead.
+
+PDF cache diagnostics use the production provider, not the interactive one.
+The panel synchronizes its retained GPX controller with Adventure settings on
+opening and before export without replacing the editable document. Multi-map
+OSM renderers start with `map_cache_only=True`. Only `TileCacheMissError`
+returns to a main-thread provider/proceed/cancel dialog; rendering and cache
+checks stay on the export worker. A one-export consent retries the same frozen
+snapshot with network access; it changes no saved settings. Cache interception,
+identification, pacing, 403/429 handling and atomic PDF replacement remain in
+the shared provider/export layers. Cancelled jobs never show a late warning.
+Existing background-only PNGs may be reused when geometry fingerprints,
+provider, complete attributed extent, aspect ratio, and resolution match. Other
+layouts/DPI settings render from cached tiles rather than stretching or
+upsampling a saved map. A failed required basemap aborts atomic PDF installation
+and leaves the previous report unchanged. Native export checks must verify that
+the application's delegate and main map survive success, failure and closing
+the panel during rendering; a stubbed basemap does not test this boundary.
 
 If multiple GPX files are selected, the GUI passes all existing files as input
 and passes a single output file. The editor combines/edit tracks and saves one
@@ -1366,6 +1418,28 @@ there by an arrow. Missing pilgrim animation assets also fall back to the arrow.
 
 ## GPXEditor Architecture
 
+### Logical Window Lifetime
+
+`window_lifecycle.py` tracks logical tools with weak native-window references.
+`cocoa_native_menus.WindowMenuCoordinator` lists presented tools, including
+reusable hidden tools, but excludes never-presented internal windows, closed
+windows, transient panels, and retired project windows. Menu activation checks
+the registry again so an old menu item cannot resurrect a retired tool.
+
+Adventure Map owns the editable GPX controller and Adventure Settings draft;
+the hosted Advanced Interface and embedded GPX Editor reveal these same
+instances. Reopening Settings must not discard an already-visible draft.
+Hidden plots/profiles/inspectors remain in their owner's lookup until their
+close delegate unregisters them. Help, PDF options, and media viewers hide and
+reuse their native windows rather than allocating replacements on each visit.
+
+On project replacement or Stop Demo, `retire_for_workspace()` cancels jobs,
+timers, observers and preview requests, hides all owned windows, and rejects
+late worker callbacks. Deferred cleanup waits for tracked workers to finish
+before detaching window contents and releasing project models/caches. Native
+controller/delegate wrappers remain retained for the existing PyObjC crash
+protection; do not release this graph inside an AppKit close/drop callback.
+
 `GPXEditor.py` is both standalone and embeddable.
 
 Main entry points:
@@ -1392,8 +1466,35 @@ Core classes:
   cut, anchor handling, and media/control-file drops.
 - `ElevationProfileView`: elevation profile window linked to a plot view. It
   shares selection and edit commands with `PlotView`, supports independent
-  distance and visible-elevation scaling, and retains its own temporary help
-  window and close timer.
+  distance and visible-elevation scaling, and retains its own persistent help
+  window until explicit dismissal or parent-profile closure. A track profile
+  gets its subject from `PlotView.current_track_for_title()`, not
+  `display_tracks()`, which includes map-first neighbours. Replacing map state
+  resynchronizes the profile title, data and visible distance range.
+  Map and profile use `plot_zoom_key_action()` for `z` (selection), Shift-Z
+  (current track), and `A` (all visible tracks). An explicit profile scope
+  overrides the map's track/overview mode without changing its viewport.
+  `I` shares the `interpolated_height_updates()` planner and the controller's
+  elevation-only mutation path across maps, profiles and waypoint tables.
+  The planner validates every selected range before changing XML, preserves
+  anchors and segment boundaries, and interpolates against route distance.
+  `PlotView.set_selection_marker()` shares marker placement and endpoint
+  swapping across the map/profile. Short clicks inside a marked range move
+  its cursor endpoint on release, without disrupting long-press range dragging.
+  Settled tile requests calculate resolution from the live viewport rather
+  than trusting a saved/gesture-preview tile level; retained tiles remain
+  visible until the new level arrives.
+  Info-overlay presses consume their entire mouse sequence, and unrelated
+  help panels do not overwrite its close/drag hit rectangles. Drag Undo is
+  created only on actual movement (or insertion), contains just the affected
+  track, and doubles as the Escape snapshot. Waypoint-table rebuilding waits
+  until release. Selected-range metrics use a bounded per-track memory cache
+  invalidated by point edits and keyed by the processing settings.
+  Replacing the map subject cancels old pan/pinch/wheel/hold state before
+  fitting the next track. The waypoint Plot action passes its track explicitly
+  and detaches the previous table from the reused canvas. Fitted tile zoom is
+  refreshed in both the live model and its per-track entry; old tiles remain
+  placeholders rather than becoming the new track's authoritative resolution.
 - `TrackInspectorController`: waypoint-level editor for one track.
 
 An input-free launch creates one empty track and immediately opens its world

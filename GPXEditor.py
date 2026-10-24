@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -27,7 +28,14 @@ from pathlib import Path
 from statistics import median
 from typing import Iterable
 
+from plot_rendering import add_headless_basemap, new_figure, serialized_plotting
+
 from elevation_profile_cache import elevation_profile_visible_range
+from gpx_pdf_summary import (
+    DEFAULT_PDF_COLUMNS, PDF_EXPORT_EXECUTOR, PDFExportCancelled,
+    SummaryOptions, SummarySnapshot, check_cancelled, export_summary_pdf,
+    report_name, reusable_map_background, select_summary_tracks, summary_track,
+)
 
 import objc
 from AppKit import (
@@ -47,6 +55,7 @@ from AppKit import (
     NSControlStateValueOff,
     NSControlStateValueOn,
     NSEventModifierFlagCommand,
+    NSEventModifierFlagControl,
     NSEventModifierFlagOption,
     NSEventModifierFlagShift,
     NSFont,
@@ -125,11 +134,13 @@ from cocoa_parameter_editor import CocoaParameterEditor
 from cocoa_map_provider_setup import configure_hosted_provider, run_map_provider_setup
 from cocoa_media_viewer import CocoaMediaViewer
 from cocoa_native_menus import (
+    ReusableToolWindowDelegate,
     WindowMenuCoordinator,
     add_menu,
     configure_mycamino_branding,
     menu_item,
 )
+from window_lifecycle import WINDOW_REGISTRY
 from cocoa_application_news import install_application_news
 from workspace_mutations import MutationKind, WorkspaceMutation
 from gpx_processing import (
@@ -140,6 +151,7 @@ from gpx_processing import (
     parse_time,
     process_raw_points,
     process_track_element,
+    processed_track_geometry_fingerprint,
     processing_input_fingerprint,
     raw_track_geometry_fingerprint,
     semantic_track_fingerprint,
@@ -163,6 +175,7 @@ from gpx_point_editing import (
     insert_points_at_route_matches,
     insert_points_chronologically,
     insert_points_after_row,
+    interpolated_height_updates,
     join_segments_at_row,
     joinable_segment_boundary,
     media_paths_for_point,
@@ -185,6 +198,7 @@ from gpx_coordinate_input import CoordinateParseError, ParsedCoordinate, parse_c
 from json_storage import atomic_write_json, load_parameter_subset, parameter_subset_payload
 from map_provider_utils import (
     DEFAULT_TILE_CACHE_DIR,
+    TileCacheMissError,
     configure_contextily_cache,
     contextily_provider,
     contextily_request_timeout,
@@ -384,6 +398,24 @@ MPL_CACHE_DIR = APP_CACHE_DIR / "matplotlib"
 def command_modifier_requests_media_selection(modifier_flags: int) -> bool:
     """Keep ordinary map drags available for panning."""
     return bool(int(modifier_flags) & NSEventModifierFlagCommand)
+
+
+def plot_zoom_key_action(key: str, modifier_flags: int) -> str | None:
+    """Share zoom shortcuts without consuming editing/menu key equivalents."""
+    if modifier_flags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl):
+        return None
+    shifted = bool(modifier_flags & NSEventModifierFlagShift)
+    if key.casefold() == "z":
+        return "track" if shifted or key == "Z" else "selection"
+    if key == "A" or (key == "a" and shifted):
+        return "all"
+    return None
+
+
+def height_interpolation_key(key: str, modifier_flags: int) -> bool:
+    return not modifier_flags & (
+        NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl
+    ) and (key == "I" or (key == "i" and bool(modifier_flags & NSEventModifierFlagShift)))
 
 
 def suppressed_untimed_track_identities(defaults) -> set[str]:
@@ -1021,6 +1053,7 @@ class TrackRecord:
     display_geometry_cache: dict[int, CachedDisplayTrack] = field(
         default_factory=dict, repr=False
     )
+    point_range_metrics_cache: OrderedDict = field(default_factory=OrderedDict, repr=False)
 
     @property
     def name(self) -> str:
@@ -1629,6 +1662,7 @@ class PlotView(NSView):
         self.info_overlay_origin = None
         self.info_overlay_dragging = False
         self.info_overlay_drag_offset = None
+        self.info_overlay_mouse_active = False
         self.context_overlay_coordinate = None
         self.pointer_coordinate = None
         self.pointer_elevation = None
@@ -1682,6 +1716,7 @@ class PlotView(NSView):
         self.pan_restore_extent = None
         self.last_gesture_location = None
         self.interactive_tiles_active = False
+        self.plot_closed = False
         self.interactive_tiles = OrderedDict()
         self.interactive_tile_store_provider_key = ""
         self.interactive_tile_target_keys = set()
@@ -1717,6 +1752,8 @@ class PlotView(NSView):
         return True
 
     def drawRect_(self, _rect):
+        if self.plot_closed:
+            return
         bounds = self.bounds()
         workspace = self.adventure_workspace_delegate
         NSColor.windowBackgroundColor().setFill()
@@ -1774,6 +1811,7 @@ class PlotView(NSView):
             dot.setLineWidth_(2.0)
             dot.fill()
             dot.stroke()
+        self.draw_selection_marker(transformer)
         if self.show_info and self.context_overlay_coordinate is not None:
             self.draw_coordinate_overlay(self.context_overlay_coordinate, bounds)
         elif self.show_info and self.cursor is not None:
@@ -1791,19 +1829,16 @@ class PlotView(NSView):
             workspace.drawWorkspaceOverlay_inView_bounds_(self, self, bounds)
 
     def viewWillMoveToWindow_(self, window):
-        if window is None and not self.reparenting_for_adventure_workspace:
-            self.photo_thumbnail_generation += 1
-            for future in self.photo_thumbnail_futures.values():
-                future.cancel()
-            self.photo_thumbnail_futures.clear()
-            self.photo_thumbnail_executor.shutdown(wait=False, cancel_futures=True)
-            self.cancel_interactive_tile_requests(shutdown=True)
-        elif hasattr(window, "setAcceptsMouseMovedEvents_"):
+        # Detaching/reparenting a retained view is not closing its document.
+        # PlotWindowDelegate owns worker shutdown on an actual window close.
+        if hasattr(window, "setAcceptsMouseMovedEvents_"):
             window.setAcceptsMouseMovedEvents_(True)
         objc.super(PlotView, self).viewWillMoveToWindow_(window)
 
     def mouseMoved_(self, event):
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
+        if self.show_info and self.point_inside_rect(location, self.info_overlay_rect):
+            return
         self.update_pointer_location(location)
         target = self.nearest_edit_target(location) if self.waypoint_editing_enabled() else None
         hovered = None
@@ -1933,6 +1968,7 @@ class PlotView(NSView):
         per_track = self.plot_info.get("tracks", {})
         next_info = per_track.get(track.nr)
         if next_info is not None and self.plot_info.get("current_track_nr") != track.nr:
+            self.reset_plot_interaction()
             tracks_info = self.plot_info.get("tracks")
             self.plot_info.update(next_info)
             if tracks_info is not None:
@@ -1940,6 +1976,7 @@ class PlotView(NSView):
             self.plot_info["current_track_nr"] = track.nr
             self.plot_info.setdefault("base_extent_mercator", self.plot_info.get("metadata", {}).get("extent_mercator"))
             if self.interactive_tiles_active:
+                self.refresh_interactive_tile_zoom()
                 self.interactive_tile_generation += 1
                 self.cancel_interactive_tile_requests(shutdown=False)
                 self.schedule_interactive_tiles()
@@ -1947,11 +1984,11 @@ class PlotView(NSView):
 
     def current_track_for_title(self):
         if self.mode != "track":
-            if self.adventure_workspace_delegate is not None:
-                selected = self.controller.selected_tracks()
-                if len(selected) == 1:
-                    return selected[0]
-            return None
+            selected = self.controller.selected_tracks()
+            if len(selected) == 1:
+                return selected[0]
+            current_nr = self.plot_info.get("current_track_nr")
+            return next((track for track in self.controller.tracks if track.nr == current_nr), None)
         current_nr = self.plot_info.get("current_track_nr")
         if current_nr is not None:
             for track in self.controller.tracks:
@@ -2523,6 +2560,8 @@ class PlotView(NSView):
         return result
 
     def request_photo_thumbnail(self, path: Path):
+        if getattr(self, "plot_closed", False):
+            return None
         try:
             stat = path.stat()
             cache_key = (str(path), int(stat.st_size), int(stat.st_mtime_ns))
@@ -2554,6 +2593,8 @@ class PlotView(NSView):
 
     @objc.IBAction
     def installPhotoThumbnail_(self, payload):
+        if getattr(self, "plot_closed", False):
+            return
         cache_key, generation, thumbnail_path = payload
         self.photo_thumbnail_futures.pop(cache_key, None)
         if generation != self.photo_thumbnail_generation or thumbnail_path is None:
@@ -2626,6 +2667,40 @@ class PlotView(NSView):
         elif self.inspector is not None and track is self.inspector.track:
             ranges.extend(self.group_point_indexes(self.inspector.selected_row_indexes()))
         return ranges
+
+    def set_selection_marker(self, swap=False):
+        if self.cursor is None:
+            return
+        index, _point, track = self.cursor
+        if swap and self.marker is not None:
+            points = track.points()
+            if not 0 <= self.marker < len(points):
+                return
+            self.cursor = (self.marker, points[self.marker], track)
+            self.marker = index
+            message = f"Swapped marker and cursor in track #{track.nr}."
+        else:
+            self.marker = index
+            message = f"Marker set at point {index + 1} of track #{track.nr}."
+        self.sync_inspector_selection()
+        self.controller.refresh_elevation_profile_for_plot_view(self)
+        self.update_window_title()
+        self.setNeedsDisplay_(True)
+        self.controller.set_status(message)
+
+    def draw_selection_marker(self, transformer):
+        if self.marker is None or self.cursor is None:
+            return
+        points = self.cursor[2].points()
+        if not 0 <= self.marker < len(points):
+            return
+        x, y = transformer(points[self.marker])
+        NSColor.systemRedColor().setFill()
+        NSColor.whiteColor().setStroke()
+        square = NSBezierPath.bezierPathWithRect_(NSMakeRect(x - 7, y - 7, 14, 14))
+        square.setLineWidth_(2.0)
+        square.fill()
+        square.stroke()
 
     def selected_range_at_target(self, target):
         """Return the selected range hit by a point or connecting segment."""
@@ -2781,9 +2856,8 @@ class PlotView(NSView):
         NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.72).setFill()
         panel = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, 8.0, 8.0)
         panel.fill()
-        self.info_overlay_close_rect = None
-        self.info_overlay_rect = rect if closable else None
         if closable:
+            self.info_overlay_rect = rect
             self.info_overlay_origin = rect.origin
         if closable:
             close_size = 20.0
@@ -2886,6 +2960,12 @@ class PlotView(NSView):
         )
 
     def dismiss_info_overlay(self):
+        timer = getattr(self, "long_press_timer", None)
+        if timer is not None:
+            timer.invalidate()
+            self.long_press_timer = None
+        self.long_press_origin = None
+        self.long_press_target = None
         self.show_info = False
         self.info_overlay_dismissed = True
         self.context_overlay_coordinate = None
@@ -2900,9 +2980,10 @@ class PlotView(NSView):
             "h: toggle this help",
             "i: toggle point information",
             "a: set current point as anchor for table distances",
+            "I (Shift-I): interpolate heights across the selected point range",
             "+ / -: zoom around the selected waypoint (or view center)",
             "c: center map on current cursor point",
-            "z / Shift-Z: zoom to selection / reset to the full map extent",
+            "z / Shift-Z: fit selection / current track; A: all Adventure tracks",
             "q: close this map window (quits when it is the last window)",
             "p: toggle photo thumbnails on a track map",
             "s: save current plot as PNG",
@@ -2913,7 +2994,7 @@ class PlotView(NSView):
             "drag or two-finger trackpad scroll: pan; Option-drag pans immediately",
             "mouse wheel, +/-, or trackpad pinch: zoom",
             "hold 1 second: insert or drag a waypoint or marked segment; Escape cancels",
-            "m or shift-click: set the selection marker at the current point",
+            "m / Shift-click: set square marker; M: swap marker and cursor",
             "overview double-click: open the Track Table",
             "double-click track point: open the waypoint inspector",
             "overview: n toggles track numbers",
@@ -2944,34 +3025,103 @@ class PlotView(NSView):
         return info
 
     def replace_plot_info(self, plot_info):
+        self.reset_plot_interaction()
         self.ensure_interactive_tile_store_provider()
         self.plot_info = plot_info or {}
-        self.initial_plot_info = self.clone_plot_info(self.plot_info)
         self.cursor = None
         self.marker = None
         self.last_viewport_signature = None
         self.interactive_tiles_active = self.plot_info.get("image") is None
+        if self.interactive_tiles_active:
+            self.refresh_interactive_tile_zoom()
+        self.initial_plot_info = self.clone_plot_info(self.plot_info)
         self.interactive_tile_generation += 1
         self.cancel_interactive_tile_requests(shutdown=False)
         self.interactive_tile_target_keys.clear()
         if self.interactive_tiles_active:
             self.schedule_interactive_tiles(immediate=True)
         self.setNeedsDisplay_(True)
+        self.controller.sync_elevation_profile_to_plot_view(self)
+
+    def reset_plot_interaction(self):
+        """Do not carry an unfinished gesture or edit into another track."""
+        for name in ("pinch_finish_timer", "wheel_finish_timer", "long_press_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.invalidate()
+                setattr(self, name, None)
+        track = getattr(self, "dragged_point_track", None)
+        original = getattr(self, "drag_original_xml", None)
+        if track is not None and original is not None:
+            track.element = ET.fromstring(original)
+            self.controller.invalidate_track_metrics(track)
+            inspector = self.inspector
+            if self.drag_undo_owner == "inspector" and inspector is not None:
+                if inspector.undo_stack and inspector.undo_stack[-1] is original:
+                    inspector.undo_stack.pop()
+            elif self.drag_undo_owner == "controller" and self.controller.undo_stack:
+                entry = self.controller.undo_stack[-1]
+                if isinstance(entry, TrackElementsUndoEntry) and entry.elements.get(track.nr) is original:
+                    self.controller.undo_stack.pop()
+            if inspector is not None and inspector.track is track:
+                inspector.reload_rows()
+        self.pan_active = False
+        self.pan_origin = self.pan_start_extent = self.pan_restore_extent = None
+        self.pinch_start_tile_zoom = None
+        self.pinch_accumulated_scale = 1.0
+        self.long_press_origin = self.long_press_target = None
+        self.last_gesture_location = None
+        self.info_overlay_mouse_active = self.info_overlay_dragging = False
+        self.info_overlay_drag_offset = None
+        if getattr(self, "workspace_media_selection_active", False):
+            workspace = self.adventure_workspace_delegate
+            if workspace is not None and hasattr(workspace, "cancelWorkspaceMediaSelection_"):
+                workspace.cancelWorkspaceMediaSelection_(None)
+        self.workspace_media_selection_active = False
+        self.mouse_down_started_at = None
+        self.mouse_down_click_count = 0
+        self.dragged_point_index = self.dragged_point_track = None
+        self.dragged_segment_rows = []
+        self.dragged_segment_elements = []
+        self.dragged_segment_original_coordinates = []
+        self.dragged_segment_origin_mercator = None
+        self.drag_original_xml = self.drag_undo_owner = None
+        self.drag_inserted_point = False
+
+    def refresh_interactive_tile_zoom(self):
+        extent = self.current_extent()
+        if not extent:
+            return
+        zoom = self.recommended_tile_zoom(extent)
+        self.plot_info["zoom_level"] = self.plot_info["tile_zoom_level"] = zoom
+        current = (self.plot_info.get("tracks") or {}).get(self.plot_info.get("current_track_nr"))
+        if current is not None:
+            current["zoom_level"] = current["tile_zoom_level"] = zoom
 
     def mouseDown_(self, event):
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
+        self.info_overlay_mouse_active = False
         self.clicked_media_target = None
         self.clicked_workspace_media_target = None
         self.workspace_track_selection_consumed = False
-        if self.show_info and self.point_inside_rect(location, self.info_overlay_close_rect):
-            self.dismiss_info_overlay()
-            return
-        if self.show_info and self.point_inside_rect(location, self.info_overlay_rect):
-            self.info_overlay_dragging = True
-            self.info_overlay_drag_offset = NSMakePoint(
-                location.x - self.info_overlay_rect.origin.x,
-                location.y - self.info_overlay_rect.origin.y,
-            )
+        closes_info = self.show_info and self.point_inside_rect(location, self.info_overlay_close_rect)
+        if closes_info or (self.show_info and self.point_inside_rect(location, self.info_overlay_rect)):
+            self.info_overlay_mouse_active = True
+            if self.long_press_timer is not None:
+                self.long_press_timer.invalidate()
+                self.long_press_timer = None
+            self.long_press_origin = None
+            self.long_press_target = None
+            self.mouse_down_started_at = None
+            self.mouse_down_click_count = 0
+            if closes_info:
+                self.dismiss_info_overlay()
+            else:
+                self.info_overlay_dragging = True
+                self.info_overlay_drag_offset = NSMakePoint(
+                    location.x - self.info_overlay_rect.origin.x,
+                    location.y - self.info_overlay_rect.origin.y,
+                )
             return
         for rect, track, point_index, path in reversed(self.photo_thumbnail_hit_targets):
             if (
@@ -3041,10 +3191,7 @@ class PlotView(NSView):
             if not self.pan_active:
                 self.schedule_point_editing_long_press()
         if self.waypoint_editing_enabled() and self.cursor is not None and event.modifierFlags() & NSEventModifierFlagShift:
-            self.marker = self.cursor[0]
-            self.sync_inspector_selection()
-            self.controller.refresh_elevation_profile_for_plot_view(self)
-            self.controller.set_status(f"Marker set at point {self.marker + 1} of track #{self.cursor[2].nr}.")
+            self.set_selection_marker()
 
     def edit_target_for_mouse_down(self, location):
         """Resolve an edit target after an Adventure track has been selected."""
@@ -3057,6 +3204,7 @@ class PlotView(NSView):
                 if len(selected) != 1 or selected[0] is not track:
                     self.controller.select_track_in_table(track.nr)
                     self.cursor = None
+                    self.marker = None
                     self.workspace_track_selection_consumed = True
                     if hasattr(workspace, "workspaceTrackSelectedForEditing_"):
                         workspace.workspaceTrackSelectedForEditing_(track)
@@ -3091,6 +3239,8 @@ class PlotView(NSView):
             )
             self.setNeedsDisplay_(True)
             return
+        if getattr(self, "info_overlay_mouse_active", False):
+            return
         if self.workspace_media_selection_active:
             workspace = self.adventure_workspace_delegate
             if workspace is not None and hasattr(workspace, "updateWorkspaceMediaSelectionTo_"):
@@ -3102,6 +3252,9 @@ class PlotView(NSView):
             if coordinate is not None and self.dragged_segment_origin_mercator is not None:
                 current_x, current_y = lonlat_to_web_mercator(*coordinate)
                 origin_x, origin_y = self.dragged_segment_origin_mercator
+                if self.drag_original_xml is None and math.hypot(current_x - origin_x, current_y - origin_y) < 1e-6:
+                    return
+                self.prepare_drag_undo(self.dragged_point_track)
                 translate_points_web_mercator(
                     self.dragged_segment_elements,
                     self.dragged_segment_original_coordinates,
@@ -3122,6 +3275,9 @@ class PlotView(NSView):
             if coordinate is not None and self.dragged_point_index < len(points):
                 longitude, latitude = coordinate
                 element = points[self.dragged_point_index].element
+                if element.get("lat") == f"{latitude:.8f}" and element.get("lon") == f"{longitude:.8f}":
+                    return
+                self.prepare_drag_undo(self.dragged_point_track)
                 element.set("lat", f"{latitude:.8f}")
                 element.set("lon", f"{longitude:.8f}")
                 self.controller.invalidate_track_metrics(self.dragged_point_track)
@@ -3132,9 +3288,6 @@ class PlotView(NSView):
                     self.dragged_point_track,
                 )
                 self.update_window_title()
-                if self.inspector is not None and self.inspector.track is self.dragged_point_track:
-                    self.inspector.reload_rows()
-                    self.inspector.select_point_index(self.dragged_point_index)
                 self.controller.refresh_elevation_profile_for_plot_view(self)
                 self.setNeedsDisplay_(True)
             return
@@ -3162,7 +3315,8 @@ class PlotView(NSView):
                 return
 
     def mouseUp_(self, event):
-        if self.info_overlay_dragging:
+        if getattr(self, "info_overlay_mouse_active", False) or self.info_overlay_dragging:
+            self.info_overlay_mouse_active = False
             self.info_overlay_dragging = False
             self.info_overlay_drag_offset = None
             return
@@ -3178,6 +3332,7 @@ class PlotView(NSView):
         if self.long_press_timer is not None:
             self.long_press_timer.invalidate()
             self.long_press_timer = None
+        click_target = self.long_press_target
         self.long_press_origin = None
         self.long_press_target = None
         if self.pan_active:
@@ -3190,6 +3345,17 @@ class PlotView(NSView):
             return
         self.pan_origin = None
         self.pan_start_extent = None
+        if (
+            self.dragged_point_index is None
+            and self.dragged_point_track is None
+            and not self.dragged_segment_rows
+            and click_target is not None
+            and self.selected_range_at_target(click_target) is not None
+            and not (event.modifierFlags() & NSEventModifierFlagShift)
+        ):
+            # A short click moves the range end. Holding the same red range
+            # still starts the existing whole-range drag operation.
+            self.move_cursor_to_event(event)
         workspace = self.adventure_workspace_delegate
         if (
             workspace is not None
@@ -3211,6 +3377,7 @@ class PlotView(NSView):
         if self.dragged_segment_rows and self.dragged_point_track is not None:
             track = self.dragged_point_track
             rows = list(self.dragged_segment_rows)
+            changed = self.drag_original_xml is not None
             self.dragged_segment_rows = []
             self.dragged_segment_elements = []
             self.dragged_segment_original_coordinates = []
@@ -3220,6 +3387,9 @@ class PlotView(NSView):
             self.drag_undo_owner = None
             self.mouse_down_started_at = None
             self.mouse_down_click_count = 0
+            if not changed:
+                self.setNeedsDisplay_(True)
+                return
             self.controller.mark_dirty(
                 f"Moved {len(rows)} selected points in track #{track.nr}."
             )
@@ -3255,6 +3425,7 @@ class PlotView(NSView):
         track = self.dragged_point_track
         point_index = self.dragged_point_index
         inserted = self.drag_inserted_point
+        changed = self.drag_original_xml is not None
         self.dragged_point_index = None
         self.dragged_point_track = None
         self.drag_original_xml = None
@@ -3262,6 +3433,9 @@ class PlotView(NSView):
         self.drag_undo_owner = None
         self.mouse_down_started_at = None
         self.mouse_down_click_count = 0
+        if not changed:
+            self.setNeedsDisplay_(True)
+            return
         if self.inspector is not None and self.inspector.track is track:
             self.inspector.reload_rows()
             self.inspector.select_point_index(point_index)
@@ -3454,6 +3628,7 @@ class PlotView(NSView):
             self._plot_context_item(menu, "Copy Marked Segment", "copyContextSegment:")
             self._plot_context_item(menu, "Cut Marked Segment", "cutContextSelectedSegment:")
             self._plot_context_item(menu, "Delete Marked Segment", "deleteContextSelectedSegment:")
+            self._plot_context_item(menu, "Interpolate Height", "interpolateHeight:")
             menu.addItem_(NSMenuItem.separatorItem())
             self.add_location_context_items(menu)
             menu.addItem_(NSMenuItem.separatorItem())
@@ -3861,8 +4036,20 @@ class PlotView(NSView):
         if inspector is not None:
             inspector.push_undo()
             return "inspector"
-        self.controller.push_undo()
+        self.controller.push_track_elements_undo([track])
         return "controller"
+
+    def prepare_drag_undo(self, track):
+        if self.drag_original_xml is not None:
+            return
+        inspector = self.inspector if self.inspector is not None and self.inspector.track is track else None
+        self.drag_undo_owner = self.push_map_edit_undo(track, inspector)
+        # Reuse the affected-track snapshot for Escape instead of serializing
+        # it a second time. Merely holding a point does not create an Undo.
+        self.drag_original_xml = (
+            inspector.undo_stack[-1] if inspector is not None
+            else self.controller.undo_stack[-1].elements[track.nr]
+        )
 
     def discard_map_edit_undo(self, inspector=None):
         if inspector is not None and inspector.undo_stack:
@@ -4266,6 +4453,20 @@ class PlotView(NSView):
         if workspace is not None:
             if workspace.show_workspace_overview(reset_viewport=True) is not None:
                 self.controller.set_status("Fitted the Adventure overview to all visible tracks.")
+            return
+        tracks = self.controller.visible_tracks()
+        info = self.controller.interactive_plot_info("overview", tracks_override=tracks)
+        if info is None:
+            return
+        current = self.current_track_for_title()
+        if current is not None:
+            info["current_track_nr"] = current.nr
+        self.mode = "overview"
+        self.replace_plot_info(info)
+        self.render_extent(
+            info["metadata"]["extent_mercator"],
+            status="Fitted the Adventure overview to all visible tracks.",
+        )
 
     @objc.IBAction
     def beginPointEditingLongPress_(self, _timer):
@@ -4286,8 +4487,8 @@ class PlotView(NSView):
         if inspector is not None:
             self.inspector = inspector
             inspector.plot_view = self
-        self.drag_undo_owner = self.push_map_edit_undo(track, inspector)
-        self.drag_original_xml = ET.tostring(track.element, encoding="unicode")
+        self.drag_undo_owner = None
+        self.drag_original_xml = None
         selected_range = self.selected_range_at_target(target)
         if selected_range is not None:
             _selected_track, start, end = selected_range
@@ -4299,7 +4500,6 @@ class PlotView(NSView):
             ]
             coordinate = self.coordinate_for_view_point(self.long_press_origin)
             if coordinate is None:
-                self.discard_map_edit_undo(inspector)
                 self.dragged_segment_rows = []
                 return
             self.dragged_segment_origin_mercator = lonlat_to_web_mercator(*coordinate)
@@ -4307,11 +4507,13 @@ class PlotView(NSView):
             self.controller.set_status(
                 f"Drag the marked segment ({len(self.dragged_segment_rows)} points); release to keep it or press Escape to cancel."
             )
+            self.setNeedsDisplay_(True)
             return
         if kind == "segment":
             from gpx_point_editing import insertion_for_row
 
             try:
+                self.prepare_drag_undo(track)
                 segment, insert_index, point = insertion_for_row(
                     track.element,
                     index,
@@ -4339,9 +4541,6 @@ class PlotView(NSView):
         points = track.points()
         if 0 <= index < len(points):
             self.cursor = (index, points[index], track)
-        if inspector is not None:
-            inspector.reload_rows()
-            inspector.select_point_index(index)
         self.controller.set_status(
             f"Drag point {index + 1}; release to keep it or press Escape to cancel."
         )
@@ -4435,28 +4634,38 @@ class PlotView(NSView):
             self.schedule_interactive_tiles()
 
     def schedule_interactive_tiles(self, immediate=False):
+        if getattr(self, "plot_closed", False):
+            return
         if self.interactive_tile_timer is not None:
             self.interactive_tile_timer.invalidate()
-        self.interactive_tile_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        self.interactive_tile_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             0.0 if immediate else 0.15,
             self,
             "requestInteractiveTiles:",
             None,
             False,
         )
+        NSRunLoop.mainRunLoop().addTimer_forMode_(
+            self.interactive_tile_timer, NSRunLoopCommonModes
+        )
 
     @objc.IBAction
     def requestInteractiveTiles_(self, _timer):
+        if getattr(self, "plot_closed", False):
+            return
+        if _timer is not None and _timer != self.interactive_tile_timer:
+            return
         self.interactive_tile_timer = None
-        if not self.interactive_tiles_active or self.pan_active:
+        # Gesture previews cancel this timer and never schedule requests. A
+        # settled viewport must not be vetoed by unrelated mouse-event state.
+        if not self.interactive_tiles_active:
             return
         extent = self.current_extent()
         if not extent:
             return
-        effective_zoom, _diagnostics = self.controller.effective_tile_zoom(
-            extent,
-            self.current_tile_zoom(),
-        )
+        # Saved viewports and gesture previews can carry a coarse zoom. The
+        # final request must derive its resolution from the live map scale.
+        effective_zoom = self.recommended_tile_zoom(extent)
         if effective_zoom != self.current_tile_zoom():
             self.plot_info["tile_zoom_level"] = effective_zoom
             self.plot_info["zoom_level"] = effective_zoom
@@ -4527,6 +4736,8 @@ class PlotView(NSView):
 
     @objc.IBAction
     def installInteractiveTile_(self, payload):
+        if getattr(self, "plot_closed", False):
+            return
         key = tuple(payload.get("key") or ())
         generation = int(payload.get("generation", -1))
         self.interactive_tile_futures.pop((generation, key), None)
@@ -4738,6 +4949,20 @@ class PlotView(NSView):
         }
 
     def zoom_to_selected(self):
+        track = self.current_track_for_title()
+        if track is None and self.cursor is not None:
+            track = self.cursor[2]
+        ranges = self.selected_ranges_for_track(track) if track is not None else []
+        if ranges:
+            points = track.points()
+            selected_points = [
+                point for index, point in enumerate(points)
+                if any(start <= index <= end for start, end in ranges)
+            ]
+            extent = self.extent_for_points(selected_points)
+            if extent is not None:
+                self.render_extent(extent, status="Zoomed track map to selected points.")
+                return
         if self.mode == "overview":
             tracks = self.controller.selected_tracks()
             if not tracks:
@@ -4746,20 +4971,9 @@ class PlotView(NSView):
             extent = self.controller.extent_for_track_records(tracks)
             self.render_extent(extent, status="Zoomed overview to selected tracks.")
             return
-        tracks = self.display_tracks()
-        if not tracks:
+        if track is None:
             return
-        track = tracks[0]
-        points = track.points()
-        selected_indexes = []
-        if self.marker is not None and self.cursor is not None and self.cursor[2] is track:
-            selected_indexes = list(range(min(self.marker, self.cursor[0]), max(self.marker, self.cursor[0]) + 1))
-        elif self.inspector is not None and self.inspector.track is track:
-            selected_indexes = self.inspector.selected_row_indexes()
-        selected_points = [points[index] for index in selected_indexes if 0 <= index < len(points)]
-        if not selected_points:
-            selected_points = points
-        extent = self.extent_for_points(selected_points)
+        extent = self.controller.extent_for_track_records([track])
         if extent is None:
             return
         self.render_extent(extent, status="Zoomed track map to selected points.")
@@ -4778,6 +4992,8 @@ class PlotView(NSView):
         transformer = self._metadata_transformer(all_points, self.bounds()) or self._point_transformer(all_points, self.bounds())
         location = self.convertPoint_fromView_(event.locationInWindow(), None)
         best = min(points, key=lambda item: (transformer(item[2])[0] - location.x) ** 2 + (transformer(item[2])[1] - location.y) ** 2)
+        if self.cursor is None or self.cursor[2] is not best[0]:
+            self.marker = None
         self.cursor = (best[1], best[2], best[0])
         self.context_overlay_coordinate = None
         self.show_info = not self.info_overlay_dismissed
@@ -4794,6 +5010,7 @@ class PlotView(NSView):
         inspector=None,
         sync_table: bool = True,
         focus_plot: bool = True,
+        preserve_marker: bool = False,
     ):
         points = track.points()
         if point_index < 0 or point_index >= len(points):
@@ -4804,15 +5021,17 @@ class PlotView(NSView):
                 self.track_index = index
                 break
         self.update_track_plot_info(track)
+        previous_track = self.cursor[2] if self.cursor is not None else None
         self.cursor = (point_index, points[point_index], track)
         self.context_overlay_coordinate = None
         self.show_info = not self.info_overlay_dismissed
-        self.marker = None
+        if not preserve_marker or previous_track is not track:
+            self.marker = None
         if inspector is not None:
             self.inspector = inspector
             inspector.plot_view = self
             if sync_table:
-                inspector.select_point_index(point_index)
+                self.sync_inspector_selection()
         window = self.window()
         if focus_plot and window is not None:
             window.makeFirstResponder_(self)
@@ -4846,6 +5065,7 @@ class PlotView(NSView):
         command_down = bool(event.modifierFlags() & NSEventModifierFlagCommand)
         option_down = bool(event.modifierFlags() & NSEventModifierFlagOption)
         shift_down = bool(event.modifierFlags() & NSEventModifierFlagShift)
+        zoom_action = plot_zoom_key_action(key, event.modifierFlags())
         self.transient_help_until = None
         workspace = self.adventure_workspace_delegate
         if workspace is not None and workspace.handleWorkspaceKeyEvent_(event):
@@ -4913,7 +5133,11 @@ class PlotView(NSView):
             self.cut_track()
             self.setNeedsDisplay_(True)
             return
-        if key in {"+", "=", "-", "_", "c", "C", "z", "Z"} and event.isARepeat():
+        if (key in {"+", "=", "-", "_", "c", "C"} or zoom_action is not None) and event.isARepeat():
+            return
+        if height_interpolation_key(key, event.modifierFlags()):
+            if not event.isARepeat():
+                self.interpolate_selected_heights()
             return
         if key in {"i", "I"}:
             self.show_info = not self.show_info
@@ -4925,7 +5149,7 @@ class PlotView(NSView):
         elif key in {"q", "Q"}:
             window = self.window()
             if window is not None:
-                window.close()
+                window.performClose_(None)
             return
         elif key in {"u", "U"}:
             self.unselect_plot_items()
@@ -4942,7 +5166,9 @@ class PlotView(NSView):
             self.controller.set_status(
                 "Start/end dots shown." if self.show_endpoint_markers else "Start/end dots hidden."
             )
-        elif key in {"a", "A"} and self.cursor is not None:
+        elif zoom_action == "all":
+            self.fitEntireAdventure_(None)
+        elif key == "a" and not command_down and not option_down and self.cursor is not None:
             self.controller.set_anchor_from_point(self.cursor[1])
         elif option_down and (key in {"\uf702", "\uf700", "\uf703", "\uf701"} or key_code in {123, 124, 125, 126}):
             width = self.bounds().size.width * 0.20
@@ -4968,8 +5194,8 @@ class PlotView(NSView):
                 self.change_view_zoom(0.5)
         elif key in {"c", "C"}:
             self.center_on_cursor()
-        elif key.casefold() == "z":
-            if shift_down or key == "Z":
+        elif zoom_action in {"selection", "track"}:
+            if zoom_action == "track":
                 self.reset_view()
             else:
                 self.zoom_to_selected()
@@ -4981,13 +5207,11 @@ class PlotView(NSView):
             return
         elif (
             self.mode == "track" or self.adventure_workspace_delegate is not None
-        ) and key in {"m", "M"} and self.cursor is not None:
-            previous_show_info = self.show_info
-            self.marker = self.cursor[0]
-            if self.inspector is not None and self.cursor[2] is self.inspector.track:
-                self.inspector.select_point_index(self.marker)
-            self.controller.refresh_elevation_profile_for_plot_view(self)
-            self.show_info = previous_show_info
+        ) and key in {"m", "M"} and self.cursor is not None and not (
+            command_down or option_down or event.modifierFlags() & NSEventModifierFlagControl
+        ):
+            if not event.isARepeat():
+                self.set_selection_marker(swap=shift_down or key == "M")
         elif key in {"\x08", "\x7f", "\uf728"} and (
             self.mode == "track" or self.adventure_workspace_delegate is not None
         ):
@@ -5004,40 +5228,26 @@ class PlotView(NSView):
         self.setNeedsDisplay_(True)
 
     def reset_view(self):
-        selected_point_index = None
-        selected_track = None
-        if self.inspector is not None:
-            rows = self.inspector.selected_row_indexes()
-            if rows:
-                selected_point_index = rows[-1]
-                selected_track = self.inspector.track
+        track = self.current_track_for_title()
+        if track is None and self.cursor is not None:
+            track = self.cursor[2]
+        if track is None:
+            selected = self.controller.selected_tracks()
+            track = selected[0] if len(selected) == 1 else None
+        if track is None:
+            self.controller.set_status("Select a track to fit first; press A to show all tracks.")
+            return
+        extent = self.controller.extent_for_track_records([track])
+        if extent is None:
+            return
         self.zoom = 1.0
-        self.marker = None
         self.last_viewport_signature = None
-        if self.mode == "overview":
-            tracks = self.controller.tracks
-            extent = self.controller.extent_for_track_records(tracks)
-            if extent is not None:
-                self.render_extent(extent, status="Reset overview to all tracks.")
-                return
-        else:
-            tracks = self.display_tracks()
-            extent = self.controller.extent_for_track_records(tracks)
-            if extent is not None:
-                self.render_extent(extent, status="Reset track map to the full track extent.")
-                if any(track is selected_track for track in tracks) and selected_point_index is not None:
-                    self.move_cursor_to_track_point(selected_track, selected_point_index, self.inspector, sync_table=False)
-                return
-        self.plot_info = self.clone_plot_info(self.initial_plot_info)
-        self.zoom = 1.0
-        self.marker = None
-        self.last_viewport_signature = None
-        if selected_track is not None and selected_point_index is not None:
-            self.move_cursor_to_track_point(selected_track, selected_point_index, self.inspector, sync_table=False)
-        self.controller.set_status("Reset plot map to full extent.")
-        self.setNeedsDisplay_(True)
+        self.render_extent(extent, status=f"Fitted the map to the complete track #{track.nr}.")
 
     def change_view_zoom(self, factor: float, focus_location=None):
+        if self.wheel_finish_timer is not None:
+            self.wheel_finish_timer.invalidate()
+            self.wheel_finish_timer = None
         if self.pinch_finish_timer is not None:
             self.pinch_finish_timer.invalidate()
             self.pinch_finish_timer = None
@@ -5110,6 +5320,21 @@ class PlotView(NSView):
             self.cursor = None
             self.refresh_after_map_edit(track, next_index)
 
+    def interpolate_selected_heights(self):
+        track = self.cursor[2] if self.cursor is not None else self.current_track_for_title()
+        ranges = self.selected_ranges_for_track(track) if track is not None else []
+        if not ranges:
+            self.controller.set_status("Select a point range first to interpolate its heights.")
+            return
+        inspector = self.controller.existing_inspector_for_track(track)
+        if inspector is not None:
+            self.inspector = inspector
+        self.controller.interpolate_track_heights(track, ranges)
+
+    @objc.IBAction
+    def interpolateHeight_(self, _sender):
+        self.interpolate_selected_heights()
+
     def delete_cursor_waypoint(self):
         if self.cursor is None:
             return
@@ -5148,6 +5373,14 @@ class PlotWindowDelegate(NSObject):
         if window is not None:
             window.makeFirstResponder_(self.view)
 
+    def windowShouldClose_(self, window):
+        workspace = getattr(self.view, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "hideWorkspaceMapIfOtherWindowsRemain_"):
+            if workspace.hideWorkspaceMapIfOtherWindowsRemain_(window):
+                return False
+            return workspace.confirm_quit()
+        return True
+
     def windowWillClose_(self, _notification):
         window = _notification.object()
         workspace = getattr(self.view, "adventure_workspace_delegate", None)
@@ -5168,10 +5401,11 @@ class ElevationProfileView(NSView):
         self.plot_view = plot_view
         self.x_zoom = 1.0
         self.x_center = None
+        self.profile_scope = None
         self.y_axis_mode = "default"
         self.profile_help_window = None
         self.profile_help_text_view = None
-        self.profile_help_timer = None
+        self.profile_help_delegate = None
         self.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         return self
 
@@ -5179,7 +5413,7 @@ class ElevationProfileView(NSView):
         return True
 
     def profile_title(self):
-        if self.plot_view.mode == "overview":
+        if self.shows_all_tracks():
             return "Overview Elevation Profile"
         track = self.current_track()
         if track is None:
@@ -5187,14 +5421,27 @@ class ElevationProfileView(NSView):
         return f"Track #{track.nr}: {track.name} - Elevation Profile"
 
     def current_track(self):
-        tracks = self.plot_view.display_tracks()
-        return tracks[0] if tracks else None
+        track = self.plot_view.current_track_for_title()
+        if track is None:
+            cursor = getattr(self.plot_view, "cursor", None)
+            if cursor is not None:
+                track = cursor[2]
+        if track is None:
+            selected = self.controller.selected_tracks()
+            track = selected[0] if len(selected) == 1 else None
+        return track
+
+    def shows_all_tracks(self):
+        scope = getattr(self, "profile_scope", None)
+        return scope == "all" or (scope is None and self.plot_view.mode == "overview")
 
     def profile_tracks(self):
-        if self.plot_view.mode == "overview":
+        if self.shows_all_tracks():
             return self.controller.visible_tracks()
-        tracks = self.plot_view.display_tracks()
-        return tracks
+        # Map-first views also draw neighbouring tracks. The single-track
+        # profile must follow the active subject, not that background list.
+        track = self.current_track()
+        return [track] if track is not None else []
 
     def profile_data(self):
         rows = []
@@ -5249,6 +5496,7 @@ class ElevationProfileView(NSView):
         self.draw_selected_ranges(rows, track_ranges, transform, x_min, x_max)
         self.draw_scale_bar(plot, y_min, y_max)
         self.draw_cursor(rows, transform, x_min, x_max, plot)
+        self.draw_selection_marker(rows, transform, x_min, x_max)
         self.draw_text(self.profile_title(), plot.origin.x, bounds.size.height - 22, 13, NSColor.labelColor())
 
     def fixed_elevation_range(self, elevations):
@@ -5263,7 +5511,7 @@ class ElevationProfileView(NSView):
 
     def elevation_range(self, rows, x_min, x_max):
         axis_rows = rows
-        if self.plot_view.mode == "overview":
+        if self.shows_all_tracks():
             axis_rows = elevation_rows_for_selected_tracks(
                 rows,
                 self.controller.selected_nrs,
@@ -5504,7 +5752,7 @@ class ElevationProfileView(NSView):
 
         def track_color(track):
             if (
-                self.plot_view.mode != "overview"
+                not self.shows_all_tracks()
                 and not workspace_selection
             ) or not selected_tracks:
                 return NSColor.systemBlueColor()
@@ -5541,11 +5789,7 @@ class ElevationProfileView(NSView):
 
     def draw_selected_ranges(self, rows, track_ranges, transform, x_min, x_max):
         del track_ranges
-        tracks = (
-            self.profile_tracks()
-            if self.plot_view.mode == "overview"
-            else [self.current_track()]
-        )
+        tracks = self.profile_tracks()
         for track in (item for item in tracks if item is not None):
             ranges = self.plot_view.selected_ranges_for_track(track)
             if (
@@ -5668,12 +5912,29 @@ class ElevationProfileView(NSView):
         }
         NSString.stringWithString_(str(text)).drawAtPoint_withAttributes_((x, y), attrs)
 
+    def draw_selection_marker(self, rows, transform, x_min, x_max):
+        cursor = self.plot_view.cursor
+        marker = self.plot_view.marker
+        if cursor is None or marker is None:
+            return
+        track_rows = [row for row in rows if row["track"] is cursor[2] and row["elevation"] is not None]
+        if not track_rows:
+            return
+        row = min(track_rows, key=lambda item: abs(item["index"] - marker))
+        if not x_min <= row["distance"] <= x_max:
+            return
+        x, y = transform(row["distance"], row["elevation"])
+        NSColor.systemRedColor().setFill()
+        NSColor.blackColor().setStroke()
+        square = NSBezierPath.bezierPathWithRect_(NSMakeRect(x - 4, y - 4, 8, 8))
+        square.setLineWidth_(1.2)
+        square.fill()
+        square.stroke()
+
     def mouseDown_(self, event):
         self.move_cursor_to_event(event)
         if event.modifierFlags() & NSEventModifierFlagShift and self.plot_view.cursor is not None:
-            self.plot_view.marker = self.plot_view.cursor[0]
-            self.plot_view.sync_inspector_selection()
-            self.controller.set_status(f"Profile marker set at point {self.plot_view.marker + 1}.")
+            self.plot_view.set_selection_marker()
         if event.clickCount() >= 2 and self.plot_view.cursor is not None:
             if self.plot_view.mode == "overview":
                 self.controller.open_track_workflow_at_point(
@@ -5700,12 +5961,8 @@ class ElevationProfileView(NSView):
             return
         track = row["track"]
         index = row["index"]
-        previous_marker = self.plot_view.marker
-        previous_marker_track = self.plot_view.cursor[2] if self.plot_view.cursor is not None else track
         self.controller.select_track_in_table(track.nr)
-        self.plot_view.move_cursor_to_track_point(track, index)
-        if previous_marker is not None and previous_marker_track is track:
-            self.plot_view.marker = previous_marker
+        self.plot_view.move_cursor_to_track_point(track, index, preserve_marker=True, focus_plot=False)
         self.plot_view.sync_inspector_selection()
         self.plot_view.setNeedsDisplay_(True)
         self.setNeedsDisplay_(True)
@@ -5738,11 +5995,19 @@ class ElevationProfileView(NSView):
         modifiers = event.modifierFlags()
         command_down = bool(modifiers & NSEventModifierFlagCommand)
         shift_down = bool(modifiers & NSEventModifierFlagShift)
+        zoom_action = plot_zoom_key_action(key, modifiers)
         if command_down and key.casefold() == "z":
+            inspector = getattr(self.plot_view, "inspector", None)
             if shift_down:
-                self.controller.redo_(None)
+                if inspector is not None and inspector.redo_stack:
+                    inspector.redo()
+                else:
+                    self.controller.redo_(None)
             else:
-                self.controller.undo_(None)
+                if inspector is not None and inspector.undo_stack:
+                    inspector.undo()
+                else:
+                    self.controller.undo_(None)
             return
         if command_down and self.plot_view.mode == "track" and key.casefold() == "x":
             self.plot_view.cut_track()
@@ -5756,17 +6021,21 @@ class ElevationProfileView(NSView):
             if window is not None:
                 window.close()
             return
-        if key.casefold() == "z" and (shift_down or key == "Z"):
-            self.x_zoom = 1.0
-            self.x_center = None
-            self.setNeedsDisplay_(True)
-            self.controller.set_status("Elevation profile reset to the full distance range.")
+        if zoom_action == "track":
+            self.set_profile_scope("track")
+            return
+        if zoom_action == "all":
+            self.set_profile_scope("all")
             return
         if key in {"+", "="}:
             self.change_zoom(4.0 if command_down else 2.0)
             return
         if key in {"-", "_"}:
             self.change_zoom(0.25 if command_down else 0.5)
+            return
+        if height_interpolation_key(key, modifiers):
+            if not event.isARepeat():
+                self.plot_view.interpolate_selected_heights()
             return
         if key in {"i", "I"}:
             self.plot_view.show_info = not self.plot_view.show_info
@@ -5785,7 +6054,7 @@ class ElevationProfileView(NSView):
         if key in {"c", "C"}:
             self.center_on_cursor()
             return
-        if key.casefold() == "z":
+        if zoom_action == "selection":
             self.zoom_to_selected()
             return
         if key in {"y", "Y"}:
@@ -5823,21 +6092,37 @@ class ElevationProfileView(NSView):
             self.plot_view.switch_track(-1)
             self.setNeedsDisplay_(True)
             return
-        if key in {"m", "M"} and self.plot_view.cursor is not None:
-            self.plot_view.marker = self.plot_view.cursor[0]
-            self.plot_view.sync_inspector_selection()
-            self.plot_view.setNeedsDisplay_(True)
+        if key in {"m", "M"} and self.plot_view.cursor is not None and not (
+            modifiers & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl)
+        ):
+            if not event.isARepeat():
+                self.plot_view.set_selection_marker(swap=shift_down or key == "M")
             self.setNeedsDisplay_(True)
-            self.controller.set_status(f"Profile marker set at point {self.plot_view.marker + 1}.")
             return
         objc.super(ElevationProfileView, self).keyDown_(event)
 
     def keyUp_(self, event):
         key = str(event.charactersIgnoringModifiers() or event.characters() or "")
         if key in {"h", "H"}:
-            self.schedule_profile_help_close(4.0)
             return
         objc.super(ElevationProfileView, self).keyUp_(event)
+
+    def menuForEvent_(self, _event):
+        menu = NSMenu.alloc().initWithTitle_("Elevation Profile")
+        menu.setAutoenablesItems_(False)
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Interpolate Height", "interpolateHeight:", ""
+        )
+        item.setTarget_(self)
+        track = self.current_track()
+        ranges = self.plot_view.selected_ranges_for_track(track) if track is not None else []
+        item.setEnabled_(any(end - start >= 2 for start, end in ranges))
+        menu.addItem_(item)
+        return menu
+
+    @objc.IBAction
+    def interpolateHeight_(self, _sender):
+        self.plot_view.interpolate_selected_heights()
 
     def profile_help_text(self):
         return "\n".join(
@@ -5845,12 +6130,15 @@ class ElevationProfileView(NSView):
                 "myCamino GPX Editor - Elevation Profile Keys",
                 "",
                 "h                 Show this help window",
+                "Close button      Close help (it stays open until you close it)",
                 "i                 Toggle cursor point information",
+                "I (Shift-I)       Interpolate height across the selected range",
                 "+ / -             Zoom distance in / out around the cursor",
                 "Cmd + / Cmd -     Zoom two additional levels in / out",
                 "c                 Center the visible profile on the cursor",
                 "z                 Zoom to selected tracks or selected points",
-                "Shift-Z           Reset to the full distance range",
+                "Shift-Z           Fit the complete current track",
+                "A (Shift-A)       Show all Adventure tracks",
                 "y                 Fit height to the currently visible profile (+5% margins)",
                 "0                 Restore the zero-based default height axis",
                 "u                 Clear the current selection",
@@ -5860,7 +6148,8 @@ class ElevationProfileView(NSView):
                 "Click / drag      Move the cursor to the nearest track point",
                 "Shift-click       Set the selection marker",
                 "Double-click      Open the track point inspector",
-                "m                 Set the marker at the current cursor",
+                "m                 Set the square marker at the current cursor",
+                "M (Shift-M)       Swap marker and cursor (selection ends)",
                 "Delete            Delete points between marker and cursor",
                 "x or Cmd-X        Cut the track after the current cursor point",
                 "Cmd-Z             Undo the last track edit",
@@ -5871,7 +6160,6 @@ class ElevationProfileView(NSView):
         )
 
     def show_profile_help(self):
-        self.cancel_profile_help_timer()
         if self.profile_help_window is None:
             width = 650.0
             height = 445.0
@@ -5882,6 +6170,8 @@ class ElevationProfileView(NSView):
                 False,
             )
             window.setReleasedWhenClosed_(False)
+            self.profile_help_delegate = ReusableToolWindowDelegate.alloc().init()
+            window.setDelegate_(self.profile_help_delegate)
             window.setTitle_("Elevation Profile Help")
             window.setMinSize_(NSMakeSize(500, 300))
             scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
@@ -5912,35 +6202,10 @@ class ElevationProfileView(NSView):
                 y = profile_frame.origin.y - help_frame.size.height - 8.0
             y = max(visible.origin.y, min(y, visible.origin.y + visible.size.height - help_frame.size.height))
             help_window.setFrameOrigin_((x, y))
+        help_window.makeKeyAndOrderFront_(None)
         help_window.orderFrontRegardless()
-        if profile_window is not None:
-            profile_window.makeKeyAndOrderFront_(None)
-            profile_window.makeFirstResponder_(self)
-        # This fallback also closes the help if AppKit does not deliver keyUp.
-        self.schedule_profile_help_close(10.0)
-
-    def schedule_profile_help_close(self, delay):
-        self.cancel_profile_help_timer()
-        self.profile_help_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            float(delay),
-            self,
-            "hideProfileHelp:",
-            None,
-            False,
-        )
-
-    def cancel_profile_help_timer(self):
-        if self.profile_help_timer is not None:
-            self.profile_help_timer.invalidate()
-            self.profile_help_timer = None
-
-    def hideProfileHelp_(self, _timer):
-        self.profile_help_timer = None
-        if self.profile_help_window is not None:
-            self.profile_help_window.orderOut_(None)
 
     def close_profile_help(self):
-        self.cancel_profile_help_timer()
         window = self.profile_help_window
         self.profile_help_window = None
         self.profile_help_text_view = None
@@ -5948,10 +6213,12 @@ class ElevationProfileView(NSView):
             return
         self.controller.unregister_auxiliary_window(window)
         try:
+            window.setDelegate_(None)
             window.orderOut_(None)
             window.close()
         except Exception:
             pass
+        self.profile_help_delegate = None
 
     def change_zoom(self, factor):
         rows, _ranges, total_distance = self.profile_data()
@@ -5991,36 +6258,49 @@ class ElevationProfileView(NSView):
         self.setNeedsDisplay_(True)
         self.controller.set_status("Centered elevation profile on the current cursor point.")
 
+    def set_profile_scope(self, scope):
+        if scope == "track" and self.current_track() is None:
+            self.controller.set_status("Select a track to fit first; press A to show all tracks.")
+            return
+        # Profile scope is independent of the associated map's viewport.
+        self.profile_scope = scope
+        self.x_zoom = 1.0
+        self.x_center = None
+        window = self.window()
+        if window is not None:
+            window.setTitle_(self.profile_title())
+        self.setNeedsDisplay_(True)
+        self.controller.set_status(
+            "Showing elevation profiles for all visible Adventure tracks."
+            if scope == "all" else "Fitted the elevation profile to the complete current track."
+        )
+
     def zoom_to_selected(self):
         rows, track_ranges, total_distance = self.profile_data()
         if not rows or total_distance <= 0:
             return
         distances = []
-        if self.plot_view.mode == "overview":
+        track = self.current_track()
+        ranges = self.plot_view.selected_ranges_for_track(track) if track is not None else []
+        if ranges:
+            track_rows = [row for row in rows if row["track"] is track]
+            for start, end in ranges:
+                selected_rows = [row for row in track_rows if start <= row["index"] <= end]
+                if selected_rows:
+                    distances.extend([selected_rows[0]["distance"], selected_rows[-1]["distance"]])
+                elif track_rows:
+                    first = min(track_rows, key=lambda row: abs(row["index"] - start))
+                    last = min(track_rows, key=lambda row: abs(row["index"] - end))
+                    distances.extend([first["distance"], last["distance"]])
+        elif self.shows_all_tracks():
             selected = self.controller.selected_nrs or [track.nr for track in self.profile_tracks()]
             for track_nr in selected:
                 track_range = track_ranges.get(track_nr)
                 if track_range is not None:
                     distances.extend(track_range)
         else:
-            track = self.current_track()
-            if track is not None:
-                ranges = self.plot_view.selected_ranges_for_track(track)
-                if ranges:
-                    for start, end in ranges:
-                        selected_rows = [
-                            row for row in rows if row["track"] is track and start <= row["index"] <= end
-                        ]
-                        if selected_rows:
-                            distances.extend([selected_rows[0]["distance"], selected_rows[-1]["distance"]])
-                        else:
-                            track_rows = [row for row in rows if row["track"] is track]
-                            if track_rows:
-                                first = min(track_rows, key=lambda row: abs(row["index"] - start))
-                                last = min(track_rows, key=lambda row: abs(row["index"] - end))
-                                distances.extend([first["distance"], last["distance"]])
-                elif track.nr in track_ranges:
-                    distances.extend(track_ranges[track.nr])
+            if track is not None and track.nr in track_ranges:
+                distances.extend(track_ranges[track.nr])
         if not distances:
             self.controller.set_status("No tracks or points are selected for profile zoom.")
             return
@@ -6090,6 +6370,10 @@ class InspectorPointTableView(NSTableView):
             return
         if command_down and key.casefold() == "z" and getattr(self, "controller", None) is not None:
             self.controller.undo()
+            return
+        if height_interpolation_key(key, modifiers) and getattr(self, "controller", None) is not None:
+            if not event.isARepeat():
+                self.controller.interpolateHeight_(None)
             return
         if key in {"\x08", "\x7f", "\uf728"} and getattr(self, "controller", None) is not None:
             self.controller.delete_selected_points()
@@ -6302,6 +6586,7 @@ class TrackInspectorController(NSObject):
             ("Join Track Segments", "joinTrackSegments:", ""),
             ("Split Track Above", "splitTrack:", ""),
             ("Readjust Time", "readjustTime:", ""),
+            ("Interpolate Height", "interpolateHeight:", ""),
             ("Fit Map to Selection", "fitMapToSelection:", ""),
             ("Fit to Track", "fitMapToTrack:", ""),
         ]:
@@ -7108,6 +7393,11 @@ class TrackInspectorController(NSObject):
         if view is not None:
             view.reset_view()
 
+    @objc.IBAction
+    def interpolateHeight_(self, _sender):
+        ranges = PlotView.group_point_indexes(self, self.selected_row_indexes())
+        self.parent.interpolate_track_heights(self.track, ranges)
+
     def delete_selected_points(self):
         rows = self.selected_row_indexes()
         if not rows:
@@ -7214,9 +7504,18 @@ class TrackInspectorController(NSObject):
         self.parent.update_selection_field()
         self.parent.highlight_selected_rows()
         existing = self.parent.existing_plot_view("track")
-        view = self.parent.open_plot_window("track")
+        workspace = getattr(self.parent, "adventure_workspace_delegate", None)
+        existing_workspace_map = getattr(workspace, "plot_view", None)
+        view = self.parent.open_plot_window("track", tracks_override=[self.track])
         if view is not None:
-            self.owns_plot_window = self.owns_plot_window or existing is None
+            previous = view.inspector
+            if previous is not None and previous is not self and previous.plot_view is view:
+                previous.plot_view = None
+                previous.owns_plot_window = False
+            self.owns_plot_window = (
+                False if existing_workspace_map is not None
+                else self.owns_plot_window or existing is None
+            )
             view.inspector = self
             self.plot_view = view
             view.setNeedsDisplay_(True)
@@ -7568,7 +7867,15 @@ class GPXEditorPdfSummaryWindowDelegate(NSObject):
     def windowDidResize_(self, _notification):
         self.controller.layout_pdf_summary_window()
 
+    def windowShouldClose_(self, window):
+        self.controller.closePdfSummary_(None)
+        return False
+
     def windowWillClose_(self, notification):
+        self.controller.cancelPdfSummary_(None)
+        if self.controller.pdf_summary_poll_timer is not None:
+            self.controller.pdf_summary_poll_timer.invalidate()
+            self.controller.pdf_summary_poll_timer = None
         window = notification.object()
         self.controller.unregister_auxiliary_window(window)
         self.controller.pdf_summary_window = None
@@ -7576,6 +7883,146 @@ class GPXEditorPdfSummaryWindowDelegate(NSObject):
         self.controller.pdf_summary_export_button = None
         self.controller.pdf_summary_close_button = None
         self.controller.pdf_summary_delegate = None
+
+
+class PDFMapRenderer:
+    """Reuse PDF map rendering with detached tracks and no Cocoa objects."""
+
+    _render_methods = frozenset({
+        "processing_parameter_signature", "processed_track", "display_processed_track",
+        "extent_for_track_records", "fit_extent_to_aspect",
+        "effective_tile_zoom_for_limit", "tile_diagnostics", "map_tile_urls", "map_tile_urls_for_provider",
+        "cached_tile_urls", "missing_map_tile_count", "add_basemap_with_timeout",
+        "make_pdf_map_figure", "draw_pdf_elevation_profile", "draw_pdf_profile_time_ticks",
+        "pdf_distance_at_elapsed", "profile_time_tick_step", "profile_short_elapsed_label",
+        "draw_pdf_profile_scale_bar", "draw_pdf_start_end_labels",
+    })
+
+    def __init__(self, source, tracks, options, cancel, progress):
+        self.options, self.cancel, self.progress = options, cancel, progress
+        self.processing_settings = source.processing_options()
+        self.project_parameters = dict(source.project_parameters)
+        self.selected_nrs = tuple(source.selected_nrs)
+        for name in (
+            "tile_cache_dir", "map_padding_fraction", "track_zoom", "overview_zoom",
+            "pdf_document_dpi", "pdf_map_dpi", "pdf_overview_zoom", "pdf_track_zoom",
+            "pdf_maximum_map_tiles", "maximum_map_zoom", "map_provider",
+            "output_map_provider", "custom_map_url", "custom_map_attribution",
+            "map_credential_id", "map_request_timeout_seconds", "elevation_headroom_fraction", "debug",
+        ):
+            setattr(self, name, getattr(source, name))
+        pdf_provider = self.project_parameters.get("pdf.map_provider", "output")
+        if pdf_provider != "output":
+            self.output_map_provider = pdf_provider
+        self.geoapify_style = self.project_parameters.get("pdf.geoapify_style", "osm-bright")
+        self.cached_map_tile_urls = None
+        map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
+        self.map_cache_only = self.output_map_provider == "osm" and map_count > 1
+        self.overview_numbers = source.pdf_overview_show_track_numbers()
+        self.overview_dots = source.pdf_overview_show_endpoint_dots()
+        self.track_dots = source.pdf_track_show_endpoint_dots()
+        directories = {Path(track.source_file).parent / "trackimages" for track in tracks if track.source_file}
+        media_context = getattr(source, "media_context", {}) or {}
+        if media_context.get("project_directory"):
+            directories.add(Path(media_context["project_directory"]) / "trackimages")
+        self.background_directories = tuple(sorted(directories))
+        self.tracks = []
+        for track in tracks:
+            record = TrackRecord(
+                nr=track.nr, element=copy.deepcopy(track.element),
+                source_file=track.source_file, source_track_index=track.source_track_index,
+                metrics=dict(track.metrics), metrics_dirty=False,
+                processed=track.processed, processed_signature=track.processed_signature,
+                processed_fingerprint=track.processed_fingerprint,
+                display_geometry=track.display_geometry,
+            )
+            name = record.element.find("gpx:name", NS)
+            if name is not None:
+                name.text = report_name(track.name, options.name_prefix)
+            self.tracks.append(record)
+
+    def __getattr__(self, name):
+        if name in self._render_methods:
+            method = getattr(GPXEditorController, name)
+            return lambda *args, **kwargs: method(self, *args, **kwargs)
+        raise AttributeError(name)
+
+    def processing_options(self):
+        return self.processing_settings
+
+    def selected_tracks(self):
+        return [track for track in self.tracks if track.nr in self.selected_nrs]
+
+    def pdf_overview_show_track_numbers(self):
+        return self.overview_numbers
+
+    def pdf_overview_show_endpoint_dots(self):
+        return self.overview_dots
+
+    def pdf_track_show_endpoint_dots(self):
+        return self.track_dots
+
+    def set_status(self, message):
+        check_cancelled(self.cancel)
+        self.progress(message)
+
+    def pdf_track_summary_text(self, mode, tracks, title):
+        visible = [track for track in tracks if not track.hidden]
+        length = sum(track.metrics.get("length_km", 0) for track in visible)
+        duration = sum((track.metrics.get("duration") or timedelta() for track in visible), timedelta())
+        return f"{len(tracks)} track(s) | Length {length:.1f} km | Duration {format_total_duration(duration)}"
+
+    def reuse_pdf_background(self, ax, mode, tracks, extent, pixel_size, tile_zoom=None):
+        if self.output_map_provider == "custom":
+            return False  # A display name cannot identify a custom URL/style.
+        candidates = []
+        for directory in self.background_directories:
+            if mode == "track":
+                candidates.extend(sorted(directory.glob(f"{tracks[0].nr:04d}_*.png")))
+            else:
+                candidates.extend(path for path in sorted(directory.glob("*.png"))
+                                  if not path.name[:1].isdigit())
+        if not candidates:
+            return False
+        image = reusable_map_background(
+            candidates, mode=mode, extent=extent, pixel_size=pixel_size,
+            fingerprints=[processed_track_geometry_fingerprint(self.processed_track(track)) for track in tracks],
+            provider=provider_display_name(self.output_map_provider, self.geoapify_style),
+            minimum_zoom=tile_zoom,
+        )
+        if image is None:
+            return False
+        ax.imshow(image, extent=(extent["min_x"], extent["max_x"], extent["min_y"], extent["max_y"]),
+                  origin="upper", interpolation="bilinear", zorder=0)
+        self.set_status("PDF export: reusing an existing attributed map background.")
+        return True
+
+    @serialized_plotting
+    def write_pages(self, pdf):
+        class Figures:
+            figure = staticmethod(new_figure)
+            close = staticmethod(lambda figure: figure.clear())
+
+        size = (11.69, 8.27) if self.options.orientation == "landscape" else (8.27, 11.69)
+        options = {
+            "elevation_profile": self.options.elevation_profile,
+            "rotate_maps": self.options.rotate_maps,
+        }
+        jobs = []
+        if self.options.include_overview:
+            jobs.append(("overview", self.tracks, "Overview"))
+        if self.options.include_track_maps:
+            jobs.extend(("track", [track], f"Track #{track.nr}: {track.name}") for track in self.tracks)
+        for index, (mode, tracks, title) in enumerate(jobs, 1):
+            self.set_status(f"Rendering map page {index} of {len(jobs)}: {title}")
+            figure = self.make_pdf_map_figure(size, mode, tracks, title, self.options.orientation, options, Figures)
+            try:
+                check_cancelled(self.cancel)
+                if figure is not None:
+                    pdf.savefig(figure, dpi=self.pdf_document_dpi)
+            finally:
+                if figure is not None:
+                    figure.clear()
 
 
 class GPXEditorController(NSObject):
@@ -7609,6 +8056,19 @@ class GPXEditorController(NSObject):
         self.pdf_summary_export_button = None
         self.pdf_summary_close_button = None
         self.pdf_summary_delegate = None
+        self.pdf_summary_poll_timer = None
+        self.pdf_summary_future = None
+        self.pdf_summary_export_request = None
+        self.pdf_summary_cancel = None
+        self.pdf_summary_progress = ""
+        self.pdf_summary_result_message = ""
+        self.pdf_only_loading = False
+        self.pdf_summary_name_prefix = None
+        self.pdf_summary_scope_menu = None
+        self.pdf_summary_open_button = None
+        self.pdf_summary_reveal_button = None
+        self.pdf_summary_cancel_button = None
+        self.pdf_summary_positions = []
         self.on_close_callback = None
         self.on_save_callback = None
         self.on_settings_change_callback = None
@@ -8004,7 +8464,7 @@ class GPXEditorController(NSObject):
             if key in values:
                 updated[key] = values[key]
         credential_id = str(updated.get("maps.credential_id", "default"))
-        for key in ("maps.interactive_provider", "maps.output_provider"):
+        for key in ("maps.interactive_provider", "maps.output_provider", "pdf.map_provider"):
             provider = str(updated.get(key, "osm"))
             if provider_requires_credential(provider) and not request_provider_api_key(
                 provider, credential_id
@@ -8056,6 +8516,10 @@ class GPXEditorController(NSObject):
 
     @objc.IBAction
     def showSettings_(self, _sender):
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None:
+            workspace.open_shared_settings("GPX Processing")
+            return
         if self.settings_controller is None:
             self.settings_controller = CocoaParameterEditor.alloc().init()
             self.settings_controller.configure(
@@ -8065,8 +8529,10 @@ class GPXEditorController(NSObject):
                 apply_callback=self._apply_editor_settings,
                 manage_map_provider_callback=self._manage_map_provider_from_settings,
             )
-        else:
+        elif not self.settings_controller.window.isVisible():
             self.settings_controller.update_values(self.project_parameters)
+        else:
+            self.settings_controller._capture_controls()
         self.settings_controller.show()
 
     def _manage_map_provider_from_settings(self, draft):
@@ -8227,7 +8693,7 @@ class GPXEditorController(NSObject):
             ("Save", "save:", "Save all tracks to the output GPX filename."),
             ("Save & Exit", "saveAndExit:", "Save the GPX file and exit the editor."),
             ("PNG", "savePng:", "Save the current selected-track plot as a PNG image."),
-            ("PDF", "exportPdf:", "Export the track table to a PDF file."),
+            ("PDF Summary", "exportPdf:", "Create a printable track summary, with optional maps and elevation profiles."),
             ("Sort", "sortByDate:", "Sort by Date & Time using the special distance placement for untimed or zero-duration tracks."),
             ("Select All", "selectAllTracks:", "Select all tracks."),
             ("Unselect All", "unselectAllTracks:", "Clear the track selection."),
@@ -8498,7 +8964,7 @@ class GPXEditorController(NSObject):
         exit_width = 112
         quit_width = 72
         right_start = width - PADDING - quit_width - gap - exit_width
-        file_button_widths = [("PDF", 58), ("PNG", 62), ("Plot Overview", 112), ("Plot Track(s)", 112), ("View File", 88)]
+        file_button_widths = [("PDF Summary", 112), ("PNG", 62), ("Plot Overview", 112), ("Plot Track(s)", 112), ("View File", 88)]
         fixed_after_output = gap + BUTTON_HEIGHT + sum(gap + button_width for _title, button_width in file_button_widths)
         output_width = min(420, max(180, right_start - gap - x - fixed_after_output))
         self.output_field.setFrame_(NSMakeRect(x, y, output_width, FIELD_HEIGHT))
@@ -8544,7 +9010,7 @@ class GPXEditorController(NSObject):
             self.buttons["Save"],
             self.output_field,
             self.output_browse_button,
-            self.buttons["PDF"],
+            self.buttons["PDF Summary"],
             self.buttons["PNG"],
             self.buttons["Plot Overview"],
             self.buttons["Plot Track(s)"],
@@ -8676,6 +9142,8 @@ class GPXEditorController(NSObject):
         if self.editor_close_finalized:
             return
         self.editor_close_finalized = True
+        WINDOW_REGISTRY.retire_owner(self)
+        self.cancelPdfSummary_(None)
         self.cancel_staged_track_loading()
         if self.processing_poll_timer is not None:
             self.processing_poll_timer.invalidate()
@@ -8716,9 +9184,11 @@ class GPXEditorController(NSObject):
         """Hide the shared Track Table without closing its map-first document."""
         workspace = getattr(self, "adventure_workspace_delegate", None)
         map_window = getattr(workspace, "window", None) if workspace is not None else None
-        if map_window is None or not map_window.isVisible():
+        if map_window is None:
             return False
         try:
+            if not map_window.isVisible():
+                map_window.makeKeyAndOrderFront_(None)
             self.window.orderOut_(None)
         except Exception:
             return False
@@ -8804,13 +9274,18 @@ class GPXEditorController(NSObject):
         return urls
 
     def map_tile_urls(self, cx, diagnostics: dict, zoom: int) -> list[str]:
+        return self.map_tile_urls_for_provider(cx, diagnostics, zoom, self.map_provider)
+
+    @objc.python_method
+    def map_tile_urls_for_provider(self, cx, diagnostics, zoom, provider):
         provider = contextily_provider(
             cx,
-            self.map_provider,
+            provider,
             self.custom_map_url,
             self.custom_map_attribution,
             self.maximum_map_zoom,
             self.map_credential_id,
+            geoapify_style=getattr(self, "geoapify_style", "osm-bright"),
         )
         return [
             provider_tile_url(provider, x, y, zoom)
@@ -8818,9 +9293,12 @@ class GPXEditorController(NSObject):
             for y in range(diagnostics["y0"], diagnostics["y1"] + 1)
         ]
 
-    def missing_map_tile_count(self, cx, diagnostics: dict, zoom: int) -> int:
+    @objc.python_method
+    def missing_map_tile_count(self, cx, diagnostics: dict, zoom: int, provider=None) -> int:
         cached = self.cached_tile_urls()
-        return sum(1 for url in self.map_tile_urls(cx, diagnostics, zoom) if url not in cached)
+        urls = (self.map_tile_urls(cx, diagnostics, zoom) if provider is None else
+                self.map_tile_urls_for_provider(cx, diagnostics, zoom, provider))
+        return sum(1 for url in urls if url not in cached)
 
     def tile_diagnostics(self, extent: dict, zoom: int) -> dict:
         radius = 6378137.0
@@ -9012,6 +9490,47 @@ class GPXEditorController(NSObject):
         track.processed_fingerprint = None
         track.display_geometry = None
         track.display_geometry_cache.clear()
+        cache = getattr(track, "point_range_metrics_cache", None)
+        if cache is not None:
+            cache.clear()
+
+    def interpolate_track_heights(self, track, ranges):
+        try:
+            updates = interpolated_height_updates(track.element, ranges)
+        except ValueError as exc:
+            show_alert("Cannot interpolate height.", str(exc))
+            return 0
+        if not updates:
+            self.set_status("No height changes needed. Select at least three points with valid endpoint heights.")
+            return 0
+        inspector = self.existing_inspector_for_track(track)
+        selected_rows = inspector.selected_row_indexes() if inspector is not None else []
+        if inspector is not None:
+            inspector.push_undo()
+        else:
+            self.push_track_elements_undo([track], MutationKind.ELEVATION)
+        for point, text in updates:
+            elevation = point.find("gpx:ele", NS)
+            if elevation is None:
+                elevation = ET.Element(qname("ele"))
+                point.insert(0, elevation)
+            elevation.text = text
+        self.invalidate_track_metrics(track)
+        self.mark_dirty(
+            f"Interpolated height for {len(updates)} {'point' if len(updates) == 1 else 'points'} in track #{track.nr}.",
+            MutationKind.ELEVATION, [track.nr],
+        )
+        if inspector is not None:
+            inspector.reload_rows()
+            inspector.select_point_rows(selected_rows)
+        points = track.points()
+        for _window, _delegate, view in self.plot_windows:
+            if isinstance(view, PlotView) and view.cursor is not None and view.cursor[2] is track:
+                index = view.cursor[0]
+                if 0 <= index < len(points):
+                    view.cursor = (index, points[index], track)
+        self.redraw_open_plot_views()
+        return len(updates)
 
     def invalidate_all_metrics(self):
         for track in self.tracks:
@@ -9020,7 +9539,10 @@ class GPXEditorController(NSObject):
     def refresh_open_plot_views(self):
         live_windows = []
         for window, delegate, view in self.plot_windows:
-            if window is None or not window.isVisible():
+            if window is None:
+                continue
+            live_windows.append((window, delegate, view))
+            if not window.isVisible():
                 continue
             if hasattr(view, "rerender_current_map"):
                 if isinstance(view, PlotView):
@@ -9030,17 +9552,18 @@ class GPXEditorController(NSObject):
                 view.rerender_current_map()
             elif isinstance(view, ElevationProfileView):
                 view.setNeedsDisplay_(True)
-            live_windows.append((window, delegate, view))
         self.plot_windows = live_windows
 
     def redraw_open_plot_views(self):
         live_windows = []
         for window, delegate, view in self.plot_windows:
-            if window is None or not window.isVisible():
+            if window is None:
+                continue
+            live_windows.append((window, delegate, view))
+            if not window.isVisible():
                 continue
             if isinstance(view, (PlotView, ElevationProfileView)):
                 view.setNeedsDisplay_(True)
-            live_windows.append((window, delegate, view))
         self.plot_windows = live_windows
 
     def register_auxiliary_window(self, window):
@@ -9054,6 +9577,7 @@ class GPXEditorController(NSObject):
     def unregister_auxiliary_window(self, window):
         if window is None:
             return
+        WINDOW_REGISTRY.retire(window)
         self.auxiliary_windows = [existing for existing in self.auxiliary_windows if existing != window]
         self.plot_windows = [
             (plot_window, delegate, view)
@@ -9068,7 +9592,7 @@ class GPXEditorController(NSObject):
         live_windows = []
         found = None
         for window, delegate, view in self.plot_windows:
-            if window is None or not window.isVisible():
+            if window is None:
                 continue
             live_windows.append((window, delegate, view))
             if found is None and isinstance(view, PlotView) and view.mode == mode:
@@ -9080,7 +9604,7 @@ class GPXEditorController(NSObject):
         live_windows = []
         found = None
         for window, delegate, view in self.plot_windows:
-            if window is None or not window.isVisible():
+            if window is None:
                 continue
             live_windows.append((window, delegate, view))
             if found is None and isinstance(view, ElevationProfileView) and view.plot_view is plot_view:
@@ -9097,7 +9621,8 @@ class GPXEditorController(NSObject):
         for window in list(self.auxiliary_windows):
             if window is not None and not any(existing == window for existing in windows):
                 windows.append(window)
-        for window, _delegate, _view in list(self.plot_windows):
+        for window, _delegate, view in list(self.plot_windows):
+            self.plot_window_closing(view)
             if window is not None and not any(existing == window for existing in windows):
                 windows.append(window)
         if self.help_window is not None and not any(existing == self.help_window for existing in windows):
@@ -9295,6 +9820,17 @@ class GPXEditorController(NSObject):
 
     def plot_window_closing(self, closing_view):
         if isinstance(closing_view, PlotView):
+            if closing_view.plot_closed:
+                return
+            closing_view.plot_closed = True
+            if closing_view.long_press_timer is not None:
+                closing_view.long_press_timer.invalidate()
+                closing_view.long_press_timer = None
+            closing_view.photo_thumbnail_generation += 1
+            for future in closing_view.photo_thumbnail_futures.values():
+                future.cancel()
+            closing_view.photo_thumbnail_futures.clear()
+            closing_view.photo_thumbnail_executor.shutdown(wait=False, cancel_futures=True)
             closing_view.cancel_interactive_tile_requests(shutdown=True)
             self.close_elevation_profile_for_plot_view(closing_view)
         elif isinstance(closing_view, ElevationProfileView):
@@ -9353,8 +9889,13 @@ class GPXEditorController(NSObject):
                 all_paths.append(path)
         if not all_paths or selected_path is None:
             return False
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None:
+            self.media_viewer = workspace.media_viewer
         if self.media_viewer is None:
             self.media_viewer = CocoaMediaViewer.alloc().init()
+            if workspace is not None:
+                workspace.media_viewer = self.media_viewer
         self.media_viewer.show_paths(
             all_paths,
             all_paths.index(selected_path),
@@ -9724,8 +10265,18 @@ class GPXEditorController(NSObject):
         return metrics
 
     def compute_point_range_metrics(self, track: TrackRecord, ranges: list[tuple[int, int]]) -> dict | None:
+        if not ranges:
+            return None
+        key = (
+            self.processing_parameter_signature(),
+            tuple(sorted((min(int(start), int(end)), max(int(start), int(end))) for start, end in ranges)),
+        )
+        cache = track.point_range_metrics_cache
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
         raw_points = extract_raw_track_points(track.element)
-        if not raw_points or not ranges:
+        if not raw_points:
             return None
         normalized = []
         for start, end in ranges:
@@ -9766,7 +10317,7 @@ class GPXEditorController(NSObject):
         speed = None
         if duration_value is not None and duration_value.total_seconds() > 0:
             speed = length / (duration_value.total_seconds() / 3600.0)
-        return {
+        result = {
             "start_index": first_index,
             "end_index": last_index,
             "npoints": sum(end - start + 1 for start, end in normalized),
@@ -9779,6 +10330,10 @@ class GPXEditorController(NSObject):
             "ascent_m": ascent,
             "descent_m": descent,
         }
+        cache[key] = result
+        while len(cache) > 8:
+            cache.popitem(last=False)
+        return result
 
     def is_editable_cell(self, row: int, column: str) -> bool:
         return (
@@ -10895,7 +11450,8 @@ class GPXEditorController(NSObject):
             if len(untimed) == 1:
                 self.offerRouteTimingForPaths_((untimed[0].nr, pending_media))
         self.notify_initial_load_complete()
-        self.offer_track_time_entry()
+        if not self.pdf_only_loading:
+            self.offer_track_time_entry()
         if self.pending_pdf_export_after_load:
             self.pending_pdf_export_after_load = False
             self.exportPdf_(None)
@@ -11287,9 +11843,6 @@ class GPXEditorController(NSObject):
 
     @objc.IBAction
     def exportPdf_(self, _sender):
-        if not self.table_rows:
-            show_alert("No table data to export.", "Load tracks before exporting the table to PDF.")
-            return
         self.open_pdf_summary_window()
 
     def default_pdf_path(self) -> Path:
@@ -11312,13 +11865,22 @@ class GPXEditorController(NSObject):
         name = self.project_name.strip() if self.project_name else "tracks"
         return name or "tracks"
 
+    def sync_pdf_project_settings(self):
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None:
+            values = normalize_parameters(workspace.parameters)
+            if values != self.project_parameters:
+                self.apply_project_parameters(values)
+
     def open_pdf_summary_window(self):
-        if self.pdf_summary_window is not None and self.pdf_summary_window.isVisible():
-            self.pdf_summary_window.makeKeyAndOrderFront_(None)
-            self.pdf_summary_window.orderFrontRegardless()
-            NSApp().activateIgnoringOtherApps_(True)
-            return
-        self.build_pdf_summary_window()
+        self.sync_pdf_project_settings()
+        if self.pdf_summary_window is None:
+            self.build_pdf_summary_window()
+        if self.pdf_summary_poll_timer is None:
+            self.pdf_summary_poll_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.1, self, "pollPdfSummary:", None, True
+            )
+        self.pollPdfSummary_(None)
         self.pdf_summary_window.makeKeyAndOrderFront_(None)
         self.pdf_summary_window.orderFrontRegardless()
         NSApp().activateIgnoringOtherApps_(True)
@@ -11326,124 +11888,90 @@ class GPXEditorController(NSObject):
     def build_pdf_summary_window(self):
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
         window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(180, 180, 760, 460), style, NSBackingStoreBuffered, False
+            NSMakeRect(180, 180, 820, 650), style, NSBackingStoreBuffered, False
         )
         window.setReleasedWhenClosed_(False)
         window.setTitle_("PDF Summary")
-        window.setMinSize_(NSMakeSize(700, 430))
-        root = NSView.alloc().initWithFrame_(window.contentView().bounds())
-        root.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        window.contentView().addSubview_(root)
+        window.setContentMinSize_(NSMakeSize(800, 620))
+        root = window.contentView()
+        self.pdf_summary_positions = []
 
-        title = self.make_label("PDF Summary", 17, True, 0)
-        title.setFrame_(NSMakeRect(20, 416, 220, 26))
-        root.addSubview_(title)
-        hint = self.make_label("The GPX Editor table remains available. Select tracks there before exporting if needed.", 12, False, 0)
-        hint.setFrame_(NSMakeRect(20, 390, 700, 22))
-        hint.setAutoresizingMask_(NSViewWidthSizable)
-        root.addSubview_(hint)
+        def place(view, x, top, width, height=24, flexible=False):
+            self.pdf_summary_positions.append((view, x, top, width, height, flexible))
+            root.addSubview_(view)
+            return view
 
-        path_label = self.make_label("PDF file", 12, False, 0)
-        path_label.setFrame_(NSMakeRect(20, 354, 70, FIELD_HEIGHT))
-        root.addSubview_(path_label)
-        self.pdf_summary_path_field = NSTextField.alloc().initWithFrame_(NSMakeRect(92, 354, 548, FIELD_HEIGHT))
+        def label(text, x, top, width, size=12, bold=False, height=24, flexible=False):
+            return place(self.make_label(text, size, bold, 0), x, top, width, height, flexible)
+
+        def button(title, action, x, top, width):
+            view = make_liquid_glass_button(NSMakeRect(0, 0, width, BUTTON_HEIGHT))
+            view.setTitle_(title)
+            view.setTarget_(self)
+            view.setAction_(action)
+            apply_liquid_glass_button_style(view)
+            return place(view, x, top, width, BUTTON_HEIGHT)
+
+        label("PDF Summary", 20, 16, 250, 17, True)
+        hint = label(
+            "Create a printable summary of your tracks, with distances, durations, elevation statistics, "
+            "and optional overview maps, individual track maps, and elevation profiles.",
+            20, 48, 780, height=42, flexible=True,
+        )
+        hint.cell().setWraps_(True)
+        hint.cell().setScrollable_(False)
+        label("Tracks", 20, 102, 65)
+        self.pdf_summary_scope_menu = place(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 150, 24), False), 90, 102, 150)
+        self.pdf_summary_scope_menu.addItemsWithTitles_(["Visible", "All", "Selected"])
+        self.pdf_summary_scope_menu.setTarget_(self)
+        self.pdf_summary_scope_menu.setAction_("pdfSummaryOptionsChanged:")
+        self.pdf_summary_scope_menu.setToolTip_(
+            "Choose tracks for the entire PDF. Hidden tracks are gray/orange and excluded from totals and averages."
+        )
+        button("Select Tracks…", "selectPdfSummaryTracks:", 255, 102, 142)
+        label("PDF file", 20, 140, 65)
+        self.pdf_summary_path_field = place(NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 500, FIELD_HEIGHT)), 90, 140, 608, FIELD_HEIGHT, True)
         self.pdf_summary_path_field.setStringValue_(str(self.default_pdf_path()))
-        self.pdf_summary_path_field.setToolTip_("Full path of the PDF file to write.")
-        self.pdf_summary_path_field.setAutoresizingMask_(NSViewWidthSizable)
-        root.addSubview_(self.pdf_summary_path_field)
-        browse_button = make_liquid_glass_button(NSMakeRect(650, 354, 84, BUTTON_HEIGHT))
-        browse_button.setTitle_("Browse")
-        browse_button.setTarget_(self)
-        browse_button.setAction_("choosePdfSummaryOutput:")
-        browse_button.setToolTip_("Choose the PDF output file.")
-        browse_button.setAutoresizingMask_(0)
-        apply_liquid_glass_button_style(browse_button)
-        root.addSubview_(browse_button)
-        self.pdf_summary_browse_button = browse_button
-
-        columns_title = self.make_label("Columns", 13, True, 0)
-        columns_title.setFrame_(NSMakeRect(20, 316, 120, 22))
-        root.addSubview_(columns_title)
+        self.pdf_summary_path_field.setToolTip_("Destination for the printable track summary.")
+        self.pdf_summary_browse_button = button("Browse…", "choosePdfSummaryOutput:", 710, 140, 90)
+        label("Columns", 20, 185, 140, 13, True)
         self.pdf_summary_checkboxes = {}
-        default_off = {"nr", "show", "speed", "ascent", "descent", "npoints"}
-        for index, (identifier, title_text, _width, _editable) in enumerate(self.columns):
-            column_index = index % 2
-            row_index = index // 2
-            x = 20 + column_index * 265
-            y = 286 - row_index * 27
-            checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, 245, 24))
+        for index, (identifier, title, _width, _editable) in enumerate(self.columns):
+            checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
             checkbox.setButtonType_(NSButtonTypeSwitch)
-            checkbox.setTitle_(title_text.replace("\n", " ").strip())
-            checkbox.setState_(NSControlStateValueOff if identifier in default_off else NSControlStateValueOn)
-            checkbox.setToolTip_(f"Include {title_text.replace(chr(10), ' ').strip()} in the PDF table.")
-            root.addSubview_(checkbox)
+            checkbox.setTitle_(title.replace("\n", " ").strip())
+            checkbox.setState_(NSControlStateValueOn if identifier in DEFAULT_PDF_COLUMNS else NSControlStateValueOff)
+            place(checkbox, 20 + (index % 2) * 365, 214 + (index // 2) * 26, 330)
             self.pdf_summary_checkboxes[identifier] = checkbox
-
-        maps_title = self.make_label("Maps", 13, True, 0)
-        maps_title.setFrame_(NSMakeRect(20, 76, 80, 22))
-        root.addSubview_(maps_title)
-        include_overview = NSButton.alloc().initWithFrame_(NSMakeRect(20, 50, 170, 24))
-        include_overview.setButtonType_(NSButtonTypeSwitch)
-        include_overview.setTitle_("Overview plot")
-        include_overview.setState_(NSControlStateValueOff)
-        include_overview.setToolTip_("Add an overview map page after the table.")
-        root.addSubview_(include_overview)
-        elevation_profile = NSButton.alloc().initWithFrame_(NSMakeRect(190, 50, 170, 24))
-        elevation_profile.setButtonType_(NSButtonTypeSwitch)
-        elevation_profile.setTitle_("Elevation Profile")
-        elevation_profile.setState_(NSControlStateValueOn)
-        elevation_profile.setToolTip_("Add an elevation profile above each PDF map.")
-        root.addSubview_(elevation_profile)
-        rotate_maps = NSButton.alloc().initWithFrame_(NSMakeRect(360, 50, 130, 24))
-        rotate_maps.setButtonType_(NSButtonTypeSwitch)
-        rotate_maps.setTitle_("Rotate maps")
-        rotate_maps.setState_(NSControlStateValueOff)
-        rotate_maps.setToolTip_("Rotate each map image by 90 degrees on the PDF page.")
-        root.addSubview_(rotate_maps)
-
-        track_label = self.make_label("Track plots", 12, False, 0)
-        track_label.setFrame_(NSMakeRect(20, 20, 80, FIELD_HEIGHT))
-        root.addSubview_(track_label)
-        track_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(100, 20, 135, FIELD_HEIGHT), False)
-        track_menu.addItemsWithTitles_(["None", "All", "Visible", "Selected"])
-        track_menu.selectItemAtIndex_(0)
-        track_menu.setToolTip_("All includes tracks hidden in the Show column. Selected uses the current GPX Editor table selection.")
-        root.addSubview_(track_menu)
-        orientation_label = self.make_label("Page", 12, False, 0)
-        orientation_label.setFrame_(NSMakeRect(250, 20, 42, FIELD_HEIGHT))
-        root.addSubview_(orientation_label)
-        self.pdf_summary_orientation_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(294, 20, 120, FIELD_HEIGHT), False)
+        label("Remove name prefix", 20, 409, 155)
+        self.pdf_summary_name_prefix = place(NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 480, FIELD_HEIGHT)), 180, 409, 620, FIELD_HEIGHT, True)
+        self.pdf_summary_name_prefix.setToolTip_("Remove this exact text from the start of names in this PDF only. Leading blanks are always removed.")
+        label("Optional map pages", 20, 449, 200, 13, True)
+        self.pdf_summary_options = {}
+        for key, title, x, width, state in (
+            ("include_overview", "Overview map", 20, 170, False),
+            ("include_track_maps", "Individual track maps", 205, 200, False),
+            ("elevation_profile", "Elevation profiles", 425, 180, True),
+            ("rotate_maps", "Rotate maps", 620, 160, False),
+        ):
+            checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, width, 24))
+            checkbox.setButtonType_(NSButtonTypeSwitch)
+            checkbox.setTitle_(title)
+            checkbox.setState_(NSControlStateValueOn if state else NSControlStateValueOff)
+            place(checkbox, x, 478, width)
+            self.pdf_summary_options[key] = checkbox
+        label("Page", 20, 519, 55)
+        self.pdf_summary_orientation_menu = place(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 140, 24), False), 80, 519, 140)
         self.pdf_summary_orientation_menu.addItemsWithTitles_(["Portrait", "Landscape"])
-        self.pdf_summary_orientation_menu.selectItemAtIndex_(0)
-        self.pdf_summary_orientation_menu.setToolTip_("Choose the PDF page orientation.")
-        root.addSubview_(self.pdf_summary_orientation_menu)
-        export_button = make_liquid_glass_button(NSMakeRect(570, 20, 82, BUTTON_HEIGHT))
-        export_button.setTitle_("Export")
-        export_button.setTarget_(self)
-        export_button.setAction_("exportPdfSummaryNow:")
-        export_button.setAutoresizingMask_(0)
-        apply_liquid_glass_button_style(export_button)
-        root.addSubview_(export_button)
-        self.pdf_summary_export_button = export_button
-        close_button = make_liquid_glass_button(NSMakeRect(660, 20, 74, BUTTON_HEIGHT))
-        close_button.setTitle_("Close")
-        close_button.setTarget_(self)
-        close_button.setAction_("closePdfSummary:")
-        close_button.setAutoresizingMask_(0)
-        apply_liquid_glass_button_style(close_button)
-        root.addSubview_(close_button)
-        self.pdf_summary_close_button = close_button
-
-        self.pdf_summary_status_label = self.make_label("Ready. Select tracks in the GPX Editor table if using Selected.", 11, False, 0)
-        self.pdf_summary_status_label.setFrame_(NSMakeRect(20, 4, 720, 16))
-        self.pdf_summary_status_label.setAutoresizingMask_(NSViewWidthSizable)
-        root.addSubview_(self.pdf_summary_status_label)
-        self.pdf_summary_options = {
-            "include_overview": include_overview,
-            "track_menu": track_menu,
-            "elevation_profile": elevation_profile,
-            "rotate_maps": rotate_maps,
-        }
+        self.pdf_summary_status_label = label("Preparing track data...", 20, 0, 780, 11)
+        self.pdf_summary_export_button = button("Export", "exportPdfSummaryNow:", 0, 0, 82)
+        self.pdf_summary_close_button = button("Close", "closePdfSummary:", 0, 0, 74)
+        self.pdf_summary_cancel_button = button("Cancel Export", "cancelPdfSummary:", 0, 0, 120)
+        self.pdf_summary_open_button = button("Open PDF", "openPdfSummary:", 20, 0, 100)
+        self.pdf_summary_reveal_button = button("Show in Finder", "revealPdfSummary:", 130, 0, 135)
+        self.pdf_summary_open_button.setHidden_(True)
+        self.pdf_summary_reveal_button.setHidden_(True)
+        self.pdf_summary_cancel_button.setHidden_(True)
         self.pdf_summary_window = window
         self.pdf_summary_delegate = GPXEditorPdfSummaryWindowDelegate.alloc().initWithController_(self)
         window.setDelegate_(self.pdf_summary_delegate)
@@ -11453,39 +11981,75 @@ class GPXEditorController(NSObject):
     def layout_pdf_summary_window(self):
         if self.pdf_summary_window is None:
             return
-        width = self.pdf_summary_window.contentView().bounds().size.width
-        right = max(width - 20.0, 680.0)
-        if self.pdf_summary_browse_button is not None:
-            self.pdf_summary_browse_button.setFrame_(NSMakeRect(right - 84.0, 354.0, 84.0, BUTTON_HEIGHT))
-        if self.pdf_summary_path_field is not None:
-            self.pdf_summary_path_field.setFrame_(NSMakeRect(92.0, 354.0, max(120.0, right - 92.0 - 94.0), FIELD_HEIGHT))
-        if self.pdf_summary_close_button is not None:
-            self.pdf_summary_close_button.setFrame_(NSMakeRect(right - 74.0, 20.0, 74.0, BUTTON_HEIGHT))
-        if self.pdf_summary_export_button is not None:
-            self.pdf_summary_export_button.setFrame_(NSMakeRect(right - 164.0, 20.0, 82.0, BUTTON_HEIGHT))
-        if self.pdf_summary_status_label is not None:
-            self.pdf_summary_status_label.setFrame_(NSMakeRect(20.0, 4.0, max(120.0, right - 20.0), 16.0))
+        bounds = self.pdf_summary_window.contentView().bounds()
+        width, height = bounds.size.width, bounds.size.height
+        footer = {
+            self.pdf_summary_status_label, self.pdf_summary_export_button, self.pdf_summary_close_button,
+            self.pdf_summary_cancel_button, self.pdf_summary_open_button, self.pdf_summary_reveal_button,
+        }
+        for view, x, top, original_width, view_height, flexible in self.pdf_summary_positions:
+            if view in footer:
+                continue
+            view_width = original_width + (width - 820 if flexible else 0)
+            if view is self.pdf_summary_browse_button:
+                x = width - 110
+            view.setFrame_(NSMakeRect(x, height - top - view_height, view_width, view_height))
+        self.pdf_summary_status_label.setFrame_(NSMakeRect(20, 57, width - 40, 20))
+        self.pdf_summary_export_button.setFrame_(NSMakeRect(width - 184, 18, 82, BUTTON_HEIGHT))
+        self.pdf_summary_close_button.setFrame_(NSMakeRect(width - 94, 18, 74, BUTTON_HEIGHT))
+        self.pdf_summary_cancel_button.setFrame_(NSMakeRect(width - 320, 18, 125, BUTTON_HEIGHT))
+        self.pdf_summary_open_button.setFrame_(NSMakeRect(20, 18, 100, BUTTON_HEIGHT))
+        self.pdf_summary_reveal_button.setFrame_(NSMakeRect(130, 18, 135, BUTTON_HEIGHT))
+
+    @objc.IBAction
+    def selectPdfSummaryTracks_(self, _sender):
+        self.pdf_summary_scope_menu.selectItemAtIndex_(2)
+        self.pdf_only_loading = False
+        self.pdf_summary_result_message = ""
+        self.show()
+
+    @objc.IBAction
+    def pdfSummaryOptionsChanged_(self, _sender):
+        self.pdf_summary_result_message = ""
+        self.pollPdfSummary_(None)
 
     @objc.IBAction
     def choosePdfSummaryOutput_(self, _sender):
         panel = NSSavePanel.savePanel()
         panel.setAllowedFileTypes_(["pdf"])
+        panel.setCanCreateDirectories_(True)
         panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(self.default_pdf_directory())))
         panel.setNameFieldStringValue_(Path(str(self.pdf_summary_path_field.stringValue())).name or f"{self.default_pdf_basename()}.pdf")
-        if panel.runModal():
-            url = panel.URL()
-            if url is not None:
-                self.pdf_summary_path_field.setStringValue_(str(Path(str(url.path())).resolve()))
+        if panel.runModal() and panel.URL() is not None:
+            self.pdf_summary_path_field.setStringValue_(str(Path(str(panel.URL().path())).resolve()))
+
+    def pdf_report_options(self):
+        return SummaryOptions(
+            columns=tuple(key for key, checkbox in self.pdf_summary_checkboxes.items() if checkbox.state() == NSControlStateValueOn),
+            scope=("visible", "all", "selected")[self.pdf_summary_scope_menu.indexOfSelectedItem()],
+            orientation="landscape" if self.pdf_summary_orientation_menu.indexOfSelectedItem() == 1 else "portrait",
+            include_overview=self.pdf_summary_options["include_overview"].state() == NSControlStateValueOn,
+            include_track_maps=self.pdf_summary_options["include_track_maps"].state() == NSControlStateValueOn,
+            elevation_profile=self.pdf_summary_options["elevation_profile"].state() == NSControlStateValueOn,
+            rotate_maps=self.pdf_summary_options["rotate_maps"].state() == NSControlStateValueOn,
+            name_prefix=str(self.pdf_summary_name_prefix.stringValue()),
+        )
+
+    def pdf_report_tracks(self, options):
+        return select_summary_tracks(self.tracks, options.scope, self.selected_nrs)
 
     @objc.IBAction
     def exportPdfSummaryNow_(self, _sender):
-        selected_columns = [
-            identifier
-            for identifier, checkbox in self.pdf_summary_checkboxes.items()
-            if checkbox.state() == NSControlStateValueOn
-        ]
-        if not selected_columns:
-            show_alert("No columns selected.", "Select at least one column for the PDF table.")
+        if self.pdf_summary_future is not None:
+            return
+        self.sync_pdf_project_settings()
+        options = self.pdf_report_options()
+        if not options.columns:
+            show_alert("No columns selected.", "Select at least one column for the PDF summary.")
+            return
+        tracks = self.pdf_report_tracks(options)
+        if not tracks:
+            show_alert("No tracks selected.", "Choose Visible or All, or use Select Tracks to choose tracks in the table.")
             return
         value = str(self.pdf_summary_path_field.stringValue()).strip()
         if not value:
@@ -11494,283 +12058,174 @@ class GPXEditorController(NSObject):
         path = Path(value).expanduser()
         if not path.is_absolute():
             path = self.default_pdf_directory() / path
-        if path.suffix.lower() != ".pdf":
-            path = path.with_suffix(".pdf")
-        path = path.resolve()
-        orientation = "landscape" if self.pdf_summary_orientation_menu.indexOfSelectedItem() == 1 else "portrait"
-        pdf_options = self.pdf_options_from_controls(self.pdf_summary_options)
-        if self.output_map_provider == "osm":
-            track_mode = pdf_options.get("track_mode", "none")
-            if track_mode == "all":
-                selected_map_count = len(self.tracks)
-            elif track_mode == "visible":
-                selected_map_count = len(self.visible_tracks())
-            elif track_mode == "selected":
-                selected_map_count = len(self.selected_tracks())
-            else:
-                selected_map_count = 0
-            selected_map_count += int(bool(pdf_options.get("include_overview")))
-            if selected_map_count > 1:
-                show_alert(
-                    "Public OpenStreetMap cannot be used for this multi-map PDF.",
-                    "Choose a production provider in Map Service settings, or export only one map page.",
-                )
-                return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self.set_status(f"PDF export: writing {path}.")
-            if self.pdf_summary_status_label is not None:
-                self.pdf_summary_status_label.setStringValue_("Exporting PDF...")
-                self.pdf_summary_status_label.displayIfNeeded()
-            self.write_track_table_pdf(path, selected_columns, orientation, pdf_options)
-        except Exception as exc:
-            show_alert("PDF export failed.", str(exc))
-            if self.pdf_summary_status_label is not None:
-                self.pdf_summary_status_label.setStringValue_("PDF export failed.")
+        path = path.with_suffix(".pdf").resolve()
+        if path.exists() and not confirm("Replace existing PDF?", str(path)):
             return
-        self.last_pdf_path = path
-        self.pdf_summary_path_field.setStringValue_(str(path))
-        self.set_status(f"Saved track table PDF to {path}.")
-        if self.pdf_summary_status_label is not None:
-            self.pdf_summary_status_label.setStringValue_(f"Saved {path.name}.")
+        map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
+        try:
+            snapshot = SummarySnapshot(
+                self.project_name or PROGRAM_TITLE,
+                tuple(summary_track(track, index) for index, track in enumerate(self.tracks, 1) if track in tracks),
+                options,
+            )
+            cancel = threading.Event()
+            renderer = PDFMapRenderer(self, tracks, options, cancel, self._pdf_worker_progress) if map_count else None
+        except Exception as exc:
+            show_alert("Could not prepare PDF summary.", str(exc))
+            return
+        self.start_pdf_summary_export(path, snapshot, renderer, cancel)
+
+    def start_pdf_summary_export(self, path, snapshot, renderer, cancel):
+        self.pdf_summary_export_request = (path, snapshot, renderer, cancel)
+        self.pdf_summary_cancel = cancel
+        self.pdf_summary_progress = "Preparing PDF summary..."
+        self.pdf_summary_result_message = ""
+        self.pdf_summary_export_button.setEnabled_(False)
+        self.pdf_summary_cancel_button.setHidden_(False)
+        self.pdf_summary_open_button.setHidden_(True)
+        self.pdf_summary_reveal_button.setHidden_(True)
+        self.pdf_summary_future = PDF_EXPORT_EXECUTOR.submit(
+            export_summary_pdf, path, snapshot,
+            map_pages=renderer.write_pages if renderer is not None else None,
+            cancel=cancel, progress=self._pdf_worker_progress,
+        )
+
+    def confirm_pdf_osm_downloads(self):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Some PDF map tiles are not cached.")
+        alert.setInformativeText_(
+            "Existing maps and cached tiles were tried first. Completing this multi-map PDF "
+            "would download additional tiles from the public OpenStreetMap server.\n\n"
+            "This could violate its tile usage policy, which prohibits bulk downloading, "
+            "and could cause access to be blocked. Choosing to proceed is at your own "
+            "responsibility and does not grant permission from OpenStreetMap. "
+            "A production map provider is recommended.\n\n"
+            "https://operations.osmfoundation.org/policies/tiles/"
+        )
+        alert.addButtonWithTitle_("Choose Another Provider")
+        alert.addButtonWithTitle_("Proceed at My Responsibility")
+        alert.addButtonWithTitle_("Cancel")
+        return int(alert.runModal())
+
+    def show_pdf_map_settings(self):
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None:
+            workspace.open_shared_settings("PDF Export")
+        else:
+            self.showSettings_(None)
+            self.settings_controller.current_section = "PDF Export"
+            self.settings_controller.show()
+
+    @objc.python_method
+    def _pdf_worker_progress(self, message):
+        self.pdf_summary_progress = message
+
+    @objc.IBAction
+    def pollPdfSummary_(self, _sender):
+        if self.pdf_summary_window is None:
+            return
+        future = self.pdf_summary_future
+        if future is not None:
+            self.pdf_summary_export_button.setEnabled_(False)
+            self.pdf_summary_cancel_button.setHidden_(False)
+            self.pdf_summary_status_label.setStringValue_(self.pdf_summary_progress)
+            if not future.done():
+                return
+            self.pdf_summary_future = None
+            self.pdf_summary_cancel = None
+            request = self.pdf_summary_export_request
+            self.pdf_summary_export_request = None
+            self.pdf_summary_cancel_button.setHidden_(True)
+            try:
+                path = future.result()
+            except PDFExportCancelled:
+                self.pdf_summary_result_message = "Export cancelled. The previous PDF was kept."
+            except TileCacheMissError:
+                if request is None or request[3].is_set():
+                    self.pdf_summary_result_message = "Export cancelled. The previous PDF was kept."
+                else:
+                    response = self.confirm_pdf_osm_downloads()
+                    if response == 1001:
+                        path, snapshot, renderer, _old_cancel = request
+                        cancel = threading.Event()
+                        renderer.map_cache_only = False
+                        renderer.cancel = cancel
+                        self.start_pdf_summary_export(path, snapshot, renderer, cancel)
+                        return
+                    if response == 1000:
+                        self.pdf_summary_result_message = "Choose a map provider, apply Settings, then Export again."
+                        self.show_pdf_map_settings()
+                    else:
+                        self.pdf_summary_result_message = "Export cancelled. The previous PDF was kept."
+            except Exception as exc:
+                self.pdf_summary_result_message = "PDF export failed."
+                show_alert("PDF summary export failed.", str(exc))
+            else:
+                self.last_pdf_path = path
+                self.pdf_summary_path_field.setStringValue_(str(path))
+                self.pdf_summary_result_message = f"Saved {path.name}."
+                self.pdf_summary_open_button.setHidden_(False)
+                self.pdf_summary_reveal_button.setHidden_(False)
+                NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(str(path)))
+            self.pdf_summary_export_button.setEnabled_(True)
+            self.pdf_summary_status_label.setStringValue_(self.pdf_summary_result_message)
+            return
+        loading = self.track_load_timer is not None or self.processing_future is not None
+        ready = bool(self.tracks) and all(track.metrics and not track.metrics_dirty for track in self.tracks) and not loading
+        self.pdf_summary_export_button.setEnabled_(ready)
+        if not ready:
+            message = str(self.status_label.stringValue()) if loading else "No GPX tracks are available."
+            self.pdf_summary_status_label.setStringValue_(f"Preparing PDF summary: {message}")
+        else:
+            options = self.pdf_report_options()
+            count = len(self.pdf_report_tracks(options))
+            self.pdf_summary_status_label.setStringValue_(self.pdf_summary_result_message or f"{count} track(s) for this report. Hidden tracks do not contribute to totals or averages.")
+
+    @objc.IBAction
+    def cancelPdfSummary_(self, _sender):
+        if self.pdf_summary_cancel is not None:
+            self.pdf_summary_cancel.set()
+            self.pdf_summary_progress = "Cancelling after the current rendering step..."
+
+    @objc.IBAction
+    def openPdfSummary_(self, _sender):
+        if self.last_pdf_path is not None and self.last_pdf_path.is_file():
+            NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(str(self.last_pdf_path)))
+
+    @objc.IBAction
+    def revealPdfSummary_(self, _sender):
+        if self.last_pdf_path is not None and self.last_pdf_path.is_file():
+            NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([NSURL.fileURLWithPath_(str(self.last_pdf_path))])
 
     @objc.IBAction
     def closePdfSummary_(self, _sender):
         if self.pdf_summary_window is not None:
-            self.pdf_summary_window.close()
-
-    def pdf_export_accessory(self):
-        accessory = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 560, 340))
-        title = NSTextField.labelWithString_("Columns")
-        title.setFont_(NSFont.boldSystemFontOfSize_(13))
-        title.setFrame_(NSMakeRect(0, 312, 160, 22))
-        accessory.addSubview_(title)
-        checkboxes = {}
-        default_off = {"nr", "show", "speed", "ascent", "descent", "npoints"}
-        for index, (identifier, title_text, _width, _editable) in enumerate(self.columns):
-            column_index = index % 2
-            row_index = index // 2
-            x = column_index * 250
-            y = 280 - row_index * 28
-            checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, 235, 24))
-            checkbox.setButtonType_(NSButtonTypeSwitch)
-            checkbox.setTitle_(title_text.replace("\n", " ").strip())
-            checkbox.setState_(NSControlStateValueOff if identifier in default_off else NSControlStateValueOn)
-            checkbox.setToolTip_(f"Include {title_text.replace(chr(10), ' ').strip()} in the PDF table.")
-            accessory.addSubview_(checkbox)
-            checkboxes[identifier] = checkbox
-        options_title = NSTextField.labelWithString_("Maps")
-        options_title.setFont_(NSFont.boldSystemFontOfSize_(13))
-        options_title.setFrame_(NSMakeRect(0, 78, 160, 22))
-        accessory.addSubview_(options_title)
-        include_overview = NSButton.alloc().initWithFrame_(NSMakeRect(0, 52, 180, 24))
-        include_overview.setButtonType_(NSButtonTypeSwitch)
-        include_overview.setTitle_("Include overview plot")
-        include_overview.setState_(NSControlStateValueOff)
-        include_overview.setToolTip_("Add an overview map page after the table.")
-        accessory.addSubview_(include_overview)
-        elevation_profile = NSButton.alloc().initWithFrame_(NSMakeRect(190, 52, 190, 24))
-        elevation_profile.setButtonType_(NSButtonTypeSwitch)
-        elevation_profile.setTitle_("Elevation Profile")
-        elevation_profile.setState_(NSControlStateValueOn)
-        elevation_profile.setToolTip_("Add an elevation profile above each PDF map.")
-        accessory.addSubview_(elevation_profile)
-        rotate_maps = NSButton.alloc().initWithFrame_(NSMakeRect(390, 52, 150, 24))
-        rotate_maps.setButtonType_(NSButtonTypeSwitch)
-        rotate_maps.setTitle_("Rotate maps")
-        rotate_maps.setState_(NSControlStateValueOff)
-        rotate_maps.setToolTip_("Rotate each map image by 90 degrees on the PDF page.")
-        accessory.addSubview_(rotate_maps)
-        track_label = NSTextField.labelWithString_("Track plots")
-        track_label.setFrame_(NSMakeRect(0, 22, 80, FIELD_HEIGHT))
-        accessory.addSubview_(track_label)
-        track_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(90, 22, 190, FIELD_HEIGHT), False)
-        track_menu.addItemsWithTitles_(["None", "All", "Visible", "Selected"])
-        track_menu.selectItemAtIndex_(0)
-        track_menu.setToolTip_("Choose which individual track maps to include after the overview. All includes tracks hidden in the Show column.")
-        accessory.addSubview_(track_menu)
-        orientation_label = NSTextField.labelWithString_("Page")
-        orientation_label.setFrame_(NSMakeRect(300, 22, 50, FIELD_HEIGHT))
-        accessory.addSubview_(orientation_label)
-        orientation_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(350, 22, 130, FIELD_HEIGHT), False)
-        orientation_menu.addItemsWithTitles_(["Portrait", "Landscape"])
-        orientation_menu.selectItemAtIndex_(0)
-        orientation_menu.setToolTip_("Choose the PDF page orientation.")
-        accessory.addSubview_(orientation_menu)
-        pdf_options = {
-            "include_overview": include_overview,
-            "track_menu": track_menu,
-            "elevation_profile": elevation_profile,
-            "rotate_maps": rotate_maps,
-        }
-        return accessory, checkboxes, orientation_menu, pdf_options
-
-    def pdf_options_from_controls(self, controls: dict) -> dict:
-        track_modes = ["none", "all", "visible", "selected"]
-        track_index = max(0, min(controls["track_menu"].indexOfSelectedItem(), len(track_modes) - 1))
-        return {
-            "include_overview": controls["include_overview"].state() == NSControlStateValueOn,
-            "track_mode": track_modes[track_index],
-            "elevation_profile": controls["elevation_profile"].state() == NSControlStateValueOn,
-            "rotate_maps": controls["rotate_maps"].state() == NSControlStateValueOn,
-        }
+            self.cancelPdfSummary_(None)
+            self.pdf_summary_window.orderOut_(None)
+            if self.pdf_summary_poll_timer is not None:
+                self.pdf_summary_poll_timer.invalidate()
+                self.pdf_summary_poll_timer = None
 
     def write_track_table_pdf(self, path: Path, selected_columns: list[str], orientation: str, pdf_options: dict | None = None):
-        MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        os.environ["MPLCONFIGDIR"] = str(MPL_CACHE_DIR)
-        import matplotlib
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
+        """Compatibility entry point using the same snapshot/exporter as the panel."""
+        values = pdf_options or {}
+        scope = values.get("scope", "visible")
+        options = SummaryOptions(
+            columns=tuple(selected_columns), orientation=orientation, scope=scope,
+            include_overview=bool(values.get("include_overview")),
+            include_track_maps=bool(values.get("include_track_maps", values.get("track_mode", "none") != "none")),
+            elevation_profile=bool(values.get("elevation_profile", True)),
+            rotate_maps=bool(values.get("rotate_maps")), name_prefix=str(values.get("name_prefix", "")),
+        )
+        tracks = self.pdf_report_tracks(options)
+        snapshot = SummarySnapshot(self.project_name or PROGRAM_TITLE, tuple(
+            summary_track(track, index) for index, track in enumerate(self.tracks, 1) if track in tracks
+        ), options)
+        renderer = PDFMapRenderer(self, tracks, options, threading.Event(), lambda _message: None) if options.include_overview or options.include_track_maps else None
+        return export_summary_pdf(path, snapshot, map_pages=renderer.write_pages if renderer is not None else None)
 
-        column_meta = {identifier: (title, width) for identifier, title, width, _editable in self.columns}
-        headers = [column_meta[identifier][0].strip() for identifier in selected_columns]
-        pdf_source_rows = [row for row in self.table_rows if row.get("_summary") or row.get("show") != "no"]
-        rows = [[row.get(identifier, "") for identifier in selected_columns] for row in pdf_source_rows]
-        if not rows:
-            rows = [["" for _identifier in selected_columns]]
-        page_size = (11.69, 8.27) if orientation == "landscape" else (8.27, 11.69)
-        left_margin = 0.30
-        right_margin = 0.30
-        title_top = 0.975
-        table_top = 0.91
-        bottom_margin = 0.05
-        row_height_in = 0.24
-        printable_height = max((table_top - bottom_margin) * page_size[1], row_height_in * 4)
-        rows_per_page = max(1, int(printable_height / row_height_in) - 1)
-        font_size = max(5.5, min(8.5, 10.5 - len(selected_columns) * 0.18))
-        widths = [max(self.current_table_column_width(identifier, column_meta[identifier][1]), 40.0) for identifier in selected_columns]
-        total_width = sum(widths) or 1.0
-        pixels_per_inch = 72.0
-        requested_table_width_in = total_width / pixels_per_inch
-        printable_width_in = max(page_size[0] - left_margin - right_margin, 1.0)
-        table_width_in = min(requested_table_width_in, printable_width_in)
-        table_width_fraction = table_width_in / page_size[0]
-        table_left_fraction = left_margin / page_size[0]
-        col_widths = [width / total_width for width in widths]
-        row_height_fraction = row_height_in / page_size[1]
-        numeric_columns = {"row", "nr", "length", "duration", "sum", "distance", "speed", "ascent", "descent", "npoints"}
-        with PdfPages(path) as pdf:
-            for page_index, start in enumerate(range(0, len(rows), rows_per_page), start=1):
-                page_rows = rows[start : start + rows_per_page]
-                table_height = (len(page_rows) + 1) * row_height_fraction
-                fig, ax = plt.subplots(figsize=page_size, dpi=self.pdf_document_dpi)
-                fig.patch.set_facecolor("white")
-                ax.axis("off")
-                ax.text(
-                    0.02,
-                    0.975,
-                    self.project_name or PROGRAM_TITLE,
-                    transform=ax.transAxes,
-                    fontsize=14,
-                    fontweight="bold",
-                    va="top",
-                    color="#1f2933",
-                )
-                ax.text(
-                    0.98,
-                    0.975,
-                    f"Track table - page {page_index}",
-                    transform=ax.transAxes,
-                    fontsize=9,
-                    va="top",
-                    ha="right",
-                    color="#52606d",
-                )
-                table = ax.table(
-                    cellText=page_rows,
-                    colLabels=headers,
-                    colWidths=col_widths,
-                    loc="center",
-                    cellLoc="left",
-                    bbox=[table_left_fraction, table_top - table_height, table_width_fraction, table_height],
-                )
-                table.auto_set_font_size(False)
-                table.set_fontsize(font_size)
-                for (row_index, col_index), cell in table.get_celld().items():
-                    cell.set_edgecolor("#c9d1d9")
-                    cell.set_linewidth(0.45)
-                    text = cell.get_text()
-                    text.set_fontfamily("DejaVu Sans")
-                    if row_index == 0:
-                        cell.set_facecolor("#1f4e79")
-                        text.set_color("white")
-                        text.set_fontweight("bold")
-                        text.set_ha("center")
-                    else:
-                        if selected_columns[col_index] in numeric_columns:
-                            text.set_ha("right")
-                        else:
-                            text.set_ha("left")
-                        source_row = pdf_source_rows[start + row_index - 1]
-                        if source_row.get("_summary"):
-                            cell.set_facecolor("#e8f1f8")
-                            text.set_fontweight("bold")
-                        elif row_index % 2 == 0:
-                            cell.set_facecolor("#f7f9fb")
-                fig.tight_layout(pad=0.3)
-                pdf.savefig(fig, dpi=self.pdf_document_dpi)
-                plt.close(fig)
-            self.write_pdf_map_pages(pdf, page_size, orientation, pdf_options or {}, plt)
-
-    def write_pdf_map_pages(self, pdf, page_size: tuple[float, float], orientation: str, options: dict, plt):
-        if not options:
-            return
-        visible_tracks = self.visible_tracks()
-        if not visible_tracks:
-            return
-        if options.get("include_overview"):
-            self.set_status(f"PDF export: rendering overview map for {len(visible_tracks)} visible track(s).")
-            fig = self.make_pdf_map_figure(
-                page_size,
-                "overview",
-                visible_tracks,
-                "Overview",
-                orientation,
-                options,
-                plt,
-            )
-            if fig is not None:
-                save_start = time.perf_counter()
-                pdf.savefig(fig, dpi=self.pdf_document_dpi)
-                save_done = time.perf_counter()
-                if self.debug:
-                    print(f"GPXEditor PDF benchmark: save overview page={save_done - save_start:.3f}s", flush=True)
-                plt.close(fig)
-        track_mode = options.get("track_mode", "none")
-        if track_mode == "all":
-            tracks = list(self.tracks)
-        elif track_mode == "visible":
-            tracks = visible_tracks
-        elif track_mode == "selected":
-            selected = {track.nr for track in self.selected_tracks()}
-            tracks = [track for track in self.tracks if track.nr in selected]
-        else:
-            tracks = []
-        total = len(tracks)
-        for index, track in enumerate(tracks, start=1):
-            self.set_status(f"PDF export: rendering track map {index}/{total} for track #{track.nr}: {track.name}.")
-            fig = self.make_pdf_map_figure(
-                page_size,
-                "track",
-                [track],
-                f"Track #{track.nr}: {track.name}",
-                orientation,
-                options,
-                plt,
-            )
-            if fig is not None:
-                save_start = time.perf_counter()
-                pdf.savefig(fig, dpi=self.pdf_document_dpi)
-                save_done = time.perf_counter()
-                if self.debug:
-                    print(
-                        f"GPXEditor PDF benchmark: save track #{track.nr} page={save_done - save_start:.3f}s",
-                        flush=True,
-                    )
-                plt.close(fig)
-                self.set_status(f"PDF export: wrote track map {index}/{total} for track #{track.nr}.")
-
+    @objc.python_method
+    @serialized_plotting
     def make_pdf_map_figure(self, page_size, mode: str, tracks: list[TrackRecord], title: str, orientation: str, options: dict, plt):
         if not tracks:
             return None
@@ -11787,7 +12242,8 @@ class GPXEditorController(NSObject):
         top_summary_h = 0.78 / page_h
         bottom = 0.28 / page_h
         profile_h = 0.0
-        gap = 0.08 / page_h
+        # Leave room for profile tick labels and its distance-axis title.
+        gap = (0.35 if options.get("elevation_profile") else 0.08) / page_h
         if options.get("elevation_profile"):
             profile_h = 0.125
         available_h = 1.0 - bottom - top_summary_h - (profile_h + gap if profile_h else 0.0) - 0.02
@@ -11811,20 +12267,26 @@ class GPXEditorController(NSObject):
         ax.set_xlim(extent["min_x"], extent["max_x"])
         ax.set_ylim(extent["min_y"], extent["max_y"])
         ax.set_aspect("equal", adjustable="box")
-        requested_zoom = self.pdf_overview_zoom if mode == "overview" else self.pdf_track_zoom
+        requested_zoom = self.pdf_track_zoom
         if mode == "overview":
-            requested_zoom = self.overview_zoom_for_tracks(tracks, requested_zoom)
+            # A detached report contains only the exported tracks. Choose detail
+            # from its fitted extent, not its size relative to the live document.
+            requested_zoom = max(self.pdf_overview_zoom, self.pdf_track_zoom)
         tile_zoom, diagnostics = self.effective_tile_zoom_for_limit(
             extent, requested_zoom, self.pdf_maximum_map_tiles
         )
-        provider_name = provider_display_name(self.map_provider)
-        try:
-            missing_tiles = self.missing_map_tile_count(cx, diagnostics, tile_zoom)
-        except (RuntimeError, TypeError, ValueError):
-            # Cache diagnostics must never prevent the actual provider request.
-            missing_tiles = diagnostics["count"]
         pixel_width = int(max(map_rect[2] * page_w * self.pdf_map_dpi, 1.0))
         pixel_height = int(max(map_rect[3] * page_h * self.pdf_map_dpi, 1.0))
+        reuse = getattr(self, "reuse_pdf_background", None)
+        reused = bool(reuse and reuse(ax, mode, tracks, extent, (pixel_width, pixel_height), tile_zoom))
+        provider_name = provider_display_name(self.output_map_provider, getattr(self, "geoapify_style", "osm-bright"))
+        missing_tiles = 0
+        if not reused:
+            try:
+                missing_tiles = self.missing_map_tile_count(cx, diagnostics, tile_zoom, provider=self.output_map_provider)
+            except (RuntimeError, TypeError, ValueError):
+                # Cache diagnostics must never prevent the provider request.
+                missing_tiles = diagnostics["count"]
         map_label = "overview" if mode == "overview" else f"track #{tracks[0].nr}"
         self.set_status(
             f"PDF export: plotting {map_label} at {pixel_width}x{pixel_height}px, "
@@ -11832,34 +12294,43 @@ class GPXEditorController(NSObject):
         )
         missing_basemap_tiles = 0
         try:
-            if missing_tiles:
+            if reused:
+                self.set_status(f"PDF export: using existing {provider_name} map image for {map_label}.")
+            elif missing_tiles and getattr(self, "map_cache_only", False):
+                self.set_status(f"PDF export: checking cached {provider_name} tiles for {map_label}; downloads require confirmation.")
+            elif missing_tiles:
                 self.set_status(
                     f"PDF export: connecting to map server for {missing_tiles} missing tile(s) "
                     f"for {map_label} at zoom {tile_zoom}."
                 )
             else:
                 self.set_status(f"PDF export: using cached {provider_name} tiles for {map_label} at zoom {tile_zoom}.")
-            missing_basemap_tiles = self.add_basemap_with_timeout(
-                cx, ax, tile_zoom, provider=self.output_map_provider
-            )
+            if not reused:
+                missing_basemap_tiles = self.add_basemap_with_timeout(
+                    cx, ax, tile_zoom, provider=self.output_map_provider
+                )
+            if missing_tiles:
+                self.cached_map_tile_urls = None
+        except TileCacheMissError:
+            fig.clear()
+            raise
         except Exception as exc:
-            self.set_status(f"PDF export: map unavailable for {map_label}: {exc}")
-            ax.text(0.5, 0.5, f"Map unavailable\n{exc}", transform=ax.transAxes, ha="center", va="center", color="white", fontsize=10)
+            fig.clear()
+            raise RuntimeError(f"PDF map unavailable for {map_label}: {exc}") from exc
         map_done = time.perf_counter()
         if missing_basemap_tiles:
             self.set_status(
                 f"PDF export: {map_label} created with {missing_basemap_tiles} unavailable "
                 f"map tile{'s' if missing_basemap_tiles != 1 else ''} skipped."
             )
-        selected = {track.nr for track in self.selected_tracks()}
         route_mode = str(self.project_parameters.get("trackmaps.gpx_overlay", "line"))
         route_color = str(self.project_parameters.get("trackmaps.route_color", "#0000FF"))
         route_width = float(self.project_parameters.get("trackmaps.route_width", 4.0))
         endpoint_color = str(self.project_parameters.get("trackmaps.endpoint_color", "#FFFFFF"))
         endpoint_size = float(self.project_parameters.get("trackmaps.endpoint_size", 0.0))
         for track in tracks:
-            color = "red" if mode == "overview" and track.nr in selected else route_color
-            width = route_width * (1.35 if color == "red" else 1.0)
+            color = "#d66b00" if track.hidden else route_color
+            width = route_width
             processed = self.processed_track(track)
             scene = MapOverlayScene(
                 stage_kind="gpx_track",
@@ -11960,15 +12431,11 @@ class GPXEditorController(NSObject):
                 (max(ys) + max(1.0, max(ys) * self.elevation_headroom_fraction)) / 500.0
             ) * 500.0,
         )
-        ax.plot(xs, ys, color="blue", linewidth=1.4)
-        if mode == "overview":
-            selected = {track.nr for track in self.selected_tracks()}
-            for track in tracks:
-                if track.nr not in selected:
-                    continue
-                selected_rows = [row for row in rows if row[2] is track]
-                if selected_rows:
-                    ax.plot([row[0] for row in selected_rows], [row[1] for row in selected_rows], color="red", linewidth=2.4)
+        for track in tracks:
+            track_rows = [row for row in rows if row[2] is track]
+            color = "#d66b00" if track.hidden else "blue"
+            if track_rows:
+                ax.plot([row[0] for row in track_rows], [row[1] for row in track_rows], color=color, linewidth=1.4)
         ax.set_xlim(min(xs), max(xs))
         ax.set_ylim(y_min, y_max)
         ax.set_xlabel("Distance [km]", fontsize=7)
@@ -12139,15 +12606,6 @@ class GPXEditorController(NSObject):
     def pdf_track_show_endpoint_dots(self) -> bool:
         existing = self.existing_plot_view("track")
         return True if existing is None else bool(existing[1].show_endpoint_markers)
-
-    def current_table_column_width(self, identifier: str, fallback: float) -> float:
-        try:
-            column = self.track_table.tableColumnWithIdentifier_(nsstring(identifier))
-            if column is not None:
-                return float(column.width())
-        except Exception:
-            pass
-        return float(fallback)
 
     def save_current(self) -> bool:
         if not self.tracks:
@@ -12341,7 +12799,7 @@ class GPXEditorController(NSObject):
         live_windows = []
         found = None
         for window, delegate, view in self.plot_windows:
-            if window is None or not window.isVisible():
+            if window is None:
                 continue
             live_windows.append((window, delegate, view))
             if found is None and isinstance(view, TrackInspectorController) and view.track is track:
@@ -12374,12 +12832,12 @@ class GPXEditorController(NSObject):
         inspector = self.open_inspector_for_track(track)
         workspace = getattr(self, "adventure_workspace_delegate", None)
         view = getattr(workspace, "plot_view", None) if workspace is not None else None
-        if inspector is not None and view is not None:
-            inspector.plot_view = view
-            view.inspector = inspector
+        if inspector is not None:
             cursor = getattr(view, "cursor", None)
             point_index = cursor[0] if cursor is not None and cursor[2] is track else 0
+            inspector.plot_(None)
             inspector.select_point_index(point_index)
+            inspector.show()
         self.set_status(f"Opened waypoint table for track #{track.nr}.")
 
     @objc.IBAction
@@ -13130,8 +13588,6 @@ class GPXEditorController(NSObject):
             show_alert("Plotting is unavailable.", "The map drawing support could not be loaded.")
             return None
         try:
-            import matplotlib
-            matplotlib.use("Agg", force=True)
             import contextily as cx
             configure_contextily_cache(cx, self.tile_cache_dir)
         except ImportError:
@@ -13312,11 +13768,12 @@ class GPXEditorController(NSObject):
             requests = None
         try:
             with contextily_request_timeout(
-                cx, self.map_request_timeout_seconds, selected_provider
+                cx, self.map_request_timeout_seconds, selected_provider,
+                cache_only=bool(getattr(self, "map_cache_only", False)),
             ):
                 with tolerate_missing_tiles(cx) as missing_tile_report:
-                    cx.add_basemap(
-                        ax,
+                    add_headless_basemap(
+                        cx, ax,
                         source=contextily_provider(
                             cx,
                             selected_provider,
@@ -13324,6 +13781,7 @@ class GPXEditorController(NSObject):
                             self.custom_map_attribution,
                             self.maximum_map_zoom,
                             self.map_credential_id,
+                            geoapify_style=getattr(self, "geoapify_style", "osm-bright"),
                         ),
                         zoom=min(tile_zoom, self.maximum_map_zoom),
                     )
@@ -13333,14 +13791,13 @@ class GPXEditorController(NSObject):
                 raise TimeoutError(f"Map tile request timed out after {self.map_request_timeout_seconds:.0f}s.") from exc
             raise
 
+    @objc.python_method
+    @serialized_plotting
     def render_viewport_plot(self, mode: str, tracks: list[TrackRecord], extent: dict, tile_zoom: int) -> dict | None:
         timing_start = time.perf_counter()
         import_done = timing_start
         try:
-            import matplotlib
-            matplotlib.use("Agg", force=True)
             import contextily as cx
-            import matplotlib.pyplot as plt
             configure_contextily_cache(cx, self.tile_cache_dir)
             import_done = time.perf_counter()
         except ImportError as exc:
@@ -13360,7 +13817,7 @@ class GPXEditorController(NSObject):
         total_tiles = diagnostics["count"]
         width_px, height_px = 1920, 1080
         dpi = 100
-        fig = plt.figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
+        fig = new_figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
         fig.patch.set_facecolor("black")
         ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
         ax.set_facecolor("black")
@@ -13381,7 +13838,7 @@ class GPXEditorController(NSObject):
                 )
             missing_basemap_tiles = self.add_basemap_with_timeout(cx, ax, tile_zoom)
         except Exception as exc:
-            plt.close(fig)
+            fig.clear()
             message = (
                 "Could not download the map. The configured map server may be unavailable, "
                 "the network connection may be offline, or the request timed out."
@@ -13416,7 +13873,7 @@ class GPXEditorController(NSObject):
         ax.axis("off")
         png_buffer = io.BytesIO()
         fig.savefig(png_buffer, format="png", dpi=dpi, facecolor="black", bbox_inches=None, pad_inches=0)
-        plt.close(fig)
+        fig.clear()
         save_done = time.perf_counter()
         png_data = png_buffer.getvalue()
         image = nsimage_from_png_bytes(png_data)
@@ -13489,6 +13946,7 @@ class GPXEditorController(NSObject):
             return
         workspace = getattr(self, "adventure_workspace_delegate", None)
         if workspace is not None and getattr(workspace, "plot_view", None) is not None:
+            workspace.plot_view.reset_plot_interaction()
             selected = list(tracks_override or self.selected_tracks() or self.tracks[:1])
             if mode == "overview" and tracks_override is None:
                 return workspace.show_workspace_overview()
@@ -13503,6 +13961,8 @@ class GPXEditorController(NSObject):
                 reset_viewport=recreate_existing,
             )
         existing = self.existing_plot_view(mode)
+        if existing is not None:
+            existing[1].reset_plot_interaction()
         if existing is not None and not recreate_existing:
             window, view = existing
             window.makeKeyAndOrderFront_(None)
@@ -13866,11 +14326,11 @@ class GPXEditorController(NSObject):
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation. Estimate Route Times from Media keeps an untimed route's geometry unchanged and timestamps its existing points from nearby media within the configured Photo-to-route distance. More distant media is ignored only for timing. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
-            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint table. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row. Escape cancels an active table-field edit; Cmd-Z reverses a change that was already committed. While uncached track data is loading, scrolling and selection remain available, and editing is enabled when processing finishes.\n\n"
+            "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint table and fit the track in the map, like pressing Plot. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row. Escape cancels an active table-field edit; Cmd-Z reverses a change that was already committed. While uncached track data is loading, scrolling and selection remain available, and editing is enabled when processing finishes.\n\n"
             "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber Tracks records the current row order as persistent track numbers; after another sort, sorting by Track Number restores that order. Hidden rows remain numbered but are gray and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
             "Plot Overview opens an overview using the configured map service. Selected tracks are dark blue, other tracks are light blue, and marked waypoint ranges remain red. Click a track in the overview to select it in the table. In the Adventure Map, double-click a track to open the Track Table; double-click it there to open the waypoint table. The map context menu can open either table directly.\n\n"
-            "Plot Track(s) opens a detailed map for the selected track; an empty track starts on a world map. Right-click Create Waypoint Here to add its first or a later point. View File opens the original GPX source file in TextEdit. Click a map to move the cursor dot and direction arrow to the nearest waypoint; drag to pan. Double-click a linked media point to view its photo or video, or another point to open its waypoint inspector. Press i to show or hide point information; Escape hides it; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z zooms out to the full map extent; p changes photo-thumbnail display; s saves PNG; q closes the plot window. In the track map, m or Shift-click starts a marked range. Its red segment can be copied, cut, deleted, or dragged through its context menu and long-click gesture. Right-click elsewhere to paste copied points after the nearest waypoint.\n\n"
+            "Plot Track(s) opens a detailed map for the selected track; an empty track starts on a world map. Right-click Create Waypoint Here to add its first or a later point. View File opens the original GPX source file in TextEdit. Click a map to move the cursor dot and direction arrow to the nearest waypoint; drag to pan. Double-click a linked media point to view its photo or video, or another point to open its waypoint inspector. Press i to show or hide point information; Escape hides it; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z fits the current track; A shows all Adventure tracks; p changes photo-thumbnail display; s saves PNG; q closes the plot window. In the track map, m or Shift-click starts a marked range. Its red segment can be copied, cut, deleted, or dragged through its context menu and long-click gesture. Right-click elsewhere to paste copied points after the nearest waypoint.\n\n"
             "Inspect Track opens all raw waypoints of one track. The read-only XY and Elevation status columns explain quality filtering and interpolation; the header shows retained/raw counts. The processing summary above the main table shows the active XY smoothing, spacing, elevation smoothing, error, and HDOP/VDOP limits. Statistics, maps, PDFs, profiles, and timing use this common segment-aware processed geometry while saved GPX points remain unchanged.\n\n"
             "The gear button edits GPX processing, PDF, and map-service settings. Manage Map Provider opens the shared provider setup, account links, and secure Keychain registration; Esri and Custom XYZ are completed manually in Map Service. Set a smoothing, spacing, or quality limit to zero to disable it. A standalone editor keeps these settings for future sessions; an editor opened from an Adventure stores them with that Adventure. The Output file field shows where the GPX will be written; edit it and press Enter, use the folder button, or press Save to save there. Existing GPX files are backed up as .bak before they are overwritten. PNG saves the currently open track plot image. PDF exports the track table and lets you choose columns, page orientation, folder, and filename. Save & Exit saves and closes the editor. Quit asks whether to save unsaved changes. A recovery file is written periodically while there are unsaved changes."
         )
@@ -13984,7 +14444,7 @@ class GPXEditorController(NSObject):
             self.openBugReport_(None)
 
     def show_scrollable_help(self, title: str, text: str):
-        if self.help_window is not None and self.help_window.isVisible():
+        if self.help_window is not None:
             self.help_window.makeKeyAndOrderFront_(None)
             self.help_window.orderFrontRegardless()
             return
@@ -14028,6 +14488,8 @@ class GPXEditorController(NSObject):
             apply_liquid_glass_button_style(button)
             window.contentView().addSubview_(button)
         window.makeKeyAndOrderFront_(None)
+        self.help_window_delegate = ReusableToolWindowDelegate.alloc().init()
+        window.setDelegate_(self.help_window_delegate)
         self.register_auxiliary_window(window)
         self.help_window = window
 
@@ -14114,6 +14576,7 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
     file_menu.addItem_(menu_item("Add GPX Files…", "addTracks:", controller, "o", NSEventModifierFlagCommand))
     file_menu.addItem_(menu_item("Save", "save:", controller, "s", NSEventModifierFlagCommand))
     file_menu.addItem_(menu_item("Save Selected Tracks As…", "saveSelectedTracksAs:", controller))
+    file_menu.addItem_(menu_item("PDF Summary…", "exportPdf:", controller))
 
     edit_menu = add_menu(main_menu, "Edit")
     edit_menu.addItem_(menu_item("Undo", "undo:", controller, "z", NSEventModifierFlagCommand))
@@ -14134,6 +14597,7 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
 
     window_menu = add_menu(main_menu, "Window")
     coordinator = window_menu_coordinator or WindowMenuCoordinator.alloc().init()
+    coordinator.owner = controller
     coordinator.attach(window_menu)
     controller.native_window_menu_coordinator = coordinator
 
@@ -14196,6 +14660,8 @@ def show_gpx_editor(
     on_initial_load_complete=None,
     settings=None,
     media_context=None,
+    show_window=True,
+    open_pdf_summary=False,
 ):
     controller = GPXEditorController.alloc().initStandalone_(standalone)
     if settings is not None:
@@ -14208,8 +14674,12 @@ def show_gpx_editor(
     controller.media_context = dict(media_context or {})
     if output_file is not None:
         controller.set_output_path(Path(output_file).expanduser().resolve())
-    controller.show()
-    loaded_recovery = controller.offer_recovery_load()
+    controller.pdf_only_loading = bool(open_pdf_summary and not show_window)
+    if show_window:
+        controller.show()
+    if open_pdf_summary:
+        controller.open_pdf_summary_window()
+    loaded_recovery = controller.offer_recovery_load() if show_window else False
     if gpx_paths:
         controller.load_gpx_paths([Path(path).expanduser().resolve() for path in gpx_paths], mark_dirty=False)
     elif loaded_recovery:
@@ -14235,6 +14705,8 @@ def show_gpx_editor_from_cli_args(
     on_initial_load_complete=None,
     settings=None,
     media_context=None,
+    show_window=True,
+    open_pdf_summary=False,
 ):
     """Open the editor from another Python program using CLI-style arguments.
 
@@ -14253,8 +14725,9 @@ def show_gpx_editor_from_cli_args(
     line: zero or more ``*.gpx`` files, ``--output-file ofile.gpx``, and
     ``--debug``.  The GPX files are loaded sequentially in the order supplied.
 
-    This function creates and shows the editor window but does not start the
-    AppKit event loop.  If you call it from a non-GUI script, create/run
+    By default this shows the editor. Use ``show_window=False`` with
+    ``open_pdf_summary=True`` to open report options immediately instead.
+    It does not start the AppKit event loop. From a non-GUI script, create/run
     ``NSApplication`` yourself or use ``run_gpx_editor_from_cli_args()`` below.
     """
     parser = build_argument_parser()
@@ -14271,6 +14744,8 @@ def show_gpx_editor_from_cli_args(
         on_initial_load_complete=on_initial_load_complete,
         settings=settings,
         media_context=media_context,
+        show_window=show_window,
+        open_pdf_summary=open_pdf_summary,
     )
 
 
@@ -14280,31 +14755,20 @@ def export_pdf_summary_from_paths(
     project_name: str | None = None,
     debug: bool = False,
     settings=None,
-) -> Path | None:
-    """Open the standard GPXEditor PDF export panel for GPX paths."""
+) -> GPXEditorController | None:
+    """Return a retained, nonmodal PDF controller; its editor stays hidden."""
     paths = [Path(path).expanduser().resolve() for path in gpx_paths or []]
     if not paths:
         show_alert("No GPX file selected.", "Select a GPX file before exporting a PDF summary.")
         return None
-    controller = GPXEditorController.alloc().initStandalone_(False)
-    if settings is not None:
-        controller.apply_project_parameters(settings)
-    controller.debug = bool(debug)
-    if output_file is not None:
-        controller.set_output_path(Path(output_file).expanduser().resolve())
+    controller = show_gpx_editor(
+        paths, output_file=output_file, debug=debug, settings=settings,
+        show_window=False, open_pdf_summary=True,
+    )
     if project_name:
         controller.project_name = str(project_name)
         controller.project_field.setStringValue_(controller.project_name)
-    try:
-        controller.load_gpx_paths(paths, mark_dirty=False)
-        controller.exportPdf_(None)
-        return controller.last_pdf_path
-    finally:
-        try:
-            controller.autosave_timer.invalidate()
-        except Exception:
-            pass
-        controller.close_main_editor_window(delete_recovery=False)
+    return controller
 
 
 def run_gpx_editor_from_cli_args(cli_args: list[str] | tuple[str, ...] | None = None) -> int:

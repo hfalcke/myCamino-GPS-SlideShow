@@ -28,6 +28,7 @@ from AppKit import (
     NSWorkspace,
 )
 from Foundation import NSObject
+from cocoa_native_menus import ReusableToolWindowDelegate
 
 
 class MediaViewerKeyView(NSView):
@@ -68,6 +69,8 @@ class CocoaMediaViewer(NSObject):
             NSMakeRect(220, 140, 900, 620), style, NSBackingStoreBuffered, False
         )
         self.window.setReleasedWhenClosed_(False)
+        self.window_delegate = ReusableToolWindowDelegate.alloc().init()
+        self.window.setDelegate_(self.window_delegate)
         root = MediaViewerKeyView.alloc().initWithController_(self)
         root.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         self.window.setContentView_(root)

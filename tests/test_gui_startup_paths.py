@@ -280,6 +280,30 @@ class GUIStartupPathTests(unittest.TestCase):
         controller._navigate_workspace_track.assert_called_once_with(-1)
         controller._navigate_workspace_selection.assert_not_called()
 
+    def test_t_opens_track_table_from_main_map(self):
+        for key in ("t", "T"):
+            with self.subTest(key=key):
+                event = SimpleNamespace(
+                    charactersIgnoringModifiers=lambda: key, characters=lambda: key,
+                    keyCode=lambda: 17, modifierFlags=lambda: 0,
+                )
+                controller = SimpleNamespace(openTrackEditor_=Mock())
+                self.assertTrue(AdventureMapController.handleWorkspaceKeyEvent_.callable(controller, event))
+                controller.openTrackEditor_.assert_called_once_with(None)
+
+    def test_modified_t_does_not_open_track_table(self):
+        from AppKit import NSEventModifierFlagControl
+
+        for flags in (NSEventModifierFlagCommand, NSEventModifierFlagOption, NSEventModifierFlagControl):
+            with self.subTest(flags=flags):
+                event = SimpleNamespace(
+                    charactersIgnoringModifiers=lambda: "t", characters=lambda: "t",
+                    keyCode=lambda: 17, modifierFlags=lambda: flags,
+                )
+                controller = SimpleNamespace(openTrackEditor_=Mock())
+                self.assertFalse(AdventureMapController.handleWorkspaceKeyEvent_.callable(controller, event))
+                controller.openTrackEditor_.assert_not_called()
+
     def test_gpx_drop_name_prefers_document_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "route.gpx"

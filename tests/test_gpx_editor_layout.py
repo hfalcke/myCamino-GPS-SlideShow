@@ -540,6 +540,39 @@ class InspectorPointSelectionTests(unittest.TestCase):
 
         self.assertEqual(controller.selected_nrs, [7])
         controller.open_inspector_for_track.assert_called_once_with(track)
+        inspector = controller.open_inspector_for_track.return_value
+        inspector.plot_.assert_called_once_with(None)
+        inspector.select_point_index.assert_called_once_with(0)
+        inspector.show.assert_called_once_with()
+
+    def test_double_click_plots_clicked_track_and_keeps_its_selected_point(self):
+        track = SimpleNamespace(nr=39)
+        inspector = Mock()
+        view = SimpleNamespace(cursor=(17, object(), track))
+        controller = GPXEditorController.alloc().init()
+        controller.track_table = SimpleNamespace(clickedRow=lambda: 0, selectedRow=lambda: 1)
+        controller.tracks = [track, SimpleNamespace(nr=33)]
+        controller.adventure_workspace_delegate = SimpleNamespace(plot_view=view)
+        controller.update_selection_field = Mock()
+        controller.highlight_selected_rows = Mock()
+        controller.open_inspector_for_track = Mock(return_value=inspector)
+        controller.set_status = Mock()
+
+        controller.trackDoubleClicked_(None)
+
+        self.assertEqual(controller.selected_nrs, [39])
+        controller.open_inspector_for_track.assert_called_once_with(track)
+        inspector.plot_.assert_called_once_with(None)
+        inspector.select_point_index.assert_called_once_with(17)
+
+    def test_double_click_summary_or_empty_area_does_not_open_or_plot(self):
+        for row in (-1, 1):
+            controller = GPXEditorController.alloc().init()
+            controller.track_table = SimpleNamespace(clickedRow=lambda: row, selectedRow=lambda: row)
+            controller.tracks = [SimpleNamespace(nr=7)]
+            controller.open_inspector_for_track = Mock()
+            controller.trackDoubleClicked_(None)
+            controller.open_inspector_for_track.assert_not_called()
 
     def test_plot_selected_reuses_adventure_workspace_map(self):
         track = SimpleNamespace(nr=7)

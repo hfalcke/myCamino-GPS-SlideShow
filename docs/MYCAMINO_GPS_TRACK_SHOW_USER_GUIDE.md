@@ -114,6 +114,10 @@ Advanced Interface. **Adventure > Adventure Properties** edits the protected
 name, project directory, description, and Intro title image. Contextual Settings
 entries open the one shared Settings window at the appropriate section; the
 canonical command remains **myCamino > Settings** (`Cmd-,`). The **Window** menu
+shows tools you have opened, not internal preparation windows or retired
+Adventures. Reopening Track Table or Settings from another interface returns
+to the same document or draft. Closing a reusable tool hides it safely; it
+can be restored without creating another copy. The Window menu
 lists visible, hidden, minimized, processing, and unsaved windows and restores a
 selected one. **Adventure > Advanced Interface** remains available for detailed
 status and uncommon operations.
@@ -1056,9 +1060,13 @@ The Start Slide Show section contains:
   date. Shadow color is configurable and defaults to black. Apply changes the
   active slide show immediately, and `c` toggles the complete configured
   header.
-- PDF Summary: opens the same PDF export panel used by `myCamino GPX Editor`.
-  It exports the current GPX track table and can optionally include overview,
-  track maps, elevation profiles, and page orientation choices.
+- **Adventure > PDF Summary** creates a printable track report, optionally with
+  overview and individual track maps and elevation profiles. Its options open
+  immediately while any missing track calculations finish in the background.
+  Visible, All, or Selected applies to the entire report. Hidden tracks use gray
+  text and orange overview routes, and are excluded from totals and averages.
+  Export opens the completed PDF in your default viewer and offers Open PDF and
+  Show in Finder. The Advanced Interface also retains its PDF Summary button.
 - Quit: auto-save pending Adventure changes and close the main GUI.
 
 The control-file editor also offers **Start Slide Show Here** in the

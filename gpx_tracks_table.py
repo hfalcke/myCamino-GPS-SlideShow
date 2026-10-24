@@ -12,6 +12,8 @@ from datetime import date, datetime, timezone
 from math import asin, atan2, cos, degrees, floor, log, pi, radians, sin, sqrt, tan
 from pathlib import Path
 
+from plot_rendering import add_headless_basemap, new_figure, serialized_plotting
+
 from gpx_processing import (
     DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
     DEFAULT_STATIONARY_SPEED_THRESHOLD_KMH,
@@ -1439,6 +1441,7 @@ def add_single_track_markers(ax, projected_points, image_height_px, dpi, marker_
 
 # AI prompt: "Write a plotting helper that renders tracks to a PNG using shared
 # configuration for overview and single-track outputs."
+@serialized_plotting
 def render_track_plot(
     tracks,
     zoom_level,
@@ -1471,10 +1474,6 @@ def render_track_plot(
 ):
     """Render one overview or one single-track plot."""
     try:
-        import matplotlib
-        if str(matplotlib.get_backend()).lower() != "agg":
-            matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
         import contextily as cx
     except ImportError as exc:
         raise RuntimeError(
@@ -1488,7 +1487,7 @@ def render_track_plot(
 
     dpi = 100
     width_px, height_px = image_size
-    fig = plt.figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
+    fig = new_figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
     fig.patch.set_facecolor(background_color)
     if overview_mode:
         header_font_size = max(label_font_size(len(tracks)) * font_factor + 2.0, 10.0)
@@ -1708,8 +1707,8 @@ def render_track_plot(
             cache_only=map_cache_only,
         ):
             with tolerate_missing_tiles(cx) as missing_tile_report:
-                cx.add_basemap(
-                    ax,
+                add_headless_basemap(
+                    cx, ax,
                     source=basemap_provider(
                         cx,
                         use_esri,
@@ -1749,7 +1748,7 @@ def render_track_plot(
         add_single_track_markers(ax, projected_tracks[0], height_px, dpi, line_color)
     ax.axis("off")
     fig.savefig(output_path, dpi=dpi, facecolor=background_color, bbox_inches=None, pad_inches=0)
-    plt.close(fig)
+    fig.clear()
     metadata = {
         "map_content_version": MAP_CONTENT_VERSION,
         "background_only": bool(background_only),

@@ -159,6 +159,56 @@ def _number_child(point: ET.Element, name: str) -> float | None:
         return None
 
 
+def interpolated_height_updates(
+    track: ET.Element, ranges: list[tuple[int, int]],
+) -> list[tuple[ET.Element, str]]:
+    """Plan distance-linear height corrections without changing XML or anchors."""
+    locations = point_locations(track)
+    selected = set()
+    for start, end in ranges:
+        start, end = sorted((int(start), int(end)))
+        selected.update(range(max(0, start), min(len(locations), end + 1)))
+    runs = []
+    for row in sorted(selected):
+        point, segment, _index = locations[row]
+        if not runs or row != runs[-1][-1][0] + 1 or segment is not runs[-1][-1][2]:
+            runs.append([])
+        runs[-1].append((row, point, segment))
+
+    updates = []
+    for run in runs:
+        if len(run) < 3:
+            continue
+        first = _number_child(run[0][1], "ele")
+        last = _number_child(run[-1][1], "ele")
+        if first is None or last is None or not math.isfinite(first) or not math.isfinite(last):
+            raise ValueError(
+                f"Points {run[0][0] + 1} and {run[-1][0] + 1} must both have valid heights."
+            )
+        distances = [0.0]
+        previous = None
+        for _row, point, _segment in run:
+            try:
+                coordinate = (float(point.attrib["lat"]), float(point.attrib["lon"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Selected points must have valid coordinates.") from exc
+            if not all(math.isfinite(value) for value in coordinate) or not (
+                -90 <= coordinate[0] <= 90 and -180 <= coordinate[1] <= 180
+            ):
+                raise ValueError("Selected points must have valid coordinates.")
+            if previous is not None:
+                distances.append(distances[-1] + _distance_m(*previous, *coordinate))
+            previous = coordinate
+        total = distances[-1]
+        for index, (_row, point, _segment) in enumerate(run[1:-1], 1):
+            fraction = distances[index] / total if total > 0 else index / (len(run) - 1)
+            text = f"{first + (last - first) * fraction:.3f}"
+            old = _number_child(point, "ele")
+            if old is None or not math.isfinite(old) or not math.isclose(old, float(text), abs_tol=1e-9):
+                updates.append((point, text))
+    return updates
+
+
 def _time_child(point: ET.Element) -> datetime | None:
     child = _direct_child(point, "time")
     return parse_time(child.text) if child is not None and child.text else None

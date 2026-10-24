@@ -73,11 +73,14 @@ class PanelSecurityTests(unittest.TestCase):
 
     def test_all_operations_accept_same_origin_forms_and_explain_the_action(self):
         home = self.request()[2]
+        code_page = self.request('/code')[2]
+        self.assertIn('<a href="/code">Code</a>', home)
         for action in self.panel.actions().values():
-            if action.key == 'build_mycamino_dmg':
-                continue  # Asynchronous build submission is covered separately below.
+            if action.key in ('build_mycamino_dmg', 'release_mycamino_app'):
+                continue  # Asynchronous submissions are covered separately below.
             with self.subTest(action=action.key):
-                self.assertIn(action.description, home)
+                listing = code_page if action.key in CODE_ACTIONS else home
+                self.assertIn(action.description, listing)
                 _, headers, page = self.request('/action-confirm?action='+action.key)
                 # Native form submissions must retain a non-null same-origin Origin.
                 self.assertEqual(headers['Referrer-Policy'], 'same-origin')
@@ -125,7 +128,7 @@ class PanelSecurityTests(unittest.TestCase):
         self.assertEqual(second['output'], 'new output')
         self.assertEqual(self.request(endpoint+'&cursor=-1')[0], 400)
         self.assertEqual(self.request('/build-status?id=../../etc/passwd')[0], 404)
-        self.assertIn('/build-progress?id='+job.id, self.request()[2])
+        self.assertIn('/build-progress?id='+job.id, self.request('/code')[2])
 
     def test_build_rejects_missing_confirmation_csrf_and_cross_site_submission(self):
         with patch.object(self.panel.build_jobs, 'start') as start:
@@ -141,27 +144,44 @@ class PanelSecurityTests(unittest.TestCase):
         page = self.request('/action-confirm?action=release_mycamino_app')[2]
         for field in ('csrf', 'version', 'release_date', 'message'):
             self.assertIn(f'name="{field}"', page)
-        self.assertIn('<h2>Code</h2>', self.request()[2])
+        home = self.request()[2]
+        code_page = self.request('/code')[2]
+        self.assertNotIn('Release App DMG to Website', home)
+        self.assertIn('<h1>Code</h1>', code_page)
+        self.assertIn('Release App DMG to Website', code_page)
         data = {'action': 'release_mycamino_app', 'csrf': self.panel.csrf,
                 'confirmation': 'RELEASE MYCAMINO APP', 'message': 'Release "safe" <text>',
                 'version': '0.9.2', 'release_date': '2026-10-03'}
-        with patch('ops_control.server.run_command', return_value=CheckResult('test','',0,'done','')) as command:
+        job = BuildJob(key='release_mycamino_app', label='Release App DMG to Website')
+        self.panel.build_jobs.jobs[job.id] = job
+        with patch.object(self.panel, 'start_code_job', return_value=job) as start:
             response = self.request('/action-run', 'POST', data)
-            self.assertEqual(response[0], 200)
-            argv = command.call_args.args[0]
+            self.assertEqual(response[0], 303)
+            self.assertEqual(response[1]['Location'], '/build-progress?id='+job.id)
+            start.assert_called_once_with('release_mycamino_app', 'RELEASE MYCAMINO APP', {
+                'message': data['message'], 'version': '0.9.2',
+                'release_date': '2026-10-03'})
+            progress = self.request(response[1]['Location'])[2]
+            self.assertIn('<h1>Release App DMG to Website</h1>', progress)
+            self.assertIn('Back to Code', progress)
+        invalid = dict(data, version='0.9.2; touch /tmp/unsafe')
+        with patch.object(self.panel.build_jobs, 'start') as background:
+            response = self.panel.start_code_job('release_mycamino_app',
+                invalid['confirmation'], invalid)
+            self.assertIn('Version must contain', response.stderr)
+            background.assert_not_called()
+            response = self.panel.start_code_job('release_mycamino_app', '', data)
+            self.assertIn('Missing release confirmation', response.stderr)
+            background.assert_not_called()
+        with patch.object(self.panel.build_jobs, 'start', return_value=job) as background:
+            self.assertIs(self.panel.start_code_job('release_mycamino_app',
+                data['confirmation'], data), job)
+            argv = background.call_args.args[0]
             self.assertEqual(argv[1:4], ['-m', 'ops_control.app_code', 'release'])
             self.assertIn(data['message'], argv)
             self.assertIn('0.9.2', argv)
-            self.assertEqual(command.call_args.kwargs['env']['MYCAMINO_LOCK_HELD'], '1')
-            command.reset_mock()
-            data['version'] = '0.9.2; touch /tmp/unsafe'
-            response = self.request('/action-run', 'POST', data)
-            self.assertIn('Version must contain', response[2])
-            command.assert_not_called()
-            data['version'] = '0.9.2'
-            data['confirmation'] = ''
-            self.assertIn('missing confirmation', self.request('/action-run', 'POST', data)[2])
-            command.assert_not_called()
+            self.assertEqual(background.call_args.kwargs['key'], 'release_mycamino_app')
+            self.assertEqual(background.call_args.kwargs['label'], 'Release App DMG to Website')
 
     def test_unknown_action_is_never_executed(self):
         with patch.object(self.panel, 'run_action') as run:

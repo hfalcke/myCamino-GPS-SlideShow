@@ -138,9 +138,12 @@ def contextily_provider(
     custom_attribution: str = "",
     maximum_zoom: int = 19,
     credential_id: str = "default",
+    geoapify_style: str = "osm-bright",
 ):
     """Return a Contextily-compatible provider from project settings."""
     provider = str(provider or "osm").strip().lower()
+    if provider == "geoapify" and geoapify_style not in {"osm-bright", "osm-carto"}:
+        raise ValueError("Unsupported Geoapify map style.")
     if provider == "esri":
         return contextily_module.providers.Esri.WorldStreetMap
     if provider in {"geoapify", "thunderforest", "stadia"}:
@@ -155,12 +158,12 @@ def contextily_provider(
                 f"(credential '{credential_id or 'default'}')."
             )
         urls = {
-            "geoapify": "https://maps.geoapify.com/v1/tile/osm-bright/{z}/{x}/{y}.png?apiKey=" + api_key,
+            "geoapify": "https://maps.geoapify.com/v1/tile/" + geoapify_style + "/{z}/{x}/{y}.png?apiKey=" + api_key,
             "thunderforest": "https://tile.thunderforest.com/atlas/{z}/{x}/{y}.png?apikey=" + api_key,
             "stadia": "https://tiles.stadiamaps.com/tiles/alidade_smooth/{z}/{x}/{y}.png?api_key=" + api_key,
         }
         return TileProvider(
-            name=provider_display_name(provider),
+            name=provider_display_name(provider, geoapify_style),
             url=urls[provider],
             attribution=provider_attribution(provider),
             max_zoom=int(maximum_zoom),
@@ -179,11 +182,11 @@ def contextily_provider(
     return contextily_module.providers.OpenStreetMap.Mapnik
 
 
-def provider_display_name(provider: str) -> str:
+def provider_display_name(provider: str, geoapify_style: str = "osm-bright") -> str:
     provider = str(provider or "osm").strip().lower()
     return {
         "osm": "OpenStreetMap.Mapnik",
-        "geoapify": "Geoapify OSM Bright",
+        "geoapify": "Geoapify OSM Carto" if geoapify_style == "osm-carto" else "Geoapify OSM Bright",
         "thunderforest": "Thunderforest Atlas",
         "stadia": "Stadia Alidade Smooth",
         "esri": "Esri.WorldStreetMap",
