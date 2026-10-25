@@ -1266,13 +1266,56 @@ row in place. Duplicated tracks are inserted together after the last selected
 row and receive unique copy names. Every ordering, visibility, duplication,
 join, and deletion operation can be undone with the editor's Undo command.
 
-**Renumber Tracks** stores the current row order as persistent track numbers.
-You can therefore arrange tracks manually, renumber them, temporarily sort by
-another column, and later sort by **Track Number** to restore the recorded
-order. Hidden tracks remain part of that order, but appear gray and are not
-included in the bold summary row's visible-track count. If existing generated
-maps match by track fingerprint, myCamino relinks their numbered filenames and
-metadata without downloading tiles or rendering the images again.
+**Renumber…** offers Track Numbers or Stage Numbers for Selected or All tracks,
+with **Action: Assign Numbers / Clear Numbers**, an Include Hidden choice and
+a first number for assignment. Blank uses the preceding participating row's
+number plus one. Clearing also offers **Both Track and Stage Numbers** and
+disables the first-number field. Review the preview before applying; numbers
+already used outside the chosen scope are blocked. Stage renumbering gives each
+participating track its own stage. To group tracks deliberately, edit their
+**Stage** cells to the same number instead.
+
+Track Number is an editable ordering label, separate from the permanent internal
+identity. Tracks sharing Stage 3 have derived
+IDs `3a`, `3b`, and so on, continuing with `3aa` after `3z`. Hidden tracks count
+when assigning these IDs; sorting and exporting subsets do not renumber them.
+Suffixes follow visible Track Number order, then unnumbered tracks in permanent
+identity order. Changing visible numbers does not automatically reorder the table.
+PDF titles show Stage and add Track ID only when that report includes several
+members of the same stage. Grouping never joins geometry, maps, or statistics.
+Track Number, Stage and Type changes do not rename assets or rewrite control rows.
+Permanent internal IDs survive Save, restart and recovery; deleted IDs are never
+assigned to a different track. Importing or duplicating tracks allocates fresh IDs.
+
+**Invert Selection** selects all currently unselected tracks, including hidden
+tracks, and deselects the others. Use **Renumber… > Clear Numbers** to remove
+Track Numbers, Stage Numbers, or both for the chosen scope. You can also clear
+an individual Stage cell. Cleared numbers
+stay unassigned after saving and reopening; **Renumber…** assigns them again.
+These changes support Undo. Clearing a number does not delete a track or change
+its permanent internal identity, maps, or control-file references. Tracks without
+a stage are not grouped together, and their PDF stage/ID cells remain blank.
+
+Use **Set Type…** or **Set Track Type…** to assign Unassigned, Hiking,
+Pilgrimage, Bike, Horse, Car, Bus, Train, Metro, Airplane, Rest, or Sightseeing. **Select by Type…**
+replaces the selection with tracks of that type. Both offer hidden-track scope.
+Settings > Track Types controls colors and the default for newly created tracks
+(initially Pilgrimage). Existing and imported tracks without a recognized type
+stay Unassigned; unknown imported values remain in the GPX until explicitly changed.
+Visible Unassigned tracks are neutral gray. Hidden tracks are lighter gray with
+dashed lines and remain excluded from totals. Selection adds a stronger outlined
+stroke; marked waypoint ranges remain red. Escape cancels a Stage/name/date edit.
+
+Time-Lapse and dual-screen GPS tracking choose their moving symbol by Track Type.
+Settings > Slide Show > Time-Lapse > Marker source can instead select Global
+Override, retaining the earlier global marker choice. PDF pages use matching
+vector type symbols. The PDF Summary gear opens the shared PDF Export settings.
+
+Managed maps are background-only assets. Old maps with routes baked into their
+pixels, and unsupported formats, are treated as missing and regenerated when
+needed. They cannot be made current using Mark Up to Date. Existing files are
+not cleaned up or converted at startup. Finished PDF and manual PNG exports
+still include routes.
 
 The **Show** column is a checkbox. Clicking it changes visibility immediately
 without changing the track selection. Adventure edits are checkpointed at the

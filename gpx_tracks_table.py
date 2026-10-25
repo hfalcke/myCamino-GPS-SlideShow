@@ -49,6 +49,7 @@ from map_provider_utils import (
     provider_display_name,
 )
 from map_overlay import MAP_CONTENT_VERSION, json_overlay_geometry
+from track_types import element_track_type, stage_number, alphabetic_suffix, track_number, allocate_track_ids
 from track_timing_utils import timed_points_payload
 from track_map_layout_utils import (
     DEFAULT_GRID_LONG_AXIS,
@@ -438,7 +439,6 @@ def summarize_track(
         "track_geometry_fingerprint": geometry_fingerprint,
         "track_data_fingerprint": data_fingerprint,
         "track_extent_mercator": track_extent_mercator,
-        "legacy_semantic_track_fingerprint": semantic_track_fingerprint(track_element),
     }
 
 
@@ -463,8 +463,8 @@ def parse_gpx_file(
     document = load_gpx_document(file_path)
 
     tracks = []
-    used_order_numbers = set()
-    next_order_number = 1
+    internal_ids, _next_id = allocate_track_ids(document.tracks, document.next_internal_id,
+                                               legacy=document.next_internal_id == 1)
     track_total = len(document.tracks)
     callback_parameter_count = None
     if track_processing_callback is not None:
@@ -492,16 +492,16 @@ def parse_gpx_file(
             running_speed_window_distance_m,
             stationary_speed_threshold_kmh,
         )
-        stored_order_number = persistent_track_order_number(track_element)
-        if stored_order_number is not None and stored_order_number not in used_order_numbers:
-            original_sequence_number = stored_order_number
-        else:
-            while next_order_number in used_order_numbers:
-                next_order_number += 1
-            original_sequence_number = next_order_number
-            next_order_number += 1
-        used_order_numbers.add(original_sequence_number)
+        original_sequence_number = internal_ids[source_sequence_number - 1]
         track["original_sequence_number"] = original_sequence_number
+        track["internal_id"] = original_sequence_number
+        track["display_track_number"] = track_number(track_element, source_sequence_number)
+        track["track_type"] = element_track_type(track_element)
+        track["segment_count"] = len(track.get("segments", []))
+        track["hidden"] = any(node.get("hidden", "").casefold() in {"yes", "true", "1", "hidden"}
+                              for node in track_element.iter()
+                              if node.tag.rsplit("}", 1)[-1] == "mycamino_gpx_editor")
+        track["stage_number"] = stage_number(track_element, track["display_track_number"] or original_sequence_number)
         track["timing_status"] = timing_status_for_track(track_element)
         track["has_absolute_time"] = track["start_time"] is not None
         media_derived = any(
@@ -521,6 +521,16 @@ def parse_gpx_file(
             else "track"
         )
         tracks.append(track)
+    groups = {}
+    for track in sorted(tracks, key=lambda item: (item["display_track_number"] is None,
+                        item["display_track_number"] or 0, item["internal_id"])):
+        if track["stage_number"] is None:
+            track["track_id"] = ""
+        else:
+            groups.setdefault(track["stage_number"], []).append(track)
+    for stage, members in groups.items():
+        for index, track in enumerate(members):
+            track["track_id"] = str(stage) + (alphabetic_suffix(index) if len(members) > 1 else "")
     return tracks
 
 
@@ -885,7 +895,8 @@ def build_table_rows(tracks, include_original_sequence=False):
         marker = "*" if track.get("is_sort_exception") else ""
         row = [f"{index}.", marker]
         if include_original_sequence:
-            row.append(f"#{track['original_sequence_number']}")
+            number = track.get("display_track_number", track["original_sequence_number"])
+            row.append(f"#{number}" if number is not None else "")
         row.extend(
             [
                 track["name"],
@@ -912,12 +923,17 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
             {
                 "nr": track["table_number"],
                 "original_sequence_number": track["original_sequence_number"],
+                "internal_id": track.get("internal_id", track["original_sequence_number"]),
+                "display_track_number": track.get("display_track_number", track["original_sequence_number"]),
                 "track_name": track["name"],
                 "track_fingerprint": track.get("track_fingerprint"),
                 "track_fingerprint_version": track.get("track_fingerprint_version"),
                 "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
                 "track_data_fingerprint": track.get("track_data_fingerprint"),
                 "track_extent_mercator": track.get("track_extent_mercator"),
+                "track_type": track.get("track_type", "unassigned"),
+                "stage_number": track.get("stage_number", track.get("original_sequence_number")),
+                "track_id": track.get("track_id"),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
                 "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                 "track_data_sidecar": track.get("track_data_sidecar"),
@@ -968,6 +984,11 @@ def derived_track_data_payload(track, fallback_walking_speed_kmh=3.5):
     return {
         "version": 1,
         "track_number": track.get("table_number"),
+        "internal_id": track.get("internal_id", track.get("original_sequence_number")),
+        "display_track_number": track.get("display_track_number", track.get("original_sequence_number")),
+        "track_type": track.get("track_type", "unassigned"),
+        "stage_number": track.get("stage_number", track.get("original_sequence_number")),
+        "track_id": track.get("track_id"),
         "original_sequence_number": track.get("original_sequence_number"),
         "track_name": track.get("name", ""),
         "track_fingerprint": track.get("track_fingerprint"),
@@ -1293,40 +1314,11 @@ def basemap_provider(
     )
 
 
-# AI prompt: "Write a helper that draws one projected track with configurable
-# line and dot styling."
-def draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size):
-    """Draw one projected track on the axes."""
-    xs = [point[0] for point in projected_points]
-    ys = [point[1] for point in projected_points]
-    ax.plot(
-        xs,
-        ys,
-        color=line_color,
-        linewidth=line_width,
-        solid_capstyle="round",
-        solid_joinstyle="round",
-        zorder=3,
-    )
-    if dot_size > 0:
-        ax.scatter(
-            [xs[0], xs[-1]],
-            [ys[0], ys[-1]],
-            s=dot_size,
-            c=dot_color,
-            marker="o",
-            linewidths=0,
-            zorder=4,
-        )
-
-
-# AI prompt: "Write a helper that builds the overview label lines from a list of
-# requested keywords such as track name, date, length, and duration."
 def overview_label_lines(track, label_items):
     """Return the configured overview label lines for one track."""
     mapping = {
         "TRACKNAME": track["name"],
-        "TRACKNUMBER": str(track["table_number"]),
+        "TRACKNUMBER": str(track.get("display_track_number", track["table_number"]) or ""),
         "DATE": format_date_local_short(track["time"]),
         "LENGTH": f"{track['length_km']:.1f} km",
         "DURATION": format_duration_hhmm(track["duration"]),
@@ -1334,115 +1326,11 @@ def overview_label_lines(track, label_items):
     return [" ".join(mapping[item] for item in line_items) for line_items in label_items]
 
 
-# AI prompt: "Write a helper that draws one boxed point label above a projected
-# point using the same formatting for overview and single-track markers."
-def add_boxed_point_label(ax, x_coord, y_coord, text, image_height_px, dpi, marker_color):
-    """Draw one boxed point label above a projected point."""
-    marker_font_size = max(8.0, 0.02 * image_height_px * 72.0 / dpi)
-    line_offset_points = marker_font_size * 1.2
-    marker_box = {
-        "boxstyle": "round,pad=0.2",
-        "facecolor": "white",
-        "edgecolor": marker_color,
-        "linewidth": 0.8,
-    }
-    ax.annotate(
-        text,
-        xy=(x_coord, y_coord),
-        xytext=(0, line_offset_points),
-        textcoords="offset points",
-        ha="center",
-        va="bottom",
-        fontsize=marker_font_size,
-        color=marker_color,
-        bbox=marker_box,
-    )
-
-
-# AI prompt: "Write a helper that adds rotated on-track labels for the overview
-# image using the configured font scaling and user-selected label content."
-def add_overview_labels(ax, tracks, projected_tracks, actual_font_size, span, label_color, label_items):
-    """Add rotated labels to the overview plot."""
-    if not label_items:
-        return
-    font_height = span * (0.012 * (actual_font_size / 10.0))
-    label_offset = 1.0 * font_height
-
-    for index, (track, projected_points) in enumerate(zip(tracks, projected_tracks)):
-        if not projected_points:
-            continue
-        start_x, start_y = projected_points[0]
-        end_x, end_y = projected_points[-1]
-        center_x = (start_x + end_x) / 2
-        center_y = (start_y + end_y) / 2
-        delta_x = end_x - start_x
-        delta_y = end_y - start_y
-        line_length = sqrt(delta_x ** 2 + delta_y ** 2)
-        if line_length == 0:
-            normal_x, normal_y = 0.0, 1.0
-            rotation = 0.0
-        else:
-            normal_x = -delta_y / line_length
-            normal_y = delta_x / line_length
-            rotation = degrees(atan2(delta_y, delta_x))
-            if rotation > 90:
-                rotation -= 180
-            if rotation < -90:
-                rotation += 180
-
-        direction = -1.0 if index % 2 == 0 else 1.0
-        text_x = center_x + normal_x * label_offset * direction
-        text_y = center_y + normal_y * label_offset * direction
-        label_text = "\n".join(overview_label_lines(track, label_items))
-        ax.text(
-            text_x,
-            text_y,
-            label_text,
-            fontsize=actual_font_size,
-            rotation=rotation,
-            rotation_mode="anchor",
-            ha="center",
-            va="center",
-            multialignment="center",
-            linespacing=1.15,
-            color=label_color,
-        )
-
-
-# AI prompt: "Write a helper that marks the start of the first sorted track and
-# the end of the last sorted track on the overview plot using boxed labels."
-def add_overview_markers(ax, projected_tracks, image_height_px, dpi, marker_color):
-    """Add boxed Start and End labels to the overview plot."""
-    non_empty_tracks = [points for points in projected_tracks if points]
-    if not non_empty_tracks:
-        return
-    first_x, first_y = non_empty_tracks[0][0]
-    last_x, last_y = non_empty_tracks[-1][-1]
-    add_boxed_point_label(ax, first_x, first_y, "Start", image_height_px, dpi, marker_color)
-    add_boxed_point_label(ax, last_x, last_y, "End", image_height_px, dpi, marker_color)
-
-
-# AI prompt: "Write a helper that formats the title lines for an individual
-# track image with bold track name and date, length, and duration below it."
 def single_track_heading(track):
     """Return heading lines for one track image."""
     duration_text = "N/A" if track["duration"] is None else format_duration(track["duration"]).rjust(5, "0")
     subtitle = f"{format_date_local(track['time'])} ({track['length_km']:.1f} km, {duration_text})"
     return track["name"], subtitle
-
-
-# AI prompt: "Write a helper that adds boxed start and end labels above the
-# first and last point of a single-track plot."
-def add_single_track_markers(ax, projected_points, image_height_px, dpi, marker_color):
-    """Add boxed start and end labels to a single-track plot."""
-    start_x, start_y = projected_points[0]
-    end_x, end_y = projected_points[-1]
-    add_boxed_point_label(ax, start_x, start_y, "Start", image_height_px, dpi, marker_color)
-    add_boxed_point_label(ax, end_x, end_y, "Ende", image_height_px, dpi, marker_color)
-
-
-# AI prompt: "Write a plotting helper that renders tracks to a PNG using shared
-# configuration for overview and single-track outputs."
 @serialized_plotting
 def render_track_plot(
     tracks,
@@ -1470,9 +1358,9 @@ def render_track_plot(
     map_credential_id="default",
     minimum_short_dimension_m=MINIMUM_MAP_SHORT_DIMENSION_M,
     media_map_date=None,
-    background_only=True,
     media_map_title="",
     map_cache_only=False,
+    defer_install=False,
 ):
     """Render one overview or one single-track plot."""
     automatic_overview_labels = overview_label_items == [["AUTOMATIC"]]
@@ -1622,17 +1510,6 @@ def render_track_plot(
         header_font_size = max(actual_font_size + 2.0, 10.0)
         header_height_frac = (header_font_size * dpi / 72.0) / height_px
         header_y = 1.0 - (0.05 * header_height_frac)
-        if not background_only:
-            fig.text(
-                0.5,
-                header_y,
-                overview_header,
-                ha="center",
-                va="top",
-                fontsize=header_font_size,
-                fontweight="bold",
-                color=title_color,
-            )
     elif media_map_date is not None:
         title_font_size = max(actual_font_size + 2.0, 10.0)
         subtitle_font_size = max(actual_font_size, 9.0)
@@ -1648,27 +1525,6 @@ def render_track_plot(
         else:
             title_y = 1.0 - (0.05 * title_height_frac)
             subtitle_y = None
-        if not background_only:
-            fig.text(
-                0.5,
-                title_y,
-                stage_title or date_label,
-                ha="center",
-                va="top",
-                fontsize=title_font_size,
-                fontweight="bold",
-                color=title_color,
-            )
-            if subtitle_y is not None:
-                fig.text(
-                    0.5,
-                    subtitle_y,
-                    date_label,
-                    ha="center",
-                    va="top",
-                    fontsize=subtitle_font_size,
-                    color=title_color,
-                )
     else:
         title_line, subtitle_line = single_track_heading(tracks[0])
         header_lines = [line for line in (title_line, subtitle_line) if str(line).strip()]
@@ -1679,26 +1535,6 @@ def render_track_plot(
         line_gap_frac = 0.05 * (title_height_frac + subtitle_height_frac)
         title_y = 1.0 - ((0.05 * (title_font_size * dpi / 72.0 + subtitle_font_size * dpi / 72.0)) / height_px)
         subtitle_y = title_y - title_height_frac - line_gap_frac
-        if not background_only:
-            fig.text(
-                0.5,
-                title_y,
-                title_line,
-                ha="center",
-                va="top",
-                fontsize=title_font_size,
-                fontweight="bold",
-                color=title_color,
-            )
-            fig.text(
-                0.5,
-                subtitle_y,
-                subtitle_line,
-                ha="center",
-                va="top",
-                fontsize=subtitle_font_size,
-                color=title_color,
-            )
 
     ax.set_xlim(min_x, max_x)
     ax.set_ylim(min_y, max_y)
@@ -1740,30 +1576,20 @@ def render_track_plot(
         segments = [segment for track_segments in projected_track_segments for segment in track_segments]
         if not automatic_labels_visible(ax, labels, segments, actual_font_size):
             overview_label_items = []
-    if media_map_date is None and not background_only:
-        for track_segments in projected_track_segments:
-            for projected_points in track_segments:
-                if projected_points:
-                    draw_track(ax, projected_points, line_color, line_width, dot_color, dot_size)
-    if overview_mode and not background_only:
-        add_overview_markers(ax, projected_tracks, height_px, dpi, line_color)
-        add_overview_labels(
-            ax,
-            tracks,
-            projected_tracks,
-            actual_font_size,
-            span,
-            line_color,
-            overview_label_items,
-        )
-    if not background_only and not overview_mode and media_map_date is None and projected_tracks and projected_tracks[0]:
-        add_single_track_markers(ax, projected_tracks[0], height_px, dpi, line_color)
     ax.axis("off")
-    fig.savefig(output_path, dpi=dpi, facecolor=background_color, bbox_inches=None, pad_inches=0)
+    import tempfile
+    descriptor, staged_name = tempfile.mkstemp(prefix=".background-", suffix=".png", dir=Path(output_path).parent)
+    os.close(descriptor)
+    try:
+        fig.savefig(staged_name, dpi=dpi, facecolor=background_color, bbox_inches=None, pad_inches=0)
+    except BaseException:
+        Path(staged_name).unlink(missing_ok=True)
+        raise
     fig.clear()
     metadata = {
+        "_staged_background_image": staged_name,
         "map_content_version": MAP_CONTENT_VERSION,
-        "background_only": bool(background_only),
+        "background_only": True,
         "stage_kind": "overview" if overview_mode else ("media_stage" if media_map_date is not None else "gpx_track"),
         "header_lines": header_lines,
         "overlay_defaults": {
@@ -1840,6 +1666,10 @@ def render_track_plot(
         geometry_kind="media_points" if media_map_date is not None else ("overview_tracks" if overview_mode else "gpx_track"),
         estimated=media_map_date is not None,
     )
+    metadata["overlay_track_types"] = [track.get("track_type", "unassigned")
+        for track in tracks for _ in (track.get("segments") or [track.get("points", [])])]
+    metadata["overlay_hidden_tracks"] = [bool(track.get("hidden"))
+        for track in tracks for _ in (track.get("segments") or [track.get("points", [])])]
     if overview_mode and overview_label_items:
         metadata["overview_dynamic_labels"] = [
             {
@@ -1885,6 +1715,8 @@ def render_track_plot(
                 ],
             }
         )
+    if not defer_install:
+        write_plot_metadata(metadata, Path(output_path).with_suffix(".json"))
     return effective_zoom, actual_font_size, metadata
 
 
@@ -1947,6 +1779,7 @@ def render_media_location_map(
         [],
         "",
         False,
+        defer_install=True,
         map_layout=map_layout,
         track_edge_margin_fraction=track_edge_margin_fraction,
         map_provider=map_provider,
@@ -2052,13 +1885,13 @@ def render_media_overview_map(
         [],
         header,
         True,
+        defer_install=True,
         map_provider=map_provider,
         custom_map_url=custom_map_url,
         custom_map_attribution=custom_map_attribution,
         maximum_map_zoom=maximum_map_zoom,
         map_request_timeout_seconds=map_request_timeout_seconds,
         map_credential_id=map_credential_id,
-        background_only=True,
         map_cache_only=map_cache_only,
     )
     fingerprint = media_overview_fingerprint(points)
@@ -2400,13 +2233,6 @@ def build_argument_parser():
         default=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
         help="Minimum track margin inside the map axes for time-lapse layouts (default: 0.05).",
     )
-    parser.add_argument(
-        "--bake-overlays",
-        action="store_false",
-        dest="background_only",
-        default=True,
-        help="Bake routes and headers into PNG files instead of drawing them dynamically.",
-    )
     return parser
 
 
@@ -2609,11 +2435,76 @@ def prepare_run_context(args):
     }
 
 
+def refresh_track_presentation_metadata(context):
+    """Patch only labels/types in current backgrounds; never bless an old format."""
+    import json
+    from json_storage import atomic_write_json
+    from map_overlay import map_uses_dynamic_overlays
+
+    directory = Path(context["output_dir"])
+    updates = {}
+    for track in context.get("tracks", []):
+        values = {key: track.get(key) for key in ("track_type", "stage_number", "track_id", "internal_id", "display_track_number") if key in track}
+        if not values:
+            continue
+        for key in ("track_plot_image_filename", "track_plot_time_lapse_image_filename", "track_data_sidecar"):
+            name = track.get(key)
+            if not name:
+                continue
+            path = directory / str(name)
+            path = path.with_suffix(".json")
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict) or (key != "track_data_sidecar" and not map_uses_dynamic_overlays(data)):
+                continue
+            identity_key = "track_data_fingerprint" if key == "track_data_sidecar" else "track_geometry_fingerprint"
+            if track.get(identity_key) and data.get(identity_key) != track[identity_key]:
+                continue
+            if any(data.get(key) != value for key, value in values.items()):
+                data.update(values)
+                updates[path] = data
+    for path, data in updates.items():
+        atomic_write_json(path, data)
+    overview = context.get("overview_metadata_path") or context.get("overview_path")
+    if overview:
+        path = Path(overview).with_suffix(".json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        tracks = context.get("tracks", [])
+        fingerprints = [track.get("track_geometry_fingerprint") for track in tracks]
+        if (not map_uses_dynamic_overlays(data) or not all(fingerprints)
+                or data.get("source_track_geometry_fingerprints") != fingerprints):
+            return
+        updated = dict(data)
+        if all("segment_count" in track or "segments" in track for track in tracks):
+            types, hidden = [], []
+            for track in tracks:
+                count = int(track.get("segment_count", len(track.get("segments", []))))
+                types.extend([track.get("track_type", "unassigned")] * count)
+                hidden.extend([bool(track.get("hidden"))] * count)
+            updated["overlay_track_types"] = types
+            updated["overlay_hidden_tracks"] = hidden
+        rows = data.get("tracks")
+        if isinstance(rows, list) and len(rows) == len(tracks):
+            # Ordered identity is important when two tracks share geometry.
+            updated["tracks"] = [dict(item, **{key: track.get(key)
+                for key in ("track_type", "stage_number", "track_id", "internal_id", "display_track_number") if key in track})
+                if isinstance(item, dict) and item.get("track_geometry_fingerprint") == track.get("track_geometry_fingerprint")
+                else item for item, track in zip(rows, tracks)]
+        if updated != data:
+            atomic_write_json(path, updated)
+
+
 def execute_run_context(context, print_table_output=True, write_summary=True):
     """Write tables and plots for a prepared run context."""
     args = context["args"]
     gpx_path = context["gpx_path"]
     tracks = context["tracks"]
+    refresh_track_presentation_metadata(context)
     cancel_event = getattr(args, "cancel_event", None)
     render_progress_callback = getattr(args, "render_progress_callback", None)
 
@@ -2699,13 +2590,13 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
             args.print_labels,
             args.header,
             True,
+            defer_install=not args.nojson,
             map_provider=args.map_provider,
             custom_map_url=args.custom_map_url,
             custom_map_attribution=args.custom_map_attribution,
             maximum_map_zoom=args.maximum_map_zoom,
             map_request_timeout_seconds=args.map_request_timeout_seconds,
             map_credential_id=getattr(args, "map_credential_id", "default"),
-            background_only=getattr(args, "background_only", True),
             map_cache_only=getattr(args, "map_cache_only", False),
         )
         render_parameters = getattr(args, "adventure_overview_render_parameters", None)
@@ -2739,6 +2630,11 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                 "tracks": [
                     {
                         "track_number": track["table_number"],
+                        "internal_id": track.get("internal_id", track.get("original_sequence_number")),
+                        "display_track_number": track.get("display_track_number", track.get("original_sequence_number")),
+                        "track_type": track.get("track_type", "unassigned"),
+                        "stage_number": track.get("stage_number", track.get("original_sequence_number")),
+                        "track_id": track.get("track_id"),
                         "track_name": track["name"],
                         "track_fingerprint": track.get("track_fingerprint"),
                         "track_fingerprint_version": track.get("track_fingerprint_version"),
@@ -2839,7 +2735,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                 args.maximum_map_zoom,
                 args.map_request_timeout_seconds,
                 getattr(args, "map_credential_id", "default"),
-                background_only=getattr(args, "background_only", True),
+                defer_install=not args.nojson,
                 map_cache_only=getattr(args, "map_cache_only", False),
             )
             render_parameters = getattr(args, "adventure_render_parameters", None)
@@ -2851,6 +2747,8 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "source_gpx": os.path.abspath(gpx_path),
                     "output_image": track_output_path,
                     "track_number": number,
+                    "internal_id": track.get("internal_id", track.get("original_sequence_number")),
+                    "display_track_number": track.get("display_track_number", track.get("original_sequence_number")),
                     "track_name": track["name"],
                     "track_fingerprint": track.get("track_fingerprint"),
                     "track_fingerprint_version": track.get("track_fingerprint_version"),
@@ -2858,6 +2756,9 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "track_data_fingerprint": track.get("track_data_fingerprint"),
                     "track_extent_mercator": track.get("track_extent_mercator"),
                     "track_date": format_date_local(track["time"]),
+                    "track_type": track.get("track_type", "unassigned"),
+                    "stage_number": track.get("stage_number", track.get("original_sequence_number")),
+                    "track_id": track.get("track_id"),
                     "track_start_time": format_datetime_local_seconds(track["start_time"]),
                     "track_length_km": round(track["length_km"], 1),
                     "track_duration": format_duration(track["duration"]),
@@ -3106,7 +3007,6 @@ def namespace_from_options(gpx_file, **overrides):
         fallback_walking_speed_kmh=3.5,
         map_layout="standard",
         track_edge_margin_fraction=DEFAULT_TRACK_EDGE_MARGIN_FRACTION,
-        background_only=True,
         create_output_dir=True,
         adventure_render_parameters=None,
         adventure_overview_render_parameters=None,
@@ -3133,33 +3033,6 @@ def run_with_options(gpx_file, print_table_output=True, **overrides):
     return execute_run_context(context, print_table_output=print_table_output)
 
 
-def _legacy_sidecar_matches_track(metadata, track):
-    """Return True only when legacy identity fields unambiguously match a track."""
-    try:
-        if int(metadata.get("track_number")) != int(track["table_number"]):
-            return False
-    except (KeyError, TypeError, ValueError):
-        return False
-    if metadata.get("track_name") != track.get("name"):
-        return False
-    if metadata.get("track_start_time") != format_datetime_local_seconds(track.get("start_time")):
-        return False
-
-    for metadata_key, track_key in (("start_point", "first_point"), ("end_point", "last_point")):
-        stored_point = metadata.get(metadata_key)
-        current_point = track.get(track_key)
-        if not isinstance(stored_point, dict) or current_point is None:
-            return False
-        try:
-            stored_lat = float(stored_point["lat"])
-            stored_lon = float(stored_point["lon"])
-        except (KeyError, TypeError, ValueError):
-            return False
-        if abs(stored_lat - float(current_point[0])) > 1e-7:
-            return False
-        if abs(stored_lon - float(current_point[1])) > 1e-7:
-            return False
-    return True
 
 
 def upgrade_timed_track_sidecars(gpx_file, output_dir, *, prepared_context=None, **overrides):
@@ -3182,6 +3055,10 @@ def upgrade_timed_track_sidecars(gpx_file, output_dir, *, prepared_context=None,
         except Exception as exc:
             report["skipped"].append((metadata_path.name, f"unreadable metadata: {exc}"))
             continue
+        from map_overlay import map_uses_dynamic_overlays
+        if not map_uses_dynamic_overlays(metadata):
+            report["skipped"].append((metadata_path.name, "map background must be regenerated"))
+            continue
         fingerprint = metadata.get("track_fingerprint")
         if fingerprint:
             track = tracks_by_fingerprint.get(fingerprint)
@@ -3189,20 +3066,8 @@ def upgrade_timed_track_sidecars(gpx_file, output_dir, *, prepared_context=None,
                 report["skipped"].append((metadata_path.name, "GPX track no longer matches plot metadata"))
                 continue
         else:
-            legacy_matches = [
-                candidate
-                for candidate in context["tracks"]
-                if _legacy_sidecar_matches_track(metadata, candidate)
-            ]
-            if not legacy_matches:
-                if metadata.get("track_number") is not None:
-                    report["skipped"].append((metadata_path.name, "legacy track identity does not match current GPX"))
-                continue
-            if len(legacy_matches) != 1:
-                report["skipped"].append((metadata_path.name, "legacy track identity is ambiguous"))
-                continue
-            track = legacy_matches[0]
-            fingerprint = track.get("track_fingerprint")
+            report["skipped"].append((metadata_path.name, "map identity is missing; regenerate background"))
+            continue
         matched_fingerprints.add(fingerprint)
         payload = timed_points_payload(
             track.get("point_records", []),

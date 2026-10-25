@@ -43,7 +43,6 @@ from AppKit import (
     NSColorSpace,
     NSColorWell,
     NSComboBox,
-    NSComboBoxCell,
     NSFont,
     NSFontAttributeName,
     NSFontManager,
@@ -205,6 +204,7 @@ from plot_metadata_utils import (
 )
 from slideshow_startup import file_signature, options_signature, validate_startup
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
+from cocoa_table_editing import make_table_text_cell, make_table_combo_box_cell
 from video_audio_normalization import (
     GENERATED_DIRECTORY_NAMES,
     NormalizationSettings,
@@ -281,9 +281,10 @@ from slideshow_control_format import (
     serialize_font_parameters,
     split_disabled_control_line,
 )
-from map_overlay import MAP_CONTENT_VERSION
+from map_overlay import MAP_CONTENT_VERSION, map_uses_dynamic_overlays
+from track_types import type_color_palette
 from track_asset_relink import (
-    reconcile_legacy_track_sidecars,
+    reconcile_track_sidecars,
     relink_numbered_track_assets,
 )
 from map_provider_utils import (
@@ -1222,7 +1223,7 @@ def slideshow_dependency_issues(control_text, trackimages_dir, context):
             metadata = read_plot_metadata(path.with_suffix(".json"))
         except Exception:
             metadata = None
-        if not isinstance(metadata, dict):
+        if not map_uses_dynamic_overlays(metadata):
             map_issues.append(path.name)
             return
         if expected_kind == "track":
@@ -9254,10 +9255,12 @@ class GPXTrackerController(NSObject):
                 column.setWidth_(preview_geometry["column_width"] or 44.0)
                 column.setHidden_(self.control_table_preview_size == "off")
             elif column_id == "type":
-                type_cell = NSComboBoxCell.alloc().init()
+                type_cell = make_table_combo_box_cell()
                 type_cell.addItemsWithObjectValues_(list(CONTROL_ROW_TYPE_CHOICES))
                 type_cell.setCompletes_(True)
                 column.setDataCell_(type_cell)
+            else:
+                column.setDataCell_(make_table_text_cell())
             table.addTableColumn_(column)
 
         data_source = SlideShowControlTableDataSource.alloc().initWithController_(self)
@@ -13043,7 +13046,7 @@ class GPXTrackerController(NSObject):
                     "Map relinking is deferred until the open control-file edits are saved."
                 )
             else:
-                reconciliation_report = reconcile_legacy_track_sidecars(
+                reconciliation_report = reconcile_track_sidecars(
                     context,
                     render_parameters_by_layout={
                         "standard": self._track_map_parameter_signature("standard"),
@@ -16374,6 +16377,10 @@ class GPXTrackerController(NSObject):
             ),
             "--time-lapse-marker",
             str(settings["timelapse.marker_style"]),
+            "--time-lapse-marker-source",
+            str(settings["timelapse.marker_source"]),
+            "--track-type-colors",
+            json.dumps(dict(type_color_palette(settings))),
             "--audio-crossfade-seconds",
             str(settings["audio.crossfade_seconds"]),
             "--music-volume-percent",
@@ -16682,6 +16689,7 @@ class GPXTrackerController(NSObject):
                 gpx_overlay_mode=str(self.parameters["trackmaps.gpx_overlay"]),
                 media_overlay_mode=str(self.parameters["trackmaps.media_overlay"]),
                 route_color=parse_color_option(self.parameters["trackmaps.route_color"], "route color"),
+                track_type_colors=type_color_palette(self.parameters),
                 route_width=float(self.parameters["trackmaps.route_width"]),
                 endpoint_color=parse_color_option(self.parameters["trackmaps.endpoint_color"], "endpoint color"),
                 endpoint_size=float(self.parameters["trackmaps.endpoint_size"]),
@@ -17694,7 +17702,7 @@ class GPXTrackerController(NSObject):
         return map_render_signature_matches(metadata, expected)
 
     def _map_metadata_structure_is_current(self, metadata, variant):
-        if not isinstance(metadata, dict):
+        if not map_uses_dynamic_overlays(metadata):
             return False
         if variant != "overview":
             extent = metadata.get("extent_mercator")
@@ -18288,7 +18296,7 @@ class GPXTrackerController(NSObject):
                 raise RuntimeError("Map analysis cancelled")
             total_steps = counter["total"] + 4
             report_progress(counter["total"] + 1, total_steps, "Reconciling existing map sidecars...")
-            reconciliation_report = reconcile_legacy_track_sidecars(
+            reconciliation_report = reconcile_track_sidecars(
                 selection_context,
                 render_parameters_by_layout=parameter_signatures,
             )
@@ -18666,7 +18674,7 @@ class GPXTrackerController(NSObject):
                         )
                         relink_report = None
                         if not defer_asset_relink:
-                            reconcile_legacy_track_sidecars(
+                            reconcile_track_sidecars(
                                 context,
                                 render_parameters_by_layout={
                                     "standard": self._track_map_parameter_signature("standard"),

@@ -117,7 +117,7 @@ class HeightInterpolationTests(unittest.TestCase):
         self.assertEqual(len(controller.undo_stack), 1)
         self.assertEqual(controller.undo_stack[0].kind, MutationKind.ELEVATION)
         controller.mark_dirty.assert_called_once_with(
-            "Interpolated height for 1 point in track #26.", MutationKind.ELEVATION, [26],
+            "Interpolated height for 1 point in Track #26.", MutationKind.ELEVATION, [26],
         )
         after = ET.tostring(track.element)
         invoke(GPXEditorController.undo_, controller, None)

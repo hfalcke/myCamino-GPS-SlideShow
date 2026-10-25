@@ -106,7 +106,7 @@ MENU_HELP = {
     "PDF Summary…": "Create a printable track summary, with optional maps and elevation profiles.",
     "Adventure Properties…": "Change the Adventure name, description and title image.",
     "Advanced Interface": "Open the detailed workflow controls and project status.",
-    "Track Table": "Select, order and edit the Adventure's tracks.",
+    "Track Table & Editor": "Select, order and edit the Adventure's tracks.",
     "Waypoint Table": "Inspect and edit individual points in the selected track.",
     "Import Media…": "Add photos and videos to this Adventure.",
     "Update Metadata": "Prepare media dates, GPS coordinates and enabled optional information.",

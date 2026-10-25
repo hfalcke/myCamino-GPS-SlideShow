@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gpx_processing import GPX_NAMESPACE, parse_time
+from track_types import document_next_internal_id, editor_extension
 
 
 GPX_10_NAMESPACE = "http://www.topografix.com/GPX/1/0"
@@ -176,6 +177,7 @@ class NormalizedGpxDocument:
     metadata: ET.Element | None = None
     document_name: str = ""
     document_name_is_explicit: bool = False
+    next_internal_id: int = 1
 
 
 def sanitize_track_element(
@@ -310,7 +312,10 @@ def load_gpx_document(path: str | Path) -> NormalizedGpxDocument:
         sanitize_track_element(track, report)
         if any(_core_children(segment, "trkpt") for segment in _core_children(track, "trkseg")):
             usable_tracks.append(track)
-    if not usable_tracks:
+    identity = editor_extension(root)
+    if identity is not None and identity.get("identity_version") == "1":
+        usable_tracks = normalized_tracks
+    if not usable_tracks and not (identity is not None and identity.get("identity_version") == "1"):
         raise ValueError(
             "The GPX file contains no usable track, route, or waypoint coordinates."
         )
@@ -327,6 +332,7 @@ def load_gpx_document(path: str | Path) -> NormalizedGpxDocument:
         ),
         document_name=fallback_name,
         document_name_is_explicit=_has_document_name(root),
+        next_internal_id=document_next_internal_id(root),
     )
 
 

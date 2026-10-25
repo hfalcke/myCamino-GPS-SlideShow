@@ -5,8 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gpx_processing import geometry_fingerprint_from_segments
+from map_overlay import MAP_CONTENT_VERSION
 from track_asset_relink import (
-    reconcile_legacy_track_sidecars,
+    reconcile_track_sidecars,
     relink_numbered_track_assets,
 )
 
@@ -19,6 +20,8 @@ class TrackAssetRelinkTests(unittest.TestCase):
         metadata.write_text(
             json.dumps(
                 {
+                    "background_only": True,
+                    "map_content_version": MAP_CONTENT_VERSION,
                     "track_fingerprint": fingerprint,
                     "track_number": int(stem[:4]),
                     "track_name": "Stage",
@@ -56,6 +59,8 @@ class TrackAssetRelinkTests(unittest.TestCase):
                 json.dumps(
                     {
                         "source_track_fingerprints": ["A", "B"],
+                        "background_only": True,
+                        "map_content_version": MAP_CONTENT_VERSION,
                         "tracks": [
                             {"track_fingerprint": "A", "track_number": 1},
                             {"track_fingerprint": "B", "track_number": 2},
@@ -153,6 +158,9 @@ class TrackAssetRelinkTests(unittest.TestCase):
             metadata.write_text(
                 json.dumps(
                     {
+                        "background_only": True,
+                        "map_content_version": MAP_CONTENT_VERSION,
+                        "track_geometry_fingerprint": geometry_fingerprint_from_segments(segments),
                         "track_fingerprint": "legacy-semantic-hash",
                         "track_number": 1,
                         "track_name": "Old",
@@ -183,7 +191,7 @@ class TrackAssetRelinkTests(unittest.TestCase):
                 ],
             }
 
-            report = reconcile_legacy_track_sidecars(
+            report = reconcile_track_sidecars(
                 context,
                 render_parameters_by_layout={
                     "standard": {
@@ -220,7 +228,9 @@ class TrackAssetRelinkTests(unittest.TestCase):
             segments = [[{"lat": 50.0, "lon": 7.0}]]
             metadata = image.with_suffix(".json")
             metadata.write_text(
-                json.dumps({"processed_track_segments": segments}),
+                json.dumps({"processed_track_segments": segments, "background_only": True,
+                            "map_content_version": MAP_CONTENT_VERSION,
+                            "track_geometry_fingerprint": geometry_fingerprint_from_segments(segments)}),
                 encoding="utf-8",
             )
             geometry = geometry_fingerprint_from_segments(segments)
@@ -233,12 +243,9 @@ class TrackAssetRelinkTests(unittest.TestCase):
                     for number in (1, 2)
                 ],
             }
-            report = reconcile_legacy_track_sidecars(context)
+            report = reconcile_track_sidecars(context)
             self.assertEqual(report.ambiguous, [metadata.name])
-            self.assertNotIn(
-                "track_geometry_fingerprint",
-                json.loads(metadata.read_text(encoding="utf-8")),
-            )
+            self.assertEqual(json.loads(metadata.read_text())["track_geometry_fingerprint"], geometry)
 
 
 if __name__ == "__main__":

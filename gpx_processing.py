@@ -299,16 +299,19 @@ def local_tag_name(tag: str) -> str:
 def semantic_track_fingerprint(track_element: ET.Element) -> str:
     """Return a stable content hash independent of XML formatting whitespace."""
     parts = []
+    presentation_type_nodes = {id(child) for child in track_element if local_tag_name(child.tag) == "type"}
     order_only_nodes = {
         id(element)
         for element in track_element.iter()
         if local_tag_name(element.tag) == "mycamino_gpx_editor"
-        and set(element.attrib) <= {"order_number"}
+        and set(element.attrib) <= {"order_number", "stage_number", "track_number_unassigned", "internal_id"}
         and not (element.text or "").strip()
         and len(element) == 0
     }
     for element in track_element.iter():
         tag = local_tag_name(element.tag)
+        if id(element) in presentation_type_nodes:
+            continue
         if id(element) in order_only_nodes:
             continue
         if (
@@ -322,6 +325,9 @@ def semantic_track_fingerprint(track_element: ET.Element) -> str:
         attributes = dict(element.attrib)
         if tag == "mycamino_gpx_editor":
             attributes.pop("order_number", None)
+            attributes.pop("stage_number", None)
+            attributes.pop("track_number_unassigned", None)
+            attributes.pop("internal_id", None)
         text = (element.text or "").strip()
         if (
             tag == "mycamino_gpx_editor"

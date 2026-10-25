@@ -20,6 +20,7 @@ import warnings
 import textwrap
 import threading
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -66,6 +67,8 @@ from elevation_profile_cache import (
     elevation_profile_state_at_distance,
 )
 from map_overlay import map_uses_dynamic_overlays, placement_obstacle_points, scene_from_metadata
+from track_types import TYPE_MARKERS, TYPE_COLORS, normalize_track_type
+from track_symbols import draw_cocoa_symbol
 from audio_playlist import (
     AUDIO_EXTENSIONS,
     MusicTransportState,
@@ -388,12 +391,29 @@ def pilgrim_motion_threshold(width: float, height: float) -> float:
     return max(1.0, math.hypot(max(0.0, width), max(0.0, height)) * PILGRIM_MOTION_TOLERANCE_FRACTION)
 
 
-def time_lapse_marker_style(configured_style: str, *, overview: bool) -> str:
+@lru_cache(maxsize=128)
+def time_lapse_marker_style(configured_style: str, *, overview: bool, source="global", track_type=None) -> str:
     """Use transport symbols on both maps while keeping pilgrims stage-local."""
-    normalized = str(configured_style or "pilgrim").strip().casefold()
+    normalized = (TYPE_MARKERS[normalize_track_type(track_type)] if source == "track_type"
+                  else str(configured_style or "pilgrim").strip().casefold())
     if overview and normalized == "pilgrim":
         return "arrow"
-    return normalized if normalized in {"pilgrim", "bike", "car", "plane", "arrow"} else "arrow"
+    return normalized if normalized in TYPE_MARKERS.values() else "arrow"
+
+
+@lru_cache(maxsize=256)
+def type_route_color(track_type, colors):
+    kind = normalize_track_type(track_type)
+    return parse_color_option(dict(colors).get(kind, TYPE_COLORS[kind]), "track type color")
+
+
+def validated_type_colors(values):
+    if values is None:
+        values = {}
+    if not isinstance(values, dict):
+        raise ValueError("Track type colors must be a JSON object of type names and colors.")
+    return tuple((kind, parse_color_option(values.get(kind, default), f"{kind} color"))
+                 for kind, default in TYPE_COLORS.items())
 
 
 @dataclass
@@ -558,6 +578,8 @@ class Config:
     time_lapse_media_min_fraction: float = 0.5
     time_lapse_adaptive_media_overlap: bool = True
     time_lapse_marker: str = "pilgrim"
+    time_lapse_marker_source: str = "track_type"
+    track_type_colors: tuple = tuple(TYPE_COLORS.items())
     time_lapse_overview_as_media: bool = True
     time_lapse_overview_on_stage_map_dual: bool = True
     track_map_before_media: bool = False
@@ -1049,6 +1071,10 @@ def parse_args(argv: list[str]) -> Config:
         default="pilgrim",
         help="Moving Time-Lapse marker: pilgrim, bicycle, car, airplane, or arrow (default: pilgrim).",
     )
+    parser.add_argument("--time-lapse-marker-source", choices=("track_type", "global"), default="track_type",
+                        help="Choose markers by GPX track type or use the global marker override.")
+    parser.add_argument("--track-type-colors", type=json.loads, default=TYPE_COLORS,
+                        help="JSON mapping of GPX track types to route/symbol colors.")
     parser.add_argument(
         "--time-lapse-overview-fullscreen",
         action="store_false",
@@ -1279,6 +1305,10 @@ def parse_args(argv: list[str]) -> Config:
             except ControlSyntaxError as exc:
                 parser.error(f"invalid resume control transition: {exc}")
 
+    try:
+        type_colors = validated_type_colors(args.track_type_colors)
+    except ValueError as exc:
+        parser.error(str(exc))
     return Config(
         photodir=photodir,
         inputlist=inputlist,
@@ -1329,6 +1359,8 @@ def parse_args(argv: list[str]) -> Config:
         time_lapse_media_min_fraction=float(args.time_lapse_media_min_fraction),
         time_lapse_adaptive_media_overlap=bool(args.time_lapse_adaptive_media_overlap),
         time_lapse_marker=str(args.time_lapse_marker),
+        time_lapse_marker_source=str(args.time_lapse_marker_source),
+        track_type_colors=type_colors,
         time_lapse_overview_as_media=bool(args.time_lapse_overview_as_media),
         time_lapse_overview_on_stage_map_dual=bool(
             args.time_lapse_overview_on_stage_map_dual
@@ -1516,6 +1548,8 @@ def config_from_options(
     time_lapse_media_max_fraction: Optional[float] = None,
     time_lapse_adaptive_media_overlap: bool = True,
     time_lapse_marker: str = "pilgrim",
+    time_lapse_marker_source: str = "track_type",
+    track_type_colors: Optional[dict] = None,
     time_lapse_overview_as_media: bool = True,
     time_lapse_overview_on_stage_map_dual: bool = True,
     track_map_before_media: bool = False,
@@ -1612,6 +1646,9 @@ def config_from_options(
         raise ValueError("time_lapse_media_min_fraction must be greater than 0 and at most 1")
     if time_lapse_marker not in {"pilgrim", "bike", "car", "plane", "arrow"}:
         raise ValueError("time_lapse_marker must be pilgrim, bike, car, plane, or arrow")
+    if time_lapse_marker_source not in {"track_type", "global"}:
+        raise ValueError("time_lapse_marker_source must be track_type or global")
+    type_colors = validated_type_colors(track_type_colors)
     if dot_size < 1:
         raise ValueError("dot_size must be at least 1")
     if gpx_overlay_mode not in {"line", "hidden"}:
@@ -1730,6 +1767,8 @@ def config_from_options(
         time_lapse_media_min_fraction=float(time_lapse_media_min_fraction),
         time_lapse_adaptive_media_overlap=bool(time_lapse_adaptive_media_overlap),
         time_lapse_marker=str(time_lapse_marker),
+        time_lapse_marker_source=str(time_lapse_marker_source),
+        track_type_colors=type_colors,
         time_lapse_overview_as_media=bool(time_lapse_overview_as_media),
         time_lapse_overview_on_stage_map_dual=bool(
             time_lapse_overview_on_stage_map_dual
@@ -3454,6 +3493,8 @@ if APPKIT_AVAILABLE:
             self.map_image = None
             self.map_metadata = None
             self.profile_image = None
+            self.profile_source_image = None
+            self.profile_color_key = None
             self.profile_metadata = None
             self.pilgrim_marker = None
             self.media_marker = None
@@ -3480,17 +3521,22 @@ if APPKIT_AVAILABLE:
             *,
             header_background_style="off",
             header_visible=False,
+            route_color=None,
         ) -> None:
             layout_changed = (
                 map_image is not self.map_image
                 or map_metadata is not self.map_metadata
-                or profile_image is not self.profile_image
+                or profile_image is not self.profile_source_image
                 or str(header_background_style or "off") != self.header_background_style
                 or bool(header_visible) != self.header_visible
             )
             self.map_image = map_image
             self.map_metadata = map_metadata
-            self.profile_image = profile_image
+            color_key = (id(profile_image), id(profile_metadata), route_color)
+            if color_key != self.profile_color_key:
+                self.profile_image = colorized_profile_image(profile_image, profile_metadata, route_color)
+                self.profile_color_key = color_key
+            self.profile_source_image = profile_image
             self.profile_metadata = profile_metadata
             self.pilgrim_marker = pilgrim_marker
             self.media_marker = media_marker
@@ -4134,7 +4180,11 @@ if APPKIT_AVAILABLE:
                     )
                 draw_marker_at(view_point[0], view_pixel_y, view_height, self.marker_color, self.marker_radius)
             else:
-                if self.marker_style in {"bike", "car", "plane"}:
+                if self.marker_style in {"hiking", "horse", "rest", "sightseeing", "bus", "train", "metro"}:
+                    if self.arrow_factor > 0:
+                        draw_cocoa_symbol(self.marker_style, view_point,
+                            max(24, self.marker_radius * 5) * self.arrow_factor, ns_color(self.marker_color))
+                elif self.marker_style in {"bike", "car", "plane"}:
                     draw_transport_marker_at(
                         view_point[0],
                         view_pixel_y,
@@ -5130,151 +5180,20 @@ def draw_transport_marker_at(
     radius: int,
     size_factor: float,
 ) -> None:
-    """Draw a compact bicycle, car, or airplane aligned with the route."""
-    if style not in {"bike", "car", "plane"} or size_factor <= 0.0:
+    """Draw the shared vector artwork aligned with the route."""
+    if style not in {"bike", "car", "plane"} or size_factor <= 0:
         return
-    size = max(float(radius) * 5.0, float(image_height) * 0.055 * float(size_factor))
+    size = max(float(radius) * 5, float(image_height) * .055 * size_factor)
     rotation, mirrored = transport_marker_orientation(style, tangent)
-    outline_width = max(1.5, size * 0.055)
-    local_offset = float(radius) * 1.5 + size * ({"car": 0.32, "bike": 0.24}.get(style, 0.0))
-
-    def marker_point(point: tuple[float, float]) -> tuple[float, float]:
-        return point[0], point[1] + local_offset
-
-    def marker_rect(x: float, y: float, width: float, height: float):
-        return NSMakeRect(x, y + local_offset, width, height)
-
     NSGraphicsContext.saveGraphicsState()
     try:
         transform = NSAffineTransform.transform()
-        transform.translateXBy_yBy_(float(pixel_x), float(image_height) - float(pixel_y))
+        transform.translateXBy_yBy_(pixel_x, image_height - pixel_y)
         transform.rotateByDegrees_(rotation)
         if mirrored:
-            transform.scaleXBy_yBy_(-1.0, 1.0)
+            transform.scaleXBy_yBy_(-1., 1.)
         transform.concat()
-        if style == "car":
-            # A top-view silhouette stays readable at every route angle. Its
-            # nose points along +X, the same native facing direction as the
-            # pilgrim artwork.
-            for wheel_x in (-size * 0.31, size * 0.31):
-                for wheel_y in (-size * 0.27, size * 0.27):
-                    wheel = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                        marker_rect(
-                            wheel_x - size * 0.10,
-                            wheel_y - size * 0.055,
-                            size * 0.20,
-                            size * 0.11,
-                        ),
-                        size * 0.035,
-                        size * 0.035,
-                    )
-                    ns_color(COLOR_NAMES["black"]).setFill()
-                    wheel.fill()
-            body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                marker_rect(-size * 0.50, -size * 0.23, size, size * 0.46),
-                size * 0.16,
-                size * 0.16,
-            )
-            ns_color(color).setFill()
-            body.fill()
-            ns_color(COLOR_NAMES["black"]).setStroke()
-            body.setLineWidth_(outline_width)
-            body.stroke()
-
-            windows = NSBezierPath.bezierPath()
-            windows.moveToPoint_(marker_point((-size * 0.22, -size * 0.17)))
-            windows.lineToPoint_(marker_point((size * 0.19, -size * 0.15)))
-            windows.lineToPoint_(marker_point((size * 0.28, 0.0)))
-            windows.lineToPoint_(marker_point((size * 0.19, size * 0.15)))
-            windows.lineToPoint_(marker_point((-size * 0.22, size * 0.17)))
-            windows.lineToPoint_(marker_point((-size * 0.29, 0.0)))
-            windows.closePath()
-            NSColor.colorWithSRGBRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.62).setFill()
-            windows.fill()
-            for light_y in (-size * 0.13, size * 0.13):
-                headlight = NSBezierPath.bezierPathWithOvalInRect_(
-                    marker_rect(size * 0.43, light_y - size * 0.035, size * 0.07, size * 0.07)
-                )
-                ns_color(COLOR_NAMES["yellow"]).setFill()
-                headlight.fill()
-                tail_light = NSBezierPath.bezierPathWithOvalInRect_(
-                    marker_rect(-size * 0.50, light_y - size * 0.035, size * 0.07, size * 0.07)
-                )
-                ns_color(COLOR_NAMES["red"]).setFill()
-                tail_light.fill()
-        elif style == "bike":
-            wheel_radius = size * 0.22
-            wheel_centers = (-size * 0.29, size * 0.29)
-            for wheel_x in wheel_centers:
-                wheel = NSBezierPath.bezierPathWithOvalInRect_(
-                    marker_rect(wheel_x - wheel_radius, -wheel_radius, wheel_radius * 2.0, wheel_radius * 2.0)
-                )
-                ns_color(COLOR_NAMES["black"]).setStroke()
-                wheel.setLineWidth_(outline_width * 2.0)
-                wheel.stroke()
-                ns_color(color).setStroke()
-                wheel.setLineWidth_(outline_width)
-                wheel.stroke()
-            frame = NSBezierPath.bezierPath()
-            for start, end in (
-                ((-size * 0.29, 0.0), (0.0, size * 0.05)),
-                ((0.0, size * 0.05), (size * 0.29, 0.0)),
-                ((0.0, size * 0.05), (-size * 0.09, size * 0.30)),
-                ((-size * 0.09, size * 0.30), (-size * 0.29, 0.0)),
-                ((-size * 0.09, size * 0.30), (size * 0.17, size * 0.30)),
-                ((size * 0.17, size * 0.30), (size * 0.29, 0.0)),
-                ((size * 0.17, size * 0.30), (size * 0.25, size * 0.40)),
-                ((size * 0.25, size * 0.40), (size * 0.34, size * 0.40)),
-            ):
-                frame.moveToPoint_(marker_point(start))
-                frame.lineToPoint_(marker_point(end))
-            configure_round_stroke(frame)
-            ns_color(COLOR_NAMES["black"]).setStroke()
-            frame.setLineWidth_(outline_width * 2.2)
-            frame.stroke()
-            ns_color(color).setStroke()
-            frame.setLineWidth_(outline_width)
-            frame.stroke()
-            seat = NSBezierPath.bezierPath()
-            seat.moveToPoint_(marker_point((-size * 0.16, size * 0.33)))
-            seat.lineToPoint_(marker_point((-size * 0.03, size * 0.33)))
-            configure_round_stroke(seat)
-            ns_color(COLOR_NAMES["black"]).setStroke()
-            seat.setLineWidth_(outline_width * 1.8)
-            seat.stroke()
-            crank = NSBezierPath.bezierPathWithOvalInRect_(
-                marker_rect(-size * 0.045, size * 0.005, size * 0.09, size * 0.09)
-            )
-            ns_color(COLOR_NAMES["black"]).setStroke()
-            crank.setLineWidth_(outline_width)
-            crank.stroke()
-        else:
-            plane = NSBezierPath.bezierPath()
-            plane_points = (
-                (size * 0.52, 0.0),
-                (size * 0.06, size * 0.11),
-                (-size * 0.16, size * 0.44),
-                (-size * 0.28, size * 0.44),
-                (-size * 0.20, size * 0.08),
-                (-size * 0.50, size * 0.14),
-                (-size * 0.52, 0.0),
-                (-size * 0.50, -size * 0.14),
-                (-size * 0.20, -size * 0.08),
-                (-size * 0.28, -size * 0.44),
-                (-size * 0.16, -size * 0.44),
-                (size * 0.06, -size * 0.11),
-            )
-            for index, point in enumerate(plane_points):
-                if index == 0:
-                    plane.moveToPoint_(marker_point(point))
-                else:
-                    plane.lineToPoint_(marker_point(point))
-            plane.closePath()
-            ns_color(color).setFill()
-            plane.fill()
-            ns_color(COLOR_NAMES["black"]).setStroke()
-            plane.setLineWidth_(outline_width)
-            plane.stroke()
+        draw_cocoa_symbol(style, (0, radius * 1.5 + size * .3), size, ns_color(color))
     finally:
         NSGraphicsContext.restoreGraphicsState()
 
@@ -5566,6 +5485,33 @@ def _draw_profile_label(text: str, x: float, y: float, font, *, centered=False) 
         NSMakeRect(left, y, size.width + 2.0, size.height + 2.0),
         attributes,
     )
+
+
+def colorized_profile_image(image, metadata, color):
+    """Recolor the retained profile trace once per stage/settings change, never on ticks."""
+    if image is None or color is None:
+        return image
+    segments = elevation_profile_segments(metadata)
+    ranges = elevation_profile_ranges(segments)
+    if ranges is None:
+        return image
+    (x_min, x_max), (y_min, y_max) = ranges
+    left, bottom, width, height = ELEVATION_PROFILE_PLOT_RECT
+    result = copy_image(image)
+    result.lockFocus()
+    try:
+        ns_color(color).setStroke()
+        for segment in segments:
+            path = NSBezierPath.bezierPath()
+            for index, (distance, elevation) in enumerate(segment):
+                point = (left + (distance - x_min) / max(1e-9, x_max - x_min) * width,
+                         bottom + (elevation - y_min) / max(1e-9, y_max - y_min) * height)
+                (path.moveToPoint_ if index == 0 else path.lineToPoint_)(point)
+            path.setLineWidth_(5.)
+            path.stroke()
+    finally:
+        result.unlockFocus()
+    return result
 
 
 def render_elevation_profile_image(metadata: object):
@@ -7024,12 +6970,18 @@ def draw_dynamic_map_overlay(
     result.lockFocus()
     try:
         if scene.mode in {"line", "interpolated"}:
-            route_color = config.media_point_color if scene.stage_kind == "media_stage" else config.route_color
-            for segment in projected_segments:
+            types = metadata.get("overlay_track_types", [])
+            hidden = metadata.get("overlay_hidden_tracks", [])
+            for index, segment in enumerate(projected_segments):
+                kind = types[index] if index < len(types) else metadata.get("track_type")
+                route_color = config.media_point_color if scene.stage_kind == "media_stage" else type_route_color(kind, config.track_type_colors)
                 if len(segment) < 2:
                     continue
                 path = NSBezierPath.bezierPath()
                 configure_round_stroke(path)
+                if index < len(hidden) and hidden[index]:
+                    route_color = (.67, .67, .67, 1.)
+                    path.setLineDash_count_phase_([5., 4.], 2, 0.)
                 path.moveToPoint_((segment[0][0], height - segment[0][1]))
                 for pixel_x, pixel_y in segment[1:]:
                     path.lineToPoint_((pixel_x, height - pixel_y))
@@ -7278,8 +7230,8 @@ def combined_stage_metadata(
     row = summary_row if isinstance(summary_row, dict) else None
     if row is not None:
         metadata = dict(metadata or {})
-        for key in ("ascent_m", "descent_m", "track_extent_mercator"):
-            if row.get(key) is not None:
+        for key in ("ascent_m", "descent_m", "track_extent_mercator", "track_type", "stage_number", "track_id", "internal_id", "display_track_number"):
+            if key in row:
                 metadata[key] = row[key]
     relative = row.get("track_data_sidecar") if row is not None else None
     if not isinstance(relative, str) or summary_path is None:
@@ -7932,6 +7884,7 @@ class CocoaImagePresenter:
         media_marker=None,
         *,
         visible=True,
+        route_color=None,
     ) -> None:
         """Configure the retained route-free profile shown over a map target."""
         if not visible:
@@ -7946,6 +7899,7 @@ class CocoaImagePresenter:
             media_marker,
             header_background_style="off",
             header_visible=False,
+            route_color=route_color,
         )
         self._raise_overlay_views()
 
@@ -9993,6 +9947,17 @@ class GPSTrackShowApp:
                     entry = self._cached_stage_entry(stage_index, prefer_time_lapse)
                     if entry is not None and entry.map_path == self.current_track_path:
                         entry.elevation_profile = self.current_elevation_profile_image
+        metadata = getattr(self, "current_track_metadata", None) or {}
+        color = type_route_color(metadata.get("track_type"), self.config.track_type_colors)
+        key = (id(metadata), color)
+        previous = getattr(self, "current_profile_colored_image", None)
+        if self.current_elevation_profile_image is not previous or key != getattr(self, "current_profile_color_key", None):
+            source = (getattr(self, "current_profile_source_image", None) if self.current_elevation_profile_image is previous
+                      else self.current_elevation_profile_image)
+            self.current_profile_source_image = source
+            self.current_elevation_profile_image = colorized_profile_image(source, metadata, color)
+            self.current_profile_colored_image = self.current_elevation_profile_image
+            self.current_profile_color_key = key
         return self.current_elevation_profile_image
 
     def _has_persistent_dual_profile_host(self) -> bool:
@@ -10098,6 +10063,8 @@ class GPSTrackShowApp:
         profile = self._elevation_profile_for_map(profile_path, profile_metadata)
         if profile is None:
             return profile_map
+        profile = colorized_profile_image(profile, profile_metadata,
+            type_route_color((profile_metadata or {}).get("track_type"), self.config.track_type_colors))
         return draw_unframed_media_on_map(
             profile_map,
             profile_metadata,
@@ -10281,6 +10248,7 @@ class GPSTrackShowApp:
             self._path_signature(self.config.inputlist),
             (
                 tuple(getattr(self.config, "route_color", ())),
+                tuple(getattr(self.config, "track_type_colors", ())),
                 float(getattr(self.config, "route_width", 0.0)),
                 str(getattr(self.config, "gpx_overlay_mode", "line")),
                 tuple(getattr(self.config, "dot_color", ())),
@@ -12922,6 +12890,8 @@ class GPSTrackShowApp:
                                 self._uses_persistent_dual_profile()
                                 and target.elevation_profile_image is not None
                             ),
+                            route_color=type_route_color((target.elevation_profile_metadata or {}).get("track_type"),
+                                getattr(self.config, "track_type_colors", tuple(TYPE_COLORS.items()))),
                         )
                     header_state = getattr(self, "current_header_state", None)
                     if header_state is None:
@@ -14108,15 +14078,17 @@ class GPSTrackShowApp:
         if stage_view is not None:
             stage_view.elevation_profile_view.clear()
             stage_view.setHidden_(False)
-            stage_view.marker_color = self.config.dot_color
+            stage_view.marker_color = type_route_color((self.current_track_metadata or {}).get("track_type"), self.config.track_type_colors)
             stage_view.marker_radius = self.config.dot_size
             stage_view.arrow_factor = self.config.arrow_length
             stage_view.marker_style = time_lapse_marker_style(
                 self.config.time_lapse_marker,
                 overview=False,
+                source=self.config.time_lapse_marker_source,
+                track_type=(self.current_track_metadata or {}).get("track_type"),
             )
             stage_view.route_visible = self.config.gpx_overlay_mode == "line"
-            stage_view.route_color = self.config.route_color
+            stage_view.route_color = stage_view.marker_color
             stage_view.route_width = self.config.route_width
             stage_view.media_min_fraction = self.config.time_lapse_media_min_fraction
             stage_view.adaptive_media_overlap = self.config.time_lapse_adaptive_media_overlap
@@ -14155,7 +14127,7 @@ class GPSTrackShowApp:
             stage_view.updateCaptionOverlay()
         if overview_view is not None:
             overview_view.setHidden_(False)
-            overview_view.marker_color = self.config.dot_color
+            overview_view.marker_color = stage_view.marker_color if stage_view is not None else self.config.dot_color
             overview_view.marker_radius = self.config.dot_size
             overview_view.arrow_factor = self.config.arrow_length
             # The overview remains a conventional navigation map even when
@@ -14163,6 +14135,8 @@ class GPSTrackShowApp:
             overview_view.marker_style = time_lapse_marker_style(
                 self.config.time_lapse_marker,
                 overview=True,
+                source=self.config.time_lapse_marker_source,
+                track_type=(self.current_track_metadata or {}).get("track_type"),
             )
             # The shared renderer already draws the complete highlighted stage;
             # this retained view adds only the moving/current marker.
@@ -14207,6 +14181,7 @@ class GPSTrackShowApp:
                 ),
                 header_background_style=overview_view.header_background_style,
                 header_visible=self._header_mode_for_role("map") != "off",
+                route_color=type_route_color((self.current_track_metadata or {}).get("track_type"), self.config.track_type_colors),
             )
             overview_view._raise_clock_overlay()
         self._debug_assert_header_state_applied(
@@ -14241,15 +14216,17 @@ class GPSTrackShowApp:
         if map_view is None:
             return
         self._raise_time_lapse_view(map_view)
-        map_view.marker_color = self.config.dot_color
+        map_view.marker_color = type_route_color((self.current_track_metadata or {}).get("track_type"), self.config.track_type_colors)
         map_view.marker_radius = self.config.dot_size
         map_view.arrow_factor = self.config.arrow_length
         map_view.marker_style = time_lapse_marker_style(
             self.config.time_lapse_marker,
             overview=False,
+            source=self.config.time_lapse_marker_source,
+            track_type=(self.current_track_metadata or {}).get("track_type"),
         )
         map_view.route_visible = self.config.gpx_overlay_mode == "line"
-        map_view.route_color = self.config.route_color
+        map_view.route_color = map_view.marker_color
         map_view.route_width = self.config.route_width
         map_view.media_marker_latlon = self.time_lapse_media_marker_latlon
         map_view.media_marker_fixed_arrow = False
@@ -14291,6 +14268,7 @@ class GPSTrackShowApp:
             ),
             header_background_style=map_view.header_background_style,
             header_visible=self._header_mode_for_role("map") != "off",
+            route_color=map_view.route_color,
         )
         map_view._raise_clock_overlay()
         if photo_presenter is not None:
@@ -16359,6 +16337,8 @@ class GPSTrackShowApp:
                         and self._uses_persistent_dual_profile()
                         and target.elevation_profile_image is not None
                     ),
+                    route_color=type_route_color((target.elevation_profile_metadata or {}).get("track_type"),
+                        getattr(self.config, "track_type_colors", tuple(TYPE_COLORS.items()))),
                 )
             presenter.set_place_text(None, False, int(active_font.size), self.config.font_color)
             presenter.set_info_text(target.info_text if target.presenter_name == "photo" else None)
@@ -16748,6 +16728,7 @@ class GPSTrackShowApp:
             "timelapse.media_min_fraction": ("time_lapse_media_min_fraction", float),
             "timelapse.adaptive_media_overlap": ("time_lapse_adaptive_media_overlap", bool),
             "timelapse.marker_style": ("time_lapse_marker", str),
+            "timelapse.marker_source": ("time_lapse_marker_source", str),
             "timelapse.overview_as_media": ("time_lapse_overview_as_media", bool),
             "timelapse.overview_on_stage_map_dual": ("time_lapse_overview_on_stage_map_dual", bool),
             "trackmaps.gpx_overlay": ("gpx_overlay_mode", str),
@@ -16798,6 +16779,12 @@ class GPSTrackShowApp:
             "slideshow.marker_color": "dot_color",
             "trackmaps.route_color": "route_color",
         }
+        type_colors = dict(getattr(self.config, "track_type_colors", TYPE_COLORS.items()))
+        for kind in TYPE_COLORS:
+            key = f"track_types.{kind}_color"
+            if key in values:
+                type_colors[kind] = values[key]
+        object.__setattr__(self.config, "track_type_colors", tuple(type_colors.items()))
         for key, attribute in color_values.items():
             if key in values:
                 try:

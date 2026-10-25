@@ -14,8 +14,8 @@ def invoke(method, *args):
 
 class ElevationProfileWindowTests(unittest.TestCase):
     def profile(self):
-        first = SimpleNamespace(nr=1, name="First stage")
-        selected = SimpleNamespace(nr=26, name="Selected stage")
+        first = SimpleNamespace(nr=1, name="First stage", display_label="Track #1")
+        selected = SimpleNamespace(nr=26, name="Selected stage", display_label="Track #26")
         controller = SimpleNamespace(
             tracks=[first, selected], visible_tracks=Mock(return_value=[first, selected]),
             selected_tracks=Mock(return_value=[]), set_status=Mock(),

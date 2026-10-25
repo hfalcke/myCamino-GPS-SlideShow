@@ -70,7 +70,7 @@ class AdventureOverviewNavigationTests(unittest.TestCase):
         view.mode = 'track'
         self.assertEqual(PlotView.display_tracks(view), tracks)
 
-    def test_hidden_routes_are_orange_without_changing_blue_visible_routes(self):
+    def test_hidden_routes_are_lighter_gray_and_dashed(self):
         tracks = [SimpleNamespace(nr=1, hidden=False), SimpleNamespace(nr=2, hidden=False),
                   SimpleNamespace(nr=3, hidden=True)]
         geometry = SimpleNamespace(segments=[SimpleNamespace(points=[object(), object()])])
@@ -80,11 +80,12 @@ class AdventureOverviewNavigationTests(unittest.TestCase):
         PlotView.draw_track_layers(view, [(track, geometry) for track in tracks], Mock())
         colors = [call.args[2] for call in view.draw_track.call_args_list]
         self.assertEqual(len(colors), 2)
-        self.assertAlmostEqual(colors[0].redComponent(), .435)
-        self.assertAlmostEqual(colors[0].blueComponent(), .863)
-        self.assertAlmostEqual(colors[1].redComponent(), .84)
-        self.assertAlmostEqual(colors[1].greenComponent(), .42)
-        self.assertAlmostEqual(colors[1].blueComponent(), 0)
+        self.assertAlmostEqual(colors[0].redComponent(), 119 / 255)
+        self.assertAlmostEqual(colors[1].redComponent(), 170 / 255)
+        self.assertAlmostEqual(colors[1].greenComponent(), 170 / 255)
+        self.assertAlmostEqual(colors[1].blueComponent(), 170 / 255)
+        self.assertFalse(view.draw_track.call_args_list[0].args[4])
+        self.assertTrue(view.draw_track.call_args_list[1].args[4])
 
     def make_workspace(self, state):
         view = SimpleNamespace(

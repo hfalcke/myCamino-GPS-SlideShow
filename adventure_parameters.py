@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable
+from track_types import TRACK_TYPES
 
 from gpx_processing import (
     DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M,
@@ -13,7 +14,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 26
+PARAMETER_SCHEMA_VERSION = 27
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -93,6 +94,7 @@ PARAMETER_SPECS = (
     ParameterSpec("timelapse.overview_as_media", "Slide Show", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.overview_on_stage_map_dual", "Slide Show", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.marker_style", "Slide Show", "Moving marker", "pilgrim", "choice", "Choose the moving symbol shown at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("bike", "Bicycle"), ("car", "Car"), ("plane", "Airplane"), ("arrow", "Arrow")), subsection="Time-Lapse"),
+    ParameterSpec("timelapse.marker_source", "Slide Show", "Marker source", "track_type", "choice", "Use the track type, or override all tracks with the existing moving-marker choice.", choices=(("track_type", "Track Type"), ("global", "Global Override")), subsection="Time-Lapse"),
     ParameterSpec("slideshow.speedometer", "Slide Show", "Show speedometer", True, "bool", "Show distance-smoothed moving speed in Time-Lapse when recorded timing is available.", subsection="Time-Lapse"),
 
     ParameterSpec("slideshow.weather", "Slide Show", "Show historical weather", True, "bool", "Show stored historical weather beside the speedometer while media timing is available.", subsection="Header"),
@@ -109,7 +111,7 @@ PARAMETER_SPECS = (
     ParameterSpec("trackmaps.image_size", "Map Generation", "Image size", "1920x1080", "image_size", "Output map dimensions in pixels."),
     ParameterSpec("trackmaps.zoom", "Map Generation", "Map zoom", 16, "int", "Requested basemap zoom level.", 0, 22),
     ParameterSpec("trackmaps.route_width", "Map Generation", "Route width", 4.0, "float", "Width of the plotted route line.", 0.1, 50.0),
-    ParameterSpec("trackmaps.route_color", "Map Generation", "Route color", "#0000FF", "color", "Color of the plotted route."),
+    ParameterSpec("trackmaps.route_color", "Map Generation", "Route color", "#0000FF", "color", "General route fallback. GPX route, profile and symbol colors are configured under Track Types."),
     ParameterSpec("trackmaps.endpoint_color", "Map Generation", "Endpoint color", "#FFFFFF", "color", "Color of start/end point dots."),
     ParameterSpec("trackmaps.endpoint_size", "Map Generation", "Endpoint size", 0.0, "float", "Size of start/end dots; zero hides them.", 0.0, 500.0),
     ParameterSpec("trackmaps.media_point_color", "Map Generation", "Media point color", "#0066FF", "color", "Color used for media-derived location dots and estimated routes."),
@@ -177,12 +179,14 @@ PARAMETER_SPECS = (
     ParameterSpec("maps.maximum_zoom", "Map Service", "Maximum provider zoom", 19, "int", "Maximum supported tile zoom.", 0, 30),
     ParameterSpec("maps.request_timeout_seconds", "Map Service", "Tile request timeout", 12.0, "float", "Maximum wait for a map tile request.", 1.0, 300.0, advanced=True, unit="s"),
     ParameterSpec("maps.cache_retention_hours", "Map Service", "Tile cache retention", 720.0, "float", "Delete cached tiles older than this age. Public OSM tiles are retained for at least seven days.", 0.0, 8760.0, advanced=True, unit="h"),
+    ParameterSpec("track_types.new_track_default", "Track Types", "Default type for new tracks", "pilgrimage", "choice", "Used only for newly created tracks. Imported and existing tracks keep their types.", choices=tuple((key, label) for key, label, _, _ in TRACK_TYPES)),
+    *(ParameterSpec(f"track_types.{key}_color", "Track Types", label, color, "color", "Route, profile and symbol color. Hidden tracks remain light gray.") for key, label, color, _ in TRACK_TYPES),
 )
 
 
 SPECS_BY_KEY = {spec.key: spec for spec in PARAMETER_SPECS}
 SECTION_ORDER = tuple(dict.fromkeys(spec.section for spec in PARAMETER_SPECS))
-EDITOR_PARAMETER_SECTIONS = ("GPX Processing", "PDF Export", "Map Service", "Map Generation")
+EDITOR_PARAMETER_SECTIONS = ("GPX Processing", "PDF Export", "Map Service", "Map Generation", "Track Types")
 EDITOR_PARAMETER_KEYS = tuple(
     spec.key for spec in PARAMETER_SPECS if spec.section in EDITOR_PARAMETER_SECTIONS
 )
@@ -483,7 +487,8 @@ def accepted_render_signature_matches(metadata: object, expected: object) -> boo
 
 def map_render_signature_matches(metadata: object, expected: object) -> bool:
     """Match actual render settings or a deliberate user acceptance record."""
-    if not isinstance(metadata, dict):
+    from map_overlay import map_uses_dynamic_overlays
+    if not map_uses_dynamic_overlays(metadata):
         return False
     return parameter_signatures_match(
         metadata.get("adventure_render_parameters"), expected
@@ -497,6 +502,9 @@ def add_accepted_render_signature(
     accepted_at: str,
 ) -> bool:
     """Add one bounded acceptance record while preserving render provenance."""
+    from map_overlay import map_uses_dynamic_overlays
+    if not map_uses_dynamic_overlays(metadata):
+        return False
     if map_render_signature_matches(metadata, expected):
         return False
     normalized = normalize_parameter_signature(expected)

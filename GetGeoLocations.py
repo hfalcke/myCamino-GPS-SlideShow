@@ -3974,7 +3974,8 @@ def media_map_variant_is_current(
         metadata = read_json_data(output_path.with_suffix(".json"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
-    if not isinstance(metadata, dict):
+    from map_overlay import map_uses_dynamic_overlays
+    if not map_uses_dynamic_overlays(metadata):
         return False
     if not media_map_metadata_matches_coordinates(
         metadata,
@@ -4131,7 +4132,8 @@ def media_overview_is_current(
         metadata = read_json_data(output_path.with_suffix(".json"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
-    if not isinstance(metadata, dict):
+    from map_overlay import map_uses_dynamic_overlays
+    if not map_uses_dynamic_overlays(metadata):
         return False
     expected_fingerprint = media_overview_fingerprint(
         [(point["lat"], point["lon"]) for point in media_points]

@@ -24,7 +24,7 @@ def key_event(key, flags=0):
 class MarkerNavigationTests(unittest.TestCase):
     def plot(self):
         points = [object() for _ in range(10)]
-        track = SimpleNamespace(nr=22, points=lambda: points)
+        track = SimpleNamespace(nr=22, display_label="Track #22", points=lambda: points)
         plot = SimpleNamespace(
             cursor=(8, points[8], track), marker=None, show_info=False,
             controller=SimpleNamespace(refresh_elevation_profile_for_plot_view=Mock(), set_status=Mock()),

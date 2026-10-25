@@ -76,8 +76,8 @@ class PDFSummaryTests(unittest.TestCase):
         self.assertEqual(rows[0].cells, ("N/A", "N/A", "N/A"))
 
     def test_numeric_thresholds_prefix_and_defaults(self):
-        self.assertEqual(set(key for key, _, _ in PDF_COLUMNS) - set(DEFAULT_PDF_COLUMNS), {"row", "show", "npoints"})
-        self.assertIn("nr", DEFAULT_PDF_COLUMNS)
+        self.assertEqual(set(key for key, _, _ in PDF_COLUMNS) - set(DEFAULT_PDF_COLUMNS), {"row", "show", "npoints", "nr", "track_id"})
+        self.assertIn("stage", DEFAULT_PDF_COLUMNS)
         self.assertEqual(compact_number(99.4), "99.4")
         self.assertEqual(compact_number(100), "100")
         self.assertEqual(format_report_duration(86340), "23h 59m")
@@ -248,7 +248,7 @@ class PDFIntegrationTests(unittest.TestCase):
         with patch("GPXEditor.configure_contextily_cache"):
             figure = renderer.make_pdf_map_figure((8.27, 11.69), "overview", renderer.tracks, "Overview", "portrait", {"elevation_profile": False}, SimpleNamespace(figure=Figure))
         colors = [line.get_color() for axis in figure.axes for line in axis.lines]
-        self.assertIn("#d66b00", colors)
+        self.assertIn("#AAAAAA", colors)
         from matplotlib.backends.backend_pdf import PdfPages
         with tempfile.TemporaryDirectory() as temporary, patch("GPXEditor.configure_contextily_cache"):
             path = Path(temporary) / "maps.pdf"

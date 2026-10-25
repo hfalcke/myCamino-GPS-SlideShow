@@ -65,9 +65,9 @@ class SelectedTrackRenderingTests(unittest.TestCase):
                 view.controller.display_processed_track.reset_mock()
                 with patch("GPXEditor.NSColor") as colors:
                     PlotView.draw_track_layers(view, prepared, Mock())
-                    colors.colorWithSRGBRed_green_blue_alpha_.assert_any_call(0.02, 0.25, 0.62, 1.0)
-                    colors.colorWithSRGBRed_green_blue_alpha_.assert_any_call(0.435, 0.659, 0.863, 1.0)
-                self.assertEqual(view.draw_track.call_count, 2)
+                    gray = 119 / 255
+                    colors.colorWithSRGBRed_green_blue_alpha_.assert_any_call(gray, gray, gray, 1)
+                self.assertEqual(view.draw_track.call_count, 3)
                 selected_call = view.draw_track.call_args_list[-1]
                 self.assertIs(selected_call.args[0], full.segments[0].points)
                 self.assertEqual(len(selected_call.args[0]), 2408)
@@ -85,8 +85,8 @@ class SelectedTrackRenderingTests(unittest.TestCase):
         view, tracks, full, _ = self.make_view()
         full.segments.append(SimpleNamespace(points=[9000, 9001]))
         PlotView.draw_selected_tracks_overlay(view, Mock(), [(tracks[0], full)])
-        self.assertEqual(view.draw_track.call_count, 2)
-        self.assertEqual(view.draw_track.call_args_list[1].args[0], [9000, 9001])
+        self.assertEqual(view.draw_track.call_count, 4)
+        self.assertEqual(view.draw_track.call_args_list[-1].args[0], [9000, 9001])
 
     def test_zoom_and_resize_recompute_screen_space_detail(self):
         points = [(0.0, 0.0), (0.2, 0.2), (2.0, 0.0)]

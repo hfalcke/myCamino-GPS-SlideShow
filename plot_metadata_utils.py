@@ -39,7 +39,41 @@ def web_mercator_to_lonlat(x_coord, y_coord):
 # be read again by this or other programs."
 def write_plot_metadata(metadata, output_path):
     """Write plot metadata to a JSON file."""
-    write_json_data(metadata, output_path)
+    staged = metadata.pop("_staged_background_image", None)
+    if staged is None:
+        from json_storage import atomic_write_json
+        atomic_write_json(Path(output_path), metadata)
+        return
+    install_map_pair(Path(staged), Path(output_path).with_suffix(".png"), metadata)
+
+
+def install_map_pair(staged_image, image_path, metadata):
+    """Install one completed background pair, rolling both files back on failure."""
+    import shutil
+    from json_storage import atomic_write_json
+
+    image_path = Path(image_path)
+    sidecar = image_path.with_suffix(".json")
+    with tempfile.TemporaryDirectory(prefix=".map-install-", dir=image_path.parent) as directory:
+        backups = {}
+        for path in (image_path, sidecar):
+            if path.exists():
+                backup = Path(directory) / ("previous-" + path.name)
+                shutil.copy2(path, backup)
+                backups[path] = backup
+        try:
+            atomic_write_json(Path(directory) / sidecar.name, metadata)
+            os.replace(staged_image, image_path)
+            os.replace(Path(directory) / sidecar.name, sidecar)
+        except BaseException:
+            for path in (image_path, sidecar):
+                if path in backups:
+                    os.replace(backups[path], path)
+                else:
+                    path.unlink(missing_ok=True)
+            raise
+        finally:
+            Path(staged_image).unlink(missing_ok=True)
 
 
 # AI prompt: "Write a helper that reads previously stored plot metadata from a

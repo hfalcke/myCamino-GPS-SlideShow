@@ -1557,12 +1557,12 @@ selection and asks the controller for a freshly validated Track menu. Shared
 helpers handle disjoint-group movement, block duplication, and copy naming.
 Context and header sorting both call `sort_by_column()`; selected-row sorting
 replaces only the selected slots and includes processed moving-average speed.
-`Renumber Tracks` persists the current row order in the private
-`mycamino_gpx_editor` `order_number` attribute. This presentation-only
-attribute is excluded from semantic fingerprints. After an embedded save,
-`track_asset_relink.py` matches numbered map pairs by fingerprint, stages
-filename cycles, patches JSON/overview metadata and control-file references,
-and performs no raster rendering or tile access.
+`Renumber…` assigns or clears visible `order_number` and `stage_number` values
+through the same scope, preview and confirmation workflow. These presentation
+attributes are excluded from semantic fingerprints. Renumbering is METADATA,
+not ORDER: it never invokes asset renaming or authored control-row relinking.
+The separate existing asset reconciliation handles genuine structural/order
+changes and never guesses ownership when geometry matches are ambiguous.
 `Save Selected Tracks As…` deep-copies only the selected records, assigns the
 copies order numbers from one, rewrites local media links for the destination,
 and installs the new GPX atomically without touching source records.
@@ -1613,12 +1613,62 @@ Their `overlay_geometry`, `header_lines`, and stage metadata are rendered by:
 - the PDF Matplotlib path, which uses the same scene semantics while retaining
   vector lines and text at PDF resolution.
 
-Legacy sidecars are never overdrawn. `map_uses_dynamic_overlays(...)` is the
-single compatibility check. Geometry, extent, provider, zoom, layout, and
+Unsupported or baked-route map assets are treated as missing.
+`map_uses_dynamic_overlays(...)` accepts only `MAP_CONTENT_VERSION` and literal
+`background_only: true`; it is used by launch validation, PDF reuse, map status,
+media-map freshness, identity reconciliation, and manual acceptance. No baked
+generation switch or legacy identity-upgrade path remains. Geometry, extent, provider, zoom, layout, and
 background remain map-affecting; colors, widths, point styles, overview labels,
 track-title choice, and header presentation are runtime overlay parameters.
-Map content version 5 reserves a 25% taller stage header; older background-only
-maps remain display-compatible until regenerated.
+`render_track_plot(..., defer_install=True)` stages a PNG until its final metadata
+is ready. `write_plot_metadata` installs the pair with rollback through
+`install_map_pair`; failed installs restore both previous files. The normal
+missing-map workflow regenerates only requested assets, preserving tile-cache and
+provider safeguards. Final PDF/manual PNG output continues drawing vector routes.
+
+### Track Types and Stage Labels
+
+`track_types.py` owns normalization, type colors, derived stage IDs and pure
+numbering proposals. Standard GPX `<type>` preserves unsupported imported text
+until explicit assignment. `mycamino_gpx_editor.stage_number` is optional and
+falls back to the persistent Track Number. IDs use bijective alphabetic suffixes
+in complete-document Track Number order, including hidden tracks. Report subsets
+never relabel IDs; only the decision to display the ID column is report-local.
+
+An explicitly empty `stage_number` or `order_number` means unassigned. Legacy
+`track_number_unassigned="yes"` is read and normalized to an empty order number.
+`TrackRecord.nr` remains the immutable internal lookup key; `internal_id` exposes
+it explicitly. GPX track extensions store `internal_id`, while the document's
+editor extension stores `identity_version=1` and `next_internal_id`. The counter
+never decreases during deletion, Undo, failed imports or recovery. Loading the
+same document preserves IDs; importing into an existing document allocates fresh
+destination IDs. Legacy files seed IDs from unique old order numbers when possible.
+Normal Adventure saves, standalone Save and recovery persist the counter.
+Visible numbers are read through `track_number`; selection-field input maps them
+to immutable IDs. Numbering, identity and type metadata are excluded from
+calculation fingerprints.
+Unassigned stages never form a group or receive suffix IDs. PDF snapshots carry
+assignment flags so older snapshot callers retain their default-number behavior.
+
+Stage/type fields are excluded from processing and semantic fingerprints.
+`TrackMetadataUndoEntry` stores small metadata deltas rather than point XML;
+metadata changes reuse metrics and retained geometry. Numbering proposals reject
+collisions with assigned visible numbers outside the scope before mutation;
+unassigned fields do not reserve a number. All numbering changes are METADATA
+only and leave open view identities, selection and geometry caches intact.
+
+`cocoa_table_editing.py` provides shared text/combo cells for the track,
+waypoint and control-file tables. After AppKit initializes the shared field
+editor, they restore semantic text/background, caret, selection and typing
+colors independently of selected/hidden row styling. Factories retain the
+editable/selectable defaults of native table cells; column and delegate rules
+still decide which fields may be edited. Display fonts and formatting remain intact.
+
+`track_symbols.py` provides cached, font-independent vector paths for Cocoa and
+Matplotlib. Pilgrimage playback retains the existing animated pilgrim artwork.
+`timelapse.marker_source` defaults to `track_type`; `global` uses the unchanged
+`timelapse.marker_style` value. Presentation metadata can be refreshed in current
+map/derived sidecars without rendering PNGs or blessing unsupported maps.
 
 `trackmaps.track_title` selects `endpoint_places` (default) or `track_name`.
 `track_header_lines(...)` formats the chosen title and compact

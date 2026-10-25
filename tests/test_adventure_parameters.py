@@ -248,6 +248,7 @@ class AdventureParameterTests(unittest.TestCase):
                 "timelapse.overview_as_media",
                 "timelapse.overview_on_stage_map_dual",
                 "timelapse.marker_style",
+                "timelapse.marker_source",
                 "slideshow.speedometer",
             },
         )
@@ -322,6 +323,8 @@ class AdventureParameterTests(unittest.TestCase):
 
     def test_accepted_render_signature_preserves_original_provider(self):
         metadata = {
+            "background_only": True,
+            "map_content_version": 6,
             "adventure_render_parameters": {
                 "maps.output_provider": "osm",
                 "trackmaps.rendered_layout": "standard",
@@ -349,6 +352,8 @@ class AdventureParameterTests(unittest.TestCase):
 
     def test_new_render_setting_invalidates_previous_acceptance(self):
         metadata = {
+            "background_only": True,
+            "map_content_version": 6,
             "adventure_render_parameters": {"maps.output_provider": "osm"}
         }
         add_accepted_render_signature(

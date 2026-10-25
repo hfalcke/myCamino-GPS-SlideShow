@@ -74,10 +74,10 @@ class HeadlessRenderingTests(unittest.TestCase):
                         {"elevation_profile": True}, SimpleNamespace(figure=new_figure))
                     routes = [line for axis in figure.axes for line in axis.lines if line.get_zorder() == 3]
                     self.assertTrue(routes)
-                    self.assertTrue(all(line.get_color() == "#0000FF" for line in routes))
+                    self.assertTrue(all(line.get_color() == "#777777" for line in routes))
                     self.assertTrue(all(line.get_linewidth() == 4 for line in routes))
                     colors = [line.get_color() for axis in figure.axes for line in axis.lines]
-                    self.assertIn("blue", colors)
+                    self.assertIn("#777777", colors)
                     self.assertNotIn("red", colors)
                     figure.clear()
 
@@ -300,7 +300,7 @@ class ExistingMapReuseTests(unittest.TestCase):
             Image.new("RGB", (800, 600), "lightblue").save(path)
             extent = dict(min_x=0, max_x=400 / 3, min_y=0, max_y=100)
             metadata = dict(
-                background_only=True, basemap="Esri", map_attribution="Tiles by Esri",
+                background_only=True, map_content_version=6, basemap="Esri", map_attribution="Tiles by Esri",
                 track_geometry_fingerprint="geometry", extent_mercator=extent,
                 axes_box_fraction=dict(left=.1, bottom=.1, width=.8, height=.8),
             )
@@ -338,7 +338,7 @@ class ExistingMapReuseTests(unittest.TestCase):
             Image.new("RGB", (800, 600), "lightblue").save(path)
             extent = dict(min_x=0, max_x=400 / 3, min_y=0, max_y=100)
             path.with_suffix(".json").write_text(json.dumps(dict(
-                background_only=True, basemap=provider_display_name("esri"), map_attribution="Tiles by Esri",
+                background_only=True, map_content_version=6, basemap=provider_display_name("esri"), map_attribution="Tiles by Esri",
                 extent_mercator=extent, axes_box_fraction=dict(left=0, bottom=0, width=1, height=1),
                 track_geometry_fingerprint=processed_track_geometry_fingerprint(renderer.processed_track(renderer.tracks[0])),
             )))

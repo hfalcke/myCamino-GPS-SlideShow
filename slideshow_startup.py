@@ -25,14 +25,15 @@ def prepared_track_hint(context, source_signature):
     if source_signature != file_signature(context["gpx_path"]):
         return None
     keys = ("table_number", "track_plot_image_filename", "track_plot_time_lapse_image_filename",
-            "track_data_sidecar", "track_data_fingerprint", "track_geometry_fingerprint")
+            "track_data_sidecar", "track_data_fingerprint", "track_geometry_fingerprint", "track_type", "stage_number", "track_id", "segment_count", "hidden", "internal_id", "display_track_number")
     return {
         "source": source_signature,
         "directory": str(Path(context["output_dir"]).resolve(strict=False)),
         "output_base": context["output_base"],
         "processing": context["args"].adventure_processing_parameters,
         "summary": file_signature(context["table_json_path"]),
-        "context": {"tracks": [{key: track.get(key) for key in keys} for track in context["tracks"]]},
+        "context": {"tracks": [{key: track[key] for key in keys if key in track} for track in context["tracks"]],
+                    "overview_metadata_path": context.get("overview_metadata_path")},
     }
 
 
@@ -138,6 +139,8 @@ def validate_startup(gpx, control, directory, options, *, previous_key, extra_as
         context=None if reused_loaded_tracks else context
     ))
     progress("Checking slideshow maps", 0, 0)
+    from gpx_tracks_table import refresh_track_presentation_metadata
+    refresh_track_presentation_metadata({**context, "output_dir": directory})
     validated_files = validation_signature(gpx, control, directory, options, extra_assets)
     issues = measured("Map validation", lambda: check(control_text, directory, context))
     after = validation_signature(gpx, control, directory, options, extra_assets)

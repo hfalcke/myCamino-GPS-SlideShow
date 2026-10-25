@@ -90,7 +90,7 @@ class GUIStartupPathTests(unittest.TestCase):
             SimpleNamespace(lat=50.1, lon=7.1),
             SimpleNamespace(lat=50.2, lon=7.2),
         ]
-        track = SimpleNamespace(nr=7, points=lambda: points)
+        track = SimpleNamespace(nr=7, display_label="Track #7", points=lambda: points)
         plot_view = SimpleNamespace(
             cursor=(0, points[0], track),
             marker=None,
@@ -464,7 +464,7 @@ class GUIStartupPathTests(unittest.TestCase):
     def test_route_timing_offer_uses_all_project_media_after_new_metadata(self):
         first = Path("/tmp/first.jpg")
         second = Path("/tmp/second.jpg")
-        track = SimpleNamespace(nr=4)
+        track = SimpleNamespace(nr=4, display_label="Track #4")
         prepared = [
             SimpleNamespace(path=first),
             SimpleNamespace(path=second),
@@ -677,6 +677,8 @@ class GUIStartupPathTests(unittest.TestCase):
             }
             for name, metadata in metadata_by_name.items():
                 (maps / name).write_bytes(b"png")
+                from map_overlay import MAP_CONTENT_VERSION
+                metadata.update(background_only=True, map_content_version=MAP_CONTENT_VERSION)
                 metadata["adventure_render_parameters"] = {"maps.output_provider": "old"}
                 (maps / name).with_suffix(".json").write_text(
                     json.dumps(metadata), encoding="utf-8"

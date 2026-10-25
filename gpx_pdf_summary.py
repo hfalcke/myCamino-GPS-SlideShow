@@ -11,17 +11,21 @@ import os
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections import Counter
+from track_types import stage_number, track_number, element_track_type
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from plot_rendering import new_figure, serialized_plotting
+from map_overlay import map_uses_dynamic_overlays
 
 
 PDF_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mycamino-pdf")
 PDF_COLUMNS = (
-    ("row", "Row", ""), ("nr", "Nr.", ""), ("show", "Show", ""),
+    ("row", "Row", ""), ("nr", "Track Number", ""), ("stage", "Stage", ""),
+    ("track_id", "Track ID", ""), ("show", "Show", ""),
     ("name", "Name", ""), ("date", "Date & Time", ""),
     ("length", "Length", "km"), ("duration", "Duration", ""),
     ("sum", "Sum", "km"), ("distance", "Distance", "km"),
@@ -29,7 +33,7 @@ PDF_COLUMNS = (
     ("ascent", "Ascent", "m"), ("descent", "Descent", "m"),
     ("npoints", "NPoints", ""),
 )
-DEFAULT_PDF_COLUMNS = tuple(key for key, _, _ in PDF_COLUMNS if key not in {"row", "npoints", "show"})
+DEFAULT_PDF_COLUMNS = tuple(key for key, _, _ in PDF_COLUMNS if key not in {"row", "npoints", "show", "nr", "track_id"})
 
 
 class PDFExportCancelled(Exception):
@@ -51,6 +55,20 @@ class SummaryTrack:
     ascent: float | None
     descent: float | None
     npoints: int | None
+    stage: int | None = None
+    track_id: str = ""
+    track_type: str = "unassigned"
+    number_assigned: bool = True
+    stage_assigned: bool = True
+    display_number: int | None = None
+
+    @property
+    def report_number(self):
+        return (self.display_number if self.display_number is not None else self.nr) if self.number_assigned else None
+
+    @property
+    def report_stage(self):
+        return (self.stage if self.stage is not None else self.nr) if self.stage_assigned else None
 
 
 @dataclass(frozen=True)
@@ -70,6 +88,14 @@ class SummarySnapshot:
     title: str
     tracks: tuple[SummaryTrack, ...]
     options: SummaryOptions
+
+    def __post_init__(self):
+        counts = Counter(track.report_stage for track in self.tracks if track.report_stage is not None)
+        columns = tuple(key for key in self.options.columns if key != "track_id")
+        if "stage" in columns and any(count > 1 for count in counts.values()):
+            index = columns.index("stage") + 1
+            columns = columns[:index] + ("track_id",) + columns[index:]
+        object.__setattr__(self, "options", replace(self.options, columns=columns))
 
 
 @dataclass(frozen=True)
@@ -95,16 +121,20 @@ def report_name(name: str, prefix: str = "") -> str:
     return result
 
 
-def summary_track(track, row: int) -> SummaryTrack:
+def summary_track(track, row: int, ids=None) -> SummaryTrack:
     metrics = track.metrics
     if not metrics or track.metrics_dirty:
         raise ValueError("Track data is still loading")
     duration = metrics.get("duration")
+    number = track_number(track.element, track.nr)
+    stage = stage_number(track.element, track.nr)
     return SummaryTrack(
         row, track.nr, track.name, track.hidden, metrics.get("time"),
         metrics.get("length_km"), duration.total_seconds() if duration is not None else None,
         metrics.get("distance_km"), metrics.get("speed_kmh"), metrics.get("moving_speed_kmh"),
         metrics.get("ascent_m"), metrics.get("descent_m"), metrics.get("npoints"),
+        stage, (ids or {}).get(track.nr, str(stage) if stage is not None else ""), element_track_type(track.element),
+        number is not None, stage is not None, number,
     )
 
 
@@ -151,6 +181,7 @@ def summary_rows(snapshot: SummarySnapshot) -> tuple[SummaryRow, ...]:
         return compact_number(value, integer=integer_elevation.get(key, False))
 
     rows = []
+    stage_counts = Counter(track.report_stage for track in snapshot.tracks if track.report_stage is not None)
     cumulative = 0.0
     for track in snapshot.tracks:
         if not track.hidden:
@@ -163,8 +194,12 @@ def summary_rows(snapshot: SummarySnapshot) -> tuple[SummaryRow, ...]:
                 value = track.date.astimezone().strftime("%d.%m.%Y %H:%M") if track.date else "N/A"
             elif key == "show":
                 value = "no" if track.hidden else "yes"
+            elif key == "stage":
+                value = str(track.report_stage) if track.report_stage is not None else ""
+            elif key == "track_id":
+                value = track.track_id if track.report_stage is not None and stage_counts[track.report_stage] > 1 else ""
             elif key in {"nr", "row"}:
-                value = str(getattr(track, key))
+                value = str(track.row) if key == "row" else (str(track.report_number) if track.report_number is not None else "")
             else:
                 value = formatted(key, cumulative if key == "sum" else getattr(track, key))
             cells.append(value)
@@ -190,7 +225,7 @@ def reusable_map_background(candidates, *, mode, extent, pixel_size, fingerprint
         path = Path(path)
         try:
             metadata = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
-            if not isinstance(metadata, dict) or metadata.get("background_only") is not True:
+            if not map_uses_dynamic_overlays(metadata):
                 continue
             if metadata.get("basemap") != provider or not metadata.get("map_attribution"):
                 continue
@@ -328,7 +363,7 @@ def table_figures(snapshot: SummarySnapshot):
                         color="#727b85" if row.hidden else "#202c36", weight="bold" if summary else "normal")
                 x += widths[index]
         if any(track.hidden for track in snapshot.tracks):
-            ax.text(margin, 23, "Hidden tracks: gray rows / orange routes; excluded from totals, averages and cumulative distance.", fontsize=6.5, color="#52606d")
+            ax.text(margin, 23, "Hidden tracks: gray rows and dashed gray routes; excluded from totals, averages and cumulative distance.", fontsize=6.5, color="#52606d")
         yield fig
 
 

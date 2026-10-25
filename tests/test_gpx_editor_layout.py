@@ -86,7 +86,7 @@ class InspectorPointSelectionTests(unittest.TestCase):
 
         PlotView.draw_selected_tracks_overlay(view, Mock())
 
-        view.draw_track.assert_called_once()
+        self.assertEqual(view.draw_track.call_count, 2)  # Contrasting outline plus route.
         self.assertEqual(view.draw_track.call_args.args[0], [point])
         self.assertEqual(view.draw_track.call_args.args[3], 6.0)
 
@@ -526,7 +526,7 @@ class InspectorPointSelectionTests(unittest.TestCase):
                 parent.close_plot_windows_for_inspector.assert_not_called()
 
     def test_track_table_double_click_opens_waypoint_table(self):
-        track = SimpleNamespace(nr=7)
+        track = SimpleNamespace(nr=7, display_label="Track #7")
         controller = GPXEditorController.alloc().init()
         controller.track_table = SimpleNamespace(clickedRow=Mock(return_value=0), selectedRow=Mock(return_value=0))
         controller.tracks = [track]
@@ -546,7 +546,7 @@ class InspectorPointSelectionTests(unittest.TestCase):
         inspector.show.assert_called_once_with()
 
     def test_double_click_plots_clicked_track_and_keeps_its_selected_point(self):
-        track = SimpleNamespace(nr=39)
+        track = SimpleNamespace(nr=39, display_label="Track #39")
         inspector = Mock()
         view = SimpleNamespace(cursor=(17, object(), track))
         controller = GPXEditorController.alloc().init()
@@ -985,9 +985,9 @@ class TrackBatchOrderTests(unittest.TestCase):
         ]
         next_nr = renumber_track_records(tracks)
 
-        self.assertEqual([track.nr for track in tracks], [1, 2, 3])
+        self.assertEqual([track.nr for track in tracks], [8, 3, 12])
         self.assertEqual([track.stored_order_number for track in tracks], [1, 2, 3])
-        self.assertEqual(next_nr, 4)
+        self.assertEqual(next_nr, 13)
 
     def test_batch_visibility_changes_only_tracks_that_need_it(self):
         visible = self.make_track(1, "Visible", "one.gpx")

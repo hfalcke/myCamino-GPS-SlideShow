@@ -127,6 +127,7 @@ from beta_notice import (
     beta_notice_should_be_shown,
 )
 from cocoa_button_style import apply_liquid_glass_button_style, make_liquid_glass_button
+from cocoa_table_editing import make_table_text_cell
 from basemap_tile_utils import tolerate_missing_tiles
 from adventure_parameters import (
     EDITOR_PARAMETER_KEYS,
@@ -148,6 +149,17 @@ from cocoa_native_menus import (
 from window_lifecycle import WINDOW_REGISTRY
 from cocoa_application_news import install_application_news
 from workspace_mutations import MutationKind, WorkspaceMutation
+from track_types import (TRACK_TYPES, TYPE_LABELS, element_track_type, normalize_track_type,
+                         stage_number, track_number, track_ids, numbering_proposal, track_color, report_stage_title,
+                         allocate_track_ids, store_document_counter, apply_numbering_proposal)
+from track_symbols import draw_pdf_symbol
+
+
+def cocoa_track_color(track, parameters=None):
+    from PIL import ImageColor
+    value = track_color(track, parameters)
+    red, green, blue = (component / 255 for component in ImageColor.getrgb(value)[:3])
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(red, green, blue, 1)
 from gpx_processing import (
     ProcessedTrack,
     ProcessingOptions,
@@ -1061,6 +1073,28 @@ class TrackRecord:
     )
     point_range_metrics_cache: OrderedDict = field(default_factory=OrderedDict, repr=False)
 
+    def __setattr__(self, name, value):
+        if name == "nr" and "nr" in self.__dict__ and value != self.nr:
+            raise AttributeError("A track's internal ID cannot be changed.")
+        super().__setattr__(name, value)
+
+    def __post_init__(self):
+        if not isinstance(self.nr, int) or self.nr < 1:
+            raise ValueError("Internal track IDs must be positive whole numbers.")
+        number = track_number(self.element, self.nr)
+        stage = stage_number(self.element, number if number is not None else self.nr)
+        get_or_create_mycamino_track_extension(self.element).set("internal_id", str(self.nr))
+        self.set_order_number(number)
+        self.set_stage_number(stage)
+
+    @property
+    def internal_id(self):
+        return self.nr
+
+    @property
+    def display_label(self):
+        return f"Track #{self.track_number}" if self.track_number is not None else "Unnumbered track"
+
     @property
     def name(self) -> str:
         return self.element.findtext("gpx:name", default="", namespaces=NS).strip() or "Unnamed track"
@@ -1088,9 +1122,44 @@ class TrackRecord:
     def stored_order_number(self) -> int | None:
         return stored_track_order_number(self.element)
 
-    def set_order_number(self, number: int):
+    def set_order_number(self, number: int | None):
         node = get_or_create_mycamino_track_extension(self.element)
-        node.set(MYCAMINO_ORDER_NUMBER_ATTR, str(int(number)))
+        if number is not None and int(number) < 1:
+            raise ValueError("Track Number must be positive or unassigned.")
+        node.set(MYCAMINO_ORDER_NUMBER_ATTR, str(int(number)) if number is not None else "")
+        node.attrib.pop("track_number_unassigned", None)
+
+    @property
+    def track_number(self):
+        return track_number(self.element, self.nr)
+
+    def set_track_number_assigned(self, assigned):
+        self.set_order_number((self.track_number or self.nr) if assigned else None)
+
+    @property
+    def stage_number(self):
+        return stage_number(self.element, self.nr)
+
+    def set_stage_number(self, number):
+        if number is None or str(number).strip() == "":
+            get_or_create_mycamino_track_extension(self.element).set("stage_number", "")
+            return
+        if int(number) < 1:
+            raise ValueError("Stage must be a positive number.")
+        get_or_create_mycamino_track_extension(self.element).set("stage_number", str(int(number)))
+
+    @property
+    def track_type(self):
+        return element_track_type(self.element)
+
+    def set_track_type(self, value):
+        node = self.element.find(qname("type"))
+        if node is None:
+            node = ET.Element(qname("type"))
+            index = next((i for i, child in enumerate(self.element)
+                          if child.tag in {qname("extensions"), qname("trkseg")}), len(self.element))
+            self.element.insert(index, node)
+        node.text = normalize_track_type(value)
 
     @property
     def time(self) -> datetime | None:
@@ -1135,6 +1204,13 @@ class TrackRecord:
 class VisibilityUndoEntry:
     before: dict[int, bool]
     after: dict[int, bool]
+
+
+@dataclass(frozen=True)
+class TrackMetadataUndoEntry:
+    # Compact deltas are keyed by immutable IDs, including across structural Undo.
+    values: tuple
+    kind: MutationKind = MutationKind.METADATA
 
 
 @dataclass(frozen=True)
@@ -1429,7 +1505,9 @@ def duplicate_track_records(
     )
     if not indexes:
         return list(tracks), [], next_nr
+    next_nr = max(next_nr, max((track.internal_id for track in tracks), default=0) + 1)
     existing_names = [track.name for track in tracks]
+    visible_number = max((track.track_number or 0 for track in tracks), default=0) + 1
     duplicates = []
     for index in indexes:
         source = tracks[index]
@@ -1438,7 +1516,8 @@ def duplicate_track_records(
         get_or_create_track_name(element).text = duplicate_name
         existing_names.append(duplicate_name)
         duplicate = TrackRecord(next_nr, element, source.source_file)
-        duplicate.set_order_number(next_nr)
+        duplicate.set_order_number(visible_number if source.track_number is not None else None)
+        visible_number += source.track_number is not None
         duplicates.append(duplicate)
         next_nr += 1
     insert_at = max(indexes) + 1
@@ -1448,11 +1527,10 @@ def duplicate_track_records(
 
 
 def renumber_track_records(tracks: list[TrackRecord]) -> int:
-    """Assign persistent 1-based numbers in current row order."""
+    """Assign visible 1-based numbers without changing internal identities."""
     for number, track in enumerate(tracks, start=1):
-        track.nr = number
         track.set_order_number(number)
-    return len(tracks) + 1
+    return max((track.internal_id for track in tracks), default=0) + 1
 
 
 def visible_track_count(tracks: Iterable[TrackRecord]) -> int:
@@ -1534,6 +1612,10 @@ def build_selected_tracks_root(
         get_or_create_mycamino_track_extension(output_track).set(
             MYCAMINO_ORDER_NUMBER_ATTR, str(number)
         )
+        if track.track_number is None:
+            get_or_create_mycamino_track_extension(output_track).set(MYCAMINO_ORDER_NUMBER_ATTR, "")
+        get_or_create_mycamino_track_extension(output_track).set("internal_id", str(number))
+        get_or_create_mycamino_track_extension(output_track).set("stage_number", str(track.stage_number or ""))
         rewrite_local_media_links(
             output_track,
             source_directory=Path(track.source_file).parent if track.source_file else None,
@@ -1557,6 +1639,7 @@ def build_selected_tracks_root(
             anchor_node.set("lat", f"{anchor[0]:.8f}")
             anchor_node.set("lon", f"{anchor[1]:.8f}")
         root.append(extensions)
+    store_document_counter(root, len(selected) + 1)
     return root
 
 
@@ -1597,6 +1680,9 @@ def write_selected_tracks_gpx(
 TRACK_SORT_CRITERIA = (
     ("date", "Date & Time"),
     ("nr", "Track Number"),
+    ("stage", "Stage"),
+    ("track_id", "Track ID"),
+    ("type", "Type"),
     ("name", "Name"),
     ("length", "Length"),
     ("duration", "Duration"),
@@ -2025,7 +2111,7 @@ class PlotView(NSView):
         else:
             self.set_window_title_and_cursor(
                 window,
-                f"{PROGRAM_TITLE} - Track #{track.nr}: {track.name}",
+                f"{PROGRAM_TITLE} - {track.display_label}: {track.name}",
                 cursor_text,
             )
 
@@ -2342,7 +2428,7 @@ class PlotView(NSView):
             return None
         return transformer(point)
 
-    def draw_track(self, points: list[PointInfo], transformer, color, width):
+    def draw_track(self, points: list[PointInfo], transformer, color, width, dashed=False):
         if len(points) < 2:
             return
         bounds = self.bounds()
@@ -2363,6 +2449,8 @@ class PlotView(NSView):
         for run in runs:
             path = NSBezierPath.bezierPath()
             path.setLineWidth_(width)
+            if dashed:
+                path.setLineDash_count_phase_([5., 4.], 2, 0.)
             path.setLineJoinStyle_(NSRoundLineJoinStyle)
             path.setLineCapStyle_(NSRoundLineCapStyle)
             path.moveToPoint_(run[0])
@@ -2421,14 +2509,10 @@ class PlotView(NSView):
             # A selected track is drawn once, on top, using this same geometry.
             # Do not leave a differently simplified blue line underneath it.
             selected_overlay = highlight_selection and track.nr in selected
-            color = NSColor.systemBlueColor()
-            if highlight_selection and selected and not selected_overlay:
-                color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.435, 0.659, 0.863, 1.0)
-            if track.hidden:
-                color = NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1)
+            color = cocoa_track_color(track, getattr(self.controller, "project_parameters", None))
             for segment in processed.segments:
                 if draw_base and not selected_overlay:
-                    self.draw_track(segment.points, transformer, color, 3.5)
+                    self.draw_track(segment.points, transformer, color, 3.5, track.hidden)
                 self.draw_segment_end_caps(segment.points, transformer)
         self.draw_selected_tracks_overlay(transformer, processed_tracks)
 
@@ -2459,8 +2543,9 @@ class PlotView(NSView):
             else:
                 processed = self.controller.display_processed_track(track)
             for segment in processed.segments:
-                color = NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1) if track.hidden else selected_color
-                self.draw_track(segment.points, transformer, color, 6.0)
+                color = cocoa_track_color(track, getattr(self.controller, "project_parameters", None))
+                self.draw_track(segment.points, transformer, NSColor.whiteColor(), 8.5, track.hidden)
+                self.draw_track(segment.points, transformer, color, 6.0, track.hidden)
 
     def draw_overview_endpoint_markers(self, transformer):
         if self.mode != "overview":
@@ -2491,14 +2576,7 @@ class PlotView(NSView):
             points = self.controller.display_track_geometry(track, 64).points
             if not points:
                 continue
-            if track.hidden:
-                stroke_color = NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1)
-            elif track.nr in selected:
-                stroke_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.25, 0.62, 1.0)
-            elif selected:
-                stroke_color = NSColor.colorWithSRGBRed_green_blue_alpha_(0.435, 0.659, 0.863, 1.0)
-            else:
-                stroke_color = NSColor.systemBlueColor()
+            stroke_color = cocoa_track_color(track, getattr(self.controller, "project_parameters", None))
             NSColor.whiteColor().setFill()
             stroke_color.setStroke()
             for point in (points[0], points[-1]):
@@ -2517,7 +2595,8 @@ class PlotView(NSView):
                 continue
             point = points[len(points) // 2]
             x, y = transformer(point)
-            self.draw_label_box(str(track.nr), x + 8, y + 8)
+            if track.track_number is not None:
+                self.draw_label_box(str(track.track_number), x + 8, y + 8)
 
     def draw_track_start_end_markers(self, track: TrackRecord, transformer):
         points = self.controller.display_processed_track(track).points
@@ -2691,10 +2770,10 @@ class PlotView(NSView):
                 return
             self.cursor = (self.marker, points[self.marker], track)
             self.marker = index
-            message = f"Swapped marker and cursor in track #{track.nr}."
+            message = f"Swapped marker and cursor in {track.display_label}."
         else:
             self.marker = index
-            message = f"Marker set at point {index + 1} of track #{track.nr}."
+            message = f"Marker set at point {index + 1} of {track.display_label}."
         self.sync_inspector_selection()
         self.controller.refresh_elevation_profile_for_plot_view(self)
         self.update_window_title()
@@ -2914,7 +2993,7 @@ class PlotView(NSView):
             metric_parts.append(f"Duration: {format_duration(metrics['duration'], allow_days=True)}")
         if metrics.get("speed_kmh") is not None:
             metric_parts.append(f"Avg: {format_speed(metrics.get('speed_kmh'))}")
-        rows = ["   ".join(point_parts), f"Track #{track.nr}: {track.name}", "   ".join(metric_parts)]
+        rows = ["   ".join(point_parts), f"{track.display_label}: {track.name}", "   ".join(metric_parts)]
         if metrics.get("start_time") is not None and metrics.get("end_time") is not None:
             rows.append(
                 "Track time: "
@@ -3404,7 +3483,7 @@ class PlotView(NSView):
                 self.setNeedsDisplay_(True)
                 return
             self.controller.mark_dirty(
-                f"Moved {len(rows)} selected points in track #{track.nr}."
+                f"Moved {len(rows)} selected points in {track.display_label}."
             )
             self.refresh_after_map_edit(track, rows[-1])
             self.marker = rows[0]
@@ -3454,7 +3533,7 @@ class PlotView(NSView):
             self.inspector.select_point_index(point_index)
         self.controller.mark_dirty(
             f"{'Inserted' if inserted else 'Moved'} point {point_index + 1} "
-            f"in track #{track.nr}."
+            f"in {track.display_label}."
         )
         self.refresh_after_map_edit(track, point_index)
 
@@ -3893,7 +3972,7 @@ class PlotView(NSView):
             return
         self.controller.invalidate_track_metrics(track)
         self.controller.mark_dirty(
-            f"Pasted {len(inserted_rows)} point(s) after point {anchor + 1} in track #{track.nr}."
+            f"Pasted {len(inserted_rows)} point(s) after point {anchor + 1} in {track.display_label}."
         )
         if inspector is not None:
             self.inspector = inspector
@@ -3916,13 +3995,13 @@ class PlotView(NSView):
         if copy_first and not self.copy_point_rows_to_clipboard(track, rows):
             return
         action = "Cut" if copy_first else "Delete"
-        if not confirm(f"{action} marked segment?", f"{action} {len(rows)} selected points from track #{track.nr}?"):
+        if not confirm(f"{action} marked segment?", f"{action} {len(rows)} selected points from {track.display_label}?"):
             return
         inspector = self.controller.existing_inspector_for_track(track)
         self.push_map_edit_undo(track, inspector)
         removed = remove_rows(track.element, rows)
         self.controller.invalidate_track_metrics(track)
-        self.controller.mark_dirty(f"{action} {removed} selected points from track #{track.nr}.")
+        self.controller.mark_dirty(f"{action} {removed} selected points from {track.display_label}.")
         self.marker = None
         next_index = min(rows[0], len(track.points()) - 1) if track.points() else None
         if inspector is not None:
@@ -4129,7 +4208,7 @@ class PlotView(NSView):
             track,
             inserted_row,
             inspector,
-            f"Inserted waypoint {position} point {row + 1} in track #{track.nr}.",
+            f"Inserted waypoint {position} point {row + 1} in {track.display_label}.",
         )
 
     def insert_context_location(self, *, before):
@@ -4162,7 +4241,7 @@ class PlotView(NSView):
             track,
             inserted_row,
             inspector,
-            f"Inserted waypoint at the map location {position} point {row + 1} in track #{track.nr}.",
+            f"Inserted waypoint at the map location {position} point {row + 1} in {track.display_label}.",
         )
 
     @objc.IBAction
@@ -4285,7 +4364,7 @@ class PlotView(NSView):
         if context is None:
             return
         track, row = context
-        if not confirm("Delete waypoint?", f"Delete point {row + 1} from track #{track.nr}?"):
+        if not confirm("Delete waypoint?", f"Delete point {row + 1} from {track.display_label}?"):
             return
         points = track.points()
         if not (0 <= row < len(points)):
@@ -4297,7 +4376,7 @@ class PlotView(NSView):
                 segment.remove(target)
                 break
         self.controller.invalidate_track_metrics(track)
-        self.controller.mark_dirty(f"Deleted point {row + 1} from track #{track.nr}.")
+        self.controller.mark_dirty(f"Deleted point {row + 1} from {track.display_label}.")
         self.refresh_after_map_edit(track, min(row, max(0, len(track.points()) - 1)))
 
     @objc.IBAction
@@ -4370,7 +4449,7 @@ class PlotView(NSView):
             track,
             inserted_row,
             inspector,
-            f"Inserted waypoint on a segment in track #{track.nr}.",
+            f"Inserted waypoint on a segment in {track.display_label}.",
         )
 
     @objc.IBAction
@@ -4391,7 +4470,7 @@ class PlotView(NSView):
             track,
             row,
             inspector,
-            f"Cut the track connection after point {row + 1} in track #{track.nr}.",
+            f"Cut the track connection after point {row + 1} in {track.display_label}.",
         )
 
     @objc.IBAction
@@ -4412,7 +4491,7 @@ class PlotView(NSView):
             track,
             row,
             inspector,
-            f"Cut the track connection after point {row + 1} in track #{track.nr}.",
+            f"Cut the track connection after point {row + 1} in {track.display_label}.",
         )
 
     @objc.IBAction
@@ -4433,7 +4512,7 @@ class PlotView(NSView):
             track,
             row,
             inspector,
-            f"Joined track segments at point {row + 1} in track #{track.nr}.",
+            f"Joined track segments at point {row + 1} in {track.display_label}.",
         )
 
     @objc.IBAction
@@ -4461,7 +4540,7 @@ class PlotView(NSView):
             workspace.focus_workspace_track(track, reset_viewport=True)
             return
         extent = self.controller.extent_for_track_records([track])
-        self.render_extent(extent, status=f"Fitted track #{track.nr} to the map.")
+        self.render_extent(extent, status=f"Fitted {track.display_label} to the map.")
 
     @objc.IBAction
     def showAdventureOverview_(self, _sender):
@@ -5265,7 +5344,7 @@ class PlotView(NSView):
             return
         self.zoom = 1.0
         self.last_viewport_signature = None
-        self.render_extent(extent, status=f"Fitted the map to the complete track #{track.nr}.")
+        self.render_extent(extent, status=f"Fitted the map to the complete {track.display_label}.")
 
     def change_view_zoom(self, factor: float, focus_location=None):
         if self.wheel_finish_timer is not None:
@@ -5335,7 +5414,7 @@ class PlotView(NSView):
         track = self.cursor[2]
         start = min(self.marker, self.cursor[0])
         end = max(self.marker, self.cursor[0])
-        if confirm("Delete selected points?", f"Delete points {start + 1} through {end + 1} from track #{track.nr}?"):
+        if confirm("Delete selected points?", f"Delete points {start + 1} through {end + 1} from {track.display_label}?"):
             self.controller.delete_points(track, start, end, refresh=False)
             self.marker = None
             points = track.points()
@@ -5363,7 +5442,7 @@ class PlotView(NSView):
             return
         track = self.cursor[2]
         index = self.cursor[0]
-        if not confirm("Delete waypoint?", f"Delete point {index + 1} from track #{track.nr}?"):
+        if not confirm("Delete waypoint?", f"Delete point {index + 1} from {track.display_label}?"):
             return
         self.controller.delete_points(track, index, index, refresh=False)
         points = track.points()
@@ -5376,7 +5455,7 @@ class PlotView(NSView):
             return
         track = self.cursor[2]
         index = self.cursor[0]
-        if confirm("Cut track after cursor?", f"Cut track #{track.nr} after point {index + 1}?"):
+        if confirm("Cut track after cursor?", f"Cut {track.display_label} after point {index + 1}?"):
             self.controller.cut_track(track, index, refresh=False)
             self.marker = None
             self.refresh_after_map_edit(track, min(index, len(track.points()) - 1))
@@ -5441,7 +5520,7 @@ class ElevationProfileView(NSView):
         track = self.current_track()
         if track is None:
             return "Track Elevation Profile"
-        return f"Track #{track.nr}: {track.name} - Elevation Profile"
+        return f"{track.display_label}: {track.name} - Elevation Profile"
 
     def current_track(self):
         track = self.plot_view.current_track_for_title()
@@ -5776,22 +5855,15 @@ class ElevationProfileView(NSView):
         workspace_selection = self.plot_view.adventure_workspace_delegate is not None
 
         def track_color(track):
-            if track.hidden:
-                return NSColor.colorWithSRGBRed_green_blue_alpha_(.84, .42, 0, 1)
-            if (
-                not self.shows_all_tracks()
-                and not workspace_selection
-            ) or not selected_tracks:
-                return NSColor.systemBlueColor()
-            if track.nr in selected_tracks:
-                return NSColor.colorWithSRGBRed_green_blue_alpha_(0.02, 0.25, 0.62, 1.0)
-            return NSColor.colorWithSRGBRed_green_blue_alpha_(0.435, 0.659, 0.863, 1.0)
+            return cocoa_track_color(track, self.controller.project_parameters)
 
         def stroke(path, track):
             if path is None or track is None:
                 return
             track_color(track).setStroke()
             path.setLineWidth_(3.0 if track.nr in selected_tracks else 2.0)
+            if track.hidden:
+                path.setLineDash_count_phase_([5., 4.], 2, 0.)
             path.stroke()
 
         current_track = None
@@ -6530,7 +6602,7 @@ class TrackInspectorController(NSObject):
             False,
         )
         self.window.setReleasedWhenClosed_(False)
-        self.window.setTitle_(f"Inspect Track #{self.track.nr}")
+        self.window.setTitle_(f"Inspect {self.track.display_label}")
         self.window.setMinSize_(NSMakeSize(620, 360))
         self.window.setDelegate_(self)
         root = NSView.alloc().initWithFrame_(self.window.contentView().bounds())
@@ -6901,7 +6973,7 @@ class TrackInspectorController(NSObject):
         points = self.track.points()
         metrics = self.parent.compute_metrics(self.track)
         text = (
-            f"Track #{self.track.nr}: {self.track.name} | Points: "
+            f"{self.track.display_label}: {self.track.name} | Points: "
             f"{metrics['retained_npoints']}/{metrics['raw_npoints']} retained/raw | "
             f"Length: {metrics['length_km']:.1f} km | Duration: {format_duration(metrics['duration'])} | "
             f"Avg: {format_speed(metrics.get('speed_kmh'))} | "
@@ -6986,6 +7058,7 @@ class TrackInspectorController(NSObject):
         identifiers += ["xy_status", "z_status"]
         for identifier in identifiers:
             column = NSTableColumn.alloc().initWithIdentifier_(nsstring(identifier))
+            column.setDataCell_(make_table_text_cell())
             column.headerCell().setStringValue_(titles.get(identifier, identifier))
             if identifier in tooltips and hasattr(column, "setHeaderToolTip_"):
                 column.setHeaderToolTip_(tooltips[identifier])
@@ -7132,7 +7205,7 @@ class TrackInspectorController(NSObject):
             self.sync_track_start_time_from_first_point()
         self.reload_rows()
         self.refresh_calculated_velocity_rows([row])
-        self.parent.mark_dirty(f"Edited point {row + 1} in track #{self.track.nr}.")
+        self.parent.mark_dirty(f"Edited point {row + 1} in {self.track.display_label}.")
         self.refresh_after_point_table_change([row])
 
     def selected_row_indexes(self):
@@ -7189,7 +7262,7 @@ class TrackInspectorController(NSObject):
         position = "before" if before else "after"
         self.finish_point_structure_change(
             [new_row],
-            f"Inserted point {position} the selection in track #{self.track.nr}.",
+            f"Inserted point {position} the selection in {self.track.display_label}.",
         )
 
     @objc.IBAction
@@ -7260,7 +7333,7 @@ class TrackInspectorController(NSObject):
         next_row = min(rows[0], max(0, len(self.point_elements()) - 1))
         self.finish_point_structure_change(
             [next_row] if self.point_elements() else [],
-            f"Cut {removed} point(s) from track #{self.track.nr}.",
+            f"Cut {removed} point(s) from {self.track.display_label}.",
         )
 
     def paste_points(self):
@@ -7288,7 +7361,7 @@ class TrackInspectorController(NSObject):
             return
         self.finish_point_structure_change(
             inserted_rows,
-            f"Pasted {len(inserted_rows)} point(s) into track #{self.track.nr}.",
+            f"Pasted {len(inserted_rows)} point(s) into {self.track.display_label}.",
         )
 
     def insert_parsed_coordinates(self, coordinates: list[ParsedCoordinate]):
@@ -7317,7 +7390,7 @@ class TrackInspectorController(NSObject):
             return
         self.finish_point_structure_change(
             inserted_rows,
-            f"Inserted {len(inserted_rows)} coordinate point(s) in track #{self.track.nr}.",
+            f"Inserted {len(inserted_rows)} coordinate point(s) in {self.track.display_label}.",
         )
         view = self.ensure_plot_view()
         if view is not None:
@@ -7359,7 +7432,7 @@ class TrackInspectorController(NSObject):
             return
         self.finish_point_structure_change(
             inserted_rows,
-            f"Duplicated {len(inserted_rows)} point(s) in track #{self.track.nr}.",
+            f"Duplicated {len(inserted_rows)} point(s) in {self.track.display_label}.",
         )
 
     def move_selected_rows(self, rows, destination_row):
@@ -7379,7 +7452,7 @@ class TrackInspectorController(NSObject):
             return False
         self.finish_point_structure_change(
             moved_rows,
-            f"Moved {len(moved_rows)} point(s) in track #{self.track.nr}.",
+            f"Moved {len(moved_rows)} point(s) in {self.track.display_label}.",
         )
         return True
 
@@ -7429,7 +7502,7 @@ class TrackInspectorController(NSObject):
         rows = self.selected_row_indexes()
         if not rows:
             return
-        if not confirm("Delete selected waypoints?", f"Delete {len(rows)} waypoint(s) from track #{self.track.nr}?"):
+        if not confirm("Delete selected waypoints?", f"Delete {len(rows)} waypoint(s) from {self.track.display_label}?"):
             return
         self.push_undo()
         delete_set = {self.point_elements()[index] for index in rows if index < len(self.point_elements())}
@@ -7439,7 +7512,7 @@ class TrackInspectorController(NSObject):
                     segment.remove(point)
         self.parent.invalidate_track_metrics(self.track)
         self.reload_rows()
-        self.parent.mark_dirty(f"Deleted {len(delete_set)} point(s) from track #{self.track.nr}.")
+        self.parent.mark_dirty(f"Deleted {len(delete_set)} point(s) from {self.track.display_label}.")
         remaining_rows = [row for row in rows if row < len(self.rows)]
         if not remaining_rows and self.rows:
             remaining_rows = [min(rows[0], len(self.rows) - 1)]
@@ -7504,7 +7577,7 @@ class TrackInspectorController(NSObject):
         self.parent.tracks[index] = self.track
         self.parent.invalidate_track_metrics(self.track)
         self.reload_rows()
-        self.parent.mark_dirty(f"Undid point edit in track #{self.track.nr}.")
+        self.parent.mark_dirty(f"Undid point edit in {self.track.display_label}.")
         self.refresh_after_point_table_change()
 
     def redo(self):
@@ -7518,7 +7591,7 @@ class TrackInspectorController(NSObject):
         self.parent.tracks[index] = self.track
         self.parent.invalidate_track_metrics(self.track)
         self.reload_rows()
-        self.parent.mark_dirty(f"Redid point edit in track #{self.track.nr}.")
+        self.parent.mark_dirty(f"Redid point edit in {self.track.display_label}.")
         self.refresh_after_point_table_change()
 
     @objc.IBAction
@@ -7577,7 +7650,7 @@ class TrackInspectorController(NSObject):
         self.owns_plot_window = self.owns_plot_window or existing is None
         self.select_point_index(row)
         view.move_cursor_to_track_point(self.track, row, self)
-        self.parent.set_status(f"Moved plot cursor to point {row + 1} of track #{self.track.nr}.")
+        self.parent.set_status(f"Moved plot cursor to point {row + 1} of {self.track.display_label}.")
 
     @objc.IBAction
     def splitTrack_(self, _sender):
@@ -7616,7 +7689,7 @@ class TrackInspectorController(NSObject):
             return
         self.finish_point_structure_change(
             [row],
-            f"Cut the track connection after point {row + 1} in track #{self.track.nr}.",
+            f"Cut the track connection after point {row + 1} in {self.track.display_label}.",
         )
 
     @objc.IBAction
@@ -7636,7 +7709,7 @@ class TrackInspectorController(NSObject):
             return
         self.finish_point_structure_change(
             [row],
-            f"Joined track segments at point {row + 1} in track #{self.track.nr}.",
+            f"Joined track segments at point {row + 1} in {self.track.display_label}.",
         )
 
     @objc.IBAction
@@ -7692,7 +7765,7 @@ class TrackInspectorController(NSObject):
             self.parent.invalidate_track_metrics(self.track)
             self.reload_rows()
             self.refresh_calculated_velocity_rows(selected)
-            self.parent.mark_dirty(f"Interpolated timestamps for {len(selected)} point(s) in track #{self.track.nr}.")
+            self.parent.mark_dirty(f"Interpolated timestamps for {len(selected)} point(s) in {self.track.display_label}.")
             self.refresh_after_point_table_change(selected)
             return
         anchor_index = selected[0] if direction == "forward" else selected[-1]
@@ -7732,7 +7805,7 @@ class TrackInspectorController(NSObject):
         self.parent.invalidate_track_metrics(self.track)
         self.reload_rows()
         self.refresh_calculated_velocity_rows(selected)
-        self.parent.mark_dirty(f"Readjusted timestamps for {len(selected)} point(s) in track #{self.track.nr}.")
+        self.parent.mark_dirty(f"Readjusted timestamps for {len(selected)} point(s) in {self.track.display_label}.")
         self.refresh_after_point_table_change(selected)
 
     def interpolation_speed_for_selected_rows(self) -> float | None:
@@ -7828,7 +7901,7 @@ class TrackInspectorController(NSObject):
 
     @objc.IBAction
     def save_(self, _sender):
-        self.parent.mark_dirty(f"Track #{self.track.nr} waypoint edits saved in memory.")
+        self.parent.mark_dirty(f"{self.track.display_label} waypoint edits saved in memory.")
         self.parent.redraw_open_plot_views()
 
     @objc.IBAction
@@ -7839,7 +7912,7 @@ class TrackInspectorController(NSObject):
     @objc.IBAction
     def help_(self, _sender):
         show_alert(
-            f"Inspect Track #{self.track.nr} Help",
+            f"Inspect {self.track.display_label} Help",
             "This window shows every raw waypoint of the selected track. Scroll the table to inspect coordinates, height, time, accuracy fields, and any extra data stored with each point. The compact XY use and Elevation use columns are at the right end. Used means retained in processed geometry; Smooth means valid but used only for smoothing. Interp retains the reason for elevation interpolation, while the other short values state rejection reasons. The header reports retained/raw point counts.\n\n"
             "Click a row to select a waypoint. Shift-click or drag in the table to select a range. Double-click a row to open the track map if needed and move the white cursor dot and arrow to that waypoint.\n\n"
             "Edit a table cell and press Enter to change a waypoint value. Undo restores recent inspector edits. Backspace/Delete removes selected waypoints after confirmation.\n\n"
@@ -7937,6 +8010,7 @@ class PDFMapRenderer:
         self.processing_settings = source.processing_options()
         self.project_parameters = dict(source.project_parameters)
         self.selected_nrs = tuple(source.selected_nrs)
+        self.track_ids = track_ids(getattr(source, "tracks", tracks))
         for name in (
             "tile_cache_dir", "map_padding_fraction", "track_zoom", "overview_zoom",
             "pdf_document_dpi", "pdf_map_dpi", "pdf_overview_zoom", "pdf_track_zoom",
@@ -8033,7 +8107,7 @@ class PDFMapRenderer:
         if not self.project_parameters.get("pdf.checkpoints", True):
             return ()
         if track.nr not in self.checkpoint_cache:
-            self.set_status(f"Preparing checkpoints and breaks for track #{track.nr}.")
+            self.set_status(f"Preparing checkpoints and breaks for {track.display_label}.")
             markers = build_checkpoints(self.processed_track(track), self.project_parameters)
             if self.project_parameters.get("pdf.track_info", True) and (
                 self.project_parameters.get("pdf.checkpoint_weather", True)
@@ -8116,7 +8190,7 @@ class PDFMapRenderer:
         if self.options.include_overview:
             jobs.append(("overview", self.tracks, "Overview"))
         if self.options.include_track_maps:
-            jobs.extend(("track", [track], f"Track #{track.nr}: {track.name}") for track in self.tracks)
+            jobs.extend(("track", [track], report_stage_title(track, self.tracks, self.track_ids)) for track in self.tracks)
         for index, (mode, tracks, title) in enumerate(jobs, 1):
             self.page_continuation = None
             self.set_status(f"Rendering map page {index} of {len(jobs)}: {title}")
@@ -8150,6 +8224,7 @@ class GPXEditorController(NSObject):
         self.selected_nrs: list[int] = []
         self.suppress_selection_change = False
         self.next_nr = 1
+        self.document_ids_initialized = False
         self.anchor: tuple[float, float] | None = None
         self.project_name = ""
         self.project_name_fallback = ""
@@ -8273,7 +8348,10 @@ class GPXEditorController(NSObject):
         self.prune_tile_cache(max_age_seconds=self.map_cache_retention_hours * 3600.0)
         self.columns = [
             ("row", "Row\n", 56, False),
-            ("nr", "Nr.\n", 56, False),
+            ("nr", "Track\nNumber", 76, False),
+            ("stage", "Stage\n", 62, True),
+            ("track_id", "Track ID\n", 76, False),
+            ("type", "Type\n", 100, False),
             ("show", "Show\n", 58, True),
             ("name", "Name\n", 220, True),
             ("date", "Date & Time\n", 155, True),
@@ -8760,9 +8838,11 @@ class GPXEditorController(NSObject):
         self.track_table.registerForDraggedTypes_([DRAG_TYPE, FILE_DRAG_TYPE])
         table_font = self.table_font(12)
         header_font = self.table_font(11)
-        numeric_columns = {"row", "nr", "length", "duration", "sum", "distance", "speed", "ascent", "descent", "npoints"}
+        numeric_columns = {"row", "nr", "stage", "length", "duration", "sum", "distance", "speed", "ascent", "descent", "npoints"}
         for identifier, title, width, editable in self.columns:
             column = NSTableColumn.alloc().initWithIdentifier_(nsstring(identifier))
+            if identifier != "show":
+                column.setDataCell_(make_table_text_cell())
             column.headerCell().setStringValue_(title)
             if hasattr(column.headerCell(), "setWraps_"):
                 column.headerCell().setWraps_(True)
@@ -8805,9 +8885,9 @@ class GPXEditorController(NSObject):
                 "Review photos/videos and add their GPS positions as linked waypoints to the selected track.",
             ),
             (
-                "Renumber Tracks",
+                "Renumber…",
                 "renumberTracks:",
-                "Assign persistent track numbers 1 through N in the current row order.",
+                "Preview and assign track or stage numbers to selected or all tracks.",
             ),
             ("Save", "save:", "Save all tracks to the output GPX filename."),
             ("Save & Exit", "saveAndExit:", "Save the GPX file and exit the editor."),
@@ -8815,6 +8895,9 @@ class GPXEditorController(NSObject):
             ("PDF Summary", "exportPdf:", "Create a printable track summary, with optional maps and elevation profiles."),
             ("Sort", "sortByDate:", "Sort by Date & Time using the special distance placement for untimed or zero-duration tracks."),
             ("Select All", "selectAllTracks:", "Select all tracks."),
+            ("Invert Selection", "invertTrackSelection:", "Select every unselected track, including hidden tracks."),
+            ("Set Track Type…", "setTrackType:", "Assign a track type to selected or all tracks."),
+            ("Select Tracks by Type…", "selectTracksByType:", "Select tracks matching a type."),
             ("Unselect All", "unselectAllTracks:", "Clear the track selection."),
             ("Set Anchorpoint", "setAnchorpoint:", "Set the anchor to the first point of the first track in the current table."),
             ("Join Tracks", "joinTracks:", "Join selected tracks into the first selected track."),
@@ -8907,6 +8990,9 @@ class GPXEditorController(NSObject):
             and all(point.time is None for point in selected[0].points()),
         )
         menu.addItem_(NSMenuItem.separatorItem())
+        self._track_context_item(menu, "Set Track Type…", "setTrackType:", editing and bool(self.tracks))
+        self._track_context_item(menu, "Select Tracks by Type…", "selectTracksByType:", bool(self.tracks))
+        self._track_context_item(menu, "Invert Selection", "invertTrackSelection:", bool(self.tracks))
         self._track_context_item(menu, "Inspect Track", "contextInspectTrack:", editing and count == 1)
         self._track_context_item(menu, "Plot Track(s)", "contextPlotTracks:", count > 0)
         self._track_context_item(menu, "Elevation Profile", "contextElevationProfile:", editing and count > 0)
@@ -8928,7 +9014,7 @@ class GPXEditorController(NSObject):
         )
         self._track_context_item(
             menu,
-            "Renumber Tracks",
+            "Renumber…",
             "renumberTracks:",
             editing and bool(self.tracks),
         )
@@ -9043,10 +9129,12 @@ class GPXEditorController(NSObject):
         )
         project_x = PADDING + 96 + gap + 104 + gap + 140 + gap
         self.project_label.setFrame_(NSMakeRect(project_x, project_y + FIELD_HEIGHT + 2, 220, 18))
-        self.project_field.setFrame_(NSMakeRect(project_x, project_y, 310, FIELD_HEIGHT))
-        self.buttons["Renumber Tracks"].setFrame_(
-            NSMakeRect(project_x + 318, project_y, 132, BUTTON_HEIGHT)
+        self.project_field.setFrame_(NSMakeRect(project_x, project_y, 190, FIELD_HEIGHT))
+        self.buttons["Renumber…"].setFrame_(
+            NSMakeRect(project_x + 198, project_y, 100, BUTTON_HEIGHT)
         )
+        self.buttons["Set Track Type…"].setFrame_(NSMakeRect(project_x + 306, project_y, 142, BUTTON_HEIGHT))
+        self.buttons["Select Tracks by Type…"].setFrame_(NSMakeRect(project_x + 456, project_y, 172, BUTTON_HEIGHT))
         undo_size = BUTTON_HEIGHT
         redo_x = width - PADDING - undo_size
         undo_x = redo_x - gap - undo_size
@@ -9065,10 +9153,11 @@ class GPXEditorController(NSObject):
         selection_widths = {
             "Select All": 88,
             "Unselect All": 108,
+            "Invert Selection": 126,
             "Join Tracks": 104,
             "Inspect Track": 116,
         }
-        for title in ["Select All", "Unselect All", "Join Tracks", "Inspect Track"]:
+        for title in ["Select All", "Unselect All", "Invert Selection", "Join Tracks", "Inspect Track"]:
             button = self.buttons[title]
             width_for_button = selection_widths[title]
             button.setFrame_(NSMakeRect(x, y, width_for_button, BUTTON_HEIGHT))
@@ -9123,6 +9212,7 @@ class GPXEditorController(NSObject):
             self.selection_field,
             self.buttons["Select All"],
             self.buttons["Unselect All"],
+            self.buttons["Invert Selection"],
             self.buttons["Join Tracks"],
             self.buttons["Inspect Track"],
             self.buttons["Set Anchorpoint"],
@@ -9483,7 +9573,7 @@ class GPXEditorController(NSObject):
         for nr, xml_text, source in snapshot:
             restored.append(TrackRecord(nr, ET.fromstring(xml_text), source))
         self.tracks = restored
-        self.next_nr = max([track.nr for track in self.tracks], default=0) + 1
+        self.next_nr = max(getattr(self, "next_nr", 1), max([track.nr for track in self.tracks], default=0) + 1)
         self.dirty = True
         self.recalculate()
 
@@ -9496,6 +9586,50 @@ class GPXEditorController(NSObject):
         self.undo_stack.append(VisibilityUndoEntry(dict(before), dict(after)))
         self.undo_stack = self.undo_stack[-10:]
         self.redo_stack.clear()
+
+    def metadata_snapshot(self, tracks, kind=MutationKind.METADATA):
+        return TrackMetadataUndoEntry(tuple((track.nr, track.track_number,
+            next((node.get("stage_number") for node in track.element.findall("gpx:extensions/*", NS)
+                  if node.tag.rsplit("}", 1)[-1] == MYCAMINO_EXT_TAG), None),
+            track.element.findtext(qname("type"))) for track in tracks), kind)
+
+    def push_metadata_undo(self, tracks, kind=MutationKind.METADATA):
+        self.undo_stack.append(self.metadata_snapshot(tracks, kind))
+        self.undo_stack = self.undo_stack[-10:]
+        self.redo_stack.clear()
+
+    def restore_metadata(self, entry):
+        selected = list(self.selected_tracks())
+        current = {track.nr: track for track in self.tracks}
+        restored = [(current.get(value[0]), *value[1:]) for value in entry.values]
+        restored = [value for value in restored if value[0] is not None]
+        inverse = self.metadata_snapshot([value[0] for value in restored], entry.kind)
+        for track, number, stage, kind in restored:
+            track.set_order_number(number)
+            node = get_or_create_mycamino_track_extension(track.element)
+            if stage is None:
+                node.attrib.pop("stage_number", None)
+            else:
+                node.set("stage_number", stage)
+            type_node = track.element.find(qname("type"))
+            if kind is None:
+                if type_node is not None:
+                    track.element.remove(type_node)
+            else:
+                track.set_track_type(kind)
+                track.element.find(qname("type")).text = kind
+        self.selected_nrs = [track.nr for track in selected]
+        self.metadata_changed("Restored track metadata.", entry.kind)
+        return inverse
+
+    def metadata_changed(self, message, kind=MutationKind.METADATA):
+        self.dirty = True
+        self.next_nr = max(getattr(self, "next_nr", 1), max((track.nr for track in self.tracks), default=0) + 1)
+        self._rebuild_table_rows_from_cached_metrics()
+        self.update_selection_field()
+        self.redraw_open_plot_views()
+        self.set_status(message)
+        self._notify_workspace_mutation(kind, message, [track.nr for track in self.tracks])
 
     def push_track_elements_undo(self, tracks, kind=MutationKind.GEOMETRY):
         self.undo_stack.append(
@@ -9636,7 +9770,7 @@ class GPXEditorController(NSObject):
             elevation.text = text
         self.invalidate_track_metrics(track)
         self.mark_dirty(
-            f"Interpolated height for {len(updates)} {'point' if len(updates) == 1 else 'points'} in track #{track.nr}.",
+            f"Interpolated height for {len(updates)} {'point' if len(updates) == 1 else 'points'} in {track.display_label}.",
             MutationKind.ELEVATION, [track.nr],
         )
         if inspector is not None:
@@ -9682,7 +9816,16 @@ class GPXEditorController(NSObject):
             if not window.isVisible():
                 continue
             if isinstance(view, (PlotView, ElevationProfileView)):
+                if isinstance(view, PlotView):
+                    view.update_window_title()
+                else:
+                    window.setTitle_(view.profile_title())
                 view.setNeedsDisplay_(True)
+            elif isinstance(view, TrackInspectorController):
+                window.setTitle_(f"Inspect {view.track.display_label}")
+                text = str(view.info_label.stringValue())
+                _old, separator, metrics = text.partition(" | ")
+                view.info_label.setStringValue_(f"{view.track.display_label}: {view.track.name}" + (separator + metrics if separator else ""))
         self.plot_windows = live_windows
 
     def register_auxiliary_window(self, window):
@@ -9903,7 +10046,7 @@ class GPXEditorController(NSObject):
             inspector.plot_view = view
             view.move_cursor_to_track_point(track, point_index, inspector)
         inspector.select_point_index(point_index)
-        self.set_status(f"Opened track #{track.nr} at point {point_index + 1}.")
+        self.set_status(f"Opened {track.display_label} at point {point_index + 1}.")
         return view
 
     def open_or_reload_track_plot_for_track(self, track: TrackRecord):
@@ -9973,7 +10116,7 @@ class GPXEditorController(NSObject):
         action = str(item.action() or "")
         if action in {"inspectTrack:", "plotSelected:", "contextElevationProfile:", "saveSelectedTracksAs:"}:
             return bool(self.selected_tracks())
-        if action == "renumberTracks:":
+        if action in {"renumberTracks:", "invertTrackSelection:"}:
             return bool(self.tracks)
         if action == "estimateRouteTimesFromMedia:":
             selected = self.selected_tracks()
@@ -10061,7 +10204,8 @@ class GPXEditorController(NSObject):
             rows.append(
                 {
                     "row": str(index),
-                    "nr": str(track.nr),
+                    "nr": str(track.track_number or ""),
+                    "_internal_id": track.nr,
                     "show": "no" if track.hidden else "yes",
                     "name": track.name,
                     "date": "Loading…" if metrics is None else format_datetime_local(metrics.get("time")),
@@ -10136,6 +10280,7 @@ class GPXEditorController(NSObject):
     def _rebuild_table_rows_from_cached_metrics(self, reload_table: bool = True):
         """Refresh table rows and totals without reprocessing track geometry."""
         rows: list[dict[str, str]] = []
+        identities = track_ids(self.tracks)
         cumulative = 0.0
         values = {"length": [], "duration": [], "speed": [], "moving_speed": [], "ascent": [], "descent": []}
         for index, track in enumerate(self.tracks, 1):
@@ -10161,7 +10306,11 @@ class GPXEditorController(NSObject):
             rows.append(
                 {
                     "row": str(index),
-                    "nr": str(track.nr),
+                    "nr": str(track.track_number or ""),
+                    "_internal_id": track.nr,
+                    "stage": str(track.stage_number or ""),
+                    "track_id": identities[track.nr],
+                    "type": TYPE_LABELS[track.track_type],
                     "show": "no" if track.hidden else "yes",
                     "name": track.name,
                     "date": format_datetime_local(metrics["time"]),
@@ -10458,7 +10607,7 @@ class GPXEditorController(NSObject):
         return (
             self.track_mutations_enabled
             and row < len(self.tracks)
-            and column in {"show", "name", "date"}
+            and column in {"show", "name", "date", "stage"}
         )
 
     def ensure_track_mutations_available(self) -> bool:
@@ -10550,8 +10699,21 @@ class GPXEditorController(NSObject):
             track.set_hidden(hidden)
             self.mark_visibility_changed(
                 {track.nr},
-                f"Track #{track.nr} is now {'hidden' if hidden else 'shown'} for statistics, overview, and PDF export.",
+                f"{track.display_label} is now {'hidden' if hidden else 'shown'} for statistics, overview, and PDF export.",
             )
+        elif column == "stage":
+            try:
+                number = int(value.strip()) if value.strip() else None
+                if number is not None and number < 1:
+                    raise ValueError()
+            except ValueError:
+                self.set_status("Stage must be a positive whole number, or blank for no assigned stage.")
+                self._rebuild_table_rows_from_cached_metrics()
+                return
+            if number != track.stage_number:
+                self.push_metadata_undo([track])
+                track.set_stage_number(number)
+                self.metadata_changed("Stage number changed.")
         elif column == "name":
             old = track.name
             new = value.strip()
@@ -10561,7 +10723,7 @@ class GPXEditorController(NSObject):
             self.push_track_elements_undo([track], MutationKind.METADATA)
             get_or_create_track_name(track.element).text = new
             self.mark_dirty(
-                f"Track #{track.nr} name changed from '{old}' to '{new}'.",
+                f"{track.display_label} name changed from '{old}' to '{new}'.",
                 MutationKind.METADATA,
                 {track.nr},
             )
@@ -10569,12 +10731,12 @@ class GPXEditorController(NSObject):
             new_time = parse_user_datetime(value)
             if new_time is None:
                 self.recalculate()
-                self.set_status(f"Ignored invalid date for track #{track.nr}. Use dd.mm.yyyy hh:mm.")
+                self.set_status(f"Ignored invalid date for {track.display_label}. Use dd.mm.yyyy hh:mm.")
                 return
             self.push_track_elements_undo([track], MutationKind.TIMING)
             self.apply_track_start_time(track, new_time)
             self.mark_dirty(
-                f"Track #{track.nr} start date changed to {format_datetime_local(new_time)}.",
+                f"{track.display_label} start date changed to {format_datetime_local(new_time)}.",
                 MutationKind.TIMING,
                 {track.nr},
             )
@@ -10665,11 +10827,16 @@ class GPXEditorController(NSObject):
         if mark_dirty:
             self.push_undo()
         element = ET.Element(qname("trk"))
-        get_or_create_track_name(element).text = name or f"Track {self.next_nr}"
+        visible_number = max((track.track_number or 0 for track in self.tracks), default=0) + 1
+        get_or_create_track_name(element).text = name or f"Track {visible_number}"
         ET.SubElement(element, qname("trkseg"))
         record = TrackRecord(self.next_nr, element, "")
-        record.set_order_number(record.nr)
+        record.set_order_number(visible_number)
+        record.set_stage_number(visible_number)
+        record.set_track_type(self.project_parameters.get("track_types.new_track_default", "pilgrimage"))
         self.next_nr += 1
+        if mark_dirty:
+            self.document_ids_initialized = True
         self.tracks.append(record)
         self.selected_nrs = [record.nr]
         if assign_default_project_name and not self.project_name:
@@ -10679,11 +10846,11 @@ class GPXEditorController(NSObject):
         self.recalculate()
         self.update_selection_field()
         self.highlight_selected_rows()
-        self.set_status(f"Created empty track #{record.nr}. Add its first waypoint from the table, clipboard, media, or map.")
+        self.set_status(f"Created empty {record.display_label}. Add its first waypoint from the table, clipboard, media, or map.")
         if mark_dirty:
             self._notify_workspace_mutation(
                 MutationKind.STRUCTURE,
-                f"Created empty track #{record.nr}.",
+                f"Created empty {record.display_label}.",
                 {record.nr},
             )
         return record
@@ -10866,7 +11033,7 @@ class GPXEditorController(NSObject):
         if not proposal.anchors:
             self.set_status(
                 f"No dated media were within {self.media_timing_max_distance_m:g} m "
-                f"of untimed track #{track.nr}; route timing was unchanged."
+                f"of untimed {track.display_label}; route timing was unchanged."
             )
             return False
         ignored_count = max(
@@ -10970,7 +11137,7 @@ class GPXEditorController(NSObject):
         )
         self.invalidate_track_metrics(track)
         self.mark_dirty(
-            f"Estimated track #{track.nr} timestamps from {len(proposal.anchors)} nearby media file(s)"
+            f"Estimated {track.display_label} timestamps from {len(proposal.anchors)} nearby media file(s)"
             + (" and aligned its direction with the media." if proposal.route_reversed else "."),
             MutationKind.GEOMETRY if proposal.route_reversed else MutationKind.TIMING,
             {track.nr},
@@ -11087,7 +11254,7 @@ class GPXEditorController(NSObject):
                 return
             destination = [self.create_empty_track()]
         track = destination[0]
-        self.set_status(f"Preparing {len(media_paths)} media file(s) for track #{track.nr}...")
+        self.set_status(f"Preparing {len(media_paths)} media file(s) for {track.display_label}...")
         prepared = prepare_media_records(media_paths, refresh_changed=True)
         usable = [item for item in prepared if item.record is not None and item.record.latitude is not None and item.record.longitude is not None]
         skipped = [f"{item.path.name}: {item.error or 'no GPS coordinates'}" for item in prepared if item not in usable]
@@ -11182,7 +11349,7 @@ class GPXEditorController(NSObject):
                     get_or_create_point_time(point.element).text = format_gpx_time(proposal["time"])
         self.invalidate_track_metrics(track)
         self.mark_dirty(
-            f"Added {len(inserted_rows)} media point(s) to track #{track.nr}; "
+            f"Added {len(inserted_rows)} media point(s) to {track.display_label}; "
             f"reused {sum(item.action == 'reused' for item in usable)}, "
             f"extracted {sum(item.action == 'extracted' for item in usable)}, skipped {len(skipped)}.",
             MutationKind.STRUCTURE,
@@ -11215,8 +11382,10 @@ class GPXEditorController(NSObject):
         converted_routes = 0
         converted_waypoint_tracks = 0
         reassigned_order_numbers = 0
-        used_numbers = {track.nr for track in self.tracks}
+        used_numbers = {track.track_number for track in self.tracks if track.track_number is not None}
         next_available_number = max(used_numbers, default=0) + 1
+        used_ids = {track.nr for track in self.tracks}
+        adopt_document_ids = not self.tracks and not getattr(self, "document_ids_initialized", False)
         self.last_load_dir = paths[0].parent
         if prepared_sources is None:
             prepared_sources, errors = prepare_gpx_sources_for_load(
@@ -11227,6 +11396,13 @@ class GPXEditorController(NSObject):
         for prepared in prepared_sources:
             path = Path(prepared["path"])
             document = prepared["document"]
+            ids, next_id = allocate_track_ids(document.tracks,
+                max(self.next_nr, getattr(document, "next_internal_id", 1)) if adopt_document_ids else self.next_nr,
+                preserve=adopt_document_ids, used=used_ids,
+                legacy=getattr(document, "next_internal_id", 1) == 1)
+            self.next_nr = max(self.next_nr, next_id)
+            self.document_ids_initialized = True
+            adopt_document_ids = False
             if not self.tracks and not self.project_name:
                 (
                     self.project_name,
@@ -11249,8 +11425,10 @@ class GPXEditorController(NSObject):
             for source_index, trk in enumerate(document.tracks):
                 # load_gpx_document returns detached normalized elements for
                 # converted inputs and owned editable elements for GPX 1.1.
-                stored_number = stored_track_order_number(trk)
-                if stored_number is not None and stored_number not in used_numbers:
+                stored_number = track_number(trk, source_index + 1)
+                if stored_number is None:
+                    assigned_number = None
+                elif stored_number not in used_numbers:
                     assigned_number = stored_number
                 else:
                     while next_available_number in used_numbers:
@@ -11259,14 +11437,16 @@ class GPXEditorController(NSObject):
                     next_available_number += 1
                     if stored_number is not None or has_stored_track_order_number(trk):
                         reassigned_order_numbers += 1
-                used_numbers.add(assigned_number)
+                if assigned_number is not None:
+                    used_numbers.add(assigned_number)
                 record = TrackRecord(
-                    assigned_number,
+                    ids[source_index],
                     trk,
                     str(path),
                     source_track_index=source_index,
                 )
                 record.set_order_number(assigned_number)
+                used_ids.add(record.nr)
                 fingerprint, cached_metrics, cached_display_geometry = cached_tracks[
                     source_index
                 ]
@@ -11278,7 +11458,6 @@ class GPXEditorController(NSObject):
                     metrics_cache_hits += 1
                 self.tracks.append(record)
                 added_records.append(record)
-                self.next_nr = max(self.next_nr, assigned_number + 1)
         ignored_parts = []
         if removed_invalid_coordinates:
             ignored_parts.append(f"{removed_invalid_coordinates} point(s) with invalid coordinates")
@@ -11498,7 +11677,7 @@ class GPXEditorController(NSObject):
             self.track_load_timer = None
             self.pending_track_load_future = None
             del self.tracks[self.pending_track_load_start_index :]
-            self.next_nr = max([record.nr for record in self.tracks], default=0) + 1
+            self.next_nr = max(self.next_nr, max([record.nr for record in self.tracks], default=0) + 1)
             self.pending_track_loads = []
             self.pending_track_load_offer_sort = False
             self.pending_pdf_export_after_load = False
@@ -11666,7 +11845,7 @@ class GPXEditorController(NSObject):
         )
         if not pending:
             return
-        track_names = [track.name or f"Track #{track.nr}" for _row, track, _identity in pending]
+        track_names = [track.name or track.display_label for _row, track, _identity in pending]
         displayed_names = track_names[:8]
         name_text = "\n".join(f"• {name}" for name in displayed_names)
         if len(track_names) > len(displayed_names):
@@ -12032,6 +12211,8 @@ class GPXEditorController(NSObject):
             return place(view, x, top, width, BUTTON_HEIGHT)
 
         label("PDF Summary", 20, 16, 250, 17, True)
+        gear = button("Settings", "pdfTypeSettings:", 756, 16, 40)
+        self.configure_symbol_button(gear, "gearshape", "PDF Export Settings", "NSActionTemplate", "Settings")
         hint = label(
             "Create a printable summary of your tracks, with distances, durations, elevation statistics, "
             "and optional overview maps, individual track maps, and elevation profiles.",
@@ -12045,7 +12226,7 @@ class GPXEditorController(NSObject):
         self.pdf_summary_scope_menu.setTarget_(self)
         self.pdf_summary_scope_menu.setAction_("pdfSummaryOptionsChanged:")
         self.pdf_summary_scope_menu.setToolTip_(
-            "Choose tracks for the entire PDF. Hidden tracks are gray/orange and excluded from totals and averages."
+            "Choose tracks for the entire PDF. Hidden tracks are gray and excluded from totals and averages."
         )
         button("Select Tracks…", "selectPdfSummaryTracks:", 255, 102, 142)
         label("PDF file", 20, 140, 65)
@@ -12055,7 +12236,8 @@ class GPXEditorController(NSObject):
         self.pdf_summary_browse_button = button("Browse…", "choosePdfSummaryOutput:", 710, 140, 90)
         label("Columns", 20, 185, 140, 13, True)
         self.pdf_summary_checkboxes = {}
-        for index, (identifier, title, _width, _editable) in enumerate(self.columns):
+        report_columns = [column for column in self.columns if column[0] not in {"nr", "track_id", "type"}]
+        for index, (identifier, title, _width, _editable) in enumerate(report_columns):
             checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
             checkbox.setButtonType_(NSButtonTypeSwitch)
             checkbox.setTitle_(title.replace("\n", " ").strip())
@@ -12190,9 +12372,10 @@ class GPXEditorController(NSObject):
             self.sync_pdf_project_settings()
         map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
         try:
+            identities = track_ids(self.tracks)
             snapshot = SummarySnapshot(
                 self.project_name or PROGRAM_TITLE,
-                tuple(summary_track(track, index) for index, track in enumerate(self.tracks, 1) if track in tracks),
+                tuple(summary_track(track, index, identities) for index, track in enumerate(self.tracks, 1) if track in tracks),
                 options,
             )
             cancel = threading.Event()
@@ -12240,6 +12423,17 @@ class GPXEditorController(NSObject):
         else:
             self.showSettings_(None)
             self.settings_controller.current_section = "Map Service"
+            self.settings_controller.show()
+
+    @objc.IBAction
+    def pdfTypeSettings_(self, _sender):
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None:
+            workspace.open_shared_settings("PDF Export")
+        else:
+            self.showSettings_(None)
+            self.settings_controller._capture_controls()
+            self.settings_controller.current_section = "PDF Export"
             self.settings_controller.show()
 
     @objc.python_method
@@ -12344,8 +12538,9 @@ class GPXEditorController(NSObject):
             rotate_maps=bool(values.get("rotate_maps")), name_prefix=str(values.get("name_prefix", "")),
         )
         tracks = self.pdf_report_tracks(options)
+        identities = track_ids(self.tracks)
         snapshot = SummarySnapshot(self.project_name or PROGRAM_TITLE, tuple(
-            summary_track(track, index) for index, track in enumerate(self.tracks, 1) if track in tracks
+            summary_track(track, index, identities) for index, track in enumerate(self.tracks, 1) if track in tracks
         ), options)
         cancel = threading.Event()
         renderer = PDFMapRenderer(self, tracks, options, cancel, lambda _message: None,
@@ -12370,7 +12565,7 @@ class GPXEditorController(NSObject):
         left_inches = 0.72 if options.get("elevation_profile") else 0.42
         left = left_inches / page_w
         right = 0.25 / page_w
-        displayed_title = report_title(fig, title, (1 - left - right) * page_w, 15 if mode == "track" else 13)
+        displayed_title = report_title(fig, title, (1 - left - right) * page_w - (.4 if mode == "track" else 0), 15 if mode == "track" else 13)
         top_summary_h = 0.78 / page_h
         recording_time = (tracks[0].metrics.get("time") or tracks[0].metrics.get("start_time")) if mode == "track" else None
         if mode == "track":
@@ -12412,6 +12607,16 @@ class GPXEditorController(NSObject):
         title_y = 1 - 6 / (top_summary_h * page_h * 72) if mode == "track" else .92
         ax_text.text(0.0, title_y, displayed_title, ha="left", va="top", fontsize=15 if mode == "track" else 13,
                      fontweight="bold", color="#173b5e", wrap=True)
+        if mode == "track":
+            from matplotlib.backends.backend_agg import RendererAgg
+            from matplotlib.font_manager import FontProperties
+            title_lines = displayed_title.splitlines()
+            renderer = RendererAgg(1, 1, 72)
+            text_width = renderer.get_text_width_height_descent(title_lines[-1], FontProperties(size=15, weight="bold"), False)[0]
+            symbol_ax = fig.add_axes([left + (text_width + 6) / (72 * page_w),
+                1 - (24 + 18 * (len(title_lines) - 1)) / (72 * page_h),
+                18 / (72 * page_w), 18 / (72 * page_h)])
+            draw_pdf_symbol(symbol_ax, tracks[0].track_type, color=track_color(tracks[0], self.project_parameters))
         if recording_time is not None:
             height_points = top_summary_h * page_h * 72
             y = title_y - (18 * (displayed_title.count('\n') + 1) + 3) / height_points
@@ -12452,7 +12657,7 @@ class GPXEditorController(NSObject):
             except (RuntimeError, TypeError, ValueError):
                 # Cache diagnostics must never prevent the provider request.
                 missing_tiles = diagnostics["count"]
-        map_label = "overview" if mode == "overview" else f"track #{tracks[0].nr}"
+        map_label = "overview" if mode == "overview" else tracks[0].display_label
         self.set_status(
             f"PDF export: plotting {map_label} at {pixel_width}x{pixel_height}px, "
             f"tile zoom {tile_zoom}, tiles {diagnostics['nx']}x{diagnostics['ny']}={diagnostics['count']}."
@@ -12494,7 +12699,7 @@ class GPXEditorController(NSObject):
         endpoint_color = str(self.project_parameters.get("trackmaps.endpoint_color", "#FFFFFF"))
         endpoint_size = float(self.project_parameters.get("trackmaps.endpoint_size", 0.0))
         for track in tracks:
-            color = "#d66b00" if track.hidden else route_color
+            color = track_color(track, self.project_parameters)
             width = route_width
             processed = self.processed_track(track)
             scene = MapOverlayScene(
@@ -12513,7 +12718,7 @@ class GPXEditorController(NSObject):
                     continue
                 xs = [point[0] for point in projected]
                 ys = [point[1] for point in projected]
-                ax.plot(xs, ys, color=color, linewidth=width, solid_capstyle="round", zorder=3)
+                ax.plot(xs, ys, color=color, linewidth=width, linestyle="--" if track.hidden else "-", solid_capstyle="round", zorder=3)
                 show_endpoints = endpoint_size > 0 or (
                     self.pdf_overview_show_endpoint_dots() if mode == "overview" else self.pdf_track_show_endpoint_dots()
                 )
@@ -12555,7 +12760,7 @@ class GPXEditorController(NSObject):
             total_duration = sum((self.compute_metrics(track)["duration"] for track in tracks if self.compute_metrics(track)["duration"] is not None), timedelta())
             return f"{len(tracks)} visible track(s)\nLength {total_length:.1f} km | Duration {format_duration(total_duration, allow_days=True)}"
         track = tracks[0]
-        row = next((row for row in self.table_rows if row.get("nr") == str(track.nr)), None)
+        row = next((row for row in self.table_rows if row.get("_internal_id") == track.nr), None)
         if row is None:
             metrics = self.compute_metrics(track)
             return f"Length {metrics['length_km']:.1f} km | Duration {format_duration(metrics['duration'], allow_days=True)}\nAvg {format_speed(metrics.get('speed_kmh'))}"
@@ -12596,9 +12801,9 @@ class GPXEditorController(NSObject):
         )
         for track in tracks:
             track_rows = [row for row in rows if row[2] is track]
-            color = "#d66b00" if track.hidden else "blue"
+            color = track_color(track, self.project_parameters)
             if track_rows:
-                ax.plot([row[0] for row in track_rows], [row[1] for row in track_rows], color=color, linewidth=1.4)
+                ax.plot([row[0] for row in track_rows], [row[1] for row in track_rows], color=color, linewidth=1.4, linestyle="--" if track.hidden else "-")
         ax.set_xlim(min(xs), max(xs))
         ax.set_ylim(y_min, y_max)
         ax.set_xlabel("Distance [km]", fontsize=7)
@@ -12803,7 +13008,7 @@ class GPXEditorController(NSObject):
         return True if existing is None else bool(existing[1].show_endpoint_markers)
 
     def save_current(self) -> bool:
-        if not self.tracks:
+        if not self.tracks and not getattr(self, "document_ids_initialized", False):
             show_alert("No tracks to save.")
             return False
         if not str(self.output_field.stringValue()).strip():
@@ -12826,7 +13031,7 @@ class GPXEditorController(NSObject):
             url = panel.URL()
             if url is not None:
                 self.set_output_path(Path(str(url.path())).resolve())
-                if not self.tracks:
+                if not self.tracks and not getattr(self, "document_ids_initialized", False):
                     self.set_status(f"Output file set to {self.last_save_path}. Add tracks before saving.")
                     return False
                 self.save_current()
@@ -12844,7 +13049,6 @@ class GPXEditorController(NSObject):
             anchor.set("lat", f"{self.anchor[0]:.8f}")
             anchor.set("lon", f"{self.anchor[1]:.8f}")
         for track in self.tracks:
-            track.set_order_number(track.nr)
             output_track = copy.deepcopy(track.element)
             if output_path is not None:
                 rewrite_local_media_links(
@@ -12856,6 +13060,7 @@ class GPXEditorController(NSObject):
                 if child.tag == qname("time"):
                     output_track.remove(child)
             root.append(output_track)
+        store_document_counter(root, max(getattr(self, "next_nr", 1), max((track.nr for track in self.tracks), default=0) + 1))
         return root
 
     def write_gpx_file(self, path: Path) -> ET.Element:
@@ -12941,10 +13146,15 @@ class GPXEditorController(NSObject):
         self.notify_save_callback(path)
 
     def write_track_json(self, directory: Path, base: str):
+        identities = track_ids(self.tracks)
         for row, track in zip(self.table_rows, self.tracks):
             data = {
                 "source_gpx": str(self.last_save_path) if self.last_save_path else None,
-                "nr": track.nr,
+                "nr": track.track_number,
+                "internal_id": track.internal_id,
+                "stage": track.stage_number,
+                "track_id": identities[track.nr],
+                "type": TYPE_LABELS[track.track_type],
                 "track_name": track.name,
                 "erstellungsdatum": row["date"],
                 "dauer": row["duration"],
@@ -12978,7 +13188,7 @@ class GPXEditorController(NSObject):
         self.push_anchor_undo()
         self.anchor = (points[0].lat, points[0].lon)
         self.mark_dirty(
-            f"Anchorpoint set to the first point of track #{track.nr}.",
+            f"Anchorpoint set to the first point of {track.display_label}.",
             MutationKind.METADATA,
         )
 
@@ -13033,7 +13243,7 @@ class GPXEditorController(NSObject):
             inspector.plot_(None)
             inspector.select_point_index(point_index)
             inspector.show()
-        self.set_status(f"Opened waypoint table for track #{track.nr}.")
+        self.set_status(f"Opened waypoint table for {track.display_label}.")
 
     @objc.IBAction
     def contextInspectTrack_(self, sender):
@@ -13214,20 +13424,147 @@ class GPXEditorController(NSObject):
 
     @objc.IBAction
     def renumberTracks_(self, _sender):
-        if not self.tracks:
+        if not self.tracks or not self.ensure_track_mutations_available():
             return
-        selected_tracks = list(self.selected_tracks())
-        self.push_undo()
-        self.next_nr = renumber_track_records(self.tracks)
-        self.selected_nrs = [track.nr for track in selected_tracks]
-        self.duration_diagnostic_cache.clear()
-        self.update_selection_field()
-        self.mark_dirty(
-            f"Renumbered {len(self.tracks)} track(s) in current row order.",
-            MutationKind.ORDER,
-            {track.nr for track in self.tracks},
-        )
-        self.redraw_open_plot_views()
+        result = self.track_metadata_options("Renumber", numbering=True)
+        if result is None:
+            return
+        mode, scope, include_hidden, start, action = result
+        try:
+            proposal = numbering_proposal(self.tracks, self.selected_nrs, mode=mode,
+                scope=scope, include_hidden=include_hidden, start=start, action=action)
+            if not proposal.changes:
+                self.set_status("No numbers need changing.")
+                return
+            copies = [copy.copy(track) for track in self.tracks]
+            by_number = {track.nr: track for track in copies}
+            originals = {track.nr: track for track in self.tracks}
+            for old, new in proposal.changes:
+                track = by_number[old]
+                # A tiny metadata-only preview must never mutate source XML.
+                track.element = ET.Element(qname("trk"))
+                source_track = originals[old]
+                get_or_create_track_name(track.element).text = source_track.name
+                track.set_stage_number(source_track.stage_number)
+                track.set_order_number(source_track.track_number)
+            apply_numbering_proposal(copies, proposal)
+            ids = track_ids(copies)
+            label = lambda value: str(value) if value is not None else "Unassigned"
+            lines = []
+            for identity, _new in proposal.changes:
+                old, new = originals[identity], by_number[identity]
+                changes = []
+                if mode in {"track", "both"}:
+                    changes.append(f"Track: {label(old.track_number)} → {label(new.track_number)}")
+                if mode in {"stage", "both"}:
+                    changes.append(f"Stage: {label(old.stage_number)} → {label(new.stage_number)}")
+                lines.append(f"{old.name}:  {', '.join(changes)}  (Track ID: {ids[identity] or 'Unassigned'})")
+            preview = "\n".join(lines)
+        except (ValueError, TypeError) as exc:
+            show_alert("Cannot renumber tracks.", str(exc))
+            return
+        if not self.confirm_numbering_preview(preview):
+            return
+        affected = [originals[old] for old, _ in proposal.changes]
+        self.push_metadata_undo(affected)
+        apply_numbering_proposal(self.tracks, proposal)
+        self.metadata_changed("Cleared numbers." if action == "clear" else "Renumbered tracks.")
+
+    def confirm_numbering_preview(self, preview):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Apply these numbers?")
+        alert.setInformativeText_("Review the visible numbers and resulting Track IDs. Only the chosen scope changes; internal identities and file references stay unchanged.")
+        alert.addButtonWithTitle_("Apply Numbers")
+        alert.addButtonWithTitle_("Cancel")
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 430, 240))
+        scroll.setHasVerticalScroller_(True)
+        text = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 410, 240))
+        text.setEditable_(False)
+        text.setFont_(NSFont.userFixedPitchFontOfSize_(12))
+        text.setString_(preview)
+        scroll.setDocumentView_(text)
+        alert.setAccessoryView_(scroll)
+        return int(alert.runModal()) == 1000
+
+    def track_metadata_options(self, title, numbering=False, selection=False):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.addButtonWithTitle_("Preview" if numbering else "Select" if selection else "Apply")
+        alert.addButtonWithTitle_("Cancel")
+        accessory = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, 164 if numbering else 126))
+        operation = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 134, 390, 24), False)
+        operation.addItemsWithTitles_(["Action: Assign Numbers", "Action: Clear Numbers"])
+        choice = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 96, 390, 24), False)
+        choice.addItemsWithTitles_(["Track Numbers", "Stage Numbers", "Both Track and Stage Numbers"] if numbering else list(TYPE_LABELS.values()))
+        if numbering:
+            choice.menu().setAutoenablesItems_(False)
+        scope = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 64, 230, 24), False)
+        scope.addItemsWithTitles_(["Selected tracks", "All tracks"])
+        hidden = NSButton.alloc().initWithFrame_(NSMakeRect(0, 34, 230, 24))
+        hidden.setButtonType_(NSButtonTypeSwitch)
+        hidden.setTitle_("Include hidden tracks")
+        hidden.setState_(NSControlStateValueOn)
+        start = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 2, 390, 24))
+        start.setPlaceholderString_("First number (blank: continue preceding row)")
+        for view in ((operation, choice, scope, hidden, start) if numbering else
+                     (choice, hidden) if selection else (choice, scope, hidden)):
+            accessory.addSubview_(view)
+        alert.setAccessoryView_(accessory)
+        if numbering:
+            self.numbering_dialog_controls = (operation, choice, start)
+            operation.setTarget_(self)
+            operation.setAction_("numberingOptionsChanged:")
+            self.numberingOptionsChanged_(None)
+        try:
+            if int(alert.runModal()) != 1000:
+                return None
+            value = ("track", "stage", "both")[choice.indexOfSelectedItem()] if numbering else tuple(TYPE_LABELS)[choice.indexOfSelectedItem()]
+            result = value, ("selected", "all")[scope.indexOfSelectedItem()], bool(hidden.state()), str(start.stringValue()).strip() or None
+            return (*result, "clear" if operation.indexOfSelectedItem() == 1 else "assign") if numbering else result
+        finally:
+            if numbering:
+                self.numbering_dialog_controls = None
+
+    @objc.IBAction
+    def numberingOptionsChanged_(self, _sender):
+        controls = getattr(self, "numbering_dialog_controls", None)
+        if controls is None:
+            return
+        operation, choice, start = controls
+        clearing = operation.indexOfSelectedItem() == 1
+        choice.itemAtIndex_(2).setEnabled_(clearing)
+        if not clearing and choice.indexOfSelectedItem() == 2:
+            choice.selectItemAtIndex_(0)
+        start.setEnabled_(not clearing)
+
+    @objc.IBAction
+    def setTrackType_(self, _sender):
+        if not self.ensure_track_mutations_available():
+            return
+        result = self.track_metadata_options("Set Track Type")
+        if result is None:
+            return
+        kind, scope, include_hidden, _ = result
+        selected = set(self.selected_nrs)
+        tracks = [track for track in self.tracks if (scope == "all" or track.nr in selected)
+                  and (include_hidden or not track.hidden)]
+        if not tracks:
+            return
+        self.push_metadata_undo(tracks)
+        for track in tracks:
+            track.set_track_type(kind)
+        self.metadata_changed(f"Set {len(tracks)} track(s) to {TYPE_LABELS[kind]}.")
+
+    @objc.IBAction
+    def selectTracksByType_(self, _sender):
+        result = self.track_metadata_options("Select Tracks by Type", selection=True)
+        if result is not None:
+            kind, _, include_hidden, _ = result
+            self.selected_nrs = [track.nr for track in self.tracks if track.track_type == kind
+                                 and (include_hidden or not track.hidden)]
+            self.update_selection_field()
+            self.highlight_selected_rows()
+            self.redraw_open_plot_views()
 
     @objc.IBAction
     def saveSelectedTracksAs_(self, _sender):
@@ -13336,7 +13673,10 @@ class GPXEditorController(NSObject):
             current_index = position_cache[id(track)]
             mapping = {
                 "row": current_index,
-                "nr": track.nr,
+                "nr": track.track_number if track.track_number is not None else float("inf"),
+                "stage": track.stage_number if track.stage_number is not None else float("inf"),
+                "track_id": (track.stage_number if track.stage_number is not None else float("inf"), track.nr),
+                "type": TYPE_LABELS[track.track_type],
                 "name": track.name.casefold(),
                 "date": metrics["time"] or datetime.max.replace(tzinfo=UTC),
                 "length": metrics["length_km"],
@@ -13450,9 +13790,18 @@ class GPXEditorController(NSObject):
         self.set_status("Selection cleared.")
 
     @objc.IBAction
+    def invertTrackSelection_(self, _sender):
+        selected = set(self.selected_nrs)
+        self.selected_nrs = [track.nr for track in self.tracks if track.nr not in selected]
+        self.update_selection_field()
+        self.highlight_selected_rows()
+        self.redraw_open_plot_views()
+        self.set_status(f"Inverted selection: {len(self.selected_nrs)} track(s) selected.")
+
+    @objc.IBAction
     def selectionFieldCommitted_(self, _sender):
-        valid = {track.nr for track in self.tracks}
-        self.selected_nrs = [number for number in parse_track_numbers(str(self.selection_field.stringValue())) if number in valid]
+        by_number = {track.track_number: track.nr for track in self.tracks if track.track_number is not None}
+        self.selected_nrs = [by_number[number] for number in parse_track_numbers(str(self.selection_field.stringValue())) if number in by_number]
         self.update_selection_field()
         self.highlight_selected_rows()
         self.redraw_open_plot_views()
@@ -13474,7 +13823,11 @@ class GPXEditorController(NSObject):
         self.redraw_open_plot_views()
 
     def update_selection_field(self):
-        self.selection_field.setStringValue_(compress_track_numbers(self.selected_nrs))
+        by_id = {track.nr: track for track in self.tracks}
+        selected = [by_id[identity] for identity in self.selected_nrs if identity in by_id]
+        self.selection_field.setStringValue_(compress_track_numbers([track.track_number for track in selected if track.track_number is not None]))
+        unnumbered = sum(track.track_number is None for track in selected)
+        self.selection_field.setToolTip_(f"{len(selected)} track(s) selected; {unnumbered} unnumbered. Enter visible track numbers to replace the selection.")
 
     def highlight_selected_rows(self):
         mutable = objc.lookUpClass("NSMutableIndexSet").alloc().init()
@@ -13515,7 +13868,7 @@ class GPXEditorController(NSObject):
         selected = self.selected_tracks()
         if not selected:
             return
-        label = ", ".join(f"#{track.nr}" for track in selected[:12])
+        label = ", ".join(f"{track.display_label}: {track.name}" for track in selected[:12])
         if len(selected) > 12:
             label += ", ..."
         plural = "track" if len(selected) == 1 else "tracks"
@@ -13567,7 +13920,7 @@ class GPXEditorController(NSObject):
         self.selected_nrs = [primary.nr]
         self.update_selection_field()
         self.mark_dirty(
-            f"Joined {len(selected)} tracks into track #{primary.nr} using metadata from track #{metadata_source.nr}.",
+            f"Joined {len(selected)} tracks into {primary.display_label} using metadata from {metadata_source.display_label}.",
             MutationKind.STRUCTURE,
             {track.nr for track in selected},
         )
@@ -13579,7 +13932,7 @@ class GPXEditorController(NSObject):
             metrics = self.compute_metrics(track)
             rows.append(
                 {
-                    "nr": str(track.nr),
+                    "nr": str(track.track_number or ""),
                     "name": track.name,
                     "time": format_datetime_local(metrics.get("start_time") or metrics.get("time")),
                     "length": f"{metrics['length_km']:.1f}",
@@ -13624,6 +13977,7 @@ class GPXEditorController(NSObject):
     def apply_track_metadata(self, target: TrackRecord, source: TrackRecord):
         if target is source:
             return
+        number, stage = target.track_number, target.stage_number
         for child in list(target.element):
             if child.tag != qname("trkseg"):
                 target.element.remove(child)
@@ -13633,6 +13987,9 @@ class GPXEditorController(NSObject):
                 continue
             target.element.insert(insert_at, copy.deepcopy(child))
             insert_at += 1
+        get_or_create_mycamino_track_extension(target.element).set("internal_id", str(target.internal_id))
+        target.set_order_number(number)
+        target.set_stage_number(stage)
 
     @objc.IBAction
     def plotAll_(self, _sender):
@@ -13719,6 +14076,11 @@ class GPXEditorController(NSObject):
             "rejection_counts": processed.rejection_counts,
             "processing_options": processed.options.as_dict(),
             "original_sequence_number": track.nr,
+            "internal_id": track.internal_id,
+            "display_track_number": track.track_number,
+            "track_type": track.track_type,
+            "stage_number": track.stage_number,
+            "track_id": track_ids(self.tracks)[track.nr],
             "table_number": table_number,
         }
 
@@ -14060,7 +14422,8 @@ class GPXEditorController(NSObject):
                     ax.plot(
                         xs,
                         ys,
-                        color="blue",
+                        color=track_color(track, self.project_parameters),
+                        linestyle="--" if track.hidden else "-",
                         linewidth=4.0,
                         solid_capstyle="round",
                         solid_joinstyle="round",
@@ -14270,7 +14633,7 @@ class GPXEditorController(NSObject):
                     segment.remove(point)
         self.invalidate_track_metrics(track)
         self.mark_dirty(
-            f"Deleted {len(delete_elements)} point(s) from track #{track.nr}.",
+            f"Deleted {len(delete_elements)} point(s) from {track.display_label}.",
             MutationKind.STRUCTURE,
             {track.nr},
         )
@@ -14297,7 +14660,7 @@ class GPXEditorController(NSObject):
                     segment.remove(point)
         get_or_create_track_name(new_track).text = f"{track.name} part 2"
         new_record = TrackRecord(self.next_nr, new_track, track.source_file)
-        new_record.set_order_number(self.next_nr)
+        new_record.set_order_number(max((item.track_number or 0 for item in self.tracks), default=0) + 1)
         self.next_nr += 1
         insert_at = self.tracks.index(track) + 1
         self.tracks.insert(insert_at, new_record)
@@ -14306,7 +14669,7 @@ class GPXEditorController(NSObject):
         self.selected_nrs = [track.nr, new_record.nr]
         self.update_selection_field()
         self.mark_dirty(
-            f"Cut track #{track.nr}; new track #{new_record.nr} created.",
+            f"Cut {track.display_label}; new {new_record.display_label} created.",
             MutationKind.STRUCTURE,
             {track.nr, new_record.nr},
         )
@@ -14345,15 +14708,15 @@ class GPXEditorController(NSObject):
         if first_new_time is not None:
             get_or_create_track_time(new_track).text = format_gpx_time(first_new_time)
         new_record = TrackRecord(self.next_nr, new_track, track.source_file)
-        new_record.set_order_number(self.next_nr)
+        new_record.set_order_number(max((item.track_number or 0 for item in self.tracks), default=0) + 1)
         self.next_nr += 1
         insert_at = self.tracks.index(track) + 1
         self.tracks.insert(insert_at, new_record)
         self.invalidate_track_metrics(track)
         self.invalidate_track_metrics(new_record)
         self.mark_dirty(
-            f"Split track #{track.nr} above point {start_index + 1}; "
-            f"new track #{new_record.nr} created.",
+            f"Split {track.display_label} above point {start_index + 1}; "
+            f"new {new_record.display_label} created.",
             MutationKind.STRUCTURE,
             {track.nr, new_record.nr},
         )
@@ -14365,6 +14728,9 @@ class GPXEditorController(NSObject):
             self.set_status("Nothing to undo.")
             return
         entry = self.undo_stack.pop()
+        if isinstance(entry, TrackMetadataUndoEntry):
+            self.redo_stack.append(self.restore_metadata(entry))
+            return
         if isinstance(entry, VisibilityUndoEntry):
             self.redo_stack.append(entry)
             self.redo_stack = self.redo_stack[-10:]
@@ -14429,6 +14795,9 @@ class GPXEditorController(NSObject):
             self.set_status("Nothing to redo.")
             return
         entry = self.redo_stack.pop()
+        if isinstance(entry, TrackMetadataUndoEntry):
+            self.undo_stack.append(self.restore_metadata(entry))
+            return
         if isinstance(entry, VisibilityUndoEntry):
             self.undo_stack.append(entry)
             self.undo_stack = self.undo_stack[-10:]
@@ -14524,8 +14893,8 @@ class GPXEditorController(NSObject):
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
             "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation. Estimate Route Times from Media keeps an untimed route's geometry unchanged and timestamps its existing points from nearby media within the configured Photo-to-route distance. More distant media is ignored only for timing. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
             "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint table and fit the track in the map, like pressing Plot. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row. Escape cancels an active table-field edit; Cmd-Z reverses a change that was already committed. While uncached track data is loading, scrolling and selection remain available, and editing is enabled when processing finishes.\n\n"
-            "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber Tracks records the current row order as persistent track numbers; after another sort, sorting by Track Number restores that order. Hidden rows remain numbered but are gray and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
-            "Use the selection field to type track numbers such as 1,3-5. Select All and Unselect All change the current track selection. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
+            "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber… previews Track Numbers or Stage Numbers for Selected or All tracks, optionally including hidden tracks. Enter the first number or leave it blank to continue the preceding row. Conflicts with untouched tracks are blocked. Edit Stage cells directly to group tracks; Track IDs remain stable in persistent Track Number order, including hidden tracks. Set Type… assigns a type, and Select by Type… replaces the selection. Types and colors are configured under Track Types in Settings. These metadata edits retain cached metrics and the current viewport. Hidden rows remain numbered but use dashed light gray routes and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
+            "Use the selection field to type visible track numbers such as 1,3-5; unnumbered tracks can be selected in the table. Select All and Unselect All change the current track selection. Invert Selection selects unselected tracks and deselects the others, including hidden tracks. Renumber offers Assign Numbers or Clear Numbers, Track Numbers or Stage Numbers, Selected or All, and Include Hidden; clearing also offers Both. Preview and confirm the changes. A Stage cell may also be cleared directly. Undo restores changed values. Internal identities and file references never change when renumbering. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
             "Plot Overview opens an overview using the configured map service. Selected tracks are dark blue, other tracks are light blue, and marked waypoint ranges remain red. Click a track in the overview to select it in the table. In the Adventure Map, double-click a track to open the Track Table; double-click it there to open the waypoint table. The map context menu can open either table directly.\n\n"
             "Plot Track(s) opens a detailed map for the selected track; an empty track starts on a world map. Right-click Create Waypoint Here to add its first or a later point. View File opens the original GPX source file in TextEdit. Click a map to move the cursor dot and direction arrow to the nearest waypoint; drag to pan. Double-click a linked media point to view its photo or video, or another point to open its waypoint inspector. Press i to show or hide point information; Escape hides it; h shows map keys; a sets the anchorpoint; + and - zoom; c centers on the cursor; z zooms to the current selection; Shift-Z fits the current track; A shows all Adventure tracks; p changes photo-thumbnail display; s saves PNG; q closes the plot window. In the track map, m or Shift-click starts a marked range. Its red segment can be copied, cut, deleted, or dragged through its context menu and long-click gesture. Right-click elsewhere to paste copied points after the nearest waypoint.\n\n"
             "Inspect Track opens all raw waypoints of one track. The read-only XY and Elevation status columns explain quality filtering and interpolation; the header shows retained/raw counts. The processing summary above the main table shows the active XY smoothing, spacing, elevation smoothing, error, and HDOP/VDOP limits. Statistics, maps, PDFs, profiles, and timing use this common segment-aware processed geometry while saved GPX points remain unchanged.\n\n"
@@ -14692,7 +15061,7 @@ class GPXEditorController(NSObject):
 
     @objc.IBAction
     def autosave_(self, _timer):
-        if not self.dirty or not self.tracks:
+        if not self.dirty or (not self.tracks and not getattr(self, "document_ids_initialized", False)):
             return
         try:
             self.save_to_path(RECOVERY_PATH, autosave=True)
@@ -14782,12 +15151,15 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
     track_menu = add_menu(main_menu, "Track")
     for title, action in (
         ("New Track", "newTrack:"),
-        ("Track Table", "showTrackTable:"),
+        ("Track Table & Editor", "showTrackTable:"),
         ("Waypoint Table", "inspectTrack:"),
         ("Plot Track(s)", "plotSelected:"),
         ("Elevation Profile", "contextElevationProfile:"),
         ("Estimate Route Times from Media…", "estimateRouteTimesFromMedia:"),
-        ("Renumber Tracks", "renumberTracks:"),
+        ("Renumber…", "renumberTracks:"),
+        ("Set Track Type…", "setTrackType:"),
+        ("Select Tracks by Type…", "selectTracksByType:"),
+        ("Invert Selection", "invertTrackSelection:"),
         ("Save Selected Tracks As…", "saveSelectedTracksAs:"),
     ):
         track_menu.addItem_(menu_item(title, action, controller))

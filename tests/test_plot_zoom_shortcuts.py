@@ -68,7 +68,7 @@ class PlotZoomShortcutTests(unittest.TestCase):
         plot.controller.redo_.assert_called_once_with(None)
 
     def test_map_shift_z_uses_current_track_not_neighbours_and_preserves_selection(self):
-        current = SimpleNamespace(nr=26)
+        current = SimpleNamespace(nr=26, display_label="Track #26")
         plot = SimpleNamespace(
             mode="overview", current_track_for_title=lambda: current,
             controller=SimpleNamespace(extent_for_track_records=Mock(return_value={"current": True})),
@@ -141,8 +141,8 @@ class PlotZoomShortcutTests(unittest.TestCase):
 
 class ProfileZoomShortcutTests(unittest.TestCase):
     def profile(self, map_mode="overview"):
-        first = SimpleNamespace(nr=1, name="First")
-        current = SimpleNamespace(nr=26, name="Current")
+        first = SimpleNamespace(nr=1, name="First", display_label="Track #1")
+        current = SimpleNamespace(nr=26, name="Current", display_label="Track #26")
         plot = SimpleNamespace(
             mode=map_mode, current_track_for_title=lambda: current,
             selected_ranges_for_track=Mock(return_value=[]),

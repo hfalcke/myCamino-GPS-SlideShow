@@ -12,7 +12,7 @@ from map_overlay import (
 class MapOverlayTests(unittest.TestCase):
     def test_legacy_map_is_not_drawn_twice(self):
         self.assertFalse(map_uses_dynamic_overlays({"track_points": [[1.0, 2.0], [3.0, 4.0]]}))
-        self.assertTrue(
+        self.assertFalse(
             map_uses_dynamic_overlays(
                 {"map_content_version": 3, "background_only": True}
             )

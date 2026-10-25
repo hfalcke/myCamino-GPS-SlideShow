@@ -627,8 +627,12 @@ class AdventureMapController(NSObject):
             return has_control
         if action in {
             "showTrackTable:", "showWaypointTable:", "showElevationProfile:",
-            "fitToTrack:", "renumberTracks:", "estimateRouteTimesFromMedia:",
+            "fitToTrack:", "renumberTracks:", "estimateRouteTimesFromMedia:", "selectTracksByType:",
         }:
+            return has_tracks
+        if action == "setTrackType:":
+            return has_tracks and self.gpx_controller.track_mutations_enabled
+        if action == "invertTrackSelection:":
             return has_tracks
         if action == "saveSelectedTracksAs:":
             return has_selection
@@ -859,6 +863,7 @@ class AdventureMapController(NSObject):
             self._show_empty_world()
             self.gpx_controller.tracks = []
             self.gpx_controller.next_nr = 1
+            self.gpx_controller.document_ids_initialized = False
             self.gpx_controller.load_gpx_paths(gpx_paths, mark_dirty=False)
         else:
             self.startup_media_extent_pending = True
@@ -990,9 +995,11 @@ class AdventureMapController(NSObject):
         # Put a usable world canvas on screen before a large GPX finishes loading.
         self.gpx_controller.tracks = []
         self.gpx_controller.next_nr = 1
+        self.gpx_controller.document_ids_initialized = False
         self._show_empty_world()
         self.gpx_controller.tracks = []
         self.gpx_controller.next_nr = 1
+        self.gpx_controller.document_ids_initialized = False
         if gpx is not None and gpx.is_file():
             self.startup_track_loading = True
             self.startup_media_scan_deferred = True
@@ -1540,7 +1547,7 @@ class AdventureMapController(NSObject):
         self._journal(
             "Route Timing",
             f"The new media metadata is ready. Checking all {len(project_media)} "
-            f"project media file(s) against track #{timing_track.nr}.",
+            f"project media file(s) against {timing_track.display_label}.",
         )
         self._prepare_route_timing_offer(
             timing_track.nr,
@@ -2353,7 +2360,7 @@ class AdventureMapController(NSObject):
             self.plot_view.setNeedsDisplay_(True)
             self.gpx_controller.refresh_elevation_profile_for_plot_view(self.plot_view)
         self.gpx_controller.set_status(
-            "Hidden tracks are shown in orange; they remain excluded from totals."
+            "Hidden tracks are shown in dashed light gray; they remain excluded from totals."
             if self.show_hidden_tracks else "Hidden tracks are no longer displayed.")
 
     @objc.IBAction
@@ -2560,7 +2567,7 @@ class AdventureMapController(NSObject):
             points[point_index].lon,
         )
         self.gpx_controller.set_status(
-            f"Selected point {point_index + 1} of {len(points)} in track #{track.nr}."
+            f"Selected point {point_index + 1} of {len(points)} in {track.display_label}."
         )
         return True
 
@@ -2991,6 +2998,7 @@ class AdventureMapController(NSObject):
             if len(self.gpx_controller.tracks) == 1 and not self.gpx_controller.tracks[0].points():
                 self.gpx_controller.tracks = []
                 self.gpx_controller.next_nr = 1
+                self.gpx_controller.document_ids_initialized = False
             self.gpx_controller.load_gpx_paths(
                 gpx_paths,
                 mark_dirty=True,
@@ -3160,10 +3168,10 @@ class AdventureMapController(NSObject):
                 self._journal(
                     "Route Timing",
                     (
-                        f"Will estimate timestamps for track #{route_timing_track.nr} "
+                        f"Will estimate timestamps for {route_timing_track.display_label} "
                         "after media GPS and dates are ready."
                         if attempt_route_timing
-                        else f"Route timing was declined for track #{route_timing_track.nr}."
+                        else f"Route timing was declined for {route_timing_track.display_label}."
                     ),
                 )
         if self.adventure_file is None and not self._create_adventure_for_media_drop():
@@ -3857,6 +3865,8 @@ class AdventureMapController(NSObject):
         try:
             root = ET.fromstring(newest["gpx_xml"])
             self.gpx_controller.tracks = []
+            self.gpx_controller.next_nr = 1
+            self.gpx_controller.document_ids_initialized = False
             temp = self.recovery.directory / "recovered.gpx"
             ET.ElementTree(root).write(temp, encoding="utf-8", xml_declaration=True)
             self.gpx_controller._load_gpx_paths_synchronously([temp], mark_dirty=False)
@@ -4522,6 +4532,18 @@ class AdventureMapController(NSObject):
         self.gpx_controller.renumberTracks_(None)
 
     @objc.IBAction
+    def setTrackType_(self, _sender):
+        self.gpx_controller.setTrackType_(None)
+
+    @objc.IBAction
+    def selectTracksByType_(self, _sender):
+        self.gpx_controller.selectTracksByType_(None)
+
+    @objc.IBAction
+    def invertTrackSelection_(self, _sender):
+        self.gpx_controller.invertTrackSelection_(None)
+
+    @objc.IBAction
     def saveSelectedTracksAs_(self, _sender):
         self.gpx_controller.saveSelectedTracksAs_(None)
 
@@ -4836,7 +4858,7 @@ class AdventureMapController(NSObject):
                 "Drop an Adventure, project folder, GPX tracks, photos, videos, or audio onto the map.\n\n"
                 "TRACKS\n\n"
                 "Click a track to select it. The selected track is dark blue; other tracks are light blue, and marked ranges are red.\n\n"
-                "Choose Show Hidden Tracks in the map context menu to display hidden tracks in orange. This does not change their saved visibility or include them in totals. Choose Hide Hidden Tracks to hide them again.\n\n"
+                "Choose Show Hidden Tracks in the map context menu to display hidden tracks in dashed light gray. Visible tracks use their type colors, selected tracks have a stronger outlined stroke, and marked ranges stay red. This does not change saved visibility or include hidden tracks in totals. Choose Hide Hidden Tracks to hide them again.\n\n"
                 "Double-click a track to open the Track Table. Double-click it there to open its Waypoint Table. Right-click a track on the map to open either table, fit the view, or show the synchronized Elevation Profile.\n\n"
                 "Double-click empty map space, or press Command-0, to return to the Adventure overview at its remembered zoom and position. Choose Fit Entire Adventure in the map context menu to fit all visible tracks. Drag the map or use two-finger scrolling to pan.\n\n"
                 "MEDIA\n\n"
@@ -4960,6 +4982,7 @@ class AdventureMapController(NSObject):
             self.gpx_controller.cancel_staged_track_loading()
         self.gpx_controller.tracks = []
         self.gpx_controller.next_nr = 1
+        self.gpx_controller.document_ids_initialized = False
         self.gpx_controller.dirty = False
         self.gpx_controller.project_name = ""
         self.gpx_controller.project_name_fallback = ""
@@ -5286,12 +5309,15 @@ def build_adventure_map_menu(controller):
     track_menu = add_menu(main_menu, "Track")
     for title, action in (
         ("Add GPX Files…", "addGPXFiles:"),
-        ("Track Table", "showTrackTable:"),
+        ("Track Table & Editor", "showTrackTable:"),
         ("Waypoint Table", "showWaypointTable:"),
         ("Elevation Profile", "showElevationProfile:"),
         ("Fit to Track", "fitToTrack:"),
         ("Estimate Route Times from Media…", "estimateRouteTimesFromMedia:"),
-        ("Renumber Tracks", "renumberTracks:"),
+        ("Renumber…", "renumberTracks:"),
+        ("Set Track Type…", "setTrackType:"),
+        ("Select Tracks by Type…", "selectTracksByType:"),
+        ("Invert Selection", "invertTrackSelection:"),
         ("Save Selected Tracks As…", "saveSelectedTracksAs:"),
     ):
         track_menu.addItem_(menu_item(title, action, controller))

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import tempfile
+from map_overlay import map_uses_dynamic_overlays
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -152,6 +153,11 @@ def _apply_track_identity(
         {
             "track_number": track.get("table_number"),
             "track_name": track.get("name", ""),
+            "track_type": track.get("track_type", "unassigned"),
+            "stage_number": track.get("stage_number", track.get("original_sequence_number", track.get("table_number"))),
+            "track_id": track.get("track_id"),
+            "internal_id": track.get("internal_id", track.get("original_sequence_number")),
+            "display_track_number": track.get("display_track_number", track.get("original_sequence_number")),
             "track_fingerprint": stored_data_fingerprint,
             "track_fingerprint_version": TRACK_FINGERPRINT_VERSION,
             "track_geometry_fingerprint": track.get("track_geometry_fingerprint"),
@@ -167,12 +173,12 @@ def _apply_track_identity(
     return updated
 
 
-def reconcile_legacy_track_sidecars(
+def reconcile_track_sidecars(
     context: dict,
     *,
     render_parameters_by_layout: dict[str, dict] | None = None,
 ) -> TrackAssetReconciliationReport:
-    """Upgrade uniquely geometry-matching sidecars without touching map images."""
+    """Reconcile identities of modern backgrounds without touching map images."""
     report = TrackAssetReconciliationReport()
     output_dir = Path(context["output_dir"]).resolve(strict=False)
     source_gpx = str(Path(context["args"].gpx_file).resolve(strict=False))
@@ -193,17 +199,20 @@ def reconcile_legacy_track_sidecars(
             report.unmatched.append(metadata_path.name)
             continue
         stored_geometry = str(payload.get("track_geometry_fingerprint") or "")
-        if not stored_geometry:
-            segments = _stored_geometry_segments(payload)
-            if segments:
-                stored_geometry = geometry_fingerprint_from_segments(segments)
+        if not map_uses_dynamic_overlays(payload):
+            report.unmatched.append(metadata_path.name)
+            continue
         matches = tracks_by_geometry.get(stored_geometry, [])
         if not matches:
             report.unmatched.append(metadata_path.name)
             continue
         if len(matches) != 1:
-            report.ambiguous.append(metadata_path.name)
-            continue
+            identified = [item for item in matches if payload.get("internal_id") is not None
+                          and item.get("internal_id") == payload["internal_id"]]
+            if len(identified) != 1:
+                report.ambiguous.append(metadata_path.name)
+                continue
+            matches = identified
         track = matches[0]
         stored_segments = _stored_geometry_segments(payload)
         stored_data_fingerprint = (
@@ -247,7 +256,11 @@ def reconcile_legacy_track_sidecars(
             geometry = geometry_fingerprint_from_segments(segments)
             matches = tracks_by_geometry.get(geometry, [])
             if len(matches) != 1:
-                continue
+                identified = [item for item in matches if payload.get("internal_id") is not None
+                              and item.get("internal_id") == payload["internal_id"]]
+                if len(identified) != 1:
+                    continue
+                matches = identified
             track = matches[0]
             stored_data_fingerprint = data_fingerprint_from_segments(segments)
             if stored_data_fingerprint != str(track.get("track_data_fingerprint") or ""):
@@ -344,6 +357,9 @@ def relink_numbered_track_assets(
             metadata = _read_json(metadata_path)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
+        if not map_uses_dynamic_overlays(metadata):
+            report.skipped.append(metadata_path.name)
+            continue
         fingerprint = str(
             metadata.get("track_geometry_fingerprint")
             or metadata.get("track_fingerprint")
@@ -414,13 +430,15 @@ def relink_numbered_track_assets(
 
     overview_metadata_path = Path(
         context.get("overview_metadata_path")
-        or Path(context.get("overview_path", "")).with_suffix(".json")
+        or Path(context.get("overview_path") or output_dir / "overview.png").with_suffix(".json")
     ).resolve(strict=False)
     overview_original = None
     overview_updated = None
     if overview_metadata_path.is_file():
         try:
             overview_original = _read_json(overview_metadata_path)
+            if not map_uses_dynamic_overlays(overview_original):
+                raise StopIteration
             old_overview_tracks = [
                 item
                 for item in overview_original.get("tracks", [])
@@ -442,8 +460,7 @@ def relink_numbered_track_assets(
                 )
                 for track in context.get("tracks", [])
             ]
-            # Relinking may modernize an overview only when its complete route
-            # set is unchanged. Added or removed tracks require a redraw.
+            # Reuse a modern overview only when its complete route set matches.
             if not old_geometry or sorted(old_geometry) != sorted(current_geometry):
                 overview_updated = None
                 raise StopIteration

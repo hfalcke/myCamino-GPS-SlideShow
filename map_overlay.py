@@ -8,7 +8,6 @@ from typing import Any, Iterable, Optional
 
 
 MAP_CONTENT_VERSION = 6
-DYNAMIC_OVERLAY_MIN_VERSION = 3
 GPX_OVERLAY_MODES = frozenset({"line", "hidden"})
 MEDIA_OVERLAY_MODES = frozenset({"dots", "interpolated", "hidden"})
 
@@ -43,7 +42,7 @@ def map_uses_dynamic_overlays(metadata: object) -> bool:
         version = int(metadata.get("map_content_version", 0))
     except (TypeError, ValueError):
         return False
-    return version >= DYNAMIC_OVERLAY_MIN_VERSION and bool(metadata.get("background_only"))
+    return version == MAP_CONTENT_VERSION and metadata.get("background_only") is True
 
 
 def overlay_stage_kind(metadata: object) -> str:

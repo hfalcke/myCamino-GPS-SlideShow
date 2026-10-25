@@ -561,7 +561,8 @@ class TrackTimingTests(unittest.TestCase):
             map_image = Path(temp_dir) / "existing-track-map.png"
             map_image.write_bytes(b"unchanged map pixels")
             image_mtime = map_image.stat().st_mtime_ns
-            sidecar.write_text(json.dumps({"track_fingerprint": "track-one", "preserved": True}), encoding="utf-8")
+            sidecar.write_text(json.dumps({"track_fingerprint": "track-one", "preserved": True,
+                                          "background_only": True, "map_content_version": 6}), encoding="utf-8")
             with patch("gpx_tracks_table.prepare_with_options", return_value=context):
                 report = upgrade_timed_track_sidecars("unused.gpx", temp_dir)
             updated = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -575,7 +576,7 @@ class TrackTimingTests(unittest.TestCase):
         self.assertEqual(updated["running_speed"]["version"], 1)
         self.assertEqual(updated["running_speed"]["window_distance_m"], 500.0)
 
-    def test_sidecar_upgrade_safely_matches_legacy_identity_fields(self):
+    def test_sidecar_upgrade_does_not_adopt_legacy_identity_fields(self):
         start = datetime(2020, 10, 17, 11, 0, tzinfo=timezone.utc)
         context = {
             "tracks": [
@@ -607,9 +608,8 @@ class TrackTimingTests(unittest.TestCase):
                 with patch("gpx_tracks_table.prepare_with_options", return_value=context):
                     report = upgrade_timed_track_sidecars("unused.gpx", temp_dir)
             updated = json.loads(sidecar.read_text(encoding="utf-8"))
-        self.assertEqual(report["updated"], [1])
-        self.assertEqual(updated["track_fingerprint"], "legacy-track-fingerprint")
-        self.assertEqual(len(updated["timed_track_points"]), 2)
+        self.assertEqual(report["updated"], [])
+        self.assertEqual(updated, metadata)
 
     def test_sidecar_upgrade_rejects_legacy_identity_mismatch(self):
         context = {
@@ -640,7 +640,7 @@ class TrackTimingTests(unittest.TestCase):
             unchanged = json.loads(sidecar.read_text(encoding="utf-8"))
         self.assertEqual(report["updated"], [])
         self.assertIn(
-            ("legacy-track-map.json", "legacy track identity does not match current GPX"),
+            ("legacy-track-map.json", "map background must be regenerated"),
             report["skipped"],
         )
         self.assertIn((1, "matching track-map metadata missing"), report["skipped"])
