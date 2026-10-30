@@ -260,13 +260,24 @@ Important GUI support classes:
 - Window delegate classes retain lifecycle hooks and should be kept alive while
   their windows are open.
 
-Adventure discovery keeps strict format-2 loading separate from copied-folder
-recovery. `discover_adventure_candidates()` returns valid records, relocatable
-templates whose only structural problem is their recorded project root, and
-genuinely invalid files. `create_adventure_from_template()` creates a new file
-without replacing an existing destination, rebases only absolute paths below
-the old project root, retains shared relative project assets, and clears resume
-history. Normal `load_adventure()` validation remains strict.
+Adventure discovery keeps strict format-2 validation separate from opening.
+`resolve_adventure_location()` is read-only and accepts a relocated file only
+when its recorded root is the sole validation problem. It rebases project-local
+absolute paths, preserving external paths, names, relative assets, resume history
+and media-identity provenance. `discover_adventure_candidates()` returns all
+openable records together, a relocation subset, and errors, without writing files.
+After authorization and switch safeguards, `open_adventure()` atomically repairs
+the selected existing `.adv`; on write failure it returns corrected in-memory
+state and `location_save_error`, which the UI warns about and keeps dirty.
+Normal `load_adventure()` remains strict. Explicit copy/create APIs retain
+their no-overwrite safeguards and are never invoked by normal opening.
+
+`cocoa_adventure_chooser.choose_adventure()` is shared by both interfaces:
+one file opens directly; multiple files always show Open Selected/Cancel.
+Explicit `.adv` requests bypass folder selection. Directory inspection uses
+temporary security-scoped access without releasing the active project's scope;
+cancelled or invalid requests do not stop watchers or enrichment. Recent entries
+support both legacy directory paths and selected `.adv` paths.
 
 The main window is built manually in `_build_window()` and positioned in
 `layout_window()`. Help text is mostly in `_configure_tooltips()`.
@@ -525,6 +536,48 @@ one explicitly selected map plan.
 
 ## Shared GPX Processing
 
+`track_time_estimation.py` is the pure segment-aware GPX repair planner. Frozen
+points, missing ranges and timestamp patches keep source row indexes. Fill
+preserves all existing times; refresh treats only generated times as targets.
+Processed source distances drive interpolation, with same-segment speed samples,
+anchor-pair speed and configured fallback for open ends. UTC arithmetic handles
+DST, no calendar time is invented without an anchor, and conflicts remain
+unresolved. It reuses the media matcher in forward-only mode and excludes
+track-time-inferred GPS; it does not change `track_timing_utils` playback repair.
+
+`cocoa_track_timing.py` retains one diagnostics window and one estimation window
+per editor. The executor receives detached XML/settings, reuses sidecars and
+prepares basic metadata only if unbounded/unresolved gaps need media. Existing
+map media indexes and control references provide inputs without a file chooser.
+AppKit polls results and validates source XML, settings and Adventure context
+before applying. Cancellation and superseded jobs cannot install late results.
+Diagnostics are prepared during background loading and invalidated per track.
+Timestamp Undo stores only time/provenance deltas, preserves XML child order,
+checks for newer edits, and synchronizes the main and open inspector histories.
+GPX editor and timestamp CLI writes use `format_gpx_timestamp`, retaining
+microseconds in UTC. A distance plateau may legitimately share its preceding
+anchor's fractional timestamp; truncating it to whole seconds would cause the
+importer to reject that repaired point as backwards. Regression tests therefore
+exercise Apply, actual GPX writing, and repeated normalized reloads.
+After Apply the tool enables Save Tracks, invoking the editor's canonical
+`save_current`/Save As workflow rather than exporting the selection or writing a
+second GPX variant. Save cancellation and failures retain the in-memory edits
+and allow retry; successful saving leaves the timestamp Undo history intact.
+`save_current` delegates saves of the active managed GPX to the Adventure's
+`save_gpx_editor_document` and existing workspace flush. The GPX file, `.adv`
+identity, mutation acknowledgements, recovery cleanup and dirty flags therefore
+complete together rather than leaving a saved GPX marked pending in its host.
+Standalone and separate Save As exports retain their existing file-save path.
+Failed Adventure commits and newer GPX generations remain dirty and retryable.
+Timing mutations retain display geometry and follow normal autosave/derived-data
+invalidation without rendering maps or requesting tiles.
+
+Automatic partial/untimed offers share the existing Adventure suppression field,
+using raw segment-preserving geometry identities. Only explicit Ignore with the
+checkbox writes suppression; standalone decisions are namespaced by document
+path in the v2 preference dictionary. Legacy global decisions do not suppress
+new unrelated documents. Explicit tools/new-media offers bypass suppression.
+
 `media_route_timing.py` provides the geometry-preserving route-timing service.
 It projects dated media onto GPX segments within the configured
 `gpx.media_timing_max_distance_m`, selects a forward monotonic set of anchors,
@@ -651,6 +704,17 @@ if they no longer match any current GPX track. Obsolete media-stage maps are
 removed only within the active Adventure's sanitized `<base>-media-...` family.
 Both valid variants are retained. Cleanup intentionally does not remove the
 overview image, summary JSON, other Adventure families, or unrelated files.
+`protected_control_map_paths` also protects image/JSON pairs referenced by every
+project `.lst`, including disabled rows and implicit Time-Lapse partners. Unsaved
+control edits or unreadable control files defer cleanup rather than risk loss.
+
+`select_map_repair_numbers` narrows automatic slideshow repairs only when all
+requested names resolve to the current plan. Older authored filenames retain the
+complete missing/stale selection, not an empty intersection. After rendering,
+the worker verifies the requested control dependencies again. Unresolved current
+assets are failures; outdated references set `control_review_required`, cancel
+the deferred launch, and route to the existing review after status refresh.
+Neither path recursively restarts playback or silently rewrites authored rows.
 
 Map generation runs on a background thread. The GUI shows a Cancel button that
 sets an event. Cancellation is cooperative and stops after the current image.
@@ -1042,6 +1106,25 @@ AppKit calls. AppKit polls progress and completion on the main thread; closing
 the panel cancels work and stops its polling timer. Export never writes GPX
 or Adventure data. Table-only reports need no geometry processing or tiles.
 
+PDF renderers opt into `contextily_request_timeout` with three maximum attempts,
+their cancellation event, worker progress, and a 30-second minimum read timeout
+for non-OSM providers. The configured connection timeout and any larger read
+timeout are preserved. Interactive requests retain the default single-attempt
+policy and configured timeout. Retries occur inside the existing cached tile
+fetch, not around whole maps; cache keys and successful entries remain unchanged.
+Transient connection/timeouts and HTTP 408/500/502/503/504 use increasing delays
+with jitter. Progress rounds the backoff to one decimal place, replaces it with
+the active attempt and connection/read timeouts immediately before the request,
+and reports receipt afterward; the backoff is not a download-duration estimate.
+HTTP 429 retries at most once with a valid numeric or HTTP-date
+Retry-After; 401/403 and other terminal provider errors never retry. Retry waits
+and offline waits are cancellation-aware; PDF jobs fail resumably when offline
+rather than waiting indefinitely. `TileRequestCancelled` remains unwrapped during
+rendering and becomes `PDFExportCancelled` at the export boundary. Errors and
+retry progress contain provider names but no raw URLs, keys or underlying request
+exception strings. Threads outside a request-policy context bypass the temporary
+process-wide requests patch entirely.
+
 `gpx_pdf_details.py` builds frozen checkpoints and detects breaks on accepted
 raw observations, so spacing/smoothing cannot erase stationary periods. Break
 candidates are scanned once; raw-to-processed distance mapping is linear and
@@ -1061,9 +1144,16 @@ chaining spatial matches beyond the radius. The index itself remains read-only.
 plotting phase. It reuses `resolve_place_for_coordinate` with configured jitter
 and explicit cancellation, and `enrich_weather_sidecars` with the media service's
 same batching/sampling/backoff. Weather consent/settings and Keychain accounts
-are unchanged. The versioned `<PDF name>-checkpoints.json` stores only retrieved
-checkpoint data, keyed by coordinates and UTC timestamp, preserving unknown
-fields. Writes are atomic and coalesced during fast batches, flushed on normal
+are unchanged. Adventure exports use the versioned
+`.mycamino/pdf-checkpoints.json`; standalone exports retain
+`<PDF name>-checkpoints.json`. `prepare_checkpoint_cache` imports existing
+report sidecars in the Adventure, plus the current report companion even outside
+the project, without requests or changes to the originals. Import signatures
+avoid rereading unchanged files. Unused historical records remain available
+under the existing spatial/temporal reuse rules. Records are keyed by coordinates
+and UTC timestamp, preserving unknown fields and intact weather provenance.
+Per-path locks serialize imports and enrichment. Writes are atomic and coalesced
+during fast batches, flushed on normal
 return and cancellation. Media/GPX files are never written. Offline exports use
 cached data and remain retryable; future unknown cache versions are not replaced.
 `export_prepared_summary_pdf` runs enrichment outside `PLOT_RENDER_LOCK`; map,
@@ -1416,6 +1506,13 @@ containing stage, marker progress, and visible medium. Music state remaps saved
 paths after playlist reordering and falls back to replaying preceding
 `#MUSIC:` directives when exact restoration is impossible.
 The control snapshot restores the effective media duration and playback style.
+Keyboard/live-settings transition choices are retained as a session style
+override anchored to the current control row. Reconstruction ignores earlier
+transition assignments already superseded by that choice, while later authored
+assignments and active repeated transitions end the override. The optional
+`style_override` field in the version-1 control snapshot preserves this through
+Continue; older snapshots still restore their saved effective style. A full
+replay from the title retains its existing reset-to-startup behavior.
 
 Only checkpoint format version 6 is accepted. Older
 `slideshow_resume_position` data and unsupported history entries are ignored
@@ -1633,7 +1730,9 @@ numbering proposals. Standard GPX `<type>` preserves unsupported imported text
 until explicit assignment. `mycamino_gpx_editor.stage_number` is optional and
 falls back to the persistent Track Number. IDs use bijective alphabetic suffixes
 in complete-document Track Number order, including hidden tracks. Report subsets
-never relabel IDs; only the decision to display the ID column is report-local.
+never relabel IDs. PDF summary tables use one Track ID column, including for
+singleton exported subsets; legacy Stage-column requests map to that column
+without duplicates. Individual track-page titles retain their Stage naming.
 
 An explicitly empty `stage_number` or `order_number` means unassigned. Legacy
 `track_number_unassigned="yes"` is read and normalized to an empty order number.

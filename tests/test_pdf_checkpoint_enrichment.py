@@ -14,7 +14,9 @@ from unittest.mock import Mock, patch
 
 from adventure_parameters import default_parameters
 from gpx_pdf_details import Checkpoint, PDFMediaIndex, coordinate_place
-from gpx_pdf_enrichment import CheckpointSidecar, checkpoint_key, enrich_checkpoints
+from gpx_pdf_enrichment import (
+    ADVENTURE_CACHE, CheckpointSidecar, checkpoint_key, enrich_checkpoints, prepare_checkpoint_cache,
+)
 from gpx_pdf_summary import PDFExportCancelled
 from historical_weather import weather_is_current
 import test_gpx_pdf_details as detail_tests
@@ -276,6 +278,138 @@ class CheckpointEnrichmentTests(unittest.TestCase):
                     store.flush()
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(list(Path(directory).glob('*.tmp')), [])
+
+
+class AdventureCheckpointCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.marker = CheckpointEnrichmentTests().markers()[0]
+        self.parameters = CheckpointEnrichmentTests().parameters(**{'pdf.retrieve_checkpoint_data': False})
+
+    def write_record(self, path, payload, marker=None):
+        store = CheckpointSidecar(path)
+        store.update(marker or self.marker, payload)
+        store.flush()
+        return path.read_bytes()
+
+    def test_project_merges_report_files_and_keeps_unused_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / 'old-checkpoints.json'
+            second = root / 'reports' / 'selected-checkpoints.json'
+            original = self.write_record(first, detail_tests.ExistingEnrichmentTests().payload())
+            distant = replace(self.marker, latitude=51)
+            other = self.write_record(second, {'place': 'Elsewhere', 'custom': 'retained'}, distant)
+            with patch('gpx_pdf_enrichment.enrich_weather_sidecars', side_effect=AssertionError('network')):
+                cache = prepare_checkpoint_cache(root, root / 'renamed-checkpoints.json')
+                result = enrich_checkpoints((self.marker,), PDFMediaIndex(), self.parameters, cache)
+            self.assertEqual(cache, (root / ADVENTURE_CACHE).resolve())
+            self.assertEqual(result[0].place, 'Dijon')
+            self.assertTrue(result[0].weather)
+            records = CheckpointSidecar(cache).payload['records']
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[checkpoint_key(distant)]['custom'], 'retained')
+            self.assertEqual(first.read_bytes(), original)
+            self.assertEqual(second.read_bytes(), other)
+            self.assertEqual(records[checkpoint_key(self.marker)]['weather'],
+                             detail_tests.ExistingEnrichmentTests().payload()['weather'])
+
+    def test_import_is_incremental_and_merges_complementary_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'old-checkpoints.json'
+            self.write_record(path, {'place': 'Dijon', 'custom': 42})
+            cache = prepare_checkpoint_cache(root, path)
+            before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+            with patch.object(CheckpointSidecar, 'records', side_effect=AssertionError('not needed')):
+                prepare_checkpoint_cache(root, path)
+            self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+            payload = detail_tests.ExistingEnrichmentTests().payload()
+            self.write_record(path, {'weather': payload['weather']})
+            prepare_checkpoint_cache(root)
+            record = CheckpointSidecar(cache).payload['records'][checkpoint_key(self.marker)]
+            self.assertEqual(record['place'], 'Dijon')
+            self.assertEqual(record['custom'], 42)
+            self.assertEqual(record['weather'], payload['weather'])
+
+    def test_changed_checkpoint_spacing_reuses_nearby_historical_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / ADVENTURE_CACHE
+            self.write_record(cache, detail_tests.ExistingEnrichmentTests().payload())
+            changed = replace(self.marker, latitude=50.008, timestamp=START + timedelta(minutes=30))
+            result = enrich_checkpoints((changed,), PDFMediaIndex(), self.parameters,
+                                        prepare_checkpoint_cache(root))
+            self.assertEqual(result[0].place, 'Dijon')
+            self.assertTrue(result[0].weather)
+            self.assertEqual(len(CheckpointSidecar(cache).records()), 1)
+
+    def test_report_outside_project_is_imported_and_standalone_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as external:
+            report = Path(external) / 'report-checkpoints.json'
+            original = self.write_record(report, {'place': 'Dijon'})
+            self.assertEqual(prepare_checkpoint_cache(None, report), report)
+            cache = prepare_checkpoint_cache(directory, report)
+            self.assertEqual(len(CheckpointSidecar(cache).records()), 1)
+            self.assertEqual(report.read_bytes(), original)
+            self.assertFalse((Path(external) / ADVENTURE_CACHE).exists())
+
+    def test_invalid_legacy_files_are_skipped_and_shared_corruption_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for number, value in enumerate(('broken', 'null', '{"kind":"other"}')):
+                (root / f'{number}-checkpoints.json').write_text(value)
+            good = root / 'valid-checkpoints.json'
+            self.write_record(good, {'place': 'Dijon'})
+            messages = []
+            cache = prepare_checkpoint_cache(root, progress=messages.append)
+            self.assertEqual(len(CheckpointSidecar(cache).records()), 1)
+            self.assertEqual(sum('Could not reuse' in message for message in messages), 3)
+            for value in ('broken', 'null', '{"schema_version":999}'):
+                cache.write_text(value)
+                with self.assertRaises(ValueError):
+                    prepare_checkpoint_cache(root)
+                self.assertEqual(cache.read_text(), value)
+
+    def test_invalid_coordinates_are_not_imported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'old-checkpoints.json'
+            self.write_record(path, {'latitude': 1000})
+            cache = prepare_checkpoint_cache(root)
+            self.assertFalse(CheckpointSidecar(cache).records())
+
+    def test_cancellation_keeps_completed_imports_and_does_not_mark_partial_import_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'old-checkpoints.json'
+            self.write_record(path, {'place': 'First'})
+            self.write_record(path, {'place': 'Second'}, replace(self.marker, latitude=51))
+            calls = 0
+            def check(_cancel):
+                nonlocal calls
+                calls += 1
+                if calls == 4:
+                    raise PDFExportCancelled('cancel')
+            with patch('gpx_pdf_enrichment.check_cancelled', side_effect=check):
+                with self.assertRaises(PDFExportCancelled):
+                    prepare_checkpoint_cache(root)
+            self.assertEqual(len(CheckpointSidecar(root / ADVENTURE_CACHE).records()), 1)
+            cache = prepare_checkpoint_cache(root)
+            self.assertEqual(len(CheckpointSidecar(cache).records()), 2)
+
+    def test_renderer_uses_adventure_cache_across_pdf_destinations(self):
+        from test_plot_rendering import map_renderer
+        with tempfile.TemporaryDirectory() as directory:
+            renderer, _ = map_renderer(directory)
+            renderer.checkpoint_project_directory = directory
+            renderer.project_parameters['pdf.retrieve_checkpoint_data'] = False
+            marker = renderer.checkpoints_for_track(renderer.tracks[0])[0]
+            self.write_record(Path(directory) / 'previous-checkpoints.json', {'place': 'Cached'}, marker)
+            renderer.checkpoint_sidecar_path = Path(directory) / 'new-report-checkpoints.json'
+            renderer.prepare_checkpoint_data()
+            self.assertTrue((Path(directory) / ADVENTURE_CACHE).exists())
+            self.assertEqual(renderer.checkpoints_for_track(renderer.tracks[0])[0].place, 'Cached')
+            self.assertFalse(renderer.checkpoint_sidecar_path.exists())
 
 
 class CheckpointGeocoderCancellationTests(unittest.TestCase):

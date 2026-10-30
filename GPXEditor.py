@@ -33,11 +33,12 @@ from plot_rendering import add_headless_basemap, new_figure, serialized_plotting
 from elevation_profile_cache import elevation_profile_visible_range
 from gpx_pdf_summary import (
     DEFAULT_PDF_COLUMNS, PDF_EXPORT_EXECUTOR, PDFExportCancelled,
-    SummaryOptions, SummarySnapshot, check_cancelled, export_summary_pdf,
+    PDF_CHECKPOINT_OPTIONS, SummaryOptions, SummarySnapshot, check_cancelled, export_summary_pdf,
+    pdf_report_parameters,
     report_name, reusable_map_background, select_summary_tracks, summary_track,
 )
 from gpx_pdf_details import PDFMediaIndex, build_checkpoints
-from gpx_pdf_enrichment import enrich_checkpoints
+from gpx_pdf_enrichment import enrich_checkpoints, prepare_checkpoint_cache
 from gpx_pdf_layout import (
     continuation_figures, draw_checkpoint_markers, draw_panel, measure_panel, report_title, track_statistics,
 )
@@ -164,6 +165,7 @@ from gpx_processing import (
     ProcessedTrack,
     ProcessingOptions,
     extract_raw_track_points,
+    format_gpx_timestamp,
     haversine_km,
     parse_time,
     process_raw_points,
@@ -203,6 +205,7 @@ from gpx_point_editing import (
     move_rows as move_point_rows,
     point_from_values,
     point_time_origin,
+    point_time_source_label,
     rewrite_local_media_links,
     remove_rows,
     serialized_points,
@@ -216,6 +219,7 @@ from json_storage import atomic_write_json, load_parameter_subset, parameter_sub
 from map_provider_utils import (
     DEFAULT_TILE_CACHE_DIR,
     TileCacheMissError,
+    TileRequestCancelled,
     configure_contextily_cache,
     contextily_provider,
     contextily_request_timeout,
@@ -293,6 +297,8 @@ def prepare_gpx_sources_for_load(
                 lookup,
                 processing_input_fingerprint,
             )
+            from track_time_estimation import missing_time_ranges_from_element
+            timing_gaps = [missing_time_ranges_from_element(track) for track in document.tracks]
         except (OSError, ValueError) as exc:
             errors.append((path, str(exc)))
             continue
@@ -301,6 +307,7 @@ def prepare_gpx_sources_for_load(
                 "path": path,
                 "document": document,
                 "cached_tracks": cached_tracks,
+                "timing_gaps": timing_gaps,
             }
         )
     return prepared, errors
@@ -857,7 +864,7 @@ def has_stored_track_order_number(track_element: ET.Element) -> bool:
 
 
 def format_gpx_time(dt_value: datetime) -> str:
-    return dt_value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return format_gpx_timestamp(dt_value)
 
 
 def format_inspector_elevation(value: str) -> str:
@@ -1222,6 +1229,13 @@ class TrackElementsUndoEntry:
 @dataclass(frozen=True)
 class TrackOrderUndoEntry:
     order: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TimestampUndoEntry:
+    values: dict
+    expected: dict | None = None
+    geometry: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -6503,7 +6517,7 @@ class TrackPointDataSource(NSObject):
 
     def tableView_shouldEditTableColumn_row_(self, _table_view, table_column, row):
         identifier = str(table_column.identifier())
-        if identifier in {"index", "xy_status", "z_status", "calc_velocity", "running_speed"}:
+        if identifier in {"index", "xy_status", "z_status", "calc_velocity", "running_speed", "time_source"}:
             return False
         self.controller.begin_point_edit(row, identifier)
         return True
@@ -6653,6 +6667,8 @@ class TrackInspectorController(NSObject):
             ("PNG", "savePng:"),
             ("Split Track Above", "splitTrack:"),
             ("Readjust Time", "readjustTime:"),
+            ("Previous Missing", "previousMissingTime:"),
+            ("Next Missing", "nextMissingTime:"),
             ("Save", "save:"),
             ("Save & Exit", "saveAndExit:"),
             ("Help", "help:"),
@@ -6685,6 +6701,8 @@ class TrackInspectorController(NSObject):
             ("Join Track Segments", "joinTrackSegments:", ""),
             ("Split Track Above", "splitTrack:", ""),
             ("Readjust Time", "readjustTime:", ""),
+            ("Previous Missing Timestamp", "previousMissingTime:", ""),
+            ("Next Missing Timestamp", "nextMissingTime:", ""),
             ("Interpolate Height", "interpolateHeight:", ""),
             ("Fit Map to Selection", "fitMapToSelection:", ""),
             ("Fit to Track", "fitMapToTrack:", ""),
@@ -6706,6 +6724,8 @@ class TrackInspectorController(NSObject):
         self.info_label.setFrame_(NSMakeRect(PADDING, height - 84, width - 2 * PADDING, 70))
         self.velocity_label.setFrame_(NSMakeRect(PADDING, height - 114, 95, FIELD_HEIGHT))
         self.velocity_field.setFrame_(NSMakeRect(PADDING + 100, height - 114, 82, FIELD_HEIGHT))
+        self.buttons["Previous Missing"].setFrame_(NSMakeRect(210, height - 114, 150, FIELD_HEIGHT))
+        self.buttons["Next Missing"].setFrame_(NSMakeRect(368, height - 114, 140, FIELD_HEIGHT))
         self.table_scroll.setFrame_(
             NSMakeRect(PADDING, 60, max(180.0, width - 2 * PADDING), max(100.0, height - 152))
         )
@@ -6856,6 +6876,7 @@ class TrackInspectorController(NSObject):
                 "lon": fields.get("@lon", ""),
                 "ele": format_inspector_elevation(fields.get("ele", "")),
                 "time": format_inspector_timestamp(fields.get("time", "")),
+                "time_source": point_time_source_label(point),
                 "calc_velocity": velocity_by_element.get(point, "N/A"),
                 "running_speed": running_speed_by_element.get(point, "N/A"),
                 "segment_index": segment_index_by_element.get(point, 0),
@@ -7033,10 +7054,12 @@ class TrackInspectorController(NSObject):
             "lon": 120,
             "ele": 72,
             "time": 205,
+            "time_source": 175,
             "calc_velocity": 105,
             "running_speed": 105,
         }
         titles = {
+            "time_source": "Time Source",
             "xy_status": "XY use",
             "z_status": "Elevation use",
             "calc_velocity": "Velocity\nkm/h",
@@ -7052,8 +7075,8 @@ class TrackInspectorController(NSObject):
                 "the suffix gives the reason."
             ),
         }
-        readonly = {"index", "xy_status", "z_status", "calc_velocity", "running_speed"}
-        identifiers = ["index", "lat", "lon", "ele", "time", "calc_velocity", "running_speed"]
+        readonly = {"index", "xy_status", "z_status", "calc_velocity", "running_speed", "time_source"}
+        identifiers = ["index", "lat", "lon", "ele", "time", "time_source", "calc_velocity", "running_speed"]
         identifiers += self.extra_columns
         identifiers += ["xy_status", "z_status"]
         for identifier in identifiers:
@@ -7166,7 +7189,7 @@ class TrackInspectorController(NSObject):
 
     def edit_point_value(self, row, column, value):
         points = self.point_elements()
-        if row < 0 or row >= len(points) or column in {"index", "calc_velocity", "running_speed"}:
+        if row < 0 or row >= len(points) or column in {"index", "calc_velocity", "running_speed", "time_source"}:
             return
         point = points[row]
         self.push_undo()
@@ -7569,6 +7592,13 @@ class TrackInspectorController(NSObject):
     def undo(self):
         if not self.undo_stack:
             return
+        if isinstance(self.undo_stack[-1], TimestampUndoEntry):
+            entry = self.undo_stack[-1]
+            if self.parent.undo_stack and self.parent.undo_stack[-1] is entry:
+                self.parent.undo_(None)
+            else:
+                self.parent.set_status("Use the Track Editor Undo to undo newer changes first.")
+            return
         self.redo_stack.append(ET.tostring(self.track.element, encoding="unicode"))
         self.redo_stack = self.redo_stack[-10:]
         restored = ET.fromstring(self.undo_stack.pop())
@@ -7582,6 +7612,13 @@ class TrackInspectorController(NSObject):
 
     def redo(self):
         if not self.redo_stack:
+            return
+        if isinstance(self.redo_stack[-1], TimestampUndoEntry):
+            entry = self.redo_stack[-1]
+            if self.parent.redo_stack and self.parent.redo_stack[-1] is entry:
+                self.parent.redo_(None)
+            else:
+                self.parent.set_status("Use the Track Editor Redo to restore earlier changes first.")
             return
         self.undo_stack.append(ET.tostring(self.track.element, encoding="unicode"))
         self.undo_stack = self.undo_stack[-10:]
@@ -7597,6 +7634,29 @@ class TrackInspectorController(NSObject):
     @objc.IBAction
     def undo_(self, _sender):
         self.undo()
+
+    def navigate_missing_time(self, direction):
+        points = self.track.points()
+        missing = [index for index, point in enumerate(points) if point.time is None]
+        if not missing:
+            self.parent.set_status("This track has no missing timestamps.")
+            return
+        selected = self.selected_row_indexes()
+        current = (max(selected) if direction > 0 else min(selected)) if selected else (-1 if direction > 0 else len(points))
+        candidates = [index for index in missing if (index - current) * direction > 0]
+        row = (min(candidates) if direction > 0 else max(candidates)) if candidates else (missing[0] if direction > 0 else missing[-1])
+        self.select_point_rows([row])
+        if self.plot_view is not None:
+            self.plot_view.move_cursor_to_track_point(self.track, row, self, sync_table=False, focus_plot=False)
+            self.parent.refresh_elevation_profile_for_plot_view(self.plot_view)
+
+    @objc.IBAction
+    def previousMissingTime_(self, _sender):
+        self.navigate_missing_time(-1)
+
+    @objc.IBAction
+    def nextMissingTime_(self, _sender):
+        self.navigate_missing_time(1)
 
     @objc.IBAction
     def plot_(self, _sender):
@@ -7986,10 +8046,13 @@ class GPXEditorPdfSummaryWindowDelegate(NSObject):
 
 
 def export_prepared_summary_pdf(path, snapshot, renderer, cancel, progress):
-    if renderer is not None:
-        renderer.prepare_checkpoint_data()
-    return export_summary_pdf(path, snapshot, map_pages=renderer.write_pages if renderer else None,
-                              cancel=cancel, progress=progress)
+    try:
+        if renderer is not None:
+            renderer.prepare_checkpoint_data()
+        return export_summary_pdf(path, snapshot, map_pages=renderer.write_pages if renderer else None,
+                                  cancel=cancel, progress=progress)
+    except TileRequestCancelled as exc:
+        raise PDFExportCancelled("PDF map downloading was cancelled.") from exc
 
 
 class PDFMapRenderer:
@@ -8008,7 +8071,7 @@ class PDFMapRenderer:
     def __init__(self, source, tracks, options, cancel, progress, checkpoint_sidecar_path=None):
         self.options, self.cancel, self.progress = options, cancel, progress
         self.processing_settings = source.processing_options()
-        self.project_parameters = dict(source.project_parameters)
+        self.project_parameters = pdf_report_parameters(source.project_parameters, options)
         self.selected_nrs = tuple(source.selected_nrs)
         self.track_ids = track_ids(getattr(source, "tracks", tracks))
         for name in (
@@ -8022,6 +8085,9 @@ class PDFMapRenderer:
         pdf_provider = self.project_parameters.get("pdf.map_provider", "output")
         if pdf_provider != "output":
             self.output_map_provider = pdf_provider
+        self.map_tile_attempts = 3
+        self.map_minimum_read_timeout = 0.0 if self.output_map_provider == "osm" else 30.0
+        self.map_wait_for_network = False
         self.geoapify_style = self.project_parameters.get("pdf.geoapify_style", "osm-bright")
         self.cached_map_tile_urls = None
         map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
@@ -8038,6 +8104,7 @@ class PDFMapRenderer:
         self.media_index = None
         self.checkpoint_cache = {}
         self.checkpoint_sidecar_path = checkpoint_sidecar_path
+        self.checkpoint_project_directory = media_context.get("project_directory")
         self.page_continuation = None
         self.track_context = {}
         cumulative, previous = 0.0, None
@@ -8143,7 +8210,13 @@ class PDFMapRenderer:
             return
         def key():
             return read_provider_credential("open-meteo", str(self.project_parameters.get("weather.credential_id", "default")))
-        result = enrich_checkpoints(markers, self.media_index, self.project_parameters, self.checkpoint_sidecar_path,
+        sidecar_path = self.checkpoint_sidecar_path
+        try:
+            sidecar_path = prepare_checkpoint_cache(self.checkpoint_project_directory, sidecar_path,
+                                                    cancel=self.cancel, progress=self.set_status)
+        except (OSError, ValueError) as exc:
+            self.set_status(f"Adventure checkpoint cache unavailable: {exc}; using this report's sidecar.")
+        result = enrich_checkpoints(markers, self.media_index, self.project_parameters, sidecar_path,
                                     cancel=self.cancel, progress=self.set_status, weather_key=key)
         offset = 0
         for number, count in counts:
@@ -8982,13 +9055,10 @@ class GPXEditorController(NSObject):
         self._track_context_item(menu, "Add Media Points…", "addTracksFromPhotos:", editing and count == 1)
         self._track_context_item(
             menu,
-            "Estimate Route Times from Media…",
-            "estimateRouteTimesFromMedia:",
-            editing
-            and count == 1
-            and bool(selected[0].points())
-            and all(point.time is None for point in selected[0].points()),
+            "Estimate Track Times…", "estimateTrackTimes:", editing and bool(self.tracks),
         )
+        self._track_context_item(menu, "Find Missing Timestamps…", "findMissingTimestamps:", bool(self.tracks))
+        self._track_context_item(menu, "Rebuild Route Times from Media…", "rebuildRouteTimesFromMedia:", editing and count == 1)
         menu.addItem_(NSMenuItem.separatorItem())
         self._track_context_item(menu, "Set Track Type…", "setTrackType:", editing and bool(self.tracks))
         self._track_context_item(menu, "Select Tracks by Type…", "selectTracksByType:", bool(self.tracks))
@@ -9351,6 +9421,10 @@ class GPXEditorController(NSObject):
         if self.editor_close_finalized:
             return
         self.editor_close_finalized = True
+        for attribute in ("timing_issues_tool", "timing_estimate_tool"):
+            tool = getattr(self, attribute, None)
+            if tool is not None:
+                tool.dismiss_(None)
         WINDOW_REGISTRY.retire_owner(self)
         self.cancelPdfSummary_(None)
         self.cancel_staged_track_loading()
@@ -9693,6 +9767,9 @@ class GPXEditorController(NSObject):
             )
 
     def _notify_workspace_mutation(self, kind, message: str, track_numbers=()):
+        refresh = getattr(self, "refresh_timing_tools", None)
+        if callable(refresh):
+            refresh()
         workspace = getattr(self, "adventure_workspace_delegate", None)
         if workspace is None:
             return
@@ -9737,6 +9814,7 @@ class GPXEditorController(NSObject):
         self._notify_workspace_mutation(kind, message, track_numbers)
 
     def invalidate_track_metrics(self, track: TrackRecord):
+        track.timing_diagnostic_generation = getattr(track, "timing_diagnostic_generation", 0) + 1
         track.metrics_dirty = True
         track.processed = None
         track.processed_signature = None
@@ -10121,6 +10199,8 @@ class GPXEditorController(NSObject):
         if action == "estimateRouteTimesFromMedia:":
             selected = self.selected_tracks()
             return len(selected) == 1 and self._media_timing_eligible_route(selected[0])
+        if action in {"estimateTrackTimes:", "findMissingTimestamps:"}:
+            return bool(self.tracks) and (action == "findMissingTimestamps:" or self.track_mutations_enabled)
         if action == "undo:":
             return bool(self.undo_stack)
         if action == "redo:":
@@ -10958,6 +11038,207 @@ class GPXEditorController(NSObject):
         points = track.points() if track is not None else []
         return bool(points) and all(point.time is None for point in points)
 
+    def refresh_timing_tools(self):
+        tool = getattr(self, "timing_issues_tool", None)
+        if tool is not None and tool.window.isVisible():
+            tool.refresh()
+
+    def timing_ranges(self, track):
+        from track_time_estimation import missing_time_ranges_from_element
+        key = (id(track.element), getattr(track, "timing_diagnostic_generation", 0))
+        if getattr(track, "timing_ranges_key", None) != key:
+            track.timing_ranges_cache = missing_time_ranges_from_element(track.element)
+            track.timing_ranges_key = key
+        return track.timing_ranges_cache
+
+    def timing_tool(self, purpose):
+        from cocoa_track_timing import TrackTimingTool
+        attribute = "timing_issues_tool" if purpose == "issues" else "timing_estimate_tool"
+        tool = getattr(self, attribute, None)
+        if tool is None:
+            tool = TrackTimingTool.alloc().initWithEditor_purpose_(self, purpose)
+            setattr(self, attribute, tool)
+        return tool
+
+    @objc.IBAction
+    def findMissingTimestamps_(self, _sender):
+        self.timing_tool("issues").show()
+
+    @objc.IBAction
+    def estimateTrackTimes_(self, _sender):
+        if not self.track_mutations_enabled:
+            self.set_status("Loading track data — editing will be available when processing finishes.")
+            return
+        self.timing_tool("estimate").show()
+
+    @objc.IBAction
+    def estimateRouteTimesFromMedia_(self, _sender):
+        self.estimateTrackTimes_(None)
+
+    def inspect_missing_time_range(self, number, first, last):
+        track = next((track for track in self.tracks if track.nr == number), None)
+        if track is None:
+            self.refresh_timing_tools()
+            return
+        self.select_track_in_table(number)
+        inspector = self.open_inspector_for_track(track)
+        inspector.select_point_rows(range(first, last + 1))
+        if inspector.plot_view is not None:
+            inspector.plot_view.move_cursor_to_track_point(track, first, inspector, sync_table=False, focus_plot=False)
+            self.refresh_elevation_profile_for_plot_view(inspector.plot_view)
+
+    def edit_timing_start(self, number, row=0):
+        self.inspect_missing_time_range(number, row, row)
+        track = next((track for track in self.tracks if track.nr == number), None)
+        inspector = self.existing_inspector_for_track(track) if track is not None else None
+        if inspector is not None:
+            column = inspector.table.columnWithIdentifier_(nsstring("time"))
+            if column >= 0:
+                inspector.table.editColumn_row_withEvent_select_(column, row, None, True)
+
+    def _timing_suppression_context(self):
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "untimed_prompt_suppressed_identities"):
+            return (set(workspace.untimed_prompt_suppressed_identities()),
+                    workspace.remember_untimed_prompt_suppressions,
+                    getattr(workspace, "forget_untimed_prompt_suppressions", None))
+        context = getattr(self, "media_context", {})
+        if ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD in context:
+            return (set(context[ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD]),
+                    context.get("remember_untimed_prompt_suppressions"),
+                    context.get("forget_untimed_prompt_suppressions"))
+        return None
+
+    def _standalone_timing_key(self, track):
+        source = self.last_save_path or track.source_file
+        return str(Path(source).expanduser().resolve(strict=False)) if source else f"untitled:{id(self)}"
+
+    def timing_prompt_suppressed(self, track):
+        identity = raw_track_geometry_fingerprint(track.element)
+        context = self._timing_suppression_context()
+        if context is not None:
+            return identity in context[0]
+        values = NSUserDefaults.standardUserDefaults().dictionaryForKey_(UNTIMED_PROMPT_SUPPRESSION_KEY + ".documents.v2") or {}
+        return identity in (values.get(self._standalone_timing_key(track), []) or [])
+
+    def update_timing_suppressions(self, numbers, *, suppress):
+        tracks = [track for track in self.tracks if track.nr in set(numbers)]
+        identities = [raw_track_geometry_fingerprint(track.element) for track in tracks]
+        context = self._timing_suppression_context()
+        if context is not None:
+            callback = context[1] if suppress else context[2]
+            if callable(callback):
+                callback(identities)
+            return
+        defaults = NSUserDefaults.standardUserDefaults()
+        key = UNTIMED_PROMPT_SUPPRESSION_KEY + ".documents.v2"
+        values = dict(defaults.dictionaryForKey_(key) or {})
+        for track, identity in zip(tracks, identities):
+            document = self._standalone_timing_key(track)
+            stored = set(values.get(document, []))
+            stored.add(identity) if suppress else stored.discard(identity)
+            values[document] = sorted(stored)[-UNTIMED_PROMPT_SUPPRESSION_LIMIT:]
+        defaults.setObject_forKey_(values, key)
+
+    def timestamp_states(self, indexes_by_track):
+        from gpx_point_editing import MYCAMINO_NAMESPACE
+        values = {}
+        for track in self.tracks:
+            if track.nr not in indexes_by_track:
+                continue
+            points = list(iter_track_points(track.element))
+            entries = []
+            for index in indexes_by_track[track.nr]:
+                point = points[index]
+                timestamp = point.find("gpx:time", NS)
+                origin = next(point.iter(f"{{{MYCAMINO_NAMESPACE}}}timeOrigin"), None)
+                extensions = point.find("gpx:extensions", NS)
+                entries.append((index, ET.tostring(timestamp) if timestamp is not None else None,
+                    ET.tostring(origin) if origin is not None else None,
+                    list(point).index(timestamp) if timestamp is not None else len(point),
+                    extensions is not None,
+                    list(extensions).index(origin) if extensions is not None and origin is not None else 0))
+            values[track.nr] = tuple(entries)
+        return TimestampUndoEntry(values)
+
+    def finish_timestamp_change(self, numbers, message):
+        for track in self.tracks:
+            if track.nr in numbers:
+                geometry, cached = track.display_geometry, dict(track.display_geometry_cache)
+                self.invalidate_track_metrics(track)
+                track.display_geometry, track.display_geometry_cache = geometry, cached
+        self.mark_dirty(message, MutationKind.TIMING, numbers)
+        for track in self.tracks:
+            if track.nr in numbers:
+                inspector = self.existing_inspector_for_track(track)
+                if inspector is not None:
+                    inspector.reload_rows()
+        self.redraw_open_plot_views()
+
+    def restore_timestamp_states(self, entry):
+        from gpx_point_editing import MYCAMINO_NAMESPACE
+        inverse = self.timestamp_states({number: [row[0] for row in rows] for number, rows in entry.values.items()})
+        geometry = {track.nr: raw_track_geometry_fingerprint(track.element) for track in self.tracks if track.nr in entry.values}
+        if (entry.expected is not None and inverse.values != entry.expected) or (entry.geometry is not None and geometry != entry.geometry):
+            raise ValueError("Undo the newer waypoint edits first; the timing transaction was left unchanged.")
+        for track in self.tracks:
+            points = list(iter_track_points(track.element))
+            for index, timestamp, origin, time_position, had_extensions, origin_position in entry.values.get(track.nr, ()):
+                point = points[index]
+                current_time = point.find("gpx:time", NS)
+                if current_time is not None:
+                    point.remove(current_time)
+                for parent in point.iter():
+                    for child in list(parent):
+                        if child.tag == f"{{{MYCAMINO_NAMESPACE}}}timeOrigin":
+                            parent.remove(child)
+                if timestamp is not None:
+                    point.insert(time_position, ET.fromstring(timestamp))
+                if origin is not None:
+                    extensions = point.find("gpx:extensions", NS)
+                    if extensions is None:
+                        extensions = ET.SubElement(point, qname("extensions"))
+                    extensions.insert(origin_position, ET.fromstring(origin))
+                else:
+                    extensions = point.find("gpx:extensions", NS)
+                    if not had_extensions and extensions is not None and not len(extensions) and not extensions.attrib and not (extensions.text or "").strip():
+                        point.remove(extensions)
+        self.finish_timestamp_change(set(entry.values), "Restored waypoint timestamps.")
+        return TimestampUndoEntry(inverse.values, entry.values, geometry)
+
+    def apply_timing_results(self, snapshots, results, settings):
+        if not getattr(self, "track_mutations_enabled", True):
+            self.set_status("Track loading is still active. Analyze again after it finishes.")
+            return False
+        tracks = {track.nr: track for track in self.tracks}
+        if settings != self.project_parameters or any(
+                number not in tracks or ET.tostring(tracks[number].element) != xml for number, xml, _label, _hidden in snapshots):
+            self.set_status("Track data or settings changed during analysis. Analyze again before applying timestamps.")
+            return False
+        indexes = {number: [patch.index for patch in proposal.patches]
+                   for number, proposal in results.items() if proposal.patches}
+        if not indexes:
+            return False
+        before = self.timestamp_states(indexes)
+        for number in indexes:
+            points = list(iter_track_points(tracks[number].element))
+            for patch in results[number].patches:
+                get_or_create_point_time(points[patch.index]).text = format_gpx_time(patch.time)
+                set_point_time_origin(points[patch.index], "generated", patch.method)
+        after = self.timestamp_states(indexes)
+        entry = TimestampUndoEntry(before.values, after.values,
+            {number: raw_track_geometry_fingerprint(tracks[number].element) for number in indexes})
+        self.undo_stack.append(entry)
+        self.undo_stack = self.undo_stack[-10:]
+        self.redo_stack.clear()
+        for number in indexes:
+            inspector = self.existing_inspector_for_track(tracks[number])
+            if inspector is not None:
+                inspector.undo_stack.append(entry)
+                inspector.redo_stack.clear()
+        self.finish_timestamp_change(set(indexes), f"Estimated {sum(len(rows) for rows in indexes.values())} missing/generated waypoint timestamp(s).")
+        return True
+
     @objc.python_method
     def _media_timing_eligible_route(self, track):
         """Any non-empty selected route may be explicitly retimed by its user."""
@@ -11167,7 +11448,7 @@ class GPXEditorController(NSObject):
         self.offer_route_timing_from_prepared(prepared, track)
 
     @objc.IBAction
-    def estimateRouteTimesFromMedia_(self, _sender):
+    def rebuildRouteTimesFromMedia_(self, _sender):
         selected_tracks = self.selected_tracks()
         if len(selected_tracks) != 1 or not self._media_timing_eligible_route(selected_tracks[0]):
             show_alert("Select one untimed or previously media-timed route.")
@@ -11445,6 +11726,9 @@ class GPXEditorController(NSObject):
                     str(path),
                     source_track_index=source_index,
                 )
+                if "timing_gaps" in prepared:
+                    record.timing_ranges_cache = prepared["timing_gaps"][source_index]
+                    record.timing_ranges_key = (id(trk), 0)
                 record.set_order_number(assigned_number)
                 used_ids.add(record.nr)
                 fingerprint, cached_metrics, cached_display_geometry = cached_tracks[
@@ -11812,84 +12096,11 @@ class GPXEditorController(NSObject):
         )
 
     def offer_track_time_entry(self):
-        """Offer, but never require, an absolute anchor for fully untimed tracks."""
-        workspace = getattr(self, "adventure_workspace_delegate", None)
-        remember_callback = None
-        if workspace is not None and hasattr(
-            workspace, "untimed_prompt_suppressed_identities"
-        ):
-            suppressed = set(workspace.untimed_prompt_suppressed_identities())
-            remember_callback = workspace.remember_untimed_prompt_suppressions
-            defaults = None
-        else:
-            context_suppressions = self.media_context.get(
-                ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD
-            )
-            context_callback = self.media_context.get(
-                "remember_untimed_prompt_suppressions"
-            )
-            if context_suppressions is not None and callable(context_callback):
-                suppressed = {
-                    str(value)
-                    for value in context_suppressions
-                    if str(value).strip()
-                }
-                remember_callback = context_callback
-                defaults = None
-            else:
-                defaults = NSUserDefaults.standardUserDefaults()
-                suppressed = suppressed_untimed_track_identities(defaults)
-        pending = untimed_tracks_requiring_prompt(
-            self.tracks,
-            suppressed,
-        )
-        if not pending:
-            return
-        track_names = [track.name or track.display_label for _row, track, _identity in pending]
-        displayed_names = track_names[:8]
-        name_text = "\n".join(f"• {name}" for name in displayed_names)
-        if len(track_names) > len(displayed_names):
-            name_text += f"\n• …and {len(track_names) - len(displayed_names)} more"
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_(
-            f"{len(pending)} track(s) have no recorded timestamps."
-        )
-        alert.setInformativeText_(
-            "The tracks can still be edited, mapped, and animated by distance. "
-            "Without a confirmed start time, photos cannot be assigned to them "
-            "by exposure time. You may enter a start in the Date & Time column "
-            "or continue with undated tracks.\n\n"
-            f"{name_text}"
-        )
-        alert.addButtonWithTitle_("Yes — Set Time")
-        alert.addButtonWithTitle_("No — Don’t Ask Again")
-        alert.addButtonWithTitle_("Later")
-        response = int(alert.runModal())
-        action, row = apply_untimed_prompt_response(
-            response,
-            pending,
-            defaults,
-            remember_callback=remember_callback,
-        )
-        if action == "suppress":
-            self.set_status(
-                f"Will not ask again about timestamps for {len(pending)} unchanged track(s)."
-            )
-            return
-        if action != "edit" or row is None:
-            return
-        self.track_table.selectRowIndexes_byExtendingSelection_(
-            objc.lookUpClass("NSIndexSet").indexSetWithIndex_(row),
-            False,
-        )
-        column = self.track_table.columnWithIdentifier_(nsstring("date"))
-        if column >= 0:
-            self.track_table.editColumn_row_withEvent_select_(
-                column,
-                row,
-                None,
-                True,
-            )
+        """One nonmodal offer covers both partial and completely untimed tracks."""
+        pending = [track.nr for track in self.tracks
+                   if self.timing_ranges(track) and not self.timing_prompt_suppressed(track)]
+        if pending:
+            self.timing_tool("issues").show(pending)
 
     def _load_gpx_paths_synchronously(self, paths: list[Path], mark_dirty: bool = True):
         """Retain synchronous loading only for the exceptional recovery-file path."""
@@ -12212,6 +12423,7 @@ class GPXEditorController(NSObject):
 
         label("PDF Summary", 20, 16, 250, 17, True)
         gear = button("Settings", "pdfTypeSettings:", 756, 16, 40)
+        self.pdf_summary_settings_button = gear
         self.configure_symbol_button(gear, "gearshape", "PDF Export Settings", "NSActionTemplate", "Settings")
         hint = label(
             "Create a printable summary of your tracks, with distances, durations, elevation statistics, "
@@ -12236,11 +12448,11 @@ class GPXEditorController(NSObject):
         self.pdf_summary_browse_button = button("Browse…", "choosePdfSummaryOutput:", 710, 140, 90)
         label("Columns", 20, 185, 140, 13, True)
         self.pdf_summary_checkboxes = {}
-        report_columns = [column for column in self.columns if column[0] not in {"nr", "track_id", "type"}]
+        report_columns = [column for column in self.columns if column[0] not in {"nr", "stage", "type"}]
         for index, (identifier, title, _width, _editable) in enumerate(report_columns):
             checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
             checkbox.setButtonType_(NSButtonTypeSwitch)
-            checkbox.setTitle_(title.replace("\n", " ").strip())
+            checkbox.setTitle_("Track" if identifier == "track_id" else title.replace("\n", " ").strip())
             checkbox.setState_(NSControlStateValueOn if identifier in DEFAULT_PDF_COLUMNS else NSControlStateValueOff)
             place(checkbox, 20 + (index % 2) * 365, 214 + (index // 2) * 26, 330)
             self.pdf_summary_checkboxes[identifier] = checkbox
@@ -12261,8 +12473,32 @@ class GPXEditorController(NSObject):
             checkbox.setState_(NSControlStateValueOn if state else NSControlStateValueOff)
             place(checkbox, x, 478, width)
             self.pdf_summary_options[key] = checkbox
-        label("Page", 20, 519, 55)
-        self.pdf_summary_orientation_menu = place(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 140, 24), False), 80, 519, 140)
+        label("Checkpoint details (this PDF only)", 20, 517, 400, 13, True)
+        defaults = pdf_report_parameters(self.project_parameters, SummaryOptions())
+        for key, title, x, top, width, tooltip in (
+            ("include_checkpoints", "Include checkpoints", 20, 545, 300,
+             "Include timed checkpoints, breaks and matching map/profile markers on individual track pages."),
+            ("include_checkpoint_places", "Include checkpoint names", 20, 575, 330,
+             "Show available place names from media and the PDF checkpoint sidecar."),
+            ("retrieve_checkpoint_places", "Retrieve missing names", 390, 575, 390,
+             "Look up missing checkpoint names when place-name retrieval is enabled in Settings. Results are stored only in the PDF checkpoint sidecar."),
+            ("include_checkpoint_weather", "Include checkpoint weather", 20, 605, 330,
+             "Show compatible weather already available in media or the PDF checkpoint sidecar."),
+            ("retrieve_checkpoint_weather", "Retrieve missing weather", 390, 605, 390,
+             "Download missing checkpoint weather using the existing Open-Meteo consent and account settings. Results are stored only in the PDF checkpoint sidecar."),
+        ):
+            checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, width, 24))
+            checkbox.setButtonType_(NSButtonTypeSwitch)
+            checkbox.setTitle_(title)
+            parameter = dict(PDF_CHECKPOINT_OPTIONS)[key]
+            checkbox.setState_(NSControlStateValueOn if defaults[parameter] else NSControlStateValueOff)
+            checkbox.setToolTip_(tooltip)
+            checkbox.setTarget_(self)
+            checkbox.setAction_("pdfSummaryOptionsChanged:")
+            place(checkbox, x, top, width)
+            self.pdf_summary_options[key] = checkbox
+        label("Page", 20, 648, 55)
+        self.pdf_summary_orientation_menu = place(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 140, 24), False), 80, 648, 140)
         self.pdf_summary_orientation_menu.addItemsWithTitles_(["Portrait", "Landscape"])
         self.pdf_summary_status_label = label("Preparing track data...", 20, 0, 780, 11)
         self.pdf_summary_export_button = button("Export", "exportPdfSummaryNow:", 0, 0, 82)
@@ -12274,16 +12510,48 @@ class GPXEditorController(NSObject):
         self.pdf_summary_reveal_button.setHidden_(True)
         self.pdf_summary_cancel_button.setHidden_(True)
         self.pdf_summary_window = window
+        self.pdf_summary_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 90, 820, 560))
+        self.pdf_summary_scroll.setHasVerticalScroller_(True)
+        self.pdf_summary_scroll.setHasHorizontalScroller_(False)
+        self.pdf_summary_scroll.setAutohidesScrollers_(True)
+        self.pdf_summary_scroll.setDrawsBackground_(False)
+        self.pdf_summary_body = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 800, 700))
+        self.pdf_summary_scroll.setDocumentView_(self.pdf_summary_body)
+        root.addSubview_(self.pdf_summary_scroll)
+        footer = {
+            self.pdf_summary_status_label, self.pdf_summary_export_button, self.pdf_summary_close_button,
+            self.pdf_summary_cancel_button, self.pdf_summary_open_button, self.pdf_summary_reveal_button,
+        }
+        for view, *_position in self.pdf_summary_positions:
+            if view not in footer:
+                view.removeFromSuperview()
+                self.pdf_summary_body.addSubview_(view)
         self.pdf_summary_delegate = GPXEditorPdfSummaryWindowDelegate.alloc().initWithController_(self)
         window.setDelegate_(self.pdf_summary_delegate)
         self.register_auxiliary_window(window)
+        self.update_pdf_checkpoint_controls()
         self.layout_pdf_summary_window()
+        clip = self.pdf_summary_scroll.contentView()
+        clip.scrollToPoint_(NSMakePoint(0, max(0, 700 - float(clip.bounds().size.height))))
+        self.pdf_summary_scroll.reflectScrolledClipView_(clip)
+
+    def update_pdf_checkpoint_controls(self):
+        controls = self.pdf_summary_options
+        enabled = controls["include_checkpoints"].state() == NSControlStateValueOn
+        for kind in ("places", "weather"):
+            include = controls[f"include_checkpoint_{kind}"]
+            include.setEnabled_(enabled)
+            controls[f"retrieve_checkpoint_{kind}"].setEnabled_(
+                enabled and include.state() == NSControlStateValueOn)
 
     def layout_pdf_summary_window(self):
         if self.pdf_summary_window is None:
             return
         bounds = self.pdf_summary_window.contentView().bounds()
         width, height = bounds.size.width, bounds.size.height
+        self.pdf_summary_scroll.setFrame_(NSMakeRect(0, 90, width, max(1, height - 90)))
+        body_width = width - 20
+        self.pdf_summary_body.setFrame_(NSMakeRect(0, 0, body_width, 700))
         footer = {
             self.pdf_summary_status_label, self.pdf_summary_export_button, self.pdf_summary_close_button,
             self.pdf_summary_cancel_button, self.pdf_summary_open_button, self.pdf_summary_reveal_button,
@@ -12291,10 +12559,12 @@ class GPXEditorController(NSObject):
         for view, x, top, original_width, view_height, flexible in self.pdf_summary_positions:
             if view in footer:
                 continue
-            view_width = original_width + (width - 820 if flexible else 0)
+            view_width = original_width + (body_width - 820 if flexible else 0)
             if view is self.pdf_summary_browse_button:
-                x = width - 110
-            view.setFrame_(NSMakeRect(x, height - top - view_height, view_width, view_height))
+                x = body_width - 110
+            if view is self.pdf_summary_settings_button:
+                x = body_width - 64
+            view.setFrame_(NSMakeRect(x, 700 - top - view_height, view_width, view_height))
         self.pdf_summary_status_label.setFrame_(NSMakeRect(20, 57, width - 40, 20))
         self.pdf_summary_export_button.setFrame_(NSMakeRect(width - 184, 18, 82, BUTTON_HEIGHT))
         self.pdf_summary_close_button.setFrame_(NSMakeRect(width - 94, 18, 74, BUTTON_HEIGHT))
@@ -12312,6 +12582,7 @@ class GPXEditorController(NSObject):
     @objc.IBAction
     def pdfSummaryOptionsChanged_(self, _sender):
         self.pdf_summary_result_message = ""
+        self.update_pdf_checkpoint_controls()
         self.pollPdfSummary_(None)
 
     @objc.IBAction
@@ -12334,6 +12605,8 @@ class GPXEditorController(NSObject):
             elevation_profile=self.pdf_summary_options["elevation_profile"].state() == NSControlStateValueOn,
             rotate_maps=self.pdf_summary_options["rotate_maps"].state() == NSControlStateValueOn,
             name_prefix=str(self.pdf_summary_name_prefix.stringValue()),
+            **{key: self.pdf_summary_options[key].state() == NSControlStateValueOn
+               for key, _parameter in PDF_CHECKPOINT_OPTIONS},
         )
 
     def pdf_report_tracks(self, options):
@@ -12363,11 +12636,12 @@ class GPXEditorController(NSObject):
         if path.exists() and not confirm("Replace existing PDF?", str(path)):
             return
         workspace = getattr(self, "adventure_workspace_delegate", None)
+        report_parameters = pdf_report_parameters(self.project_parameters, options)
         if (workspace is not None and getattr(workspace, "weather_consent", "disabled") == "unasked"
-                and options.include_track_maps and self.project_parameters.get("pdf.track_info", True)
-                and self.project_parameters.get("pdf.checkpoints", True)
-                and self.project_parameters.get("pdf.checkpoint_weather", True)
-                and self.project_parameters.get("pdf.retrieve_checkpoint_data", True)):
+                and options.include_track_maps and report_parameters.get("pdf.track_info", True)
+                and report_parameters["pdf.checkpoints"]
+                and report_parameters["pdf.checkpoint_weather"]
+                and report_parameters["pdf.retrieve_checkpoint_weather"]):
             workspace._request_initial_weather_choice(purpose="PDF checkpoints")
             self.sync_pdf_project_settings()
         map_count = int(options.include_overview) + (len(tracks) if options.include_track_maps else 0)
@@ -12536,6 +12810,7 @@ class GPXEditorController(NSObject):
             include_track_maps=bool(values.get("include_track_maps", values.get("track_mode", "none") != "none")),
             elevation_profile=bool(values.get("elevation_profile", True)),
             rotate_maps=bool(values.get("rotate_maps")), name_prefix=str(values.get("name_prefix", "")),
+            **{key: values.get(key) for key, _parameter in PDF_CHECKPOINT_OPTIONS},
         )
         tracks = self.pdf_report_tracks(options)
         identities = track_ids(self.tracks)
@@ -12681,7 +12956,7 @@ class GPXEditorController(NSObject):
                 )
             if missing_tiles:
                 self.cached_map_tile_urls = None
-        except TileCacheMissError:
+        except (TileCacheMissError, TileRequestCancelled, PDFExportCancelled):
             fig.clear()
             raise
         except Exception as exc:
@@ -13015,6 +13290,12 @@ class GPXEditorController(NSObject):
             return self.save_with_panel()
         field_path = self.output_path_from_field()
         if field_path is not None:
+            workspace = getattr(self, "adventure_workspace_delegate", None)
+            save_document = getattr(workspace, "save_gpx_editor_document", None)
+            if callable(save_document):
+                saved = save_document(self, field_path)
+                if saved is not None:
+                    return bool(saved)
             self.save_to_path(field_path)
             return True
         return False
@@ -14319,36 +14600,33 @@ class GPXEditorController(NSObject):
         }
 
     def add_basemap_with_timeout(self, cx, ax, tile_zoom: int, provider: str | None = None):
-        """Call Contextily with the configured provider and bounded timeout."""
+        """Call Contextily with provider policy and per-tile PDF retry options."""
         selected_provider = str(provider or self.map_provider)
-        try:
-            import requests
-        except ImportError:
-            requests = None
-        try:
-            with contextily_request_timeout(
-                cx, self.map_request_timeout_seconds, selected_provider,
-                cache_only=bool(getattr(self, "map_cache_only", False)),
-            ):
-                with tolerate_missing_tiles(cx) as missing_tile_report:
-                    add_headless_basemap(
-                        cx, ax,
-                        source=contextily_provider(
-                            cx,
-                            selected_provider,
-                            self.custom_map_url,
-                            self.custom_map_attribution,
-                            self.maximum_map_zoom,
-                            self.map_credential_id,
-                            geoapify_style=getattr(self, "geoapify_style", "osm-bright"),
-                        ),
-                        zoom=min(tile_zoom, self.maximum_map_zoom),
-                    )
-            return missing_tile_report.count
-        except Exception as exc:
-            if requests is not None and isinstance(exc, (requests.Timeout, requests.ConnectionError)):
-                raise TimeoutError(f"Map tile request timed out after {self.map_request_timeout_seconds:.0f}s.") from exc
-            raise
+        with contextily_request_timeout(
+            cx, self.map_request_timeout_seconds, selected_provider,
+            cache_only=bool(getattr(self, "map_cache_only", False)),
+            max_attempts=getattr(self, "map_tile_attempts", 1),
+            minimum_read_timeout=getattr(self, "map_minimum_read_timeout", 0.0),
+            cancel_event=getattr(self, "cancel", None),
+            progress=self.set_status if getattr(self, "map_tile_attempts", 1) > 1 else None,
+            provider_name=provider_display_name(selected_provider, getattr(self, "geoapify_style", "osm-bright")),
+            wait_for_network=getattr(self, "map_wait_for_network", True),
+        ):
+            with tolerate_missing_tiles(cx) as missing_tile_report:
+                add_headless_basemap(
+                    cx, ax,
+                    source=contextily_provider(
+                        cx,
+                        selected_provider,
+                        self.custom_map_url,
+                        self.custom_map_attribution,
+                        self.maximum_map_zoom,
+                        self.map_credential_id,
+                        geoapify_style=getattr(self, "geoapify_style", "osm-bright"),
+                    ),
+                    zoom=min(tile_zoom, self.maximum_map_zoom),
+                )
+        return missing_tile_report.count
 
     @objc.python_method
     @serialized_plotting
@@ -14728,6 +15006,20 @@ class GPXEditorController(NSObject):
             self.set_status("Nothing to undo.")
             return
         entry = self.undo_stack.pop()
+        if isinstance(entry, TimestampUndoEntry):
+            try:
+                inverse = self.restore_timestamp_states(entry)
+            except (ValueError, IndexError) as exc:
+                self.undo_stack.append(entry)
+                self.set_status(str(exc))
+                return
+            self.redo_stack.append(inverse)
+            for track in self.tracks:
+                inspector = self.existing_inspector_for_track(track) if track.nr in entry.values else None
+                if inspector is not None and inspector.undo_stack and inspector.undo_stack[-1] is entry:
+                    inspector.undo_stack.pop()
+                    inspector.redo_stack.append(inverse)
+            return
         if isinstance(entry, TrackMetadataUndoEntry):
             self.redo_stack.append(self.restore_metadata(entry))
             return
@@ -14795,6 +15087,20 @@ class GPXEditorController(NSObject):
             self.set_status("Nothing to redo.")
             return
         entry = self.redo_stack.pop()
+        if isinstance(entry, TimestampUndoEntry):
+            try:
+                inverse = self.restore_timestamp_states(entry)
+            except (ValueError, IndexError) as exc:
+                self.redo_stack.append(entry)
+                self.set_status(str(exc))
+                return
+            self.undo_stack.append(inverse)
+            for track in self.tracks:
+                inspector = self.existing_inspector_for_track(track) if track.nr in entry.values else None
+                if inspector is not None and inspector.redo_stack and inspector.redo_stack[-1] is entry:
+                    inspector.redo_stack.pop()
+                    inspector.undo_stack.append(inverse)
+            return
         if isinstance(entry, TrackMetadataUndoEntry):
             self.undo_stack.append(self.restore_metadata(entry))
             return
@@ -14891,7 +15197,8 @@ class GPXEditorController(NSObject):
             "This testing version may still contain bugs. Please report any problem using the prominent Report a Bug button below. Your feedback helps improve myCamino for everyone.\n"
             f"Bug-report page: {BUG_REPORT_URL}\n\n"
             f"Feature-request page: {FEATURE_REQUEST_URL}\n\n"
-            "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation. Estimate Route Times from Media keeps an untimed route's geometry unchanged and timestamps its existing points from nearby media within the configured Photo-to-route distance. More distant media is ignored only for timing. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
+            "A launch without input starts with one empty track. New Track adds another. Add Tracks loads GPX files into the table. Add Points From Clipboard accepts decimal, DMS, geo:, expanded map-link, KML, and GPX point coordinates. Add Media Points reuses or creates sidecars for only the selected media and adds every located medium as a linked raw waypoint; it never performs place lookup, weather retrieval, map generation, or slideshow generation.\n\n"
+            "Estimate Track Times fills missing timestamps from neighbours, existing Adventure media, and measured speeds without changing the route. Find Missing Timestamps locates gaps in their original waypoint rows; the inspector's Previous Missing and Next Missing buttons navigate them. The Time Source column distinguishes recorded, manual and estimated values. Ignore with Do not ask again suppresses only automatic reminders for those tracks in this Adventure; explicit tools and new-media offers remain available. Rebuild Route Times from Media is the separate full-retiming/direction operation. Edit a track name or date directly in the table and press Enter; Esc cancels the edit.\n\n"
             "Click a table row to select a track. Shift-click or drag to select more than one. Double-click a track row to open its waypoint table and fit the track in the map, like pressing Plot. Right-click a selected row to inspect, plot, sort, renumber, duplicate, move, show/hide, join, or delete the complete selection. Right-clicking an unselected track selects only that track; the Average / Total row has no track menu. Duplicates are inserted together after the last selected row. Escape cancels an active table-field edit; Cmd-Z reverses a change that was already committed. While uncached track data is loading, scrolling and selection remain available, and editing is enabled when processing finishes.\n\n"
             "Sort the table by clicking a column header; clicking the same header again reverses the direction. Date & Time sorting uses the special placement rule for untimed or zero-duration tracks. The context-menu Sort Selected Tracks dialog provides criterion and direction explicitly. If more than one table row is selected, sorting only reorders those selected rows and leaves all other rows fixed in place. If zero or one row is selected, header sorting applies to the full table. Drag selected rows to reorder tracks. Renumber… previews Track Numbers or Stage Numbers for Selected or All tracks, optionally including hidden tracks. Enter the first number or leave it blank to continue the preceding row. Conflicts with untouched tracks are blocked. Edit Stage cells directly to group tracks; Track IDs remain stable in persistent Track Number order, including hidden tracks. Set Type… assigns a type, and Select by Type… replaces the selection. Types and colors are configured under Track Types in Settings. These metadata edits retain cached metrics and the current viewport. Hidden rows remain numbered but use dashed light gray routes and excluded from the bold summary row's visible-track count. Press Backspace/Delete to delete selected tracks after confirmation.\n\n"
             "Use the selection field to type visible track numbers such as 1,3-5; unnumbered tracks can be selected in the table. Select All and Unselect All change the current track selection. Invert Selection selects unselected tracks and deselects the others, including hidden tracks. Renumber offers Assign Numbers or Clear Numbers, Track Numbers or Stage Numbers, Selected or All, and Include Hidden; clearing also offers Both. Preview and confirm the changes. A Stage cell may also be cleared directly. Undo restores changed values. Internal identities and file references never change when renumbering. Join Tracks merges selected tracks into the first selected track. Set Anchorpoint uses the first point of the current first selected track for distance calculations.\n\n"
@@ -15155,7 +15462,9 @@ def build_gpx_editor_menu(controller, window_menu_coordinator=None):
         ("Waypoint Table", "inspectTrack:"),
         ("Plot Track(s)", "plotSelected:"),
         ("Elevation Profile", "contextElevationProfile:"),
-        ("Estimate Route Times from Media…", "estimateRouteTimesFromMedia:"),
+        ("Estimate Track Times…", "estimateTrackTimes:"),
+        ("Find Missing Timestamps…", "findMissingTimestamps:"),
+        ("Rebuild Route Times from Media…", "rebuildRouteTimesFromMedia:"),
         ("Renumber…", "renumberTracks:"),
         ("Set Track Type…", "setTrackType:"),
         ("Select Tracks by Type…", "selectTracksByType:"),

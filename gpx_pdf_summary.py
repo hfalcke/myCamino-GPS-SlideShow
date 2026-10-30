@@ -12,7 +12,6 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from collections import Counter
 from track_types import stage_number, track_number, element_track_type
 from datetime import datetime
 from pathlib import Path
@@ -24,8 +23,8 @@ from map_overlay import map_uses_dynamic_overlays
 
 PDF_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mycamino-pdf")
 PDF_COLUMNS = (
-    ("row", "Row", ""), ("nr", "Track Number", ""), ("stage", "Stage", ""),
-    ("track_id", "Track ID", ""), ("show", "Show", ""),
+    ("row", "Row", ""), ("nr", "Track Number", ""),
+    ("track_id", "Track", ""), ("show", "Show", ""),
     ("name", "Name", ""), ("date", "Date & Time", ""),
     ("length", "Length", "km"), ("duration", "Duration", ""),
     ("sum", "Sum", "km"), ("distance", "Distance", "km"),
@@ -33,7 +32,7 @@ PDF_COLUMNS = (
     ("ascent", "Ascent", "m"), ("descent", "Descent", "m"),
     ("npoints", "NPoints", ""),
 )
-DEFAULT_PDF_COLUMNS = tuple(key for key, _, _ in PDF_COLUMNS if key not in {"row", "npoints", "show", "nr", "track_id"})
+DEFAULT_PDF_COLUMNS = tuple(key for key, _, _ in PDF_COLUMNS if key not in {"row", "npoints", "show", "nr"})
 
 
 class PDFExportCancelled(Exception):
@@ -81,6 +80,34 @@ class SummaryOptions:
     elevation_profile: bool = True
     rotate_maps: bool = False
     name_prefix: str = ""
+    include_checkpoints: bool | None = None
+    include_checkpoint_places: bool | None = None
+    retrieve_checkpoint_places: bool | None = None
+    include_checkpoint_weather: bool | None = None
+    retrieve_checkpoint_weather: bool | None = None
+
+
+PDF_CHECKPOINT_OPTIONS = (
+    ("include_checkpoints", "pdf.checkpoints"),
+    ("include_checkpoint_places", "pdf.checkpoint_places"),
+    ("retrieve_checkpoint_places", "pdf.retrieve_checkpoint_places"),
+    ("include_checkpoint_weather", "pdf.checkpoint_weather"),
+    ("retrieve_checkpoint_weather", "pdf.retrieve_checkpoint_weather"),
+)
+
+
+def pdf_report_parameters(parameters, options):
+    """Resolve report-only overrides without modifying the Adventure settings."""
+    values = dict(parameters)
+    for field, key in PDF_CHECKPOINT_OPTIONS:
+        override = getattr(options, field)
+        fallback = values.get("pdf.retrieve_checkpoint_data", True) if field.startswith("retrieve_") else True
+        values[key] = bool(values.get(key, fallback) if override is None else override)
+    values["pdf.retrieve_checkpoint_data"] = any(
+        values[f"pdf.checkpoint_{kind}"] and values[f"pdf.retrieve_checkpoint_{kind}"]
+        for kind in ("places", "weather")
+    )
+    return values
 
 
 @dataclass(frozen=True)
@@ -90,11 +117,8 @@ class SummarySnapshot:
     options: SummaryOptions
 
     def __post_init__(self):
-        counts = Counter(track.report_stage for track in self.tracks if track.report_stage is not None)
-        columns = tuple(key for key in self.options.columns if key != "track_id")
-        if "stage" in columns and any(count > 1 for count in counts.values()):
-            index = columns.index("stage") + 1
-            columns = columns[:index] + ("track_id",) + columns[index:]
+        # Older callers selecting Stage now get the single, stable Track ID.
+        columns = tuple(dict.fromkeys("track_id" if key == "stage" else key for key in self.options.columns))
         object.__setattr__(self, "options", replace(self.options, columns=columns))
 
 
@@ -181,7 +205,6 @@ def summary_rows(snapshot: SummarySnapshot) -> tuple[SummaryRow, ...]:
         return compact_number(value, integer=integer_elevation.get(key, False))
 
     rows = []
-    stage_counts = Counter(track.report_stage for track in snapshot.tracks if track.report_stage is not None)
     cumulative = 0.0
     for track in snapshot.tracks:
         if not track.hidden:
@@ -194,10 +217,8 @@ def summary_rows(snapshot: SummarySnapshot) -> tuple[SummaryRow, ...]:
                 value = track.date.astimezone().strftime("%d.%m.%Y %H:%M") if track.date else "N/A"
             elif key == "show":
                 value = "no" if track.hidden else "yes"
-            elif key == "stage":
-                value = str(track.report_stage) if track.report_stage is not None else ""
             elif key == "track_id":
-                value = track.track_id if track.report_stage is not None and stage_counts[track.report_stage] > 1 else ""
+                value = (track.track_id or str(track.report_stage)) if track.report_stage is not None else ""
             elif key in {"nr", "row"}:
                 value = str(track.row) if key == "row" else (str(track.report_number) if track.report_number is not None else "")
             else:

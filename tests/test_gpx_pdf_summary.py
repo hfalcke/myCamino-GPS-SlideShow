@@ -76,8 +76,9 @@ class PDFSummaryTests(unittest.TestCase):
         self.assertEqual(rows[0].cells, ("N/A", "N/A", "N/A"))
 
     def test_numeric_thresholds_prefix_and_defaults(self):
-        self.assertEqual(set(key for key, _, _ in PDF_COLUMNS) - set(DEFAULT_PDF_COLUMNS), {"row", "show", "npoints", "nr", "track_id"})
-        self.assertIn("stage", DEFAULT_PDF_COLUMNS)
+        self.assertEqual(set(key for key, _, _ in PDF_COLUMNS) - set(DEFAULT_PDF_COLUMNS), {"row", "show", "npoints", "nr"})
+        self.assertIn("track_id", DEFAULT_PDF_COLUMNS)
+        self.assertNotIn("stage", DEFAULT_PDF_COLUMNS)
         self.assertEqual(compact_number(99.4), "99.4")
         self.assertEqual(compact_number(100), "100")
         self.assertEqual(format_report_duration(86340), "23h 59m")
@@ -102,6 +103,8 @@ class PDFSummaryTests(unittest.TestCase):
                 canvas.draw()
                 renderer = canvas.get_renderer()
                 ax = figure.axes[0]
+                self.assertEqual(sum(text.get_text() == "Track" for text in ax.texts), 1)
+                self.assertNotIn("Stage", [text.get_text() for text in ax.texts])
                 self.assertEqual(sum(text.get_text() == "Speed" for text in ax.texts), 1)
                 self.assertTrue(any(text.get_text().endswith("...") for text in ax.texts))
                 # No table or footer label may escape the page edges.

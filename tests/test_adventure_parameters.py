@@ -23,6 +23,20 @@ from adventure_parameters import (
 
 
 class AdventureParameterTests(unittest.TestCase):
+    def test_pdf_break_default_is_twenty_minutes_in_new_and_older_adventures(self):
+        self.assertEqual(default_parameters()["pdf.break_duration_minutes"], 20)
+        migrated = normalize_parameters({"version": 27, "values": {"pdf.break_duration_minutes": 30}})
+        self.assertEqual(migrated["pdf.break_duration_minutes"], 20)
+        self.assertEqual(parameter_payload(migrated)["version"], PARAMETER_SCHEMA_VERSION)
+
+    def test_custom_break_thresholds_and_current_explicit_thirty_minutes_are_preserved(self):
+        for duration in (10, 25, 45):
+            restored = normalize_parameters({"version": 27, "values": {"pdf.break_duration_minutes": duration}})
+            self.assertEqual(restored["pdf.break_duration_minutes"], duration)
+        explicit = dict(default_parameters(), **{"pdf.break_duration_minutes": 30})
+        self.assertEqual(normalize_parameters(explicit)["pdf.break_duration_minutes"], 30)
+        self.assertEqual(normalize_parameters(parameter_payload(explicit))["pdf.break_duration_minutes"], 30)
+
     def test_pdf_provider_settings_are_independent_of_generated_map_freshness(self):
         values = default_parameters()
         values.update({'pdf.map_provider': 'geoapify', 'pdf.geoapify_style': 'osm-carto'})

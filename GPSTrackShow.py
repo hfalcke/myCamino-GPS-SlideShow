@@ -9817,6 +9817,7 @@ class GPSTrackShowApp:
         self.active_transition = random.choice(RANDOM_TRANSITIONS) if self.random_transition_mode else config.transition
         self.initial_duration = float(config.duration)
         self.initial_playback_style = str(config.initial_style)
+        self.playback_style_override = None
         self.control_pause_active = False
         self.control_pause_resume_callback = None
         self.control_non_display_limit = max(1000, len(self.playlist_lines) * 2)
@@ -11442,6 +11443,13 @@ class GPSTrackShowApp:
         current = self._playback_style_name()
         if normalized == current:
             return
+        # Treat a keyboard/settings choice as newer than commands already passed,
+        # not as a replacement for future authored transition commands.
+        row = getattr(self, "current_display_index", None)
+        if row is None:
+            row = int(getattr(self, "playlist_index", 0)) - 1
+        row = max(int(row), int(getattr(self, "time_lapse_control_row_cursor", -1)))
+        self.playback_style_override = {"style": normalized, "row": row}
         if normalized == "TIME_LAPSE":
             self._toggle_time_lapse_mode()
         else:
@@ -11466,14 +11474,27 @@ class GPSTrackShowApp:
         resume_state: object = None,
     ) -> None:
         """Restore persistent control state without executing flow commands."""
+        override = getattr(self, "playback_style_override", None)
+        has_resume = isinstance(resume_state, dict) and resume_state.get("version") == 1
+        if has_resume and "style_override" in resume_state:
+            override = None
+            saved_override = resume_state["style_override"]
+            if isinstance(saved_override, dict):
+                try:
+                    override = {"style": normalize_control_transition(saved_override.get("style")),
+                                "row": int(saved_override["row"])}
+                except (ControlSyntaxError, KeyError, TypeError, ValueError):
+                    pass
         duration = self.initial_duration
-        style = self.initial_playback_style
+        style = override["style"] if override is not None else self.initial_playback_style
         for index in sorted(key for key in self.control_directives if key < int(row_index)):
             for action in self.control_directives[index].actions:
                 if action.kind == "duration":
                     duration = float(action.value)
                 elif action.kind == "transition":
-                    style = str(action.value)
+                    if override is None or index > override["row"]:
+                        style = str(action.value)
+                        override = None
         for scope in repeat_ranges_at_row(
             getattr(self, "repeat_ranges", ()), int(row_index), "all"
         ):
@@ -11484,7 +11505,8 @@ class GPSTrackShowApp:
                     duration = float(action.value)
                 elif action.kind == "transition":
                     style = str(action.value)
-        if isinstance(resume_state, dict) and resume_state.get("version") == 1:
+                    override = None
+        if has_resume:
             try:
                 saved_duration = float(resume_state.get("duration"))
             except (TypeError, ValueError):
@@ -11492,9 +11514,15 @@ class GPSTrackShowApp:
             if math.isfinite(saved_duration) and saved_duration > 0.0:
                 duration = saved_duration
             try:
-                style = normalize_control_transition(resume_state.get("transition"))
+                saved_style = normalize_control_transition(resume_state.get("transition"))
+                if saved_style != style:
+                    # Older checkpoints saved the current style but not whether
+                    # it came from t/T. Preserve that choice on later navigation.
+                    override = {"style": saved_style, "row": int(row_index) - 1}
+                style = saved_style
             except ControlSyntaxError:
                 pass
+        self.playback_style_override = override
         object.__setattr__(self.config, "duration", duration)
         self._assign_playback_style(style)
 
@@ -11510,11 +11538,15 @@ class GPSTrackShowApp:
                 else str(getattr(getattr(config, "transition", Transition.BLEND), "value", "BLEND"))
             )
         )
-        return {
+        snapshot = {
             "version": 1,
             "duration": duration,
             "transition": transition,
         }
+        override = getattr(self, "playback_style_override", None)
+        if override is not None:
+            snapshot["style_override"] = dict(override)
+        return snapshot
 
     def _toggle_clock(self) -> None:
         """Cycle the logical presentation header for this playback session."""
@@ -13411,6 +13443,7 @@ class GPSTrackShowApp:
         self.control_pause_active = False
         self.control_pause_resume_callback = None
         object.__setattr__(self.config, "duration", self.initial_duration)
+        self.playback_style_override = None
         self._assign_playback_style(self.initial_playback_style)
         self.music_controller.set_slideshow_paused(True)
         if getattr(self, "narration_controller", None) is not None:
@@ -15524,6 +15557,7 @@ class GPSTrackShowApp:
                 continue
             if kind == "transition":
                 target_style = normalize_control_transition(action.value)
+                self.playback_style_override = None
                 current_style = self._playback_style_name()
                 next_row = row_index + 1
                 if target_style != current_style:

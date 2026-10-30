@@ -240,10 +240,9 @@ Controls:
 - Adventure name: a menu of the Adventures in the selected folder. A new name
   is editable until it is first committed. Existing names are protected; click
   **Edit** before deliberately renaming or copying an Adventure.
-  Selecting one loads it immediately. The most recently modified Adventure is
-  loaded automatically when a folder is chosen. Adventures copied from another
-  project directory are marked **Needs adaptation** until a valid copy is
-  created for the new folder.
+  Selecting one loads it immediately. A folder with one Adventure opens it
+  automatically; with several, **Open Adventure** lists their names and filenames
+  and offers **Open Selected** or **Cancel**.
 - Description: optional two-line description.
 
 Files created:
@@ -256,16 +255,15 @@ The `.adv` file explicitly stores its project directory, GPX filename, active
 last stopped slide-show position. After creation or loading, every relevant
 change is saved automatically.
 
-If you duplicate a complete project folder in Finder, its `.adv` files still
-record the previous absolute project directory. The GUI recognizes these as
-copied Adventure templates instead of reporting them as damaged. If the new
-folder contains no valid Adventure, select one of the templates and use
-**Create from Selected**. The proposed new name is the folder name. This creates
-a new `.adv` for the copied folder, clears old Continue positions, and shares
-the GPX, control file, generated maps, media, music, and narration files already
-present there. The selected template remains unchanged. Use **Create Blank
-Adventure** only when none of the copied settings and project-file references
-should be retained.
+Moved, copied or renamed project folders open their existing `.adv` files in
+place. myCamino corrects the saved folder and project-local absolute references
+without creating another Adventure, renaming assets, or clearing Continue
+positions. The Adventure name and internal filenames do not need to match the
+folder name. External references stay external, and another existing copy is
+not modified. If the corrected location cannot be saved, the Adventure opens
+with corrected in-memory paths and a warning; normal Save/autosave retries.
+Recent Adventures remembers the selected `.adv`, so choosing that entry opens
+it directly. Opening a folder with multiple Adventures always asks which one.
 
 In an empty folder, confirm the suggested Adventure name to create the first
 `.adv`. Committing a changed name for an existing Adventure offers **Rename**,
@@ -520,10 +518,19 @@ and provenance. Existing current sidecars are indexed incrementally in the
 EXIF data or repeat place-name lookups.
 
 When maps are created or updated, obsolete numbered track-map files in
-`trackimages/` are removed if they no longer match any current GPX track. The
+`trackimages/` are removed only within the active map family and if they no
+longer match any current GPX track or any control-file reference. Hidden control
+rows and their Time-Lapse partners remain protected. The
 same check removes obsolete media-stage maps from the active Adventure's map
 family. The overview, summary, other Adventures, and unrelated files are not
 removed.
+
+If a control file still uses older map filenames, automatic slideshow preparation
+checks the current missing/stale maps rather than repeatedly doing nothing.
+It then offers **Review Control File Updates** before playback. Accept the map
+reference changes and start the slideshow again; authored rows are never silently
+rewritten. A map that remains unavailable after preparation stops playback with
+an explanation instead of starting another repair loop.
 
 Generate and Update Maps window:
 
@@ -1065,8 +1072,39 @@ The Start Slide Show section contains:
   immediately while any missing track calculations finish in the background.
   Visible, All, or Selected applies to the entire report. Hidden tracks use gray
   text and orange overview routes, and are excluded from totals and averages.
+  The summary has one Track ID column, not separate Stage and ID columns. IDs
+  such as 3b retain their suffix even when only that track is exported. Break
+  detection defaults to stationary periods longer than 20 minutes, adjustable
+  under PDF Export. Older saved 30-minute defaults adopt 20 minutes; other custom
+  thresholds remain unchanged.
   Export opens the completed PDF in your default viewer and offers Open PDF and
   Show in Finder. The Advanced Interface also retains its PDF Summary button.
+  **Checkpoint details (this PDF only)** starts with your global PDF settings.
+  Independently choose whether to include checkpoints, checkpoint names, and
+  checkpoint weather, and whether to retrieve missing names or missing weather.
+  Turning retrieval off still reuses compatible existing sidecars. These choices
+  do not alter Adventure settings or grant weather consent; lookups follow the
+  existing place-name and Open-Meteo settings. Adventure exports share one
+  checkpoint cache in `.mycamino/pdf-checkpoints.json`, regardless of the PDF's
+  name or destination. Earlier report checkpoint sidecars in the Adventure are
+  imported automatically and left intact. Old checkpoints remain reusable after
+  changing break detection or marker spacing: names within 1 km, weather within
+  1 km and 30 minutes. Standalone exports keep their separate PDF checkpoint
+  sidecar. Turning checkpoints off omits their table and map/profile
+  markers without performing checkpoint lookups.
+  The options scroll on smaller screens; Export, Cancel and the status remain
+  visible below them.
+  PDF tile downloads retry temporary connection, timeout and server failures up
+  to three attempts per tile, with increasing delays shown in the status.
+  The rounded retry delay is only the pause before the next attempt. When that
+  attempt starts, the status changes to Downloading tile and shows separate
+  connection/data timeouts, then reports receipt and continued map preparation.
+  Geoapify and other hosted PDF providers allow at least 30 seconds to receive
+  tile data; a larger Map Service timeout remains effective. Interactive-map
+  timing and public OSM pacing are unchanged. Rate limits honor Retry-After;
+  access or credential rejections stop immediately. Cancel interrupts retry
+  waits. An unsuccessful export preserves the previous PDF and successfully
+  cached tiles, so the next export needs only the tiles still missing.
 - Quit: auto-save pending Adventure changes and close the main GUI.
 
 The control-file editor also offers **Start Slide Show Here** in the
@@ -1162,6 +1200,9 @@ Common slide-show keys:
   five seconds.
 - `t`: cycle forward through Time-Lapse and the Standard transition styles.
 - `T` (Shift-`t`): cycle backward through the same styles.
+  The chosen style survives stage jumps and backward/forward navigation. Later
+  explicit control-file transition commands can change it; active repeated
+  transition directives also retain their authored behavior.
 - `w`: switch between one slide-show window and a separate overview window.
   Closing the overview window also returns to one-window playback without
   stopping the show.
@@ -1250,6 +1291,47 @@ do not count as extra travelled stages.
 
 ## Standalone GPX Editor App
 
+### Find and Estimate Missing Times
+
+**Track > Find Missing Timestamps…** lists gaps in all tracks, including hidden
+tracks in gray. Choose Selected Tracks to narrow the results. Double-click a
+gap to open the waypoint table at its original rows; Previous Missing and Next
+Missing navigate without renumbering points or opening another map. The Time
+Source column distinguishes recorded, manual and estimated timestamps.
+
+Loading fully or partly untimed tracks opens one non-blocking offer with
+Inspect, Estimate Times and Ignore. **Do not ask again for these tracks** is
+saved only when you press Ignore. Without it, Ignore applies to this load only.
+Closing or Escape saves no suppression choice. Adventure choices stay in that
+Adventure; standalone choices stay local to the document. Renaming or moving an
+Adventure does not reset its choices. Ask Again in the results window restores
+reminders for selected tracks. Explicit tools and newly dropped-media offers
+remain available even when startup reminders are suppressed.
+
+**Track > Estimate Track Times…** defaults to Fill Missing Times, preserving
+valid existing timestamps, geometry and direction. Refresh Previously Estimated
+Times is an explicit alternative that still preserves recorded/manual values.
+Bounded gaps use route-distance interpolation within a GPX segment. Open ends
+use nearby measured speeds or the configured fallback, initially 3.5 km/h.
+Segments without an absolute time remain unresolved; Set Start Time opens the
+specific waypoint time cell rather than retiming the whole track. Analyze again
+after entering a time, then Apply the proposal. **Save Tracks** becomes available
+after Apply and saves the complete GPX document through the normal Save workflow,
+opening Save As when needed. Saving is optional; cancelling a save or a failed
+write keeps the applied changes in the editor for retry. Adventure autosave
+continues normally. Saving the active Adventure GPX also commits its Adventure
+identity and shared save state, so quitting immediately afterward does not ask
+to save the same changes again. Undo/Redo remains available after saving.
+
+Adventure media and control-file references are used automatically where needed;
+Choose Additional Media is optional. Current sidecars are reused, and only
+missing basic metadata is prepared. No places, weather, tiles or maps are
+downloaded. Photos beyond the configured Photo-to-route distance (initially
+100 m), conflicting times, duplicate evidence and GPS inferred from track times
+cannot steer the repair. Counts and unresolved reasons appear before Apply.
+**Rebuild Route Times from Media…** retains the separate deliberate full-retiming
+and route-direction workflow; ordinary gap repair never reverses a track.
+
 The DMG also contains `myCamino GPX Editor.app`. Start it by clicking the
 **myCamino GPX Editor** icon in Applications. This is the same GPX editor
 that opens from Add & Edit Tracks, but it can also be launched directly for GPX
@@ -1294,7 +1376,7 @@ an individual Stage cell. Cleared numbers
 stay unassigned after saving and reopening; **Renumber…** assigns them again.
 These changes support Undo. Clearing a number does not delete a track or change
 its permanent internal identity, maps, or control-file references. Tracks without
-a stage are not grouped together, and their PDF stage/ID cells remain blank.
+a stage are not grouped together, and their PDF Track ID cells remain blank.
 
 Use **Set Type…** or **Set Track Type…** to assign Unassigned, Hiking,
 Pilgrimage, Bike, Horse, Car, Bus, Train, Metro, Airplane, Rest, or Sightseeing. **Select by Type…**

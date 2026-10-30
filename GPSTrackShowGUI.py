@@ -192,6 +192,7 @@ from gpx_tracks_table import (
     execute_map_variants_from_context,
     run_with_options as run_gpx_tracks_table_with_options,
     render_media_overview_map,
+    sanitize_filename_component,
     selected_track_numbers,
     upgrade_timed_track_sidecars,
 )
@@ -244,15 +245,16 @@ from json_storage import atomic_write_json
 from adventure_files import (
     ADVENTURE_FORMAT_VERSION,
     AdventureFormatError,
-    create_adventure_from_template,
     discover_adventure_candidates,
     filename_base as adventure_filename_base,
-    load_adventure,
+    open_adventure,
+    resolve_adventure_location,
     project_file_names,
     rename_or_copy_adventure,
     shared_references,
     validate_adventure_payload,
 )
+from cocoa_adventure_chooser import choose_adventure
 from audio_playlist import (
     AUDIO_EXTENSIONS,
     album_directories,
@@ -1146,16 +1148,16 @@ def compact_weather_summary(metadata):
     return " · ".join(fields)
 
 
-def missing_control_map_assets(control_text, trackimages_dir):
-    """Return unavailable enabled map assets required by a control file."""
+def referenced_control_map_assets(control_text, trackimages_dir, *, include_disabled=False):
+    """Collect authored map references, including implicit Time-Lapse partners."""
     directory = Path(trackimages_dir)
-    missing = []
+    paths = []
     for raw_line in str(control_text).splitlines():
         if not raw_line.strip():
             continue
         row = parse_slideshow_control_line(raw_line)
         row_type = str(row.get("type", "")).upper()
-        if bool(row.get("disabled")) or row_type not in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
+        if (bool(row.get("disabled")) and not include_disabled) or row_type not in {"MAP", "TRK", "BEF", "AFT", "LOC"}:
             continue
         name = str(row.get("name", "")).strip()
         if not name:
@@ -1167,9 +1169,47 @@ def missing_control_map_assets(control_text, trackimages_dir):
         if row_type == "TRK":
             required.append(standard.with_name(time_lapse_track_map_name(standard.name)))
         for path in required:
-            if not path.is_file() and path.name not in missing:
-                missing.append(path.name)
-    return missing
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def missing_control_map_assets(control_text, trackimages_dir):
+    """Return unavailable enabled map assets required by a control file."""
+    return list(dict.fromkeys(path.name for path in referenced_control_map_assets(
+        control_text, trackimages_dir) if not path.is_file()))
+
+
+def protected_control_map_paths(trackimages_dir):
+    """Protect assets used by every control file sharing this map directory."""
+    directory = Path(trackimages_dir).resolve(strict=False)
+    protected = set()
+    for control in directory.parent.glob("*.lst"):
+        for path in referenced_control_map_assets(
+                control.read_text(encoding="utf-8"), directory, include_disabled=True):
+            protected.update((path.resolve(strict=False), path.with_suffix(".json").resolve(strict=False)))
+    return protected
+
+
+def select_map_repair_numbers(context, update_numbers, required_names):
+    """Narrow repairs only when every requested name belongs to the current plan.
+
+    Old authored names must not silently filter every stale map out of the job.
+    Rebuild current assets first, then offer the existing control-file review.
+    """
+    if required_names is None:
+        return update_numbers, set()
+    owners = {Path(context["overview_path"]).name.casefold(): 0}
+    for track in context.get("tracks", []):
+        for key in ("track_plot_image_filename", "track_plot_time_lapse_image_filename"):
+            name = track.get(key)
+            if name:
+                owners[Path(name).name.casefold()] = int(track["table_number"])
+    unknown = required_names - owners.keys()
+    if unknown:
+        return update_numbers, unknown
+    selected = {owners[name] for name in required_names}
+    return [number for number in update_numbers if number in selected], set()
 
 
 def slideshow_dependency_issues(control_text, trackimages_dir, context):
@@ -2510,7 +2550,6 @@ class GPXTrackerController(NSObject):
         self.track_map_base = ""
         self.gpx_identity = None
         self.adventure_records = []
-        self.adventure_templates = []
         self.adventure_combo_entries = []
         self.project_file_menu_refreshing = False
         self.committed_adventure_name = ""
@@ -3278,10 +3317,8 @@ class GPXTrackerController(NSObject):
                 path = Path(str(item)).expanduser().resolve(strict=False)
             except OSError:
                 continue
-            if path.suffix.lower() == ".adv":
-                continue
             key = str(path)
-            if path.exists() and path.is_dir() and key not in seen:
+            if (path.is_dir() or (path.suffix.casefold() == ".adv" and path.is_file())) and key not in seen:
                 recent.append(path)
                 seen.add(key)
             if len(recent) >= 10:
@@ -3313,16 +3350,19 @@ class GPXTrackerController(NSObject):
             path = Path(project_dir).expanduser().resolve(strict=False)
         except OSError:
             return
-        if path.suffix.lower() == ".adv":
-            path = path.parent
-        if not path.exists() or not path.is_dir():
+        current = self.current_project_file
+        if path.is_dir() and current is not None and Path(current).parent.resolve(strict=False) == path:
+            path = Path(current).resolve(strict=False)
+        if not (path.is_dir() or (path.suffix.casefold() == ".adv" and path.is_file())):
             return
         path_key = str(path)
-        self.recent_adventures = [item for item in self.recent_adventures if str(item) != path_key]
+        self.recent_adventures = [item for item in self.recent_adventures if str(item) != path_key
+            and not (path.suffix.casefold() == ".adv" and Path(item).resolve(strict=False) == path.parent)]
         self.recent_adventures.insert(0, path)
         normalized = []
         seen = set()
         for item in self.recent_adventures:
+            item = Path(item).expanduser().resolve(strict=False)
             key = str(item)
             if key not in seen:
                 normalized.append(item)
@@ -4200,6 +4240,12 @@ class GPXTrackerController(NSObject):
         if self.untimed_prompt_suppressions != before:
             self.mark_dirty()
 
+    def forget_untimed_prompt_suppressions(self, identities):
+        before = set(self.untimed_prompt_suppressions)
+        self.untimed_prompt_suppressions.difference_update(identities)
+        if self.untimed_prompt_suppressions != before:
+            self.mark_dirty()
+
     def mark_clean(self):
         self.project_dirty = False
         self.adventure_autosave_error = None
@@ -4746,6 +4792,8 @@ class GPXTrackerController(NSObject):
 
     def _cleanup_obsolete_track_map_files(self, context):
         """Delete numbered track-map files that no longer belong to current GPX tracks."""
+        if getattr(self, "control_table_dirty", False):
+            return []  # Unsaved authored references may not exist on disk yet.
         output_dir = Path(context["output_dir"]).resolve(strict=False)
         expected_names = set()
         for track in context.get("tracks", []):
@@ -4755,6 +4803,13 @@ class GPXTrackerController(NSObject):
                     continue
                 expected_names.add(Path(filename).name)
                 expected_names.add(Path(filename).with_suffix(".json").name)
+        # A renamed map family can still be used by this or another Adventure.
+        # Never remove a referenced image or its metadata, even for hidden rows.
+        try:
+            protected_paths = protected_control_map_paths(output_dir)
+        except (OSError, UnicodeError):
+            return []  # An unreadable control file cannot prove assets obsolete.
+        family = sanitize_filename_component(str(context["output_base"])) if context.get("output_base") else None
         removed = []
         try:
             candidates = list(output_dir.iterdir())
@@ -4767,7 +4822,12 @@ class GPXTrackerController(NSObject):
                 continue
             if not re.match(r"^\d+_.+", candidate.name):
                 continue
+            if family and not (candidate.stem.endswith(f"_{family}")
+                               or candidate.stem.endswith(f"_{family}-timelapse")):
+                continue
             if candidate.name in expected_names:
+                continue
+            if candidate.resolve(strict=False) in protected_paths:
                 continue
             try:
                 candidate.unlink()
@@ -4778,9 +4838,13 @@ class GPXTrackerController(NSObject):
 
     def _cleanup_obsolete_media_map_files(self, plan, output_dir):
         """Remove obsolete media maps only from the active Adventure map family."""
-        if plan is None:
+        if plan is None or getattr(self, "control_table_dirty", False):
             return []
         output_dir = Path(output_dir).resolve(strict=False)
+        try:
+            protected_paths = protected_control_map_paths(output_dir)
+        except (OSError, UnicodeError):
+            return []
         expected = set()
         family_prefixes = set()
         for spec in plan.media_map_specs:
@@ -4820,6 +4884,8 @@ class GPXTrackerController(NSObject):
             ):
                 continue
             if candidate.name in expected:
+                continue
+            if candidate.resolve(strict=False) in protected_paths:
                 continue
             try:
                 candidate.unlink()
@@ -6222,21 +6288,16 @@ class GPXTrackerController(NSObject):
             return
         self.project_file_menu_refreshing = True
         try:
-            records, templates, errors = discover_adventure_candidates(
+            records, _relocated, errors = discover_adventure_candidates(
                 self.current_project_dir
             )
             self.adventure_records = records
-            self.adventure_templates = templates
             self.adventure_combo_entries = [
                 ("valid", record) for record in records
-            ] + [("template", record) for record in templates]
+            ]
             current_name = str(self.title_field.stringValue()).strip()
             self.title_field.removeAllItems()
             labels = [record.project_name for record in records]
-            labels.extend(
-                f"{record.project_name} — {record.path.name} (Needs adaptation)"
-                for record in templates
-            )
             self.title_field.addItemsWithObjectValues_(labels)
             self.title_field.setStringValue_(current_name)
 
@@ -6256,71 +6317,7 @@ class GPXTrackerController(NSObject):
 
     def _find_adventure_file_in_directory(self, project_dir):
         records, _templates, _errors = discover_adventure_candidates(project_dir)
-        return records[0].path if records else None
-
-    def _choose_copied_adventure_recovery(self, project_dir, templates):
-        """Choose a copied template and target name without changing active state."""
-        if not templates:
-            return None
-        suggested_name = project_filename_base(Path(project_dir).name)
-        while True:
-            accessory = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, 520.0, 82.0))
-            template_label = self._make_label("Copied Adventure")
-            template_label.setFrame_(NSMakeRect(0.0, 56.0, 132.0, 20.0))
-            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-                NSMakeRect(138.0, 52.0, 382.0, FIELD_HEIGHT), False
-            )
-            popup.addItemsWithTitles_(
-                [
-                    f"{record.path.name} — {record.project_name}"
-                    for record in templates
-                ]
-            )
-            name_label = self._make_label("New Adventure name")
-            name_label.setFrame_(NSMakeRect(0.0, 16.0, 132.0, 20.0))
-            name_field = NSTextField.alloc().initWithFrame_(
-                NSMakeRect(138.0, 12.0, 382.0, FIELD_HEIGHT)
-            )
-            name_field.setStringValue_(suggested_name)
-            accessory.addSubview_(template_label)
-            accessory.addSubview_(popup)
-            accessory.addSubview_(name_label)
-            accessory.addSubview_(name_field)
-
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("Copied Adventures found")
-            alert.setInformativeText_(
-                "These Adventures still record their previous project directory. "
-                "Create a valid Adventure in this folder from the selected template, "
-                "or start with a blank Adventure. Existing project files are shared "
-                "and are not copied again."
-            )
-            alert.setAccessoryView_(accessory)
-            alert.addButtonWithTitle_("Create from Selected")
-            alert.addButtonWithTitle_("Create Blank Adventure")
-            alert.addButtonWithTitle_("Cancel")
-            response = int(alert.runModal())
-            if response not in {1000, 1001}:
-                return None
-            requested_name = project_filename_base(str(name_field.stringValue()).strip())
-            suggested_name = requested_name
-            target = Path(project_dir) / f"{requested_name}.adv"
-            if target.exists():
-                show_alert(
-                    "Adventure name is already in use.",
-                    f"{target.name} already exists. Choose another name or load the existing Adventure.",
-                )
-                continue
-            if response == 1001:
-                return {"action": "blank", "name": requested_name}
-            index = int(popup.indexOfSelectedItem())
-            if index < 0 or index >= len(templates):
-                index = 0
-            return {
-                "action": "copy",
-                "name": requested_name,
-                "template": templates[index],
-            }
+        return choose_adventure(records)
 
     def _auto_load_adventure_from_directory(self, project_dir):
         adv_path = self._find_adventure_file_in_directory(project_dir)
@@ -6415,17 +6412,8 @@ class GPXTrackerController(NSObject):
             candidate = (self.current_project_dir or self.base_dir) / candidate
         candidate = candidate.resolve(strict=False)
         previous_directory = self.current_project_dir
-        if (
-            previous_directory is not None
-            and previous_directory.resolve(strict=False) == candidate
-            and self.current_project_file is not None
-        ):
-            self.project_dir_field.setStringValue_(str(candidate))
-            self._ensure_project_audio_directory(show_errors=True)
-            self._ensure_project_narration_directory(show_errors=True)
-            self._refresh_music_summary()
-            self._refresh_narration_summary()
-            return True
+        if candidate.is_file() and candidate.suffix.casefold() == ".adv":
+            return self.load_project_configuration(candidate)
         if candidate.exists() and not candidate.is_dir():
             show_alert("The selected path is not a directory.", str(candidate))
             self._restore_project_directory_field(previous_directory)
@@ -6435,32 +6423,21 @@ class GPXTrackerController(NSObject):
             self._restore_project_directory_field(previous_directory)
             return False
 
+        if candidate.is_dir():
+            records, _relocated, errors = discover_adventure_candidates(candidate)
+            if records:
+                selected = choose_adventure(records)
+                if selected is None:
+                    self._restore_project_directory_field(previous_directory)
+                    return False
+                return self.load_project_configuration(selected)
+            if errors:
+                show_alert("Could not open the Adventures in this folder.", "\n".join(errors))
+                self._restore_project_directory_field(previous_directory)
+                return False
         if not self.flush_adventure_autosave():
             self._restore_project_directory_field(previous_directory)
             return False
-
-        recovered_path = None
-        blank_name = None
-        if candidate.is_dir():
-            records, templates, _errors = discover_adventure_candidates(candidate)
-            if not records and templates:
-                recovery = self._choose_copied_adventure_recovery(candidate, templates)
-                if recovery is None:
-                    self._restore_project_directory_field(previous_directory)
-                    return False
-                if recovery["action"] == "copy":
-                    try:
-                        recovered_path, _payload = create_adventure_from_template(
-                            recovery["template"].path,
-                            candidate,
-                            recovery["name"],
-                        )
-                    except (OSError, AdventureFormatError, ValueError) as exc:
-                        show_alert("Could not adapt the copied Adventure.", str(exc))
-                        self._restore_project_directory_field(previous_directory)
-                        return False
-                else:
-                    blank_name = recovery["name"]
 
         self.project_dir_field.setStringValue_(str(candidate))
         self.directory_activation_in_progress = True
@@ -6471,25 +6448,8 @@ class GPXTrackerController(NSObject):
         if resolved is None:
             self._restore_project_directory_field(previous_directory)
             return False
-        records, _templates, _errors = discover_adventure_candidates(resolved)
-        if recovered_path is not None or (records and blank_name is None):
-            adventure_file = recovered_path or records[0].path
-            loaded = self.load_project_configuration(adventure_file, flush_current=False)
-            if not loaded:
-                self.current_project_dir = previous_directory
-                self._restore_project_directory_field(previous_directory)
-                if previous_directory is not None:
-                    try:
-                        os.chdir(previous_directory)
-                    except OSError:
-                        pass
-            return loaded
-
         self._stop_project_media_watcher()
-        self._initialize_blank_adventure_fields(resolved, blank_name)
-        if blank_name is not None:
-            self.adventureNameCommitted_(self.title_field)
-            return self.current_project_file is not None
+        self._initialize_blank_adventure_fields(resolved)
         return True
 
     def _update_loaded_project_fields(self, data):
@@ -7012,11 +6972,16 @@ class GPXTrackerController(NSObject):
         return self.flush_adventure_autosave()
 
     def load_project_configuration(self, adv_path, flush_current=True):
+        try:
+            resolve_adventure_location(adv_path)
+        except AdventureFormatError as exc:
+            show_alert("Could not load adventure.", str(exc))
+            return False
         if flush_current and self.current_project_file is not None and not self.flush_adventure_autosave():
             return False
         recovery_review_requested = False
         try:
-            record = load_adventure(adv_path)
+            record = open_adventure(adv_path)
             data = dict(record.payload)
         except AdventureFormatError as exc:
             show_alert("Could not load adventure.", str(exc))
@@ -7053,14 +7018,19 @@ class GPXTrackerController(NSObject):
         )
         self.current_project_file = record.path
         self._set_adventure_name_editing(False)
-        self._remember_recent_adventure(self.current_project_file.parent)
+        self._remember_recent_adventure(self.current_project_file)
         self._refresh_project_file_menus()
         self.set_status(f"Loaded adventure from {self.current_project_file}")
         self.reset_progress()
         self._refresh_loaded_gpx_summary()
         self.layout_window()
         self.mark_clean()
-        if music_paths_changed:
+        if record.location_save_error:
+            self.saved_project_payload = None
+            self.mark_dirty()
+            show_alert("The Adventure opened, but its new location could not be saved.",
+                f"myCamino is using {record.path.parent}. Save will retry updating {record.path.name}.\n\n{record.location_save_error}")
+        elif music_paths_changed:
             self.saved_project_payload = dict(data)
             self.mark_dirty(immediate=True)
         self._start_project_media_watcher()
@@ -7395,7 +7365,7 @@ class GPXTrackerController(NSObject):
             "Recommended workflow:\n"
             "1. Choose an Adventure folder. This folder is where all material for this journey is collected.\n"
             "2. Choose an Adventure from the Adventure name menu. In an empty folder, confirm the suggested name to create one. Existing names are protected from accidental typing; click Edit before renaming or copying one, optionally including its GPX, control file, and generated maps.\n"
-            "   If a complete project folder was copied in Finder, choose a copied Adventure marked Needs adaptation. The GUI creates a valid Adventure for the new folder while sharing its already copied GPX, control, map, music, and narration files.\n"
+            "   Moved or copied project folders open their existing Adventures in place. Their saved location is corrected without creating or renaming files. If a folder contains several Adventures, choose which existing one to open. Copying or renaming an Adventure remains a separate explicit action.\n"
             "3. Use the gear beside the myCamino logo to adjust project settings. During a slide show, press s to open Settings directly at Slide Show. Header controls and Time-Lapse options are grouped in their own subsections below thin dividers. Common settings are shown first; Show Advanced Settings reveals technical map, GPX, PDF, location, and server controls. GPX Processing has separate defaults for horizontal smoothing (10 m), point spacing (10 m), elevation smoothing (50 m), horizontal/vertical error (10/20 m), and HDOP/VDOP (20/20); zero disables an individual operation. Statistics, maps, PDFs, and Time-Lapse motion use these settings consistently. Apply updates an active slide show immediately and auto-saves the settings with the Adventure.\n"
             "4. For a new Adventure, confirm a detected GPX file, choose other GPX files, or select No GPX file - use only photos. One detected file is used directly; several detected or selected files are joined in the GPX Editor. Cancelling a chooser leaves the source unconfirmed. The same media-only choice remains visible in the GPX Files section and is saved with the Adventure.\n"
             "5. Accept photos and videos already in the Adventure folder or import more. Existing files are skipped rather than copied again. One retained Adventure Processing window then shows metadata extraction, optional place-name and historical-weather lookup, map generation, and control-file work with phase headings and progress in its title. Historical weather is an explicit opt-in because media coordinates and times are sent to Open-Meteo; Skip omits only the active optional phase.\n"
@@ -7975,14 +7945,19 @@ class GPXTrackerController(NSObject):
             result = getattr(self, "automatic_map_generation_result", {}) or {}
             created_count = int(result.get("created_count", 0))
             failures = list(result.get("failures", []))
+            control_review_required = bool(result.get("control_review_required", False))
             resume_slideshow = bool(
                 getattr(self, "pending_slideshow_after_map_generation", None)
-            )
+            ) and not control_review_required
+            if control_review_required:
+                self.pending_slideshow_after_map_generation = None
             pending_imported_paths = list(
                 getattr(self, "automatic_map_pending_imported_paths", [])
             )
             self.automatic_map_pending_imported_paths = []
             summary = f"Map generation checked all stages and created {created_count} map file(s)."
+            if control_review_required:
+                summary += " Review Control File Updates before starting: some authored map references use older filenames."
             if failures:
                 summary += (
                     f" {len(failures)} map operation(s) failed; completed maps were retained."
@@ -7999,7 +7974,7 @@ class GPXTrackerController(NSObject):
             control_path = self._control_file_path()
             review_existing = bool(
                 getattr(self, "automatic_map_review_control", False)
-            )
+            ) or control_review_required
             self.automatic_map_review_control = False
             self.pending_control_update_offer_after_status = None
             if resume_slideshow:
@@ -12518,36 +12493,8 @@ class GPXTrackerController(NSObject):
         if field is self.title_field:
             index = int(self.title_field.indexOfSelectedItem())
             if 0 <= index < len(self.adventure_combo_entries):
-                kind, record = self.adventure_combo_entries[index]
-                if kind == "valid":
-                    self.load_project_configuration(record.path)
-                    return
-                if not self.flush_adventure_autosave():
-                    self.title_field.setStringValue_(self.committed_adventure_name)
-                    return
-                recovery = self._choose_copied_adventure_recovery(
-                    self.current_project_dir, [record]
-                )
-                if recovery is None:
-                    self.title_field.setStringValue_(self.committed_adventure_name)
-                    return
-                if recovery["action"] == "copy":
-                    try:
-                        target, _payload = create_adventure_from_template(
-                            record.path,
-                            self.current_project_dir,
-                            recovery["name"],
-                        )
-                    except (OSError, AdventureFormatError, ValueError) as exc:
-                        show_alert("Could not adapt the copied Adventure.", str(exc))
-                        self.title_field.setStringValue_(self.committed_adventure_name)
-                        return
-                    self.load_project_configuration(target, flush_current=False)
-                else:
-                    self._initialize_blank_adventure_fields(
-                        self.current_project_dir, recovery["name"]
-                    )
-                    self.adventureNameCommitted_(self.title_field)
+                _kind, record = self.adventure_combo_entries[index]
+                self.load_project_configuration(record.path)
         elif field is self.gpx_field:
             self.gpxSelectionCommitted_(self.gpx_field)
         elif field is self.control_file_field:
@@ -12607,7 +12554,7 @@ class GPXTrackerController(NSObject):
             if not self.flush_adventure_autosave():
                 return
             try:
-                source_payload = load_adventure(self.current_project_file).payload
+                source_payload = resolve_adventure_location(self.current_project_file).payload
             except AdventureFormatError as exc:
                 show_alert("Could not read the active Adventure.", str(exc))
                 return
@@ -13013,6 +12960,9 @@ class GPXTrackerController(NSObject):
                 status_callback(message)
 
         tracks_summary_path = None
+        context = None
+        current_map_names = set()
+        control_review_required = False
         skip_remaining_maps = bool(
             media_only
             and str(self.parameters.get("maps.output_provider", "osm")) == "osm"
@@ -13087,26 +13037,21 @@ class GPXTrackerController(NSObject):
                         f"Could not safely relink {len(relink_report.skipped)} map asset(s); "
                         "they remain selected for normal map maintenance."
                     )
+                    for reason in relink_report.skipped[:3]:
+                        report(f"  {reason}")
             removed = self._cleanup_obsolete_track_map_files(context)
             if removed:
                 report(f"Removed {len(removed)} obsolete map file(s).")
             update_numbers = self._track_map_update_numbers(gpx_path, context)
-            if required_names is not None:
-                required_track_numbers = set()
-                for track in context.get("tracks", []):
-                    names = {
-                        Path(str(track.get("track_plot_image_filename", ""))).name.casefold(),
-                        Path(str(track.get("track_plot_time_lapse_image_filename", ""))).name.casefold(),
-                    }
-                    if names & required_names:
-                        required_track_numbers.add(int(track["table_number"]))
-                overview_required = Path(context["overview_path"]).name.casefold() in required_names
-                update_numbers = [
-                    number
-                    for number in update_numbers
-                    if (number == 0 and overview_required)
-                    or (number > 0 and number in required_track_numbers)
-                ]
+            current_map_names.add(Path(context["overview_path"]).name.casefold())
+            for track in context.get("tracks", []):
+                for key in ("track_plot_image_filename", "track_plot_time_lapse_image_filename"):
+                    if track.get(key):
+                        current_map_names.add(Path(track[key]).name.casefold())
+            update_numbers, unknown_names = select_map_repair_numbers(context, update_numbers, required_names)
+            if unknown_names:
+                report("Some control-file map names differ from the current map plan. "
+                       "Checking all missing or stale current maps before reviewing references.")
             include_overview = 0 in update_numbers
             track_numbers = [number for number in update_numbers if number > 0]
             public_osm_automatic = (
@@ -13197,10 +13142,33 @@ class GPXTrackerController(NSObject):
                 output_writer=output_writer,
             )
         )
+        # A successful renderer return is not evidence that authored dependencies
+        # were repaired. In particular, old filenames may require user review.
+        if required_names is not None and not failures:
+            control_text = control_path.read_text(encoding="utf-8")
+            remaining = (slideshow_dependency_issues(control_text, trackimages_dir, context)["maps"]
+                         if context is not None else missing_control_map_assets(control_text, trackimages_dir))
+            for spec in plan.media_map_specs:
+                name = spec.get("filename")
+                if name:
+                    current_map_names.update((Path(name).name.casefold(), time_lapse_track_map_name(Path(name).name).casefold()))
+            if context is None and plan.overview_name:
+                current_map_names.add(Path(plan.overview_name).name.casefold())
+            for name in remaining:
+                if name.casefold() not in required_names:
+                    continue
+                if context is not None and name.casefold() not in current_map_names:
+                    control_review_required = True
+                    report(f"Control-file review required for older map reference: {name}")
+                else:
+                    failures.append({"filename": name, "error":
+                        "Map is still missing or geometrically outdated after preparation. "
+                        "Playback was not restarted; inspect the processing details and retry map generation."})
         return {
             "created_count": len(created_paths),
             "created_paths": [str(path) for path in created_paths],
             "failures": failures,
+            "control_review_required": control_review_required,
             "tracks_summary_path": (
                 str(tracks_summary_path) if tracks_summary_path is not None else None
             ),
@@ -18780,6 +18748,7 @@ class GPXTrackerController(NSObject):
                     "remember_untimed_prompt_suppressions": (
                         self.remember_untimed_prompt_suppressions
                     ),
+                    "forget_untimed_prompt_suppressions": self.forget_untimed_prompt_suppressions,
                 },
             )
             if (
@@ -19241,15 +19210,7 @@ class GPXTrackerController(NSObject):
             self.window.makeKeyAndOrderFront_(None)
         if self.startup_project_file is not None and self.startup_project_file.exists():
             startup_file = self.startup_project_file.resolve()
-            records, templates, _errors = discover_adventure_candidates(
-                startup_file.parent
-            )
-            if any(record.path == startup_file for record in templates):
-                loaded = self._activate_project_directory(
-                    startup_file.parent, allow_create=True
-                )
-            else:
-                loaded = self.load_project_configuration(startup_file)
+            loaded = self.load_project_configuration(startup_file)
             if loaded:
                 self.window.makeFirstResponder_(self.title_field)
                 return
@@ -19419,7 +19380,7 @@ def build_argument_parser():
         metavar="ADVENTURE_OR_DIRECTORY",
         help=(
             "Optional Adventure file or project directory. A directory loads its "
-            "most recently modified valid .adv file when available."
+            "existing Adventure, asking which one to open when several are present."
         ),
     )
     return parser

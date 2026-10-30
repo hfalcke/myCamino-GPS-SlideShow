@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import binascii
 from pathlib import Path
+from contextlib import contextmanager
 
 from runtime_distribution import is_app_store_build
 
@@ -120,6 +121,16 @@ class SecurityScopedAccessManager:
         from Foundation import NSURL
 
         return self.remember_url(NSURL.fileURLWithPath_(str(path)))
+
+
+@contextmanager
+def temporary_directory_access(path, defaults=None):
+    """Inspect a destination without releasing the active project's scope."""
+    manager = SecurityScopedAccessManager(defaults)
+    try:
+        yield manager.activate_directory(path)
+    finally:
+        manager.stop()
 
 
 _helper_access_manager = None

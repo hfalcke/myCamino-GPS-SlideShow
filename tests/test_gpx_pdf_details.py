@@ -41,6 +41,19 @@ def processed(samples, *, spacing=0, threshold=1.5):
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_twenty_minute_default_detects_a_twenty_five_minute_break(self):
+        track = processed([(0, 50), (30, 50.02), (55, 50.0201), (100, 50.06)])
+        for values in (default_parameters(), {}):
+            pauses = [marker for marker in build_checkpoints(track, values) if marker.break_end]
+            self.assertEqual(len(pauses), 1)
+            self.assertEqual(pauses[0].break_seconds, 25 * 60)
+        custom = dict(default_parameters(), **{"pdf.break_duration_minutes": 30})
+        self.assertFalse(any(marker.break_end for marker in build_checkpoints(track, custom)))
+
+    def test_exactly_twenty_minutes_remains_the_strict_break_boundary(self):
+        track = processed([(0, 50), (30, 50.02), (50, 50.02), (100, 50.06)])
+        self.assertFalse(any(marker.break_end for marker in build_checkpoints(track, default_parameters())))
+
     def test_hourly_interpolation_uses_route_distance_and_keeps_endpoints(self):
         track = processed([(0, 50), (120, 50.1)])
         markers = build_checkpoints(track, default_parameters())

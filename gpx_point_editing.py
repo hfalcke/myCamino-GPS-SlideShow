@@ -59,7 +59,7 @@ def _extensions_element(element: ET.Element) -> ET.Element:
     return extensions
 
 
-def set_point_time_origin(point: ET.Element, kind: str) -> None:
+def set_point_time_origin(point: ET.Element, kind: str, method: str | None = None) -> None:
     """Record whether a waypoint time is fixed manual input or generated."""
     extensions = _extensions_element(point)
     tag = f"{{{MYCAMINO_NAMESPACE}}}timeOrigin"
@@ -67,6 +67,10 @@ def set_point_time_origin(point: ET.Element, kind: str) -> None:
     if origin is None:
         origin = ET.SubElement(extensions, tag)
     origin.set("kind", str(kind))
+    if method is not None:
+        origin.set("method", str(method))
+    else:
+        origin.attrib.pop("method", None)
 
 
 def point_time_origin(point: ET.Element) -> str:
@@ -75,6 +79,20 @@ def point_time_origin(point: ET.Element) -> str:
         if child.tag == tag:
             return str(child.attrib.get("kind", "")).casefold()
     return ""
+
+
+def point_time_source_label(point: ET.Element) -> str:
+    if parse_time(point.findtext(qualified_like(point, "time"))) is None:
+        return "Missing"
+    tag = f"{{{MYCAMINO_NAMESPACE}}}timeOrigin"
+    origin = next(point.iter(tag), None)
+    if origin is None:
+        return "Recorded"
+    kind = origin.get("kind", "")
+    if kind == "generated":
+        method = origin.get("method", "")
+        return "Estimated" + (f": {method}" if method else "")
+    return "Manual" if kind == "manual" else "Recorded"
 
 
 def set_manual_track_start_time(track: ET.Element, value: datetime) -> None:

@@ -68,12 +68,14 @@ from Foundation import NSDate, NSObject, NSString, NSTimer, NSURL
 
 from adventure_files import (
     AdventureFormatError,
-    create_adventure_from_template,
     discover_adventure_candidates,
     filename_base,
-    load_adventure,
+    open_adventure,
+    resolve_adventure_location,
     validate_adventure_payload,
 )
+from cocoa_adventure_chooser import choose_adventure
+from security_scoped_access import temporary_directory_access
 from adventure_map_workspace import (
     MediaMapItem,
     ProcessingJournal,
@@ -628,6 +630,7 @@ class AdventureMapController(NSObject):
         if action in {
             "showTrackTable:", "showWaypointTable:", "showElevationProfile:",
             "fitToTrack:", "renumberTracks:", "estimateRouteTimesFromMedia:", "selectTracksByType:",
+            "estimateTrackTimes:", "findMissingTimestamps:", "rebuildRouteTimesFromMedia:",
         }:
             return has_tracks
         if action == "setTrackType:":
@@ -825,12 +828,23 @@ class AdventureMapController(NSObject):
     @objc.python_method
     def load_project_directory(self, directory: Path):
         directory = Path(directory).expanduser().resolve(strict=False)
+        with temporary_directory_access(directory, self.project_access.defaults) as permitted:
+            if not permitted:
+                self._alert("Adventure folder access is unavailable.", "Choose the folder again to renew myCamino's permission.")
+                return False
+            records, _relocated, errors = discover_adventure_candidates(directory)
+            selected = choose_adventure(records)
+        if records:
+            return self.load_adventure_path(selected) if selected is not None else False
+        if errors:
+            self._alert("Could not open the Adventures in this folder.", "\n".join(errors))
+            return False
+        if self.adventure_file is not None and (self.workspace_dirty_components or self.gpx_controller.dirty):
+            if not self._flush_workspace_autosave(show_errors=True):
+                return False
         if not self.project_access.activate_directory(directory):
-            self._alert(
-                "Adventure folder access is unavailable.",
-                "Choose the folder again to renew myCamino's permission.",
-            )
-            return
+            self._alert("Adventure folder access is unavailable.", "Choose the folder again to renew myCamino's permission.")
+            return False
         self._reset_optional_enrichment()
         self._stop_media_watcher()
         self.startup_track_loading = False
@@ -839,15 +853,10 @@ class AdventureMapController(NSObject):
         self.startup_post_track_work_pending = False
         self.startup_pending_media_paths.clear()
         self.startup_media_extent_pending = False
-        records, templates, errors = discover_adventure_candidates(directory)
-        if records:
-            self.load_adventure_path(records[0].path)
-            return
-        if templates:
-            selected = self._choose_copied_template(templates, directory)
-            if selected is not None:
-                self.load_adventure_path(selected)
-            return
+        self._retire_full_gui()
+        self.adventure_file = None
+        self.adventure_payload = None
+        self.control_file = None
         self.project_directory = Path(directory).resolve(strict=False)
         self.adventure_name = filename_base(self.project_directory.name)
         self._prepare_gpx_document_context()
@@ -872,43 +881,36 @@ class AdventureMapController(NSObject):
             self._journal("Adventure", "; ".join(errors))
         self._scan_project_media()
         self._start_media_watcher()
-
-    @objc.python_method
-    def _choose_copied_template(self, templates, directory):
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Use the copied Adventure?")
-        alert.setInformativeText_(
-            f"Select a copied Adventure template. A local Adventure named {directory.name} will share the copied project assets."
-        )
-        chooser = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 420, 28), False)
-        chooser.addItemsWithTitles_([f"{item.path.name} — Needs adaptation" for item in templates])
-        alert.setAccessoryView_(chooser)
-        alert.addButtonWithTitle_("Create from Selected")
-        alert.addButtonWithTitle_("Cancel")
-        if int(alert.runModal()) != 1000:
-            return None
-        try:
-            selected = templates[max(0, int(chooser.indexOfSelectedItem()))]
-            path, _payload = create_adventure_from_template(selected.path, directory, directory.name)
-            return path
-        except (AdventureFormatError, FileExistsError, OSError) as exc:
-            self._alert("Could not adapt the copied Adventure.", str(exc))
-            return None
+        return True
 
     @objc.python_method
     def load_adventure_path(self, path: Path):
         path = Path(path).expanduser().resolve(strict=False)
-        if not self.project_access.activate_directory(path.parent):
-            self._alert(
-                "Adventure folder access is unavailable.",
-                "Choose the folder again to renew myCamino's permission.",
-            )
-            return
-        if self.adventure_file is not None and (
-            self.workspace_dirty_components or self.gpx_controller.dirty
-        ):
-            if not self._flush_workspace_autosave(show_errors=True):
-                return
+        previous_directory = self.project_directory
+        with temporary_directory_access(path.parent, self.project_access.defaults) as permitted:
+            if not permitted:
+                self._alert("Adventure folder access is unavailable.", "Choose the folder again to renew myCamino's permission.")
+                return False
+            try:
+                resolve_adventure_location(path)
+            except AdventureFormatError as exc:
+                self._alert("Could not load Adventure.", str(exc))
+                return False
+            if self.adventure_file is not None and (self.workspace_dirty_components or self.gpx_controller.dirty):
+                if not self._flush_workspace_autosave(show_errors=True):
+                    return False
+            if not self.project_access.activate_directory(path.parent):
+                if previous_directory is not None:
+                    self.project_access.activate_directory(previous_directory)
+                self._alert("Adventure folder access is unavailable.", "Choose the folder again to renew myCamino's permission.")
+                return False
+            try:
+                record = open_adventure(path)
+            except AdventureFormatError as exc:
+                if previous_directory is not None:
+                    self.project_access.activate_directory(previous_directory)
+                self._alert("Could not load Adventure.", str(exc))
+                return False
         self._reset_optional_enrichment()
         self._stop_media_watcher()
         self.startup_track_loading = False
@@ -917,11 +919,6 @@ class AdventureMapController(NSObject):
         self.startup_post_track_work_pending = False
         self.startup_pending_media_paths.clear()
         self.startup_media_extent_pending = False
-        try:
-            record = load_adventure(path)
-        except AdventureFormatError as exc:
-            self._alert("Could not load Adventure.", str(exc))
-            return
         loaded_payload = dict(record.payload)
         self.missing_gpx_reference = ""
         self.pending_gpx_recovery_review = False
@@ -970,7 +967,7 @@ class AdventureMapController(NSObject):
         self.adventure_name = record.project_name
         self._prepare_gpx_document_context()
         self.demo_mode = bool(record.payload.get("guided_demo", False))
-        self._remember_recent_adventure(self.project_directory)
+        self._remember_recent_adventure(record.path)
         self.control_file = self.project_directory / str(loaded_payload.get("control_file", ""))
         self.temporary_control_model = not self.control_file.is_file()
         self.parameters = normalize_parameters(loaded_payload.get("parameters") or {})
@@ -1017,6 +1014,11 @@ class AdventureMapController(NSObject):
         self._load_control_rows()
         self._scan_project_media()
         self._start_media_watcher()
+        if record.location_save_error:
+            self._mark_adventure_component_changed("adventure")
+            self._alert("The Adventure opened, but its new location could not be saved.",
+                f"myCamino is using {record.path.parent}. Save will retry updating {record.path.name}.\n\n{record.location_save_error}")
+        return True
 
     @objc.python_method
     def _stored_startup_extent(self):
@@ -1806,6 +1808,15 @@ class AdventureMapController(NSObject):
                 self.adventure_payload[
                     ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD
                 ] = sorted(self.untimed_prompt_suppressions)
+            self.adventureComponentDidChange_("adventure")
+
+    @objc.python_method
+    def forget_untimed_prompt_suppressions(self, identities):
+        before = set(self.untimed_prompt_suppressions)
+        self.untimed_prompt_suppressions.difference_update(identities)
+        if self.untimed_prompt_suppressions != before:
+            if isinstance(getattr(self, "adventure_payload", None), dict):
+                self.adventure_payload[ADVENTURE_UNTIMED_PROMPT_SUPPRESSIONS_FIELD] = sorted(self.untimed_prompt_suppressions)
             self.adventureComponentDidChange_("adventure")
 
     @objc.IBAction
@@ -2932,9 +2943,12 @@ class AdventureMapController(NSObject):
             return False
         self.pending_workspace_drop_after_adventure_load = list(paths)
         if selected.is_dir():
-            self.load_project_directory(selected)
+            loaded = self.load_project_directory(selected)
         else:
-            self.load_adventure_path(selected)
+            loaded = self.load_adventure_path(selected)
+        if not loaded:
+            self.pending_workspace_drop_after_adventure_load = []
+            return False
         if not self.startup_track_loading:
             self._dispatch_pending_workspace_drop()
         return True
@@ -3503,6 +3517,27 @@ class AdventureMapController(NSObject):
         return success
 
     @objc.python_method
+    def save_gpx_editor_document(self, editor, path):
+        """Save the owned document and its Adventure bookkeeping in one pass.
+
+        A different Save As destination remains an explicit GPX export; it must
+        not make the active Adventure look saved or change its source silently.
+        """
+        if editor is not self.gpx_controller or self.project_directory is None or self.adventure_file is None:
+            return None
+        stored = str((self.adventure_payload or {}).get("gpx_file", "")).strip()
+        managed_path = self.project_directory / (stored or f"{filename_base(self.adventure_name)}.gpx")
+        if Path(path).resolve(strict=False) != managed_path.resolve(strict=False):
+            return None
+        if editor.dirty or "gpx" in self.workspace_dirty_components:
+            try:
+                editor.backup_existing_file(managed_path)
+            except OSError as exc:
+                self._alert("Could not save the tracks.", str(exc))
+                return False
+        return self._flush_workspace_autosave(show_errors=True)
+
+    @objc.python_method
     def _flush_workspace_autosave(self, *, show_errors=True, force=False):
         if self.workspace_autosave_future is not None:
             if not (show_errors or force):
@@ -3682,6 +3717,11 @@ class AdventureMapController(NSObject):
                 except (OSError, AdventureFormatError) as exc:
                     failures.append(f"Adventure file: {exc}")
 
+            if gpx_saved and (failures or self.mutation_journal.has_component_after("gpx", mutation_generation)):
+                # The GPX may be on disk while its new identity failed to reach
+                # the .adv, or a newer edit may have arrived during the save.
+                saved_components.discard("gpx")
+                self.gpx_controller.dirty = True
             if generation == self.workspace_autosave_generation:
                 self.workspace_dirty_components.difference_update(saved_components)
             if not failures and not self.workspace_dirty_components:
@@ -4214,7 +4254,7 @@ class AdventureMapController(NSObject):
                     demo_path = str(self.project_directory.resolve(strict=False))
                     controller.recent_adventures = [
                         path for path in controller.recent_adventures
-                        if str(path.resolve(strict=False)) != demo_path
+                        if str((path.parent if path.suffix.casefold() == ".adv" else path).resolve(strict=False)) != demo_path
                     ]
                     controller._save_recent_adventures()
                     controller._refresh_recent_adventure_menu()
@@ -4328,19 +4368,19 @@ class AdventureMapController(NSObject):
         if project is None:
             return
         path = Path(project).expanduser().resolve(strict=False)
-        if path.suffix.casefold() == ".adv":
-            path = path.parent
-        if not path.is_dir():
+        if path.is_dir() and self.adventure_file is not None and self.adventure_file.parent.resolve(strict=False) == path:
+            path = self.adventure_file.resolve(strict=False)
+        if not (path.is_dir() or (path.suffix.casefold() == ".adv" and path.is_file())):
             return
         if self.demo_mode and any(part.startswith("mycamino-demo-") for part in path.parts):
             return
         recent = []
         for candidate in [path, *self.recent_adventure_paths()]:
             candidate = Path(candidate)
-            if candidate.suffix.casefold() == ".adv":
-                candidate = candidate.parent
             candidate = candidate.resolve(strict=False)
-            if candidate.is_dir() and candidate not in recent:
+            if path.suffix.casefold() == ".adv" and candidate == path.parent:
+                continue
+            if (candidate.is_dir() or (candidate.suffix.casefold() == ".adv" and candidate.is_file())) and candidate not in recent:
                 recent.append(candidate)
             if len(recent) >= 10:
                 break
@@ -4409,6 +4449,18 @@ class AdventureMapController(NSObject):
     def estimateRouteTimesFromMedia_(self, _sender):
         self.gpx_controller.estimateRouteTimesFromMedia_(None)
 
+    @objc.IBAction
+    def estimateTrackTimes_(self, _sender):
+        self.gpx_controller.estimateTrackTimes_(None)
+
+    @objc.IBAction
+    def findMissingTimestamps_(self, _sender):
+        self.gpx_controller.findMissingTimestamps_(None)
+
+    @objc.IBAction
+    def rebuildRouteTimesFromMedia_(self, _sender):
+        self.gpx_controller.rebuildRouteTimesFromMedia_(None)
+
     @objc.python_method
     def workspace_tracks_did_load(self, loaded_records):
         """Offer geometry-preserving timing after a route is dropped into an Adventure."""
@@ -4424,25 +4476,8 @@ class AdventureMapController(NSObject):
                     "Could not create the Adventure.",
                     "The GPX tracks remain open and recoverable. Choose Save Workspace to try again.",
                 )
-        untimed = [
-            track
-            for track in loaded_records
-            if self.gpx_controller._fully_untimed_route(track)
-        ]
-        if len(untimed) != 1:
-            return
-        track = untimed[0]
-        self.pending_route_timing_track_nr = track.nr
-        self.gpx_controller.selected_nrs = [track.nr]
-        self.gpx_controller.update_selection_field()
-        self.gpx_controller.highlight_selected_rows()
-        if self.pending_route_timing_media and self.processing_active:
-            return
-        media_paths = list(self.pending_route_timing_media) or self._project_media_paths()
-        if not media_paths:
-            return
-        self.pending_route_timing_media.difference_update(media_paths)
-        self._prepare_route_timing_offer(track.nr, media_paths)
+        # The editor offers one nonmodal repair tool after loading. That tool
+        # automatically uses Adventure media; do not open a second timing prompt.
 
     @objc.python_method
     def _prepare_route_timing_offer(
@@ -5313,7 +5348,9 @@ def build_adventure_map_menu(controller):
         ("Waypoint Table", "showWaypointTable:"),
         ("Elevation Profile", "showElevationProfile:"),
         ("Fit to Track", "fitToTrack:"),
-        ("Estimate Route Times from Media…", "estimateRouteTimesFromMedia:"),
+        ("Estimate Track Times…", "estimateTrackTimes:"),
+        ("Find Missing Timestamps…", "findMissingTimestamps:"),
+        ("Rebuild Route Times from Media…", "rebuildRouteTimesFromMedia:"),
         ("Renumber…", "renumberTracks:"),
         ("Set Track Type…", "setTrackType:"),
         ("Select Tracks by Type…", "selectTracksByType:"),

@@ -73,7 +73,7 @@ class AdventureFileTests(unittest.TestCase):
             self.assertEqual(renamed["gpx_file"], "")
             self.assertFalse((directory / "Renamed.gpx").exists())
 
-    def test_discovery_separates_copied_templates_from_invalid_files(self):
+    def test_discovery_includes_relocated_adventures_and_separates_invalid_files(self):
         with TemporaryDirectory() as temporary, TemporaryDirectory() as original:
             directory = Path(temporary)
             old_directory = Path(original)
@@ -88,7 +88,8 @@ class AdventureFileTests(unittest.TestCase):
 
             records, templates, errors = discover_adventure_candidates(directory)
 
-            self.assertEqual(records, [])
+            self.assertEqual([record.project_name for record in records], ["Newer", "Older"])
+            self.assertTrue(all(record.relocated_from == old_directory.resolve() for record in records))
             self.assertEqual(
                 [record.project_name for record in templates], ["Newer", "Older"]
             )
@@ -111,7 +112,7 @@ class AdventureFileTests(unittest.TestCase):
 
             records, templates, errors = discover_adventure_candidates(directory)
 
-            self.assertEqual([record.project_name for record in records], ["Local"])
+            self.assertEqual({record.project_name for record in records}, {"Local", "Copied"})
             self.assertEqual(
                 [record.project_name for record in templates], ["Copied"]
             )

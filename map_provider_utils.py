@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import json
 import os
+import random
 import subprocess
 import time
 from threading import RLock, local
@@ -38,6 +41,42 @@ class TileProviderAccessError(RuntimeError):
 
 class TileCacheMissError(TileProviderAccessError):
     """A cache-only rendering job required a tile that was not cached."""
+
+
+class TileRequestCancelled(RuntimeError):
+    """A cancelled tile request must not start another network attempt."""
+
+
+def _check_tile_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise TileRequestCancelled("Map tile downloading was cancelled.")
+
+
+def _wait_for_tile_request(seconds, cancel_event):
+    _check_tile_cancelled(cancel_event)
+    if seconds > 0:
+        if cancel_event is None:
+            time.sleep(seconds)
+        elif cancel_event.wait(seconds):
+            raise TileRequestCancelled("Map tile downloading was cancelled.")
+    _check_tile_cancelled(cancel_event)
+
+
+def _tile_retry_after(response):
+    value = str(getattr(response, "headers", {}).get("Retry-After", "")).strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if seconds < float("inf") else None
+    except ValueError:
+        try:
+            moment = parsedate_to_datetime(value)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def provider_requires_credential(provider: str) -> bool:
@@ -263,8 +302,19 @@ def contextily_request_timeout(
     provider: str = "osm",
     minimum_interval_seconds: float | None = None,
     cache_only: bool = False,
+    *,
+    max_attempts: int = 1,
+    minimum_read_timeout: float = 0.0,
+    cancel_event=None,
+    progress=None,
+    provider_name: str | None = None,
+    wait_for_network: bool = True,
 ):
-    """Apply identification, pacing, timeout, and terminal provider errors."""
+    """Apply provider policy and optional per-tile, cancellation-aware retries.
+
+    Retries run inside Contextily's cached fetch, so successful tiles retain the
+    same cache identity and failures never become cached images.
+    """
     global _PATCHED_REQUEST_MODULE, _ORIGINAL_REQUEST_GET, _REQUEST_PATCH_USERS
 
     tile_module = getattr(contextily_module, "tile", None)
@@ -280,71 +330,124 @@ def contextily_request_timeout(
     ) if minimum_interval_seconds is None else max(0.0, float(minimum_interval_seconds))
 
     def policy_get(*args, **kwargs):
-        configuration = getattr(_REQUEST_CONTEXT, "configuration", None) or {}
+        configuration = getattr(_REQUEST_CONTEXT, "configuration", None)
+        requester = _ORIGINAL_REQUEST_GET
+        # requests is process-wide; unrelated callers must not inherit a PDF's
+        # timeout, cancellation, or retry policy from another thread.
+        if configuration is None:
+            return requester(*args, **kwargs)
         active_cache_only = bool(configuration.get("cache_only", False))
-        active_timeout = float(configuration.get("timeout", timeout_seconds))
-        active_provider = str(configuration.get("provider", normalized_provider))
-        active_interval = float(configuration.get("interval", interval))
+        active_timeout = configuration["timeout"]
+        active_provider = configuration["provider"]
+        active_interval = configuration["interval"]
+        active_cancel = configuration["cancel_event"]
+        active_progress = configuration["progress"]
+        label = configuration["provider_name"]
+        attempts = configuration["max_attempts"]
+        _check_tile_cancelled(active_cancel)
         if active_cache_only:
-            url = str(args[0] if args else kwargs.get("url", ""))
             raise TileCacheMissError(
-                "Cached OSM tiles are incomplete. No network request was sent"
-                + (f" for {url}." if url else ".")
+                f"Cached {label} tiles are incomplete. No network request was sent."
             )
-        network_availability.wait_until_available()
         kwargs.setdefault("timeout", active_timeout)
         headers = dict(kwargs.get("headers") or {})
         headers["user-agent"] = MYCAMINO_USER_AGENT
         kwargs["headers"] = headers
         url = str(args[0] if args else kwargs.get("url", ""))
         host = url.split("/", 3)[2].lower() if "://" in url else active_provider
-        if active_interval > 0.0:
-            with _REQUEST_CLOCK_LOCK:
-                elapsed = time.monotonic() - _LAST_REQUEST_BY_HOST.get(host, 0.0)
-                if elapsed < active_interval:
-                    time.sleep(active_interval - elapsed)
-                _LAST_REQUEST_BY_HOST[host] = time.monotonic()
-        try:
-            response = _ORIGINAL_REQUEST_GET(*args, **kwargs)
-        except Exception as exc:
-            network_availability.report_failure(exc)
-            raise
-        network_availability.report_success()
-        if active_interval <= 0.0:
-            with _REQUEST_CLOCK_LOCK:
-                _LAST_REQUEST_BY_HOST[host] = time.monotonic()
-        status = int(getattr(response, "status_code", 0) or 0)
-        if status == 403:
-            raise TileProviderAccessError(
-                f"{provider_display_name(active_provider)} blocked tile access (HTTP 403). "
-                "Further downloads were stopped. Check the provider policy and credentials."
-            )
-        if status == 429:
-            retry_after = str(getattr(response, "headers", {}).get("Retry-After", "")).strip()
+        import requests
+
+        attempt = 0
+        rate_limit_retried = False
+        while True:
+            _check_tile_cancelled(active_cancel)
+            if configuration["wait_for_network"]:
+                if network_availability.offline and callable(active_progress):
+                    active_progress(f"{label}: waiting for the network; no tile download is active.")
+                available = network_availability.wait_until_available(active_cancel)
+                _check_tile_cancelled(active_cancel)
+                if not available:
+                    raise ConnectionError(f"{label}: network access is unavailable.")
+            elif network_availability.offline:
+                raise ConnectionError(f"{label}: downloads are suspended while offline. Cached tiles were retained; retry when online.")
+            if active_interval > 0.0:
+                with _REQUEST_CLOCK_LOCK:
+                    elapsed = time.monotonic() - _LAST_REQUEST_BY_HOST.get(host, 0.0)
+                    _wait_for_tile_request(max(0.0, active_interval - elapsed), active_cancel)
+                    _LAST_REQUEST_BY_HOST[host] = time.monotonic()
+            _check_tile_cancelled(active_cancel)
+            attempt += 1
+            if callable(active_progress):
+                limits = kwargs["timeout"]
+                connect, read = limits if isinstance(limits, tuple) else (limits, limits)
+                active_progress(
+                    f"{label}: downloading tile (attempt {attempt}/{max(attempts, attempt)}); "
+                    f"connection timeout {connect:g} s, data timeout {read:g} s.")
+            _check_tile_cancelled(active_cancel)
+            response = None
+            retry_after = None
             try:
-                retry_seconds = max(0.0, float(retry_after))
-            except ValueError:
-                retry_seconds = 0.0
-            if retry_seconds > 0.0:
-                time.sleep(retry_seconds)
-                response = _ORIGINAL_REQUEST_GET(*args, **kwargs)
+                response = requester(*args, **kwargs)
+            except requests.exceptions.SSLError:
+                raise ConnectionError(f"{label}: secure connection failed. Check the certificate or network settings; further downloads were stopped.") from None
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                _check_tile_cancelled(active_cancel)
+                network_availability.report_failure(exc)
+                if isinstance(exc, requests.Timeout):
+                    limit = kwargs["timeout"]
+                    if isinstance(limit, tuple):
+                        limit = limit[0] if isinstance(exc, requests.ConnectTimeout) else limit[1]
+                    phase = "Connection" if isinstance(exc, requests.ConnectTimeout) else "Read"
+                    message = f"{label}: {phase.lower()} timeout ({float(limit):g}s) after {attempt} attempt(s)."
+                    error = TimeoutError
+                else:
+                    message = f"{label}: connection failed after {attempt} attempt(s). Check the network or try again later."
+                    error = ConnectionError
+                if attempt >= attempts:
+                    raise error(message) from None
+                reason = f"{phase.lower()} timeout" if isinstance(exc, requests.Timeout) else "connection failure"
+            except requests.RequestException as exc:
+                raise TileProviderAccessError(f"{label}: tile request failed ({type(exc).__name__}). No further requests were made.") from None
+            else:
+                _check_tile_cancelled(active_cancel)
+                network_availability.report_success()
+                if active_interval <= 0.0:
+                    with _REQUEST_CLOCK_LOCK:
+                        _LAST_REQUEST_BY_HOST[host] = time.monotonic()
                 status = int(getattr(response, "status_code", 0) or 0)
-            if status == 429:
-                raise TileProviderAccessError(
-                    f"{provider_display_name(active_provider)} rate-limited tile access (HTTP 429"
-                    f"{', retry after ' + retry_after + ' seconds' if retry_after else ''})."
-                )
-        if status == 403:
-            raise TileProviderAccessError(
-                f"{provider_display_name(active_provider)} blocked tile access (HTTP 403). "
-                "Further downloads were stopped. Check the provider policy and credentials."
-            )
-        content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
-        if status < 400 and "text/html" in content_type:
-            raise TileProviderAccessError(
-                f"{provider_display_name(active_provider)} returned an HTML page instead of a map tile."
-            )
-        return response
+                retry_after = _tile_retry_after(response)
+                if status in {401, 403}:
+                    raise TileProviderAccessError(
+                        f"{label} blocked tile access (HTTP {status}). "
+                        "Further downloads were stopped. Check the provider policy and credentials.")
+                if status == 429:
+                    if rate_limit_retried or retry_after is None or attempt >= max(2, attempts):
+                        hint = f" Retry after {retry_after:g} seconds." if retry_after is not None else ""
+                        raise TileProviderAccessError(f"{label} rate-limited tile access (HTTP 429).{hint}")
+                    rate_limit_retried = True
+                    reason = "provider rate limit (HTTP 429)"
+                elif status in {408, 500, 502, 503, 504}:
+                    if attempts == 1:
+                        return response  # Preserve non-PDF Contextily HTTP retries.
+                    if attempt >= attempts:
+                        raise TileProviderAccessError(f"{label}: temporary server error (HTTP {status}) after {attempt} attempt(s). Try again later; cached tiles were retained.")
+                    reason = f"temporary server error (HTTP {status})"
+                elif status >= 400 and status != 404:
+                    raise TileProviderAccessError(f"{label} rejected tile access (HTTP {status}). Further downloads were stopped.")
+                else:
+                    content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
+                    if status < 400 and "text/html" in content_type:
+                        raise TileProviderAccessError(f"{label} returned an HTML page instead of a map tile.")
+                    if status < 400 and callable(active_progress):
+                        active_progress(f"{label}: tile received; continuing map preparation.")
+                    return response
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            delay = retry_after if retry_after is not None else 2 ** (attempt - 1) + random.uniform(0.0, 0.25)
+            if callable(active_progress):
+                active_progress(f"{label}: {reason}; waiting {delay:.1f} s before retrying tile (attempt {attempt + 1}/{max(attempts, attempt + 1)}).")
+            _wait_for_tile_request(delay, active_cancel)
 
     previous_configuration = getattr(_REQUEST_CONTEXT, "configuration", None)
     with _REQUEST_PATCH_LOCK:
@@ -357,9 +460,15 @@ def contextily_request_timeout(
         _REQUEST_PATCH_USERS += 1
     _REQUEST_CONTEXT.configuration = {
         "cache_only": cache_only,
-        "timeout": float(timeout_seconds),
+        "timeout": ((float(timeout_seconds), max(float(timeout_seconds), float(minimum_read_timeout)))
+                    if minimum_read_timeout > 0 else float(timeout_seconds)),
         "provider": normalized_provider,
         "interval": interval,
+        "max_attempts": max(1, min(3, int(max_attempts))),
+        "cancel_event": cancel_event,
+        "progress": progress,
+        "provider_name": provider_name or provider_display_name(normalized_provider),
+        "wait_for_network": bool(wait_for_network),
     }
     try:
         yield

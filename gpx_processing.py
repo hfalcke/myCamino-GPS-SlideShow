@@ -471,6 +471,11 @@ def data_fingerprint_from_segments(segments: Iterable[Iterable[object]]) -> str:
     return digest.hexdigest()
 
 
+def format_gpx_timestamp(value: datetime) -> str:
+    """Keep sub-second precision so writing cannot move a point backwards."""
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None

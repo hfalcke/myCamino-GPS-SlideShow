@@ -14,7 +14,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 27
+PARAMETER_SCHEMA_VERSION = 28
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -149,7 +149,7 @@ PARAMETER_SPECS = (
     ParameterSpec("pdf.checkpoint_reuse_radius_m", "PDF Export", "Checkpoint reuse radius", 1000.0, "float", "Reuse place/weather records within this radius for PDFs only. Weather must also be within thirty minutes. Media freshness rules remain unchanged.", 0.0, 100000.0, unit="m"),
     ParameterSpec("pdf.maximum_markers", "PDF Export", "Maximum checkpoint markers", 10, "int", "Includes start and end. Breaks use no more than half the final markers.", 2, 100),
     ParameterSpec("pdf.marker_interval_minutes", "PDF Export", "Preferred checkpoint spacing", 60.0, "float", "Increase spacing automatically when the marker limit is reached.", 1.0, 10080.0, unit="min"),
-    ParameterSpec("pdf.break_duration_minutes", "PDF Export", "Minimum break duration", 30.0, "float", "A stationary run must last longer than this duration to count as a break.", 1.0, 10080.0, unit="min"),
+    ParameterSpec("pdf.break_duration_minutes", "PDF Export", "Minimum break duration", 20.0, "float", "A stationary run must last longer than this duration to count as a break.", 1.0, 10080.0, unit="min"),
     ParameterSpec("pdf.break_radius_m", "PDF Export", "Break radius", 100.0, "float", "Positions must remain within this distance of a break's arrival position.", 1.0, 10000.0, unit="m"),
     ParameterSpec("pdf.document_dpi", "PDF Export", "Document DPI", 200, "int", "Rendering resolution for PDF pages.", 72, 1200),
     ParameterSpec("pdf.map_dpi", "PDF Export", "Embedded map DPI", 600, "int", "Pixel density used for embedded PDF maps.", 72, 2400),
@@ -177,7 +177,7 @@ PARAMETER_SPECS = (
     ParameterSpec("maps.custom_url", "Map Service", "Custom URL template", "", "text", "HTTPS tile URL containing {z}, {x}, and {y}.", advanced=True),
     ParameterSpec("maps.custom_attribution", "Map Service", "Custom attribution", "", "text", "Required map attribution for a custom provider.", advanced=True),
     ParameterSpec("maps.maximum_zoom", "Map Service", "Maximum provider zoom", 19, "int", "Maximum supported tile zoom.", 0, 30),
-    ParameterSpec("maps.request_timeout_seconds", "Map Service", "Tile request timeout", 12.0, "float", "Maximum wait for a map tile request.", 1.0, 300.0, advanced=True, unit="s"),
+    ParameterSpec("maps.request_timeout_seconds", "Map Service", "Tile request timeout", 12.0, "float", "Wait for connecting to a map service or receiving tile data. Hosted PDF maps allow at least 30 seconds for tile data; larger values here are respected.", 1.0, 300.0, advanced=True, unit="s"),
     ParameterSpec("maps.cache_retention_hours", "Map Service", "Tile cache retention", 720.0, "float", "Delete cached tiles older than this age. Public OSM tiles are retained for at least seven days.", 0.0, 8760.0, advanced=True, unit="h"),
     ParameterSpec("track_types.new_track_default", "Track Types", "Default type for new tracks", "pilgrimage", "choice", "Used only for newly created tracks. Imported and existing tracks keep their types.", choices=tuple((key, label) for key, label, _, _ in TRACK_TYPES)),
     *(ParameterSpec(f"track_types.{key}_color", "Track Types", label, color, "color", "Route, profile and symbol color. Hidden tracks remain light gray.") for key, label, color, _ in TRACK_TYPES),
@@ -383,6 +383,15 @@ def normalize_parameters(raw: Any) -> dict[str, Any]:
         values["gpx.running_speed_window_distance_m"] = (
             DEFAULT_RUNNING_SPEED_WINDOW_DISTANCE_M
         )
+    # Full older payloads stored defaults too. Update their former default,
+    # without treating current unversioned settings drafts as legacy payloads.
+    if isinstance(raw, dict) and isinstance(raw.get("values"), dict):
+        try:
+            old_break_default = int(source_version or 1) < 28 and float(values.get("pdf.break_duration_minutes", 20)) == 30
+        except (TypeError, ValueError):
+            old_break_default = False
+        if old_break_default:
+            values["pdf.break_duration_minutes"] = 20.0
     normalized = default_parameters()
     for spec in PARAMETER_SPECS:
         if spec.key not in values:

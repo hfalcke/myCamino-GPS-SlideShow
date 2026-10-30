@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from control_media_inventory import control_media_inventory_path
@@ -38,6 +38,8 @@ class AdventureRecord:
     path: Path
     payload: dict
     modified_time: float
+    relocated_from: Path | None = None
+    location_save_error: str = ""
 
     @property
     def project_name(self) -> str:
@@ -96,7 +98,10 @@ def validate_adventure_payload(payload: object, adv_path: Path | None = None) ->
             f"Unsupported Adventure format {payload.get('adventure_format_version')!r}; expected {ADVENTURE_FORMAT_VERSION}"
         )
     project_name = str(payload.get("project_name", "")).strip()
-    project_directory = Path(str(payload.get("project_directory", ""))).expanduser().resolve(strict=False)
+    directory_text = str(payload.get("project_directory", "")).strip()
+    if not directory_text or not Path(directory_text).expanduser().is_absolute():
+        raise AdventureFormatError("Adventure project_directory must be an absolute directory")
+    project_directory = Path(directory_text).expanduser().resolve(strict=False)
     track_map_base = str(payload.get("track_map_base", "")).strip()
     if not project_name or not track_map_base or not project_directory.is_absolute():
         raise AdventureFormatError("Adventure name, project directory, and Track Map base must be set")
@@ -164,10 +169,46 @@ def load_relocatable_adventure(path: str | os.PathLike) -> RelocatableAdventureR
     )
 
 
+def resolve_adventure_location(path: str | os.PathLike) -> AdventureRecord:
+    """Read and validate a local Adventure without writing or creating files."""
+    try:
+        return load_adventure(path)
+    except AdventureFormatError as strict_error:
+        try:
+            relocated = load_relocatable_adventure(path)
+        except AdventureFormatError:
+            raise strict_error from None
+    payload = _rebase_copied_project_paths(
+        relocated.payload, relocated.recorded_project_directory, relocated.path.parent)
+    payload["project_directory"] = str(relocated.path.parent)
+    # This is provenance for older media identities, not an active asset path.
+    payload["media_identity_source_project"] = (
+        relocated.payload.get("media_identity_source_project")
+        or str(relocated.recorded_project_directory))
+    payload = validate_adventure_payload(payload, relocated.path)
+    return AdventureRecord(relocated.path, payload, relocated.modified_time,
+                           relocated.recorded_project_directory)
+
+
+def open_adventure(path: str | os.PathLike) -> AdventureRecord:
+    """Open an existing file, remembering its new location when possible."""
+    record = resolve_adventure_location(path)
+    if record.relocated_from is None:
+        return record
+    try:
+        if record.path.stat().st_mode & 0o222 == 0:
+            raise PermissionError(f"{record.path.name} is read-only")
+        atomic_write_json(record.path, record.payload)
+        modified_time = record.path.stat().st_mtime
+    except OSError as exc:
+        return replace(record, location_save_error=str(exc))
+    return replace(record, modified_time=modified_time)
+
+
 def discover_adventure_candidates(
     project_dir: str | os.PathLike,
 ) -> tuple[list[AdventureRecord], list[RelocatableAdventureRecord], list[str]]:
-    """Discover valid Adventures, copied templates, and genuinely invalid files."""
+    """Discover all openable Adventures, relocation candidates and invalid files."""
     directory = Path(project_dir).expanduser().resolve(strict=False)
     records: list[AdventureRecord] = []
     templates: list[RelocatableAdventureRecord] = []
@@ -176,30 +217,20 @@ def discover_adventure_candidates(
         if path.name.startswith("."):
             continue
         try:
-            records.append(load_adventure(path))
-            continue
-        except AdventureFormatError as strict_error:
-            try:
-                templates.append(load_relocatable_adventure(path))
-            except AdventureFormatError:
-                errors.append(str(strict_error))
+            record = resolve_adventure_location(path)
+            records.append(record)
+            if record.relocated_from is not None:
+                templates.append(RelocatableAdventureRecord(
+                    record.path, record.payload, record.modified_time, record.relocated_from))
+        except AdventureFormatError as exc:
+            errors.append(str(exc))
     records.sort(key=lambda item: (-item.modified_time, item.path.name.casefold()))
     templates.sort(key=lambda item: (-item.modified_time, item.path.name.casefold()))
     return records, templates, errors
 
 
 def discover_adventures(project_dir: str | os.PathLike) -> tuple[list[AdventureRecord], list[str]]:
-    directory = Path(project_dir).expanduser().resolve(strict=False)
-    records: list[AdventureRecord] = []
-    errors: list[str] = []
-    for path in sorted(directory.glob("*.adv"), key=lambda item: item.name.casefold()):
-        if path.name.startswith("."):
-            continue
-        try:
-            records.append(load_adventure(path))
-        except AdventureFormatError as exc:
-            errors.append(str(exc))
-    records.sort(key=lambda item: (-item.modified_time, item.path.name.casefold()))
+    records, _relocated, errors = discover_adventure_candidates(project_dir)
     return records, errors
 
 

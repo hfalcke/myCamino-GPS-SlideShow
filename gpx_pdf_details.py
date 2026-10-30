@@ -228,7 +228,7 @@ def build_checkpoints(processed, parameters):
     if not markers:
         return ()
     candidates = break_candidates(processed, float(parameters.get("pdf.break_radius_m", 100)),
-                                 float(parameters.get("pdf.break_duration_minutes", 30)) * 60)
+                                 float(parameters.get("pdf.break_duration_minutes", 20)) * 60)
     # The marker limit is bounded: keep only its longest candidates rather than
     # sorting every pause in a very long track.
     for candidate in heapq.nlargest(maximum, candidates, key=lambda item: (item.break_seconds, -item.position)):

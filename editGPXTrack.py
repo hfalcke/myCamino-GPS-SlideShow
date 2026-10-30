@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Iterable
 import xml.etree.ElementTree as ET
 
+from gpx_processing import format_gpx_timestamp
+
 
 GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
 NS = {"gpx": GPX_NAMESPACE}
@@ -100,7 +102,7 @@ def parse_datetime_to_utc(value: str) -> datetime:
 # trailing Z suffix.
 def format_gpx_time(dt_utc: datetime) -> str:
     """Format a timezone-aware datetime as a GPX timestamp in UTC."""
-    return dt_utc.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return format_gpx_timestamp(dt_utc)
 
 
 # AI prompt: Format a datetime for user-facing CLI output in the local system
