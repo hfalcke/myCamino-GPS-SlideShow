@@ -91,11 +91,13 @@ class MapRepairWorkflowTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.assertEqual({p.name for p in removed}, {unused.name, unused.with_suffix('.json').name})
 
-    def run_worker(self, root, *, old_reference=False, unresolved=False, renderer_error=False):
+    def run_worker(self, root, *, old_reference=False, unresolved=False, renderer_error=False, external_reference=False):
         context = self.context(root)
         maps = Path(context['output_dir'])
         control = root / 'trip.lst'
         name = '0001_Stage_Old.png' if old_reference else '0001_Stage_New.png'
+        if external_reference:
+            name = str(root.parent / 'old-project' / name)
         control.write_text(f'#Map: {name}\n')
         controller = SimpleNamespace(
             current_project_dir=root, control_table_dirty=False,
@@ -153,6 +155,13 @@ class MapRepairWorkflowTests(unittest.TestCase):
             self.assertEqual(result['created_count'], 2)
             self.assertFalse(result['control_review_required'] or result['failures'])
 
+    def test_absolute_old_project_reference_requires_review_after_local_map_is_prepared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_worker(Path(directory), external_reference=True)
+            self.assertEqual(result['created_count'], 2)
+            self.assertTrue(result['control_review_required'])
+            self.assertEqual(result['failures'], [])
+
     def test_zero_output_for_required_current_maps_is_failure_not_success(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_worker(Path(directory), unresolved=True)
@@ -165,7 +174,7 @@ class MapRepairWorkflowTests(unittest.TestCase):
             self.assertEqual(result['failures'][0]['error'], 'provider unavailable')
             self.assertFalse(result['control_review_required'])
 
-    def test_completion_routes_to_review_and_never_reschedules_playback(self):
+    def test_completion_retains_launch_request_until_reference_review_is_applied(self):
         with tempfile.TemporaryDirectory() as directory:
             control = Path(directory) / 'trip.lst'
             control.write_text('#Map: old.png\n')
@@ -178,11 +187,79 @@ class MapRepairWorkflowTests(unittest.TestCase):
                 start_async_project_status_refresh=Mock(), performSelector_withObject_afterDelay_=Mock(),
                 _finish_geolocations_run=Mock(), _show_scrollable_list=Mock())
             GPXTrackerController.geoLocationsRunFinished_.callable(controller, 'done')
-            self.assertIsNone(controller.pending_slideshow_after_map_generation)
+            self.assertTrue(controller.pending_slideshow_after_map_generation['awaiting_review'])
             self.assertEqual(controller.pending_control_update_offer_after_status, [])
             controller.performSelector_withObject_afterDelay_.assert_not_called()
             controller.start_async_project_status_refresh.assert_called_once()
             self.assertIn('Review Control File Updates', controller.set_status.call_args.args[0])
+
+    def test_successful_map_preparation_automatically_resumes_original_launch(self):
+        request = dict(time_lapse=False, continue_previous=True, transient_resume_position={'row': 12})
+        controller = SimpleNamespace(
+            geolocations_mode='automatic_maps',
+            automatic_map_generation_result=dict(created_count=3, failures=[]),
+            pending_slideshow_after_map_generation=request,
+            automatic_map_pending_imported_paths=[], automatic_map_review_control=False,
+            _control_file_path=lambda: None, set_status=Mock(), _continue_adventure_processing=Mock(),
+            start_async_project_status_refresh=Mock(), performSelector_withObject_afterDelay_=Mock(),
+            _finish_geolocations_run=Mock(), _start_slide_show=Mock())
+        GPXTrackerController.geoLocationsRunFinished_.callable(controller, 'success')
+        controller.performSelector_withObject_afterDelay_.assert_called_once_with('resumeSlideShowAfterMaps:', None, 0.0)
+        GPXTrackerController.resumeSlideShowAfterMaps_.callable(controller, None)
+        controller._start_slide_show.assert_called_once_with(**request)
+        self.assertIsNone(controller.pending_slideshow_after_map_generation)
+
+    def test_applying_reference_review_resumes_waiting_slideshow(self):
+        controller = SimpleNamespace(
+            geolocations_mode='media_update_commit', control_file_update_result=None,
+            _control_file_path=lambda: None, refresh_media_summary=Mock(), refresh_control_file_display=Mock(),
+            _finish_geolocations_run=Mock(), start_async_project_status_refresh=Mock(),
+            pending_slideshow_after_map_generation={'awaiting_review': True},
+            performSelector_withObject_afterDelay_=Mock())
+        GPXTrackerController.geoLocationsRunFinished_.callable(controller, 'success')
+        controller.performSelector_withObject_afterDelay_.assert_called_once_with('resumeSlideShowAfterMaps:', None, 0.0)
+
+    def test_partial_map_failure_retains_work_but_never_launches_or_retries_automatically(self):
+        controller = SimpleNamespace(
+            geolocations_mode='automatic_maps',
+            automatic_map_generation_result=dict(created_count=2, failures=[{'filename': 'stage.png', 'error': 'offline'}]),
+            pending_slideshow_after_map_generation={'time_lapse': True},
+            automatic_map_pending_imported_paths=[], automatic_map_review_control=False,
+            _control_file_path=lambda: None, set_status=Mock(), _continue_adventure_processing=Mock(),
+            start_async_project_status_refresh=Mock(), performSelector_withObject_afterDelay_=Mock(),
+            _finish_geolocations_run=Mock(), _show_scrollable_list=Mock())
+        GPXTrackerController.geoLocationsRunFinished_.callable(controller, 'success')
+        self.assertIsNone(controller.pending_slideshow_after_map_generation)
+        controller.performSelector_withObject_afterDelay_.assert_not_called()
+        self.assertIn('completed maps were retained', controller.set_status.call_args.args[0])
+
+    def test_preparation_waits_for_fresh_status_before_refreshing_retained_review(self):
+        review = {'phase': 'maps'}
+        controller = SimpleNamespace(
+            geolocations_mode='automatic_maps',
+            automatic_map_generation_result=dict(created_count=3, failures=[]),
+            pending_slideshow_after_map_generation={'continue_previous': True},
+            media_review_map_preparation=review,
+            automatic_map_pending_imported_paths=[], automatic_map_review_control=False,
+            _control_file_path=lambda: None, set_status=Mock(), _continue_adventure_processing=Mock(),
+            start_async_project_status_refresh=Mock(), performSelector_withObject_afterDelay_=Mock(),
+            _finish_geolocations_run=Mock())
+        GPXTrackerController.geoLocationsRunFinished_.callable(controller, 'success')
+        self.assertEqual(review['phase'], 'waiting_status')
+        self.assertTrue(controller.pending_slideshow_after_map_generation['awaiting_review'])
+        controller.start_async_project_status_refresh.assert_called_once()
+        controller.performSelector_withObject_afterDelay_.assert_not_called()
+
+    def test_osm_preparation_opens_provider_setup_instead_of_manual_track_selection(self):
+        controller = SimpleNamespace(
+            parameters={'maps.output_provider': 'osm'},
+            pending_slideshow_after_map_generation={'continue_previous': True},
+            pending_map_provider_action=None, set_status=Mock())
+        with patch('GPSTrackShowGUI.load_map_provider_preference', return_value={'preferred_output_provider': 'osm'}), \
+             patch('GPSTrackShowGUI.run_map_provider_setup', return_value={'action': 'cancel'}) as setup:
+            self.assertFalse(GPXTrackerController._ensure_automatic_map_provider(controller, ('automatic_maps', [])))
+        self.assertEqual(setup.call_args.kwargs['preferred_provider'], 'geoapify')
+        self.assertIsNone(controller.pending_slideshow_after_map_generation)
 
 
 if __name__ == '__main__':

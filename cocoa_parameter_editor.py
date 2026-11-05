@@ -301,7 +301,7 @@ class CocoaParameterEditor(NSObject):
             name = provider_display_name(provider, self.draft.get("pdf.geoapify_style", "osm-bright"))
             explanation = self._make_label(
                 f"PDF provider: {name}. Provider choices are in Map Service.\n"
-                "Route colors, widths, name prefixes and overview labels are shared with Map Generation.", 11.5)
+                "Route colors, widths and overview labels are shared with Map Generation. PDF name prefixes are set below.", 11.5)
             explanation.setFrame_(NSMakeRect(16, cursor_y - 48, document_width - 32, 46))
             form_view.addSubview_(explanation)
             for title, action, x in (("Map Service...", "pdfMapService:", 16),

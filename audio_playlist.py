@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from filename_matching import AmbiguousFilenameError, FilenameIndex
 
 from slideshow_control_format import (
     AudioSelectionDirective,
@@ -133,34 +134,45 @@ def _resolve_playlist_filename(directory: Path, text: str, available: list[Path]
         return None, "empty audio pathname"
     root = Path(directory).resolve(strict=False)
     requested = Path(value).expanduser()
+    available = list(dict.fromkeys(available))
     if requested.is_absolute():
         exact_absolute = [path for path in available if path == requested.resolve(strict=False)]
-        return (exact_absolute[0], None) if len(exact_absolute) == 1 else (None, f"Audio file not found: {value}")
+        if len(exact_absolute) == 1:
+            return exact_absolute[0], None
+        match = FilenameIndex(available, case_sensitive=False, name=lambda path: path.as_posix()).match(
+            requested.resolve(strict=False).as_posix())
+        if match.path is not None:
+            return match.path, None
+        if match.status == "ambiguous":
+            return None, str(AmbiguousFilenameError(value, match.candidates))
+        return None, f"Audio file not found: {value}"
 
-    relative_matches = []
+    relative_names = {}
     for path in available:
         try:
             relative = path.relative_to(root).as_posix()
         except ValueError:
             continue
-        if relative.casefold() == value.replace("\\", "/").casefold():
-            relative_matches.append(path)
-    if len(relative_matches) == 1:
-        return relative_matches[0], None
+        relative_names[path] = relative
+    match = FilenameIndex(relative_names, case_sensitive=False, name=relative_names.__getitem__).match(value.replace("\\", "/"))
+    if match.path is not None:
+        return match.path, None
+    if match.status == "ambiguous":
+        return None, str(AmbiguousFilenameError(value, match.candidates))
 
-    basename_matches = [path for path in available if path.name.casefold() == requested.name.casefold()]
-    if len(basename_matches) == 1:
-        return basename_matches[0], None
-    if len(basename_matches) > 1:
-        return None, f"Ambiguous audio filename; use a relative path: {value}"
+    match = FilenameIndex(available, case_sensitive=False).match(requested.name)
+    if match.path is not None:
+        return match.path, None
+    if match.status == "ambiguous":
+        return None, f"Ambiguous audio filename; use a relative path: {value}; candidates: " + "; ".join(map(str, match.candidates))
 
     if requested.suffix:
         return None, f"Audio file not found: {value}"
-    stem_matches = [path for path in available if path.stem.casefold() == requested.name.casefold()]
-    if len(stem_matches) == 1:
-        return stem_matches[0], None
-    if len(stem_matches) > 1:
-        return None, f"Ambiguous extensionless audio filename: {value}"
+    match = FilenameIndex(available, case_sensitive=False, name=lambda path: path.stem).match(requested.name)
+    if match.path is not None:
+        return match.path, None
+    if match.status == "ambiguous":
+        return None, f"Ambiguous extensionless audio filename: {value}; candidates: " + "; ".join(map(str, match.candidates))
     return None, f"Audio file not found: {value}"
 
 

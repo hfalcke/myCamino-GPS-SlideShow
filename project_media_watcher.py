@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import select
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
+from filename_matching import filename_comparison_key
 
 
 DEFAULT_EXCLUDED_MEDIA_DIRECTORIES = frozenset(
@@ -34,6 +37,58 @@ class MediaFileSignature:
     mtime_ns: int
 
 
+def generated_project_images(project: Path) -> set[Path]:
+    """Identify managed images from project documents, not from PNG extensions."""
+    result: set[Path] = set()
+
+    def remember(value):
+        if not isinstance(value, str) or not value.strip():
+            return
+        path = Path(value.strip()).expanduser()
+        if path.is_absolute():
+            # Copied project metadata can still name the old project directory.
+            candidates = (path, project / path.name, project / "trackimages" / path.name)
+        else:
+            candidates = (project / path, project / "trackimages" / path.name)
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=False)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if resolved.is_relative_to(project):
+                result.add(resolved)
+
+    for source in (*project.glob("*.adv"), *project.glob("*-summary.json")):
+        try:
+            data = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if source.suffix == ".adv":
+            base = data.get("track_map_base") or data.get("project_name")
+            if (isinstance(base, str) and base
+                    and any((directory / (base + "-summary.json")).is_file()
+                            for directory in (project, project / "trackimages"))):
+                remember(base + ".png")
+        elif data.get("source_gpx") and isinstance(data.get("tracks"), list):
+            remember(source.name.removesuffix("-summary.json") + ".png")
+            for track in data["tracks"]:
+                if isinstance(track, dict):
+                    remember(track.get("track_plot_image_filename"))
+                    remember(track.get("track_plot_time_lapse_image_filename"))
+    for control in project.glob("*.lst"):
+        try:
+            lines = control.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line in lines:
+            match = re.match(r"^\s*(?:#\s*)+(?:Overviewmap|Map|MapBefore|MapAfter|MediaMap):\s*([^|]+)", line, re.I)
+            if match:
+                remember(match.group(1))
+    return result
+
+
 def discover_project_media(
     root: Path | str,
     extensions: Iterable[str],
@@ -46,6 +101,7 @@ def discover_project_media(
     result: dict[Path, MediaFileSignature] = {}
     if not project.is_dir():
         return result
+    generated = {filename_comparison_key(path) for path in generated_project_images(project)}
     for current, directories, filenames in os.walk(project):
         directories[:] = [name for name in directories if name.casefold() not in excluded]
         current_path = Path(current)
@@ -54,10 +110,13 @@ def discover_project_media(
             if path.suffix.casefold() not in allowed:
                 continue
             try:
+                resolved = path.resolve(strict=False)
+                if filename_comparison_key(resolved) in generated:
+                    continue
                 stat_result = path.stat()
             except OSError:
                 continue
-            result[path.resolve(strict=False)] = MediaFileSignature(
+            result[resolved] = MediaFileSignature(
                 int(stat_result.st_size), int(stat_result.st_mtime_ns)
             )
     return result

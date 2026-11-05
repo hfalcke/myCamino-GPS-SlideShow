@@ -734,13 +734,16 @@ class GUIStartupPathTests(unittest.TestCase):
             {"row": 8},
         )
 
-    def test_slideshow_missing_maps_opens_osm_map_workflow(self):
+    def test_slideshow_missing_maps_uses_automatic_workflow_for_osm_too(self):
         controller = SimpleNamespace(
             _finish_slideshow_startup=Mock(),
             parameters={"maps.output_provider": "osm"},
             pending_slideshow_after_map_generation=None,
             set_status=Mock(),
             makePlots_=Mock(),
+            startAutomaticMapGeneration_=Mock(),
+            geolocations_thread=SimpleNamespace(is_alive=lambda: True),
+            pending_map_provider_action=None,
         )
 
         GPXTrackerController._prepare_maps_then_start_slideshow(
@@ -748,7 +751,8 @@ class GUIStartupPathTests(unittest.TestCase):
             ["stage.png"],
         )
 
-        controller.makePlots_.assert_called_once_with(None)
+        controller.makePlots_.assert_not_called()
+        controller.startAutomaticMapGeneration_.assert_called_once_with([])
         self.assertIsNotNone(controller.pending_slideshow_after_map_generation)
 
     def test_large_slideshow_map_repair_can_be_declined(self):

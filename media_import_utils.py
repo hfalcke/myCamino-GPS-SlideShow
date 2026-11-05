@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from plot_metadata_utils import media_file_identity
+from filename_matching import AmbiguousFilenameError, FilenameIndex
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,13 @@ def import_media_files(
     destination = Path(destination).expanduser().resolve(strict=False)
     identity_cache: dict = {}
     results = []
+    try:
+        existing = [path for path in destination.iterdir() if path.is_file()]
+    except OSError as exc:
+        return [MediaImportResult(Path(path).expanduser().resolve(strict=False), None, "failed", str(exc))
+                for path in sources]
+    filenames = FilenameIndex(existing)
+    insensitive_names = FilenameIndex(existing, case_sensitive=False)
     for raw_source in sources:
         source = Path(raw_source).expanduser().resolve(strict=False)
         if not source.is_file():
@@ -68,6 +76,16 @@ def import_media_files(
         while True:
             suffix = "" if counter == 1 else f"-{counter}"
             target = destination / f"{source.stem}{suffix}{source.suffix}"
+            match = filenames.match(target.name)
+            if match.status == "missing" and target.exists():
+                # Use the spelling actually present on a case-insensitive volume;
+                # do not merge differently cased files on case-sensitive volumes.
+                match = insensitive_names.match(target.name)
+            if match.status == "ambiguous":
+                results.append(MediaImportResult(source, None, "failed", str(AmbiguousFilenameError(target.name, match.candidates))))
+                break
+            if match.path is not None:
+                target = match.path
             if target.exists():
                 collided = True
                 try:
@@ -91,6 +109,8 @@ def import_media_files(
             except OSError as exc:
                 results.append(MediaImportResult(source, None, "failed", str(exc)))
             else:
+                filenames.add(target)
+                insensitive_names.add(target)
                 results.append(
                     MediaImportResult(
                         source,

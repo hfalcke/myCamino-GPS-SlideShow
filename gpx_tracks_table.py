@@ -932,6 +932,7 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "track_data_fingerprint": track.get("track_data_fingerprint"),
                 "track_extent_mercator": track.get("track_extent_mercator"),
                 "track_type": track.get("track_type", "unassigned"),
+                "hidden": bool(track.get("hidden")),
                 "stage_number": track.get("stage_number", track.get("original_sequence_number")),
                 "track_id": track.get("track_id"),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
@@ -987,6 +988,7 @@ def derived_track_data_payload(track, fallback_walking_speed_kmh=3.5):
         "internal_id": track.get("internal_id", track.get("original_sequence_number")),
         "display_track_number": track.get("display_track_number", track.get("original_sequence_number")),
         "track_type": track.get("track_type", "unassigned"),
+        "hidden": bool(track.get("hidden")),
         "stage_number": track.get("stage_number", track.get("original_sequence_number")),
         "track_id": track.get("track_id"),
         "original_sequence_number": track.get("original_sequence_number"),
@@ -1022,10 +1024,13 @@ def write_derived_track_data(context):
         relative_path = Path(str(track["track_data_sidecar"]))
         output_path = Path(context["output_dir"]) / relative_path
         expected.add(output_path.resolve(strict=False))
-        write_plot_metadata(
-            derived_track_data_payload(track, args.fallback_walking_speed_kmh),
-            output_path,
-        )
+        payload = derived_track_data_payload(track, args.fallback_walking_speed_kmh)
+        try:
+            current = read_plot_metadata(output_path)
+        except (OSError, ValueError):
+            current = None
+        if current != payload:
+            write_plot_metadata(payload, output_path)
     for stale_path in root.glob("*.json"):
         if stale_path.resolve(strict=False) not in expected:
             try:
@@ -2435,7 +2440,7 @@ def prepare_run_context(args):
     }
 
 
-def refresh_track_presentation_metadata(context):
+def refresh_track_presentation_metadata(context, *, read_metadata=None):
     """Patch only labels/types in current backgrounds; never bless an old format."""
     import json
     from json_storage import atomic_write_json
@@ -2443,8 +2448,9 @@ def refresh_track_presentation_metadata(context):
 
     directory = Path(context["output_dir"])
     updates = {}
+    read = read_metadata or (lambda path: json.loads(path.read_text(encoding="utf-8")))
     for track in context.get("tracks", []):
-        values = {key: track.get(key) for key in ("track_type", "stage_number", "track_id", "internal_id", "display_track_number") if key in track}
+        values = {key: track.get(key) for key in ("track_type", "hidden", "stage_number", "track_id", "internal_id", "display_track_number") if key in track}
         if not values:
             continue
         for key in ("track_plot_image_filename", "track_plot_time_lapse_image_filename", "track_data_sidecar"):
@@ -2454,7 +2460,7 @@ def refresh_track_presentation_metadata(context):
             path = directory / str(name)
             path = path.with_suffix(".json")
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = read(path)
             except (OSError, ValueError):
                 continue
             if not isinstance(data, dict) or (key != "track_data_sidecar" and not map_uses_dynamic_overlays(data)):
@@ -2462,8 +2468,34 @@ def refresh_track_presentation_metadata(context):
             identity_key = "track_data_fingerprint" if key == "track_data_sidecar" else "track_geometry_fingerprint"
             if track.get(identity_key) and data.get(identity_key) != track[identity_key]:
                 continue
-            if any(data.get(key) != value for key, value in values.items()):
-                data.update(values)
+            changes = dict(values)
+            if key != "track_data_sidecar":
+                # A stage map contains one track, repeated once per segment.
+                # Repair stale arrays even if its scalar type already matches.
+                count = track.get("segment_count")
+                if count is None and "segments" in track:
+                    count = len(track["segments"])
+                if count is None:
+                    count = max(len(data.get("overlay_track_types") or []),
+                                len(data.get("overlay_hidden_tracks") or []), 1)
+                count = max(0, int(count))
+                if "track_type" in track:
+                    changes["overlay_track_types"] = [track["track_type"]] * count
+                if "hidden" in track:
+                    changes["overlay_hidden_tracks"] = [bool(track["hidden"])] * count
+            if any(data.get(field) != value for field, value in changes.items()):
+                # Startup readers retain compact projections; never write one as
+                # the complete sidecar, or geometry and unknown fields are lost.
+                if read_metadata is not None:
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    if (not isinstance(data, dict)
+                            or (key != "track_data_sidecar" and not map_uses_dynamic_overlays(data))
+                            or (track.get(identity_key) and data.get(identity_key) != track[identity_key])):
+                        continue
+                data.update(changes)
                 updates[path] = data
     for path, data in updates.items():
         atomic_write_json(path, data)
@@ -2471,7 +2503,7 @@ def refresh_track_presentation_metadata(context):
     if overview:
         path = Path(overview).with_suffix(".json")
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read(path)
         except (OSError, ValueError):
             return
         tracks = context.get("tracks", [])
@@ -2492,10 +2524,21 @@ def refresh_track_presentation_metadata(context):
         if isinstance(rows, list) and len(rows) == len(tracks):
             # Ordered identity is important when two tracks share geometry.
             updated["tracks"] = [dict(item, **{key: track.get(key)
-                for key in ("track_type", "stage_number", "track_id", "internal_id", "display_track_number") if key in track})
+                for key in ("track_type", "hidden", "stage_number", "track_id", "internal_id", "display_track_number") if key in track})
                 if isinstance(item, dict) and item.get("track_geometry_fingerprint") == track.get("track_geometry_fingerprint")
                 else item for item, track in zip(rows, tracks)]
         if updated != data:
+            if read_metadata is not None:
+                try:
+                    original = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    return
+                if (not isinstance(original, dict) or not map_uses_dynamic_overlays(original)
+                        or original.get("source_track_geometry_fingerprints") != fingerprints):
+                    return
+                original.update({key: updated[key] for key in ("tracks", "overlay_track_types", "overlay_hidden_tracks")
+                                 if key in updated})
+                updated = original
             atomic_write_json(path, updated)
 
 
@@ -2562,7 +2605,12 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
         processing_parameters = getattr(args, "adventure_processing_parameters", None)
         if isinstance(processing_parameters, dict):
             table_summary["adventure_processing_parameters"] = processing_parameters
-        write_table_data(table_summary, context["table_json_path"])
+        try:
+            current_summary = read_plot_metadata(context["table_json_path"])
+        except (OSError, ValueError):
+            current_summary = None
+        if current_summary != table_summary:
+            write_table_data(table_summary, context["table_json_path"])
         if args.verbose:
             print(f"Tabellen-JSON gespeichert: {context['table_json_path']}")
 
@@ -2633,6 +2681,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                         "internal_id": track.get("internal_id", track.get("original_sequence_number")),
                         "display_track_number": track.get("display_track_number", track.get("original_sequence_number")),
                         "track_type": track.get("track_type", "unassigned"),
+                        "hidden": bool(track.get("hidden")),
                         "stage_number": track.get("stage_number", track.get("original_sequence_number")),
                         "track_id": track.get("track_id"),
                         "track_name": track["name"],
@@ -2757,6 +2806,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
                     "track_extent_mercator": track.get("track_extent_mercator"),
                     "track_date": format_date_local(track["time"]),
                     "track_type": track.get("track_type", "unassigned"),
+                    "hidden": bool(track.get("hidden")),
                     "stage_number": track.get("stage_number", track.get("original_sequence_number")),
                     "track_id": track.get("track_id"),
                     "track_start_time": format_datetime_local_seconds(track["start_time"]),

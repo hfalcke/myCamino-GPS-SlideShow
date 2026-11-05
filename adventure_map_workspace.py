@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from json_storage import atomic_write_json
+from filename_matching import FilenameIndex
 
 
 RECOVERY_FORMAT_VERSION = 1
@@ -357,9 +358,8 @@ def ordered_media_viewer_paths(
         item.path.resolve(strict=False): item
         for item in media
     }
-    items_by_name: dict[str, list[MediaMapItem]] = {}
-    for item in media:
-        items_by_name.setdefault(item.path.name.casefold(), []).append(item)
+    filenames = FilenameIndex(items_by_path, case_sensitive=False)
+    pathnames = FilenameIndex(items_by_path, case_sensitive=False, name=lambda path: path.as_posix())
     ordered: list[Path] = []
     seen: set[Path] = set()
     for raw_name in control_names:
@@ -372,8 +372,10 @@ def ordered_media_viewer_paths(
         resolved = candidate.resolve(strict=False)
         item = items_by_path.get(resolved)
         if item is None:
-            matches = items_by_name.get(Path(value).name.casefold(), [])
-            item = matches[0] if len(matches) == 1 else None
+            match = pathnames.match(resolved.as_posix())
+            if match.status == "missing":
+                match = filenames.match(Path(value).name)
+            item = items_by_path.get(match.path) if match.path is not None else None
         if item is not None:
             path = item.path.resolve(strict=False)
             if path not in seen:

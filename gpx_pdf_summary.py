@@ -139,10 +139,8 @@ def select_summary_tracks(tracks, scope="visible", selected=()):
 
 
 def report_name(name: str, prefix: str = "") -> str:
-    result = name.lstrip()
-    if prefix and result.startswith(prefix):
-        result = result[len(prefix):].lstrip()
-    return result
+    from track_name_utils import display_track_name
+    return display_track_name(name, prefix)
 
 
 def summary_track(track, row: int, ids=None) -> SummaryTrack:

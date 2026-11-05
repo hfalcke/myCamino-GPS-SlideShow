@@ -5,6 +5,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 from pathlib import Path
 import tempfile
+import unicodedata
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,31 @@ from media_import_utils import accepted_media_paths, import_media_files
 
 
 class MediaImportTests(unittest.TestCase):
+    def test_unicode_equivalent_name_reuses_actual_destination_spelling(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            name = "M\u00fcnchen.jpeg"
+            source = Path(source_dir) / name
+            target = Path(target_dir) / unicodedata.normalize("NFD", name)
+            source.write_bytes(b"same photo")
+            target.write_bytes(b"same photo")
+            actual = next(Path(target_dir).resolve().iterdir())
+            result = import_media_files([source], target.parent)[0]
+            self.assertEqual(result.action, "reused")
+            self.assertEqual(result.target, actual)
+            self.assertEqual(list(target.parent.resolve().iterdir()), [actual])
+
+    def test_unicode_equivalent_name_still_requires_identical_content(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            name = "M\u00fcnchen.jpeg"
+            source = Path(source_dir) / name
+            target = Path(target_dir) / unicodedata.normalize("NFD", name)
+            source.write_bytes(b"new photo")
+            target.write_bytes(b"old photo")
+            result = import_media_files([source], target.parent)[0]
+            self.assertEqual(result.action, "renamed")
+            self.assertEqual(result.target.name, "M\u00fcnchen-2.jpeg")
+            self.assertEqual(target.read_bytes(), b"old photo")
+
     def test_identical_same_name_is_reused(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
             source = Path(source_dir) / "photo.jpeg"

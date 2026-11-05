@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import unicodedata
 from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +17,7 @@ from audio_playlist import (
     load_audio_playlist,
     resolve_audio_selection,
     updated_playlist_text,
+    _resolve_playlist_filename,
 )
 from slideshow_control_format import (
     CONTROL_TRANSITIONS,
@@ -40,6 +42,63 @@ from GPSTrackShow import BackgroundMusicController
 
 
 class AudioPlaylistTests(unittest.TestCase):
+    def test_canonically_equivalent_unicode_paths_resolve_without_rewriting(self):
+        for disk_form, playlist_form in (("NFD", "NFC"), ("NFC", "NFD")):
+            with self.subTest(disk=disk_form), TemporaryDirectory() as directory:
+                root = Path(directory)
+                disk_name = unicodedata.normalize(disk_form, "München/08 Präludium.m4a")
+                name = unicodedata.normalize(playlist_form, "München/08 Präludium.m4a")
+                audio = root / disk_name
+                audio.parent.mkdir()
+                audio.write_bytes(b"audio")
+                playlist = root / "trip.playlist"
+                text = f"$START\n{name}\n{name}\n"
+                playlist.write_text(text)
+                parsed = load_audio_playlist(root, playlist)
+                self.assertEqual(parsed.warnings, ())
+                self.assertEqual(len(parsed.files), 2)
+                self.assertTrue(all(path.samefile(audio) for path in parsed.files))
+                self.assertEqual(parsed.index_for_path(name), 0)
+                self.assertEqual(parsed.index_for_path(str(root / name)), 0)
+                self.assertEqual(playlist.read_text(), text)
+                updated, missing = updated_playlist_text(text, audio_files_in_directory(root), root)
+                self.assertEqual(updated, text)
+                self.assertEqual(missing, ())
+
+    def test_unicode_basename_and_extensionless_lookup(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "album" / unicodedata.normalize("NFD", "Strandläufer.mp3")
+            audio.parent.mkdir()
+            audio.write_bytes(b"audio")
+            available = audio_files_in_directory(root)
+            for name in ("STRANDLÄUFER.MP3", "Strandläufer"):
+                resolved, warning = _resolve_playlist_filename(root, name, available)
+                self.assertIsNone(warning)
+                self.assertTrue(resolved.samefile(audio))
+
+    def test_unicode_matching_does_not_guess_between_different_files(self):
+        root = Path("/music")
+        available = [root / "first" / "Präludium.m4a",
+                     root / "second" / unicodedata.normalize("NFD", "Präludium.m4a")]
+        path, warning = _resolve_playlist_filename(root, "Präludium.m4a", available)
+        self.assertIsNone(path)
+        self.assertIn("Ambiguous", warning)
+        # Canonical-equivalent distinct paths can coexist on normalization-sensitive filesystems.
+        available = [root / "Präludium.m4a", root / unicodedata.normalize("NFD", "Präludium.m4a")]
+        path, warning = _resolve_playlist_filename(root, "Präludium.m4a", available)
+        self.assertIsNone(path)
+        self.assertIn("Ambiguous", warning)
+        path, warning = _resolve_playlist_filename(root, str(root / "PRÄLUDIUM.M4A"), available)
+        self.assertIsNone(path)
+        self.assertIn("Ambiguous", warning)
+
+    def test_unicode_normalization_does_not_fold_distinct_compatibility_names(self):
+        root = Path("/music")
+        path, warning = _resolve_playlist_filename(root, "1.m4a", [root / "①.m4a"])
+        self.assertIsNone(path)
+        self.assertIn("not found", warning)
+
     def test_every_directive_family_has_explicit_repeat_capabilities(self):
         self.assertEqual(
             set(DIRECTIVE_REPEAT_CAPABILITIES),

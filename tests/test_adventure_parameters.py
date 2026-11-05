@@ -23,6 +23,21 @@ from adventure_parameters import (
 
 
 class AdventureParameterTests(unittest.TestCase):
+    def test_prefix_controls_are_display_only_and_independent_with_legacy_preservation(self):
+        values = normalize_parameters({'version': 28, 'values': {'trackmaps.remove_name_prefix': 'JW'}})
+        self.assertEqual(values['slideshow.remove_name_prefix'], 'JW')
+        self.assertEqual(values['pdf.remove_name_prefix'], 'JW')
+        values.update({'slideshow.remove_name_prefix': 'JWM ', 'pdf.remove_name_prefix': ''})
+        restored = normalize_parameters(parameter_payload(values))
+        self.assertEqual(restored['slideshow.remove_name_prefix'], 'JWM ')
+        self.assertEqual(restored['pdf.remove_name_prefix'], '')
+        self.assertEqual(restored['trackmaps.remove_name_prefix'], 'JW')
+        self.assertFalse({'slideshow.remove_name_prefix', 'pdf.remove_name_prefix'} & map_affecting_parameter_keys())
+        for advanced in (False, True):
+            visible = {spec.key for spec in visible_specs_for_section('Map Generation', restored, advanced)}
+            self.assertNotIn('trackmaps.remove_name_prefix', visible)
+        self.assertIn('slideshow.remove_name_prefix', {s.key for s in visible_specs_for_section('Slide Show')})
+        self.assertIn('pdf.remove_name_prefix', {s.key for s in visible_specs_for_section('PDF Export')})
     def test_pdf_break_default_is_twenty_minutes_in_new_and_older_adventures(self):
         self.assertEqual(default_parameters()["pdf.break_duration_minutes"], 20)
         migrated = normalize_parameters({"version": 27, "values": {"pdf.break_duration_minutes": 30}})
@@ -285,6 +300,10 @@ class AdventureParameterTests(unittest.TestCase):
                 "slideshow.font_family",
                 "slideshow.font_style",
                 "slideshow.header_stage_name",
+                "slideshow.remove_name_prefix",
+                "slideshow.header_stage_name_style",
+                "slideshow.header_stage_statistics_style",
+                "slideshow.header_location_style",
                 "slideshow.header_track_details",
                 "slideshow.header_place_name",
                 "slideshow.header_track_stats",

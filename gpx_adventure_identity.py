@@ -9,12 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 from gpx_import import _core_child, _core_children, load_gpx_document
 from json_storage import atomic_write_json
+from filename_matching import filename_comparison_key
 
 
 GPX_IDENTITY_VERSION = 1
@@ -22,7 +22,7 @@ GPX_FINGERPRINT_VERSION = 1
 
 
 def _normalized_name(value: str) -> str:
-    return unicodedata.normalize("NFC", str(value or "")).casefold()
+    return filename_comparison_key(str(value or ""), case_sensitive=False)
 
 
 def _file_sha256(path: Path) -> str:

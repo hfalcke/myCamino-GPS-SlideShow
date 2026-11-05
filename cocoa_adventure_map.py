@@ -113,7 +113,9 @@ from cocoa_circular_progress import CircularProgressView
 from cocoa_guided_demo import GuidedDemoCoordinator, is_guided_demo_recovery
 from cocoa_gpx_recovery import recover_missing_adventure_gpx
 from cocoa_alerts import run_foreground_modal_alert
-from slideshow_startup import file_signature, prepared_track_hint
+from slideshow_startup import (
+    file_signature, prepared_track_hint, reuse_prepared_tracks, save_prepared_track_hint,
+)
 from cocoa_help_document import show_help_document
 from cocoa_parameter_editor import CocoaParameterEditor
 from demo_resources import demo_prepared_render_parameters, install_demo_prepared_assets
@@ -151,7 +153,7 @@ from media_enrichment_queue import (
 )
 from network_availability import network_availability
 from plot_metadata_utils import media_sidecar_freshness, media_sidecar_path, validate_media_sidecar
-from project_media_watcher import ProjectMediaWatcher
+from project_media_watcher import ProjectMediaWatcher, discover_project_media
 from workspace_mutations import MutationJournal, MutationKind, WorkspaceMutation
 
 
@@ -1231,6 +1233,11 @@ class AdventureMapController(NSObject):
 
         def work():
             from gpx_tracks_table import run_with_options
+            cache_options = {"output_base": output_base, "adventure_processing_parameters": processing_signature}
+            hint = reuse_prepared_tracks(gpx_path, output_dir, cache_options)
+            if hint is not None:
+                return {"tracks": hint["context"]["tracks"], "slideshow_prepared_hint": hint,
+                        "reused_prepared_tracks": True}
             source_signature = file_signature(gpx_path)
             result = run_with_options(
                 gpx_path,
@@ -1258,6 +1265,7 @@ class AdventureMapController(NSObject):
                 adventure_processing_parameters=processing_signature,
             )
             result["slideshow_prepared_hint"] = prepared_track_hint(result, source_signature)
+            save_prepared_track_hint(gpx_path, output_dir, cache_options, result["slideshow_prepared_hint"])
             return result
         future = self.executor.submit(work)
         self.derived_track_data_future = future
@@ -1274,7 +1282,8 @@ class AdventureMapController(NSObject):
                 self.slideshow_prepared_hint = result.get("slideshow_prepared_hint")
                 self._journal(
                     "Derived Track Data",
-                    f"Rebuilt current data for {len(result.get('tracks', []))} track(s); no maps were rendered.",
+                    f"{'Reused verified' if result.get('reused_prepared_tracks') else 'Rebuilt current'} data "
+                    f"for {len(result.get('tracks', []))} track(s); no maps were rendered.",
                 )
                 controller = self.full_gui_controller
                 if controller is not None:
@@ -1315,16 +1324,9 @@ class AdventureMapController(NSObject):
     def _project_media_paths(self) -> list[Path]:
         if self.project_directory is None or not self.project_directory.is_dir():
             return []
-        return sorted(
-            (
-                path.resolve(strict=False)
-                for path in self.project_directory.rglob("*")
-                if path.is_file()
-                and path.suffix.casefold() in MEDIA_EXTENSIONS
-                and not any(part.casefold() in GENERATED_DIRECTORIES for part in path.relative_to(self.project_directory).parts)
-            ),
-            key=lambda item: str(item).casefold(),
-        )
+        return sorted(discover_project_media(self.project_directory, MEDIA_EXTENSIONS,
+                                            excluded_directories=GENERATED_DIRECTORIES),
+                      key=lambda item: str(item).casefold())
 
     @objc.python_method
     def _scan_project_media(self):
@@ -2276,26 +2278,22 @@ class AdventureMapController(NSObject):
         self.selected_media_paths.clear()
         self.selected_media_path = None
         view.setNeedsDisplay_(True)
-        cursor = view.cursor
-        cursor_distance = math.inf
-        if cursor is not None and location is not None:
-            transformer = view._metadata_transformer([cursor[1]], view.bounds())
-            if transformer is not None:
-                cursor_x, cursor_y = transformer(cursor[1])
-                cursor_distance = math.hypot(cursor_x - location.x, cursor_y - location.y)
-        if click_count >= 2 and cursor_distance > 28.0:
-            self.show_workspace_overview()
-            return
-        if cursor is None:
+        target = getattr(view, "workspace_track_click_target", None)
+        if target is None:
             if click_count >= 2:
                 self.show_workspace_overview()
             return
-        track = cursor[2]
-        self.gpx_controller.selected_nrs = [track.nr]
-        self.gpx_controller.update_selection_field()
-        self.gpx_controller.highlight_selected_rows()
-        self.selected_track_identity = str(track.nr)
-        if click_count >= 2:
+        track = target[1]
+        if track not in self.gpx_controller.tracks:
+            return
+        command = bool(int(modifier_flags) & NSEventModifierFlagCommand)
+        selected = set(self.gpx_controller.selected_nrs) if command else set()
+        if command and track.nr in selected:
+            selected.remove(track.nr)
+        else:
+            selected.add(track.nr)
+        self.gpx_controller.set_track_selection(selected, reveal=track.nr)
+        if click_count >= 2 and not command:
             self.openTrackEditor_(None)
             return
         view.setNeedsDisplay_(True)
@@ -2442,10 +2440,29 @@ class AdventureMapController(NSObject):
     @objc.python_method
     def workspaceTrackSelectedForEditing_(self, track):
         """Synchronize map-first selection without changing the viewport."""
-        self.selected_track_identity = str(track.nr)
-        if self.plot_view is not None:
-            self.plot_view.setNeedsDisplay_(True)
-            self.gpx_controller.refresh_elevation_profile_for_plot_view(self.plot_view)
+        self.workspaceTrackSelectionChanged_([track])
+
+    @objc.python_method
+    def workspaceTrackSelectionChanged_(self, tracks):
+        """Follow table/map selection without fitting, loading tiles, or opening tools."""
+        track = tracks[0] if len(tracks) == 1 else None
+        self.selected_track_identity = str(track.nr) if track is not None else ""
+        view = self.plot_view
+        if view is None:
+            return
+        if track is not None:
+            view.plot_info["current_track_nr"] = track.nr
+        else:
+            view.plot_info.pop("current_track_nr", None)
+        if view.cursor is None or track is None or view.cursor[2] is not track:
+            view.cursor = None
+            view.marker = None
+            view.context_overlay_coordinate = None
+        if self.map_state == "track":
+            self.focused_track_nr = track.nr if track is not None else None
+        view.update_window_title()
+        view.setNeedsDisplay_(True)
+        self.gpx_controller.refresh_elevation_profile_for_plot_view(view)
 
     @objc.python_method
     def workspace_tracks_deleted(self, deleted_track_numbers):
@@ -3040,7 +3057,9 @@ class AdventureMapController(NSObject):
     def _expand_media_paths(self, paths):
         result = []
         for path in paths:
-            candidates = path.rglob("*") if path.is_dir() else [path]
+            candidates = (discover_project_media(path, MEDIA_EXTENSIONS,
+                                                excluded_directories=GENERATED_DIRECTORIES)
+                          if path.is_dir() else [path])
             result.extend(
                 item.resolve(strict=False)
                 for item in candidates
@@ -4892,7 +4911,7 @@ class AdventureMapController(NSObject):
                 "GETTING STARTED\n\n"
                 "Drop an Adventure, project folder, GPX tracks, photos, videos, or audio onto the map.\n\n"
                 "TRACKS\n\n"
-                "Click a track to select it. The selected track is dark blue; other tracks are light blue, and marked ranges are red.\n\n"
+                "Click a track to select its table row without changing the map view. Command-click a track to add or remove it from the selection. The table and elevation profile follow this selection. Click an already selected track to choose a waypoint; Shift-click keeps its marker behavior. Marked ranges are red.\n\n"
                 "Choose Show Hidden Tracks in the map context menu to display hidden tracks in dashed light gray. Visible tracks use their type colors, selected tracks have a stronger outlined stroke, and marked ranges stay red. This does not change saved visibility or include hidden tracks in totals. Choose Hide Hidden Tracks to hide them again.\n\n"
                 "Double-click a track to open the Track Table. Double-click it there to open its Waypoint Table. Right-click a track on the map to open either table, fit the view, or show the synchronized Elevation Profile.\n\n"
                 "Double-click empty map space, or press Command-0, to return to the Adventure overview at its remembered zoom and position. Choose Fit Entire Adventure in the map context menu to fit all visible tracks. Drag the map or use two-finger scrolling to pan.\n\n"

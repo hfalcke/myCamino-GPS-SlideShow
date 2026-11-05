@@ -54,7 +54,13 @@ created or imported by the workflow.
 The normal starting screen is the Adventure Map. Drop an `.adv` file or an
 Adventure directory to load it. Existing tracks appear as a lightweight
 overview and media are grouped into numbered location markers. Click a track
-to select it and double-click it to open the Track Table. From there,
+to select its Track Table row without changing zoom. Command-click a track adds
+or removes it from the track selection. Selection stays synchronized with the
+table and elevation profile. A short click on an already selected track chooses
+a waypoint or moves a marked range's endpoint; Shift-click retains its marker
+behavior. Hold a selected waypoint or segment to edit it, or start dragging
+immediately to pan without changing selection. Media and information-box clicks
+take priority over tracks underneath. Double-click a track to open the Track Table. From there,
 double-click its row to open the Waypoint Table; the map context menu can open
 either table directly. Nearby tracks remain visible but subdued. Double-click empty map space or press
 `Cmd-0` to return to the complete overview. The map preserves geographic
@@ -69,7 +75,7 @@ the replacement tiles are loading.
 Click a numbered media group to select all media in it. Command-click adds or
 removes another group. Command-drag from empty map space to draw a black selection
 rectangle and add the enclosed groups or thumbnails; a simple empty-map click
-clears the selection. Selected media have a red outline. Right-click a media
+clears the media selection without changing selected tracks. Selected media have a red outline. Right-click a media
 group to fit all selected media to the map or create a new track from their
 GPS positions. The map context menu can hide all media icons and show them
 again without changing the control file or media selection. Ordinary dragging
@@ -433,6 +439,15 @@ safe fallback. The subtitle shows
 `DATE · NN.N km - HH:MM h`. During Time-Lapse, an active clock removes the
 repeated date and leaves `NN.N km - HH:MM h`, with the current place on the
 third line in the same subtitle size.
+
+**Slide Show > Header > Remove track name prefix** removes exact leading text
+from GPX track names in the shared stage headers. Matching is case-sensitive;
+include a trailing space if it is part of the prefix. Endpoint place names are
+not changed. **PDF Export > Remove track name prefix** is independent and sets
+the default for the PDF Summary window's per-report prefix field, including PDF
+titles and map labels. These controls do not rename tracks or map files and do
+not regenerate maps. Existing Adventures inherit their former Map Generation
+prefix in both settings; that control is no longer shown under Map Generation.
 
 Under **Settings > Map Generation**, **Journey source** controls how stages are
 formed:
@@ -830,9 +845,16 @@ Update Control File:
 - Reports overview/stage-map references to add, replace, or remove. It
   preserves `Day before`/`Day after` section types and does not duplicate maps.
 - A map recreated under the same filename needs no reference update.
-- If maps or their summary are outdated, it asks you to run **Generate and
-  Update Maps** first. Metadata can still be refreshed, but track-dependent
-  media placement waits for current map information.
+- If maps or their summary are outdated, choose **Prepare Maps and Continue**
+  directly in the review. Your Add/Metadata/Move choices, filter, sorting, and
+  scroll position are retained while the existing processing workflow prepares
+  maps and rechecks placement. **Apply Updates** offers to prepare maps first
+  and then apply your confirmed choices.
+- Start prepares required maps before playback and starts automatically when
+  they are current. Larger jobs ask for confirmation; a public OSM configuration
+  opens provider setup rather than requiring manual map selection. Copied-project
+  references pointing to an old directory are reviewed before changing them;
+  Apply then continues the waiting slideshow. Cancelling retains the control file.
 - Compares project media with a companion
   `<control-file>.mycamino-state.json` inventory. GUI imports and files first
   discovered after an established inventory are recommended additions. On the
@@ -846,6 +868,9 @@ Update Control File:
   Unchecked absent media is remembered as excluded after Apply and is hidden
   from the normal review, but remains available through the Excluded filter;
   select **Add** there to restore it to the control file.
+- Inventory decisions also persist for media in subfolders. Known generated
+  overview/stage maps are excluded from media discovery, including older maps
+  outside `trackimages`; ordinary PNG photographs remain eligible.
 - Treats disabled photo/video rows as included. If the control file was edited
   outside myCamino, removed media is shown as unclassified for confirmation
   rather than silently treated as a deliberate exclusion.
@@ -981,6 +1006,17 @@ compact header row.
   reduced to 25% by default during narration.
   Renaming or copying an Adventure with related files enabled also renames or
   copies its playlist; the audio recordings themselves remain unchanged.
+  Moving or copying the Adventure folder in Finder keeps the selected playlist's
+  filename, even when it still contains the old Adventure name. Relative audio
+  entries keep working inside the copied folder. Selecting another playlist is
+  remembered in the Adventure; an Adventure-named default may be empty and is
+  not a replacement for an explicitly selected older playlist.
+
+Accented filenames are matched across the equivalent Unicode spellings often
+used by Finder and other applications. The real filenames and authored playlist
+paths are preserved. If multiple files match, myCamino reports ambiguity rather
+than silently choosing one; use an explicit relative audio path to distinguish
+them. Reimporting identically named media still checks file contents before reuse.
 
 ## Start Slide Show
 
@@ -989,10 +1025,14 @@ The Start Slide Show section contains:
 - Start: launches from the beginning using the initial style saved in Settings.
 - Preparation progress appears in the Adventure Map (or the Advanced Interface
   when used on its own), showing track checks, map checks, and player startup.
-  Completed Adventure loading can supply already prepared track data. Repeated
-  starts in the same session reuse successful checks while the tracks,
-  settings, control file, maps, and metadata remain unchanged. The first start
-  of a large Adventure can still require preparation. Startup timings are
+  Completed or ongoing Adventure loading supplies the same prepared track data,
+  avoiding duplicate processing. Successful checks are reused across application
+  restarts while the tracks, processing settings, control file, required maps,
+  and metadata remain unchanged. Missing or stale data is still checked and repaired
+  before playback; unrelated cached profiles and display-style choices do not
+  cause full track preparation. The disposable startup cache is stored under
+  `.mycamino/cache/` in the Adventure. A genuinely changed or unprepared large
+  Adventure can still require preparation. Startup timings are
   recorded in the Adventure's processing log.
 - Continue: opens a table of up to twenty automatically saved checkpoints,
   newest first. The table shows the last playback time, image or map, place,
@@ -1042,14 +1082,18 @@ The Start Slide Show section contains:
   from the stage start to its end. While media is visible, a red dot with a
   white edge marks the route position where it first appeared. Its reverse-
   geocoded place can appear as one of the three centered title lines. When the
-  clock option is enabled,
-  the analog clock in the upper-left follows the moving GPX marker time
+  clock option is enabled, Stage Map and Stage Overview show the track's recorded
+  start date/time. If unavailable, they use the first enabled photo/video in
+  control-file order. Without a usable time, they show the available track,
+  first-medium, or stage date only; without a date, only a known time is shown.
+  Missing information never implies midnight or today's date. Turning off
+  Show clock hides both the clock and date.
+  During Time-Lapse motion the analog clock in the upper-left follows the moving GPX marker time
   and the optional speedometer beside it follows the 500 m running mean. It is
   shown only when recorded GPX timestamps support a meaningful speed. Changing
   its window or stationary threshold updates small sidecar metadata files and
-  does not regenerate or download maps.
-  throughout the stage rather than showing a fixed media time; the separate
-  date subtitle is then omitted. The upper-right map header shows Total,
+  does not regenerate or download maps. The separate date subtitle is omitted
+  when the header already shows it. The upper-right map header shows Total,
   Stage, and Height values.
   Fade, Blend, Collage, Quad, and every other media style use this same clock,
   three-line title area, sizing, and track-statistics layout. Settings have
@@ -1057,16 +1101,30 @@ The Start Slide Show section contains:
   the persistent logical map header, clock, stage name, track length and
   duration, place name, and statistics. Press `c` to cycle the presentation
   header for the current session; the map header follows its content if the
-  physical displays are swapped. Enabled title fields are packed from the top with
-  no empty rows, and the first displayed line is larger. One Header layout
-  setting controls photos, Time-Lapse maps, and overview maps. No box and
-  Semi-transparent overlay leave pictures and maps full-frame, with the header
-  aligned to the fitted picture or map edge. Header area is the default; it
+  physical displays are swapped. Stage Map, Stage Overview, and media retain the
+  same header area and three fixed rows: stage name, basic stage statistics,
+  and location. Disabled or unavailable rows stay empty. Central text is centered
+  on the window, with space reserved for configured side widgets even when their
+  values are temporarily unavailable. Under Slide Show > Header, Stage name style,
+  Stage statistics style, and Location style offer Normal, Bold, Italic, or
+  Bold Italic; their defaults are Bold, Italic, and Normal respectively. These
+  choices are independent of caption font commands.
+  One Header layout setting controls photos, Time-Lapse maps, and overview maps.
+  No box and Semi-transparent overlay leave pictures and maps full-frame, with
+  header geometry based on the window rather than the fitted image. Header area is the default; it
   uses the selected slideshow background color and fits the display beneath
-  it while maps remain full-width. Font color also controls the clock marks and hands, time, and
+  it. Maps always remain fully visible without stretching; on a 4:3 display,
+  additional black space can remain below the map. Header text and gauges adapt
+  to the available width. Long locations lose street/regional detail before text
+  is reduced or shortened; full details remain available in Info. Compact displays
+  omit secondary weather without changing its setting.
+  Speedometer offers On, Off, or Time-Lapse Only (the default). The last option hides it in
+  Standard styles, even with dual-screen GPS route tracking. Simple and Off
+  headers still suppress the gauge. Existing enabled/disabled choices are retained.
+  Font color also controls the clock marks and hands, time, and
   date. Shadow color is configurable and defaults to black. Apply changes the
-  active slide show immediately, and `c` toggles the complete configured
-  header.
+  active slide show immediately, and `c` cycles Full, Off, and Simple for the
+  presentation header only.
 - **Adventure > PDF Summary** creates a printable track report, optionally with
   overview and individual track maps and elevation profiles. Its options open
   immediately while any missing track calculations finish in the background.
@@ -1198,6 +1256,11 @@ Common slide-show keys:
   current image remains visible longer whenever no newer image is due.
 - Command-`+` or Command-`-`: change the active stage time-lapse duration by
   five seconds.
+- Control-`+` or Control-`-`: raise or lower all slideshow audio by five percentage
+  points, including music, narration, and video. This session-only master level
+  ranges from 0% to 100% of the configured channel levels, initially 100%.
+  It preserves relative volume settings, crossfades, narration ducking, and
+  authored music-volume commands. It does not change macOS volume or saved settings.
 - `t`: cycle forward through Time-Lapse and the Standard transition styles.
 - `T` (Shift-`t`): cycle backward through the same styles.
   The chosen style survives stage jumps and backward/forward navigation. Later

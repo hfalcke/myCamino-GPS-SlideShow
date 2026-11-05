@@ -59,6 +59,18 @@ def overlay_stage_kind(metadata: object) -> str:
     return "gpx_track"
 
 
+def overlay_track_presentation(metadata: dict, segment_index: int, stage_kind: str) -> tuple[object, bool]:
+    """A stage's scalar track state wins; overviews retain per-segment state."""
+    types = metadata.get("overlay_track_types") or []
+    hidden = metadata.get("overlay_hidden_tracks") or []
+    kind = types[segment_index] if segment_index < len(types) else metadata.get("track_type")
+    is_hidden = bool(hidden[segment_index]) if segment_index < len(hidden) else False
+    if stage_kind == "gpx_track":
+        kind = metadata.get("track_type", kind)
+        is_hidden = bool(metadata.get("hidden", is_hidden))
+    return kind, is_hidden
+
+
 def normalize_overlay_mode(stage_kind: str, mode: object) -> str:
     """Validate an overlay mode and return a safe default for the stage kind."""
     normalized = str(mode or "").strip().lower().replace("-", "_")

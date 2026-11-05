@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 from gpx_processing import GPX_NAMESPACE, haversine_km
+from filename_matching import AmbiguousFilenameError, FilenameIndex, filename_comparison_key
 
 
 MYCAMINO_NAMESPACE = "https://mycamino.org/gpx/extensions/1"
@@ -97,8 +98,9 @@ def _control_stage_groups(
 ) -> list[MediaTrackStage]:
     """Group selected media by display-stage directives and control-file order."""
     by_name: dict[str, list[MediaTrackPoint]] = {}
+    filenames = FilenameIndex((point.media_path for point in points), case_sensitive=False)
     for point in points:
-        by_name.setdefault(point.media_path.name.casefold(), []).append(point)
+        by_name.setdefault(filename_comparison_key(point.media_path.name, case_sensitive=False), []).append(point)
     stages: list[MediaTrackStage] = []
     current: MediaTrackStage | None = None
     current_date = ""
@@ -120,7 +122,10 @@ def _control_stage_groups(
         if not line or line.startswith("#"):
             continue
         filename = line.split("|", 1)[0].strip()
-        candidates = by_name.get(Path(filename).name.casefold(), [])
+        match = filenames.match(Path(filename).name)
+        if match.status == "ambiguous":
+            raise AmbiguousFilenameError(filename, match.candidates)
+        candidates = by_name.get(filename_comparison_key(Path(filename).name, case_sensitive=False), [])
         if not candidates:
             continue
         if current is None:

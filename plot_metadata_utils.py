@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime
 from math import atan, degrees, exp, isfinite, log, pi, radians, tan
 from pathlib import Path
+from filename_matching import filename_comparison_key
 
 
 MEDIA_FILE_IDENTITY_VERSION = 1
@@ -309,14 +310,14 @@ def media_sidecar_matches_media(metadata, media_path) -> bool:
     if not isinstance(metadata, dict):
         return False
     path = Path(media_path)
-    expected_name = path.name.casefold()
+    expected_name = filename_comparison_key(path.name, case_sensitive=False)
     declared_names = []
     source_filename = metadata.get("source_filename")
     if isinstance(source_filename, str) and source_filename.strip():
-        declared_names.append(Path(source_filename).name.casefold())
+        declared_names.append(filename_comparison_key(Path(source_filename).name, case_sensitive=False))
     photo_path = metadata.get("photo_path")
     if isinstance(photo_path, str) and photo_path.strip():
-        declared_names.append(Path(photo_path).name.casefold())
+        declared_names.append(filename_comparison_key(Path(photo_path).name, case_sensitive=False))
     return bool(declared_names) and all(name == expected_name for name in declared_names)
 
 

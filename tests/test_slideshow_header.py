@@ -341,7 +341,7 @@ class SlideshowHeaderTests(unittest.TestCase):
         }
         self.assertEqual(
             header_content_rect((0.0, 0.0, 1000.0, 500.0), metadata, "black"),
-            (0.0, 0.0, 1000.0, 500.0),
+            (0.0, 0.0, 1000.0, 440.0),
         )
         self.assertEqual(
             header_content_rect((0.0, 0.0, 1000.0, 500.0), None, "black"),
@@ -450,7 +450,7 @@ class SlideshowHeaderTests(unittest.TestCase):
         self.assertEqual(payload["request_sequence"], 1)
         self.assertEqual(payload["sequence"], 3)
 
-    def test_selected_title_fields_compact_from_the_top(self):
+    def test_selected_title_fields_keep_their_semantic_rows(self):
         metadata = {
             "map_kind": "track",
             "track_name": "Stage 7",
@@ -465,7 +465,7 @@ class SlideshowHeaderTests(unittest.TestCase):
         )
         self.assertEqual(
             selected_stage_header_lines(metadata, config, place_text="Ponferrada\nLeón"),
-            ("18.4 km - 05:12 h", "Ponferrada · León"),
+            ("", "18.4 km - 05:12 h", "Ponferrada · León"),
         )
 
     def test_title_font_scales_above_full_hd(self):
@@ -597,7 +597,7 @@ class SlideshowHeaderTests(unittest.TestCase):
             weather={"temperature_2m_c": 18.0},
         )
 
-        self.assertEqual(state.lines, ("Stage", "Place"))
+        self.assertEqual(state.lines, ("Stage", "Place", ""))
         self.assertEqual(state.weekday_text, "Tuesday")
         self.assertEqual(state.calendar_date_text, "01.09.2026")
         self.assertEqual(state.metrics, ("Distance: 12 km",))

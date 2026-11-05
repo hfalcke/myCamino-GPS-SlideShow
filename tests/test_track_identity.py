@@ -140,6 +140,7 @@ class StableTrackIdentityTests(unittest.TestCase):
         controller = SimpleNamespace(tracks=tracks, selected_nrs=[], selection_field=field,
             highlight_selected_rows=Mock(), redraw_open_plot_views=Mock())
         controller.update_selection_field = lambda: GPXEditorController.update_selection_field(controller)
+        controller.set_track_selection = lambda ids: GPXEditorController.set_track_selection(controller, ids)
         GPXEditorController.selectionFieldCommitted_.callable(controller, None)
         self.assertEqual(controller.selected_nrs, [50, 51])
         controller.selected_nrs.append(2)

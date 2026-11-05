@@ -7,18 +7,18 @@ import hashlib
 import json
 import os
 import tempfile
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
+from filename_matching import AmbiguousFilenameError, FilenameIndex, filename_comparison_key
 
 
 CONTROL_MEDIA_INVENTORY_VERSION = 1
 
 
 def normalize_media_name(value: str | Path) -> str:
-    return unicodedata.normalize("NFC", Path(str(value).strip()).name)
+    return filename_comparison_key(Path(str(value).strip()).name)
 
 
 def control_media_inventory_path(control_file: Path | str) -> Path:
@@ -66,6 +66,7 @@ class ControlMediaInventory:
     loaded: bool = False
     updated_at: str = ""
     stored_control_identity: dict[str, object] = field(default_factory=dict)
+    ambiguous_names: set[str] = field(default_factory=set)
 
     @property
     def path(self) -> Path:
@@ -107,6 +108,10 @@ def load_control_media_inventory(control_file: Path | str) -> ControlMediaInvent
         if state not in {"included", "excluded", "pending"}:
             continue
         name = normalize_media_name(str(raw_entry.get("name") or raw_name))
+        if name in result.entries or name in result.ambiguous_names:
+            result.ambiguous_names.add(name)
+            result.entries.pop(name, None)
+            continue
         result.entries[name] = {
             "name": name,
             "state": state,
@@ -142,12 +147,15 @@ def classify_project_media(
     )
     now = _iso_now()
     memberships = []
-    for value in media_paths:
-        media_path = Path(value).expanduser().resolve(strict=False)
+    paths = [Path(value).expanduser().resolve(strict=False) for value in media_paths]
+    names = FilenameIndex(paths, name=lambda path: normalize_media_name(path.name))
+    for media_path in paths:
         name = normalize_media_name(media_path.name)
         old = inventory.entries.get(name, {})
         old_state = str(old.get("state", ""))
-        if name in included:
+        if name in inventory.ambiguous_names or names.match(media_path.name).status == "ambiguous":
+            state, reason = "unclassified", "Ambiguous filename; review the distinct media files"
+        elif name in included:
             state, reason = "included", "Already included"
         elif media_path in imported or old_state == "pending":
             state, reason = "new", "Imported with myCamino"
@@ -185,9 +193,12 @@ def build_control_media_inventory_payload(
     included = {normalize_media_name(name) for name in included_names}
     now = _iso_now()
     media = {}
-    for value in media_paths:
-        path = Path(value).expanduser().resolve(strict=False)
+    paths = [Path(value).expanduser().resolve(strict=False) for value in media_paths]
+    FilenameIndex(paths, name=lambda path: normalize_media_name(path.name)).require_unique()
+    for path in paths:
         name = normalize_media_name(path.name)
+        if name in inventory.ambiguous_names:
+            raise AmbiguousFilenameError(name, (path, inventory.path))
         old = inventory.entries.get(name, {})
         media[name] = {
             "name": name,
@@ -221,9 +232,12 @@ def mark_imported_media(
     control = Path(control_file).expanduser().resolve(strict=False)
     inventory = load_control_media_inventory(control)
     now = _iso_now()
-    for value in media_paths:
-        path = Path(value).expanduser().resolve(strict=False)
+    paths = [Path(value).expanduser().resolve(strict=False) for value in media_paths]
+    FilenameIndex(paths, name=lambda path: normalize_media_name(path.name)).require_unique()
+    for path in paths:
         name = normalize_media_name(path.name)
+        if name in inventory.ambiguous_names:
+            raise AmbiguousFilenameError(name, (path, inventory.path))
         old = inventory.entries.get(name, {})
         inventory.entries[name] = {
             "name": name,

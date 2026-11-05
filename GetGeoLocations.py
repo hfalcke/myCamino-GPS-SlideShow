@@ -21,7 +21,6 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -61,6 +60,7 @@ from control_media_inventory import (
     load_control_media_inventory,
     write_control_media_inventory,
 )
+from filename_matching import FilenameIndex, filename_comparison_key, unique_filename_mapping
 from gpx_tracks_table import (
     media_coordinates_fingerprint,
     media_map_metadata_matches_coordinates,
@@ -2226,7 +2226,7 @@ def infer_overview_image_from_tracks_path(tracks_path: Path, photolist: Path) ->
 
 def normalize_filename_for_match(path_text: str) -> str:
     """Normalize a filename for robust matching across path and Unicode variants."""
-    return unicodedata.normalize("NFC", Path(path_text.strip()).name)
+    return filename_comparison_key(Path(path_text.strip()).name)
 
 
 def normalize_track_plot_filename_for_match(path_text: str) -> str:
@@ -5459,17 +5459,24 @@ def analyze_media_updates(
             section_media_counts[section] = section_media_counts.get(section, 0) + 1
         elif entry.get("type") in {"map", "map_before", "map_after", "media_map"}:
             available_stage_sections.add(_control_section_description(entries, entry_index))
-    memberships = {
-        normalize_filename_for_match(name): membership
-        for name, membership in (media_memberships or {}).items()
-    }
-    selected_actions = {normalize_filename_for_match(key): str(value) for key, value in (actions or {}).items()}
+    paths = list(dict.fromkeys(Path(path).expanduser().resolve(strict=False) for path in media_paths))
+    FilenameIndex(
+        (path for path in paths if path.is_relative_to(project) and path.is_file()),
+        name=lambda path: normalize_filename_for_match(path.name),
+    ).require_unique()
+    relative_paths = FilenameIndex(
+        (path for path in paths if path.is_relative_to(project) and path.is_file()),
+        name=lambda path: path.relative_to(project).as_posix(),
+    )
+    memberships = unique_filename_mapping((media_memberships or {}).items(), key=normalize_filename_for_match)
+    selected_actions = unique_filename_mapping(
+        ((key, str(value)) for key, value in (actions or {}).items()), key=normalize_filename_for_match)
     results: list[MediaUpdateItem] = []
     warnings: list[str] = []
     for normalized_name, indexes in media_entry_indexes.items():
         entry_name = str(entries[indexes[0]].get("name", ""))
         referenced_path = project / entry_name
-        if referenced_path.is_file():
+        if referenced_path.is_file() or relative_paths.match(entry_name).path is not None:
             continue
         warning = (
             f"Control row references missing media and was retained: {entry_name}"
@@ -5477,7 +5484,6 @@ def analyze_media_updates(
         warnings.append(warning)
         if detail_callback is not None:
             detail_callback(warning)
-    paths = [Path(path).expanduser().resolve(strict=False) for path in media_paths]
     extraction_paths: list[Path] = []
     for media_path in paths:
         if not media_path.is_relative_to(project) or not media_path.is_file():
@@ -6135,12 +6141,7 @@ def commit_media_update_plan(
                 for entry in control_entries
                 if entry.get("type") == "media"
             ]
-            project_media = [
-                path
-                for path in plan.project_dir.iterdir()
-                if path.is_file()
-                and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-            ]
+            project_media = discover_media_files(plan.project_dir)
             staged_inventory_payload = build_control_media_inventory_payload(
                 plan.media_inventory,
                 project_media,

@@ -356,15 +356,17 @@ class InspectorPointSelectionTests(unittest.TestCase):
         first_result = PlotView.edit_target_for_mouse_down(plot, object())
 
         self.assertIsNone(first_result)
-        self.assertIsNone(plot.cursor)
+        self.assertIsNotNone(plot.cursor)
         self.assertTrue(plot.workspace_track_selection_consumed)
-        controller.select_track_in_table.assert_called_once_with(7)
-        workspace.workspaceTrackSelectedForEditing_.assert_called_once_with(track)
+        controller.select_track_in_table.assert_not_called()
+        workspace.workspaceTrackSelectedForEditing_.assert_not_called()
+        self.assertIs(plot.workspace_track_click_target[1], track)
 
+        selected.append(7)  # A short mouse release commits track selection.
         plot.workspace_track_selection_consumed = False
         second_result = PlotView.edit_target_for_mouse_down(plot, object())
         self.assertEqual(second_result, target)
-        controller.select_track_in_table.assert_called_once_with(7)
+        controller.select_track_in_table.assert_not_called()
 
     def test_long_press_timer_runs_in_common_tracking_modes(self):
         timer = Mock()

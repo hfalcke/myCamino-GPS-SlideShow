@@ -37,6 +37,7 @@ class ControlMediaInventoryTests(unittest.TestCase):
 
     def media(self, name, hour=12):
         path = self.project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(name.encode("utf-8"))
         payload = build_photo_metadata_payload(
             name,
@@ -49,6 +50,26 @@ class ControlMediaInventoryTests(unittest.TestCase):
         )
         media_sidecar_path(path).write_text(json.dumps(payload), encoding="utf-8")
         return path
+
+    def test_apply_remembers_recursive_inclusions_and_exclusions_without_rewriting_control(self):
+        included = self.media('Others/included.jpeg')
+        excluded = self.media('Others/excluded.jpeg')
+        text = '#Datum: Montag, 15.07.2024\n# Others/included.jpeg | 12:00 | 50.000000, 8.000000 | Place\n'
+        self.control.write_text(text, encoding='utf-8')
+        inventory, memberships = geo.discover_control_media_membership(self.project, self.control)
+        plan = geo.analyze_control_file_updates(
+            self.project, [included, excluded], control_file=self.control, tracks_summary_path=None,
+            media_only=True, actions={included.name: 'use_sidecar', excluded.name: 'use_sidecar'},
+            media_memberships={item.media_path.name: item for item in memberships}, media_inventory=inventory)
+        for item in plan.media.items:
+            item.add_to_control = item.update_metadata = item.reposition = item.apply_update = False
+        geo.commit_control_file_update_plan(plan, update_place_names=False)
+        self.assertEqual(self.control.read_text(encoding='utf-8'), text)
+        loaded, memberships = geo.discover_control_media_membership(self.project, self.control)
+        self.assertEqual(loaded.entry(included.name)['state'], 'included')
+        self.assertEqual(loaded.entry(excluded.name)['state'], 'excluded')
+        self.assertEqual({item.media_path.name: item.state for item in memberships},
+                         {included.name: 'included', excluded.name: 'excluded'})
 
     def test_bootstrap_keeps_absent_media_unclassified(self):
         included = self.media("included.jpeg")

@@ -13,6 +13,7 @@ from cocoa_adventure_chooser import choose_adventure
 from cocoa_adventure_map import AdventureMapController
 from GPSTrackShowGUI import GPXTrackerController
 from json_storage import atomic_write_json
+from audio_playlist import load_audio_playlist
 from security_scoped_access import temporary_directory_access
 
 
@@ -37,6 +38,36 @@ def write_adventure(root, name="Trip", previous=None):
 
 
 class RelocatedAdventureFilesTests(unittest.TestCase):
+    def test_relocation_keeps_selected_old_playlist_name_and_authored_order(self):
+        for operation in ('move', 'copy'):
+            for absolute in (False, True):
+                with self.subTest(operation=operation, absolute=absolute), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    old = root / 'old'
+                    path, data = write_adventure(old, 'New Adventure Name')
+                    audio = old / 'audio'
+                    audio.mkdir()
+                    for name in ('a.m4a', 'b.m4a'):
+                        (audio / name).write_bytes(b'audio')
+                    selected = audio / 'Old Adventure Name.playlist'
+                    text = '$START\nb.m4a\na.m4a\n'
+                    selected.write_text(text)
+                    (audio / 'New Adventure Name.playlist').write_text('')
+                    data['music_playlist'] = str(selected) if absolute else 'audio/Old Adventure Name.playlist'
+                    atomic_write_json(path, data)
+                    new = root / 'renamed'
+                    if operation == 'move':
+                        shutil.move(old, new)
+                    else:
+                        shutil.copytree(old, new)
+                    opened = open_adventure(new / path.name)
+                    value = Path(opened.payload['music_playlist'])
+                    chosen = value if value.is_absolute() else new / value
+                    self.assertEqual(chosen.resolve(), (new / 'audio' / selected.name).resolve())
+                    self.assertEqual(chosen.read_text(), text)
+                    parsed = load_audio_playlist(new / 'audio', chosen)
+                    self.assertEqual([item.name for item in parsed.files], ['b.m4a', 'a.m4a'])
+
     def test_moved_folder_opens_existing_file_preserving_every_other_asset(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

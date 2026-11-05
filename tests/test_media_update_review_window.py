@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from GPSTrackShowGUI import (
     GPXTrackerController,
@@ -27,6 +27,110 @@ def update_item(path: Path, *, add=False, metadata=False, move=False):
 
 
 class MediaUpdateReviewWindowTests(unittest.TestCase):
+    def test_map_preparation_keeps_review_objects_and_presentation_choices(self):
+        item = update_item(Path('/project/Others/photo.jpeg'), add=False, metadata=True)
+        table = Mock()
+        table.selectedRowIndexes.return_value.containsIndex_.return_value = True
+        table.visibleRect.return_value.origin = (0, 73)
+        checkbox = Mock()
+        checkbox.state.return_value = 0
+        media_plan = SimpleNamespace(project_dir=Path('/project'), control_file=Path('/project/trip.lst'), items=[item])
+        controller = SimpleNamespace(
+            control_file_update_plan=SimpleNamespace(media=media_plan), media_update_plan=media_plan,
+            media_update_preview_table=table, media_update_preview_visible_items=[item],
+            media_update_preview_place_checkbox=checkbox, media_update_preview_window=Mock(),
+            startAutomaticMapGeneration_=Mock(), geolocations_thread=None)
+        original = controller.control_file_update_plan
+        GPXTrackerController._start_review_map_preparation(controller)
+        self.assertIs(controller.control_file_update_plan, original)
+        self.assertFalse(item.add_to_control)
+        self.assertTrue(item.update_metadata)
+        self.assertEqual(controller.media_review_map_preparation['selected'], [item.media_path])
+        self.assertEqual(controller.media_review_map_preparation['scroll'], (0, 73))
+        self.assertFalse(controller.media_review_map_preparation['place'])
+        controller.startAutomaticMapGeneration_.assert_called_once_with([])
+
+    def test_rechecking_after_maps_uses_existing_analysis_merge_without_extraction_request(self):
+        root = Path('/project')
+        item = update_item(root / 'Others/photo.jpeg', add=False)
+        review = dict(project=root, control=root / 'trip.lst', phase='waiting_status')
+        controller = SimpleNamespace(
+            media_review_map_preparation=review, current_project_dir=root,
+            _control_file_path=lambda: root / 'trip.lst', media_update_plan=SimpleNamespace(items=[item]),
+            _start_control_file_update_analysis=Mock(return_value=True))
+        GPXTrackerController.refreshMediaReviewAfterMaps_.callable(controller, None)
+        controller._start_control_file_update_analysis.assert_called_once_with(
+            paths=[item.media_path], actions={'photo.jpeg': 'use_sidecar'}, append=True)
+        self.assertEqual(review['phase'], 'reanalyzing')
+
+    def test_cancelled_provider_or_failed_maps_restore_review_without_changing_choices(self):
+        plan = object()
+        controller = SimpleNamespace(media_review_map_preparation={'phase': 'maps'},
+            pending_slideshow_after_map_generation={'continue_previous': True},
+            media_update_plan=plan, _restore_media_update_preview=Mock())
+        GPXTrackerController._restore_review_after_map_failure(controller)
+        self.assertIs(controller.media_update_plan, plan)
+        self.assertIsNone(controller.pending_slideshow_after_map_generation)
+        self.assertIsNone(controller.media_review_map_preparation)
+        controller._restore_media_update_preview.assert_called_once()
+
+    def test_apply_with_stale_maps_offers_prepare_then_apply_instead_of_partial_commit(self):
+        controller = SimpleNamespace(
+            media_update_plan=object(), control_file_update_plan=SimpleNamespace(track_maps=SimpleNamespace(warning='Maps stale')),
+            _start_review_map_preparation=Mock(), _start_control_file_update_commit=Mock())
+        with patch('GPSTrackShowGUI.confirm_alert', return_value=True):
+            GPXTrackerController.applyMediaUpdatePlan_.callable(controller, None)
+        controller._start_review_map_preparation.assert_called_once_with(apply_after=True)
+        controller._start_control_file_update_commit.assert_not_called()
+
+    def test_successful_recheck_applies_only_previously_confirmed_choices(self):
+        controller = SimpleNamespace(
+            media_review_map_preparation=dict(apply_after=True, place=False),
+            control_file_update_plan=SimpleNamespace(track_maps=SimpleNamespace(warning='')),
+            _start_control_file_update_commit=Mock(), show_media_update_preview=Mock())
+        GPXTrackerController._finish_review_map_preparation(controller)
+        controller._start_control_file_update_commit.assert_called_once_with(update_places=False)
+        controller.show_media_update_preview.assert_not_called()
+        self.assertIsNone(controller.media_review_map_preparation)
+
+    def test_recheck_restores_selection_scroll_and_place_choice_without_resetting_filter(self):
+        item = update_item(Path('/project/photo.jpeg'))
+        controller = SimpleNamespace(
+            media_review_map_preparation=dict(apply_after=False, place=False, selected=[item.media_path], scroll=(0, 73)),
+            control_file_update_plan=SimpleNamespace(track_maps=SimpleNamespace(warning='')),
+            show_media_update_preview=Mock(), media_update_preview_table=Mock(),
+            media_update_preview_place_checkbox=Mock(), media_update_preview_visible_items=[item],
+            media_update_plan=SimpleNamespace(items=[item]),
+            media_update_preview_filter='excluded', media_update_preview_sort_column='name',
+            media_update_preview_sort_ascending=False)
+        GPXTrackerController._finish_review_map_preparation(controller)
+        controller.show_media_update_preview.assert_called_once()
+        controller.media_update_preview_place_checkbox.setState_.assert_called_once_with(0)
+        controller.media_update_preview_table.selectRowIndexes_byExtendingSelection_.assert_called_once()
+        controller.media_update_preview_table.scrollPoint_.assert_called_once_with((0, 73))
+        self.assertEqual(controller.media_update_preview_filter, 'excluded')
+        self.assertFalse(controller.media_update_preview_sort_ascending)
+
+    def test_map_only_preparation_with_no_remaining_review_resumes_without_empty_window(self):
+        controller = SimpleNamespace(
+            media_review_map_preparation=dict(apply_after=False),
+            media_update_plan=SimpleNamespace(items=[]),
+            control_file_update_plan=SimpleNamespace(track_maps=SimpleNamespace(warning='', change_count=0)),
+            set_status=Mock(), pending_slideshow_after_map_generation={'continue_previous': True},
+            performSelector_withObject_afterDelay_=Mock(), show_media_update_preview=Mock())
+        GPXTrackerController._finish_review_map_preparation(controller)
+        controller.show_media_update_preview.assert_not_called()
+        controller.performSelector_withObject_afterDelay_.assert_called_once_with('resumeSlideShowAfterMaps:', None, 0.0)
+
+    def test_review_recheck_from_another_project_is_discarded(self):
+        controller = SimpleNamespace(
+            media_review_map_preparation=dict(project=Path('/old'), control=Path('/old/trip.lst'), phase='waiting_status'),
+            current_project_dir=Path('/new'), _control_file_path=lambda: Path('/new/trip.lst'),
+            pending_slideshow_after_map_generation={}, _start_control_file_update_analysis=Mock())
+        GPXTrackerController.refreshMediaReviewAfterMaps_.callable(controller, None)
+        controller._start_control_file_update_analysis.assert_not_called()
+        self.assertIsNone(controller.media_review_map_preparation)
+
     def test_rechecked_rows_replace_duplicates_and_preserve_choices(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -100,7 +204,7 @@ class MediaUpdateReviewWindowTests(unittest.TestCase):
         end = module_source.index("    def cancelGeoLocationsRun_(", start)
         source = module_source[start:end]
         append_branch = source.index("if appended_analysis:")
-        automatic_commit = source.index("if not control_file_update_requires_review")
+        automatic_commit = source.index("not control_file_update_requires_review")
         self.assertLess(append_branch, automatic_commit)
         self.assertIn(
             "self.show_media_update_preview(select_paths=appended_paths)",

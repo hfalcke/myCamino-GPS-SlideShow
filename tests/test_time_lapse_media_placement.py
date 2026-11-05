@@ -31,6 +31,7 @@ from GPSTrackShow import (
     map_plot_rect,
     normalize_time_lapse_resume_phase,
     normalize_transition,
+    offset_track_symbol_center,
     overview_route_direction,
     parse_stage_descriptors,
     stage_name_endpoints,
@@ -66,6 +67,53 @@ from track_map_layout_utils import best_unframed_media_layout
 
 
 class TimeLapseMediaPlacementTests(unittest.TestCase):
+    def test_additional_symbol_square_and_stroke_clear_the_route_dot(self):
+        marker = (400., 300.)
+        for tangent in (None, (0., 0.), (1., 0.), (-1., 0.), (0., 1.), (0., -1.),
+                        (1., 1.), (-1., 1.), (1., -1.), (-1., -1.)):
+            normal = fixed_arrow_normal(tangent) or (0., -1.)
+            nx, ny = normal[0], -normal[1]
+            for radius, size in ((2., 12.), (5., 24.), (12., 120.)):
+                with self.subTest(tangent=tangent, radius=radius, size=size):
+                    center = offset_track_symbol_center(marker, size, radius, tangent)
+                    self.assertGreaterEqual(center[1], marker[1])
+                    stroke = max(1.3, size * .055)
+                    for dx in (-size / 2, size / 2):
+                        for dy in (-size / 2, size / 2):
+                            separation = (center[0] + dx - marker[0]) * nx + (center[1] + dy - marker[1]) * ny
+                            self.assertGreater(separation - stroke / 2, radius)
+
+    def test_additional_marker_views_offset_symbols_but_keep_the_dot_at_gps(self):
+        import GPSTrackShow as show
+        view = SimpleNamespace(
+            imagePixelForLat_lon_=lambda *args: (20., 30.), map_image=object(),
+            _scale_components=lambda scale: (1., 1.),
+            bounds=lambda: SimpleNamespace(size=SimpleNamespace(width=1600., height=1000.)),
+            stage_tangent=(1., 0.), pilgrim_frames=[], marker_radius=5., arrow_factor=1.,
+            marker_color=(1., 0., 0., 1.))
+        rect = SimpleNamespace(origin=SimpleNamespace(x=0., y=0.))
+        for kind in ('hiking', 'horse', 'rest', 'sightseeing', 'bus', 'train', 'metro'):
+            view.marker_style = kind
+            with self.subTest(kind=kind), \
+                 patch.object(show, 'image_size_tuple', return_value=(100., 100.)), \
+                 patch.object(show, 'draw_cocoa_symbol') as symbol, \
+                 patch.object(show, 'draw_marker_at') as dot, \
+                 patch.object(show, 'ns_color', return_value='color'):
+                point = show.TimeLapseMapView.drawMarkerForLat_lon_imageRect_scale_.callable(
+                    view, 50., 7., rect, 1.)
+                self.assertEqual(point, (20., 70.))
+                self.assertEqual(symbol.call_args.args[0], kind)
+                self.assertGreater(symbol.call_args.args[1][1], point[1])
+                dot.assert_called_once_with(20., 930., 1000., view.marker_color, 5.)
+                view.arrow_factor = 0.
+                symbol.reset_mock()
+                dot.reset_mock()
+                show.TimeLapseMapView.drawMarkerForLat_lon_imageRect_scale_.callable(
+                    view, 50., 7., rect, 1.)
+                symbol.assert_not_called()
+                dot.assert_called_once()
+                view.arrow_factor = 1.
+
     def test_z_forces_opposite_layout_and_toggles_within_stage(self):
         app = GPSTrackShowApp.__new__(GPSTrackShowApp)
         app.time_lapse_media_layout_override = None

@@ -47,9 +47,13 @@ class StartupValidationTests(unittest.TestCase):
     def make_hint(self):
         summary = self.maps / "summary.json"
         summary.write_text("{}")
+        (self.maps / "1.json").write_text(json.dumps({
+            "track_fingerprint": "data", "track_data_fingerprint": "data", "timed_track_points": [],
+            "running_speed": {"version": 1, "window_distance_m": 100, "stationary_threshold_kmh": 1}}))
         self.options.update(output_base="trip", adventure_processing_parameters={"smoothing": 10})
         context = dict(gpx_path=self.gpx, output_dir=self.maps, output_base="trip", table_json_path=summary,
-                       args=SimpleNamespace(adventure_processing_parameters={"smoothing": 10}),
+                       args=SimpleNamespace(adventure_processing_parameters={"smoothing": 10},
+                                            gpx_running_speed_window_distance=100, gpx_stationary_speed_threshold=1),
                        tracks=[dict(table_number=1, track_data_sidecar="1.json", track_data_fingerprint="data",
                                     track_geometry_fingerprint="geometry", point_records=[object()])])
         return prepared_track_hint(context, file_signature(self.gpx))
@@ -136,7 +140,7 @@ class StartupValidationTests(unittest.TestCase):
         self.assertFalse(result["reused"])
         (self.maps / "extra.json").write_text("{}")
         result = self.run_validation(result["cache_key"], [external])
-        self.assertFalse(result["reused"])
+        self.assertTrue(result["reused"])  # Unreferenced artifacts are not playback dependencies.
         (self.maps / "overview.png").unlink()
         self.check.return_value = {"maps": ["overview.png"], "derived": []}
         result = self.run_validation(result["cache_key"], [external])
@@ -153,7 +157,7 @@ class StartupValidationTests(unittest.TestCase):
     def test_source_or_map_changes_during_validation_require_retry(self):
         for path in (self.gpx, self.maps / "overview.png"):
             with self.subTest(path=path.name):
-                def check(*_args):
+                def check(*_args, **_kwargs):
                     path.write_bytes(path.read_bytes() + b" ")
                     return {"maps": [], "derived": []}
                 self.check.side_effect = check
@@ -282,6 +286,28 @@ class StartupFeedbackTests(unittest.TestCase):
                                      _resolve_project_directory=Mock())
         GPXTrackerController._start_slide_show(controller)
         controller._resolve_project_directory.assert_not_called()
+
+    def test_preflight_worker_receives_existing_background_future(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            gpx, control = root / 'trip.gpx', root / 'trip.lst'
+            gpx.write_text('<gpx/>')
+            control.write_text('')
+            future = Mock()
+            controller = SimpleNamespace(
+                slideshow_dependency_preflight_running=False, slideshow_dependency_preflight_generation=0,
+                _current_single_gpx_path=lambda: gpx, _current_project_name=lambda: 'trip',
+                _plot_common_options=Mock(return_value={}), _slideshow_startup_progress=Mock(),
+                slideshow_preflight_cache_key=None,
+                adventure_map_host=SimpleNamespace(slideshow_prepared_hint=None, derived_track_data_future=future),
+                performSelectorOnMainThread_withObject_waitUntilDone_=Mock())
+            with patch('GPSTrackShowGUI.threading.Thread') as thread, \
+                 patch('GPSTrackShowGUI.validate_startup', return_value={}) as validate:
+                GPXTrackerController._start_slideshow_dependency_preflight(controller, root, control, root)
+                thread.call_args.kwargs['target']()
+                self.assertIs(validate.call_args.kwargs['prepared_future'], future)
+                self.assertEqual(validate.call_args.kwargs['extra_assets'], ())
+                thread.return_value.start.assert_called_once()
 
     def test_background_status_waits_until_slideshow_startup_finishes(self):
         controller = SimpleNamespace(status_refresh_generation=1, slideshow_startup_started_at=1.0,

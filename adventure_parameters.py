@@ -14,7 +14,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 28
+PARAMETER_SCHEMA_VERSION = 29
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -34,6 +34,7 @@ class ParameterSpec:
     advanced: bool = False
     unit: str = ""
     subsection: str = ""
+    hidden: bool = False
 
 
 def _choice(*items: tuple[str, str]) -> tuple[tuple[str, str], ...]:
@@ -55,6 +56,9 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.font_family", "Slide Show", "Font family", "System", "str", "Font family used for automatic headers and #CAPTION text.", subsection="Header"),
     ParameterSpec("slideshow.font_style", "Slide Show", "Font style", "bold", "choice", "Default style used for automatic headers and #CAPTION text.", choices=_choice(("regular", "Regular"), ("bold", "Bold"), ("italic", "Italic"), ("bold-italic", "Bold Italic")), subsection="Header"),
     ParameterSpec("slideshow.header_mode", "Slide Show", "Initial presentation header", "full", "choice", "Initial header style for the logical media display. Press c during playback to cycle Full, Off, and Simple for the current session.", choices=_choice(("full", "Full"), ("simple", "Simple"), ("off", "Off")), subsection="Header"),
+    ParameterSpec("slideshow.header_stage_name_style", "Slide Show", "Stage name style", "bold", "choice", "Style of the fixed first central header row.", choices=_choice(("regular", "Normal"), ("bold", "Bold"), ("italic", "Italic"), ("bold-italic", "Bold Italic")), subsection="Header"),
+    ParameterSpec("slideshow.header_stage_statistics_style", "Slide Show", "Stage statistics style", "italic", "choice", "Style of the fixed second central header row.", choices=_choice(("regular", "Normal"), ("bold", "Bold"), ("italic", "Italic"), ("bold-italic", "Bold Italic")), subsection="Header"),
+    ParameterSpec("slideshow.header_location_style", "Slide Show", "Location style", "regular", "choice", "Style of the fixed third central header row.", choices=_choice(("regular", "Normal"), ("bold", "Bold"), ("italic", "Italic"), ("bold-italic", "Bold Italic")), subsection="Header"),
     ParameterSpec("slideshow.map_header_enabled", "Slide Show", "Show header on map display", True, "bool", "Keep the full configured header on the logical map display, independently of the c key.", subsection="Header"),
     ParameterSpec("slideshow.clock", "Slide Show", "Clock", True, "bool", "Show the analog clock at the left of the slide-show header when timing is available.", subsection="Header"),
     ParameterSpec("slideshow.header_stage_name", "Slide Show", "Stage name", True, "bool", "Show the stage name as the first available line in the middle of the header.", subsection="Header"),
@@ -95,7 +99,7 @@ PARAMETER_SPECS = (
     ParameterSpec("timelapse.overview_on_stage_map_dual", "Slide Show", "Overview inset with second display", True, "bool", "Also show the overview as the first Stage Map inset when a separate overview display is active.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.marker_style", "Slide Show", "Moving marker", "pilgrim", "choice", "Choose the moving symbol shown at the current track position.", choices=_choice(("pilgrim", "Walking pilgrim"), ("bike", "Bicycle"), ("car", "Car"), ("plane", "Airplane"), ("arrow", "Arrow")), subsection="Time-Lapse"),
     ParameterSpec("timelapse.marker_source", "Slide Show", "Marker source", "track_type", "choice", "Use the track type, or override all tracks with the existing moving-marker choice.", choices=(("track_type", "Track Type"), ("global", "Global Override")), subsection="Time-Lapse"),
-    ParameterSpec("slideshow.speedometer", "Slide Show", "Show speedometer", True, "bool", "Show distance-smoothed moving speed in Time-Lapse when recorded timing is available.", subsection="Time-Lapse"),
+    ParameterSpec("slideshow.speedometer", "Slide Show", "Show speedometer", "timelapse", "choice", "Show recorded running speed in all playback styles, never, or only in Time-Lapse (default). Requires available timing data and a Full header.", choices=_choice(("on", "On"), ("off", "Off"), ("timelapse", "Time-Lapse Only")), subsection="Time-Lapse"),
 
     ParameterSpec("slideshow.weather", "Slide Show", "Show historical weather", True, "bool", "Show stored historical weather beside the speedometer while media timing is available.", subsection="Header"),
     ParameterSpec("slideshow.weather_condition_icon", "Slide Show", "Weather condition icon", True, "bool", "Show a compact condition icon derived from the stored WMO weather code.", subsection="Header"),
@@ -108,6 +112,7 @@ PARAMETER_SPECS = (
     ParameterSpec("trackmaps.media_overlay", "Map Generation", "Media route display", "dots", "choice", "Show measured photo positions as dots, connect them by an estimated line, or hide them.", choices=_choice(("dots", "Photo dots"), ("interpolated", "Interpolated line"), ("hidden", "Hidden"))),
     ParameterSpec("trackmaps.dynamic_header", "Map Generation", "Show map header", True, "bool", "Draw map titles and dates dynamically so their appearance can be changed without rebuilding the basemap."),
     ParameterSpec("trackmaps.track_title", "Slide Show", "Track title", "endpoint_places", "choice", "Choose the first GPX-stage header line: reverse-geocoded start and destination places, with the GPX track name as fallback, or always the original GPX track name.", choices=_choice(("endpoint_places", "Start - destination"), ("track_name", "GPX track name")), subsection="Header"),
+    ParameterSpec("slideshow.remove_name_prefix", "Slide Show", "Remove track name prefix", "", "text", "Remove this exact leading text from displayed GPX track names, including the name fallback for endpoint titles. Does not change place names, tracks, or map files.", subsection="Header"),
     ParameterSpec("trackmaps.image_size", "Map Generation", "Image size", "1920x1080", "image_size", "Output map dimensions in pixels."),
     ParameterSpec("trackmaps.zoom", "Map Generation", "Map zoom", 16, "int", "Requested basemap zoom level.", 0, 22),
     ParameterSpec("trackmaps.route_width", "Map Generation", "Route width", 4.0, "float", "Width of the plotted route line.", 0.1, 50.0),
@@ -119,7 +124,8 @@ PARAMETER_SPECS = (
     ParameterSpec("trackmaps.title_color", "Map Generation", "Title color", "#FFFFFF", "color", "Track map title and subtitle color."),
     ParameterSpec("trackmaps.font_factor", "Map Generation", "Font factor", 2.2, "float", "Multiplier for automatically selected map label sizes.", 0.1, 10.0),
     ParameterSpec("trackmaps.overview_labels", "Map Generation", "Overview labels", "automatic", "choice", "Shared by generated and PDF overviews. Automatic shows labels only when their total width is at most 70% of the displayed route length.", choices=_choice(("none", "None"), ("default", "Track, date, length"), ("automatic", "Automatic"))),
-    ParameterSpec("trackmaps.remove_name_prefix", "Map Generation", "Remove name prefix", "", "text", "Remove this prefix from track names when displaying them."),
+    # Preserve the old asset-naming input without exposing it as a display control.
+    ParameterSpec("trackmaps.remove_name_prefix", "Map Generation", "Legacy name prefix", "", "text", "Retained for existing asset names and processing signatures.", hidden=True),
     ParameterSpec("trackmaps.edge_margin_fraction", "Map Generation", "Time-Lapse edge margin", 0.05, "fraction", "Minimum route distance from the plotting-area edge.", 0.0, 0.49, advanced=True, unit="%"),
 
     ParameterSpec("gpx.fallback_walking_speed_kmh", "GPX Processing", "Fallback walking speed", 3.5, "float", "Speed used when missing timestamps cannot be anchored.", 0.1, 50.0, unit="km/h"),
@@ -141,6 +147,7 @@ PARAMETER_SPECS = (
     ParameterSpec("gpx.maximum_map_tiles", "GPX Processing", "Maximum interactive tiles", 48, "int", "Lower zoom automatically when an interactive map would exceed this tile count.", 1, 1000, advanced=True),
 
     ParameterSpec("pdf.track_info", "PDF Export", "Track information box", True, "bool", "Show detailed information below each track title."),
+    ParameterSpec("pdf.remove_name_prefix", "PDF Export", "Remove track name prefix", "", "text", "Default prefix removed from PDF track names, map labels, and titles only. The PDF Summary window may override it for one report."),
     ParameterSpec("pdf.track_statistics", "PDF Export", "Track statistics", True, "bool", "Include recording time, distances, speeds, elevation statistics, and point count."),
     ParameterSpec("pdf.checkpoints", "PDF Export", "Timed checkpoints", True, "bool", "Mark checkpoints and breaks on individual track maps and profiles and list their details."),
     ParameterSpec("pdf.checkpoint_weather", "PDF Export", "Checkpoint weather", True, "bool", "Reuse nearby weather. Missing weather may be retrieved when historical weather is enabled and checkpoint retrieval is allowed."),
@@ -201,7 +208,7 @@ def specs_for_section(section: str, include_advanced: bool = False) -> tuple[Par
     return tuple(
         spec
         for spec in PARAMETER_SPECS
-        if spec.section == section and (include_advanced or not spec.advanced)
+        if spec.section == section and not spec.hidden and (include_advanced or not spec.advanced)
     )
 
 
@@ -224,6 +231,7 @@ def visible_specs_for_section(
         spec
         for spec in PARAMETER_SPECS
         if spec.section == section
+        and not spec.hidden
         and (
             (spec.key in custom_keys and custom_provider)
             or (spec.key == "maps.credential_id" and keyed_provider)
@@ -244,7 +252,22 @@ def _normalize_bool(value: Any) -> bool:
     raise ValueError("must be on or off")
 
 
+def normalize_speedometer_mode(value: Any) -> str:
+    """Accept legacy switches and the new playback-specific display policy."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    mode = str(value).strip().lower().replace("_", "").replace("-", "")
+    mode = {"true": "on", "yes": "on", "1": "on", "false": "off", "no": "off", "0": "off"}.get(mode, mode)
+    if mode not in {"on", "off", "timelapse"}:
+        raise ValueError("speedometer must be on, off, or timelapse")
+    return mode
+
+
 def normalize_parameter_value(spec: ParameterSpec, value: Any) -> Any:
+    if spec.key in {"slideshow.remove_name_prefix", "pdf.remove_name_prefix"}:
+        return "" if value is None else str(value)
+    if spec.key == "slideshow.speedometer":
+        return normalize_speedometer_mode(value)
     if spec.value_type == "bool":
         return _normalize_bool(value)
     if spec.value_type == "int":
@@ -330,6 +353,9 @@ def normalize_parameters(raw: Any) -> dict[str, Any]:
     values = raw.get("values", {}) if isinstance(raw, dict) and isinstance(raw.get("values"), dict) else raw
     values = values if isinstance(values, dict) else {}
     values = dict(values)
+    legacy_prefix = values.get("trackmaps.remove_name_prefix", "")
+    values.setdefault("slideshow.remove_name_prefix", legacy_prefix)
+    values.setdefault("pdf.remove_name_prefix", legacy_prefix)
     legacy_map_provider = str(values.pop("maps.provider", "") or "").strip().casefold()
     if legacy_map_provider:
         values.setdefault("maps.interactive_provider", legacy_map_provider)

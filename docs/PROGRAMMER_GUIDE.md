@@ -138,16 +138,29 @@ with currently implemented behavior.
 The active source files are:
 
 - `GPSTrackShowGUI.py`: main Cocoa GUI for creating and managing an adventure.
-- `slideshow_startup.py`: UI-independent startup validation and file signatures.
-  The preflight worker reports per-track progress, refreshes derived/speed data,
-  validates maps, and records phase timings. Successful validation is cached
-  for the current controller session only, keyed by GPX/control-file identity,
-  processing/render options and map-directory/external-asset file signatures.
-  Changes during validation trigger a retry; missing/stale dependencies and
-  failures are never cached. Speed updates reuse the already prepared context.
-  Completed Adventure derived-data work retains only compact track identities,
-  not point arrays, for first-start reuse when the GPX, processing settings,
-  output base and summary signature still match; derived files are revalidated.
+- `slideshow_startup.py`: shared UI-independent startup validation/preparation cache.
+  The existing successful-validation key and compact prepared-track hint persist
+  atomically in `.mycamino/cache/slideshow-startup-*.json`. Source/control identity,
+  relevant processing options, required map/sidecar signatures, and fingerprint/map
+  algorithm versions gate reuse. Signatures include size, nanosecond modification
+  and change times, and inode. Corrupt/obsolete/unwritable caches are harmless misses;
+  no failed validation is recorded as successful. Bump `STARTUP_CACHE_VERSION` when
+  validation semantics change without a corresponding algorithm-version change.
+  Adventure loading reuses the same prepared hint only while derived signatures
+  match. Startup joins an existing derived-data Future on its worker, then validates
+  the returned hint against the current source/settings. It does not duplicate that
+  preparation or block AppKit. Missing/stale canonical data is repaired before use.
+  `StartupMetadataReader` holds per-pass compact projections, not complete point
+  arrays, sharing reads across identity, speed and presentation checks. Unchanged
+  files are decoded once; presentation patches reload changed full payloads so
+  geometry and unknown fields survive. Unchanged derived data and summary files
+  are not replaced. Canonical derived sidecars supply speed data; old copies in
+  map JSON do not force upgrades. Required dependencies include implicit Time-Lapse
+  partners and external references, not unrelated cached profiles or exports.
+  Map geometry/format, ordered overview identities, and final race checks remain
+  mandatory. Changes during validation retry; harmless rendering preferences do
+  not invalidate processed geometry. Phase timings include presentation refresh
+  and shared preparation, and startup logs count decoded metadata sidecars.
   AppKit callbacks display startup progress in the visible Adventure Map until
   the player's first live display state (or failure). The Advanced Interface's
   background GPX status scan waits cooperatively during this preparation, so it
@@ -213,6 +226,18 @@ so revealing Track Editor does not parse the GPX again. The shell uses small
 delegate hooks on `PlotView` for workspace drops, selection, overlay drawing,
 and keyboard commands; standalone GPX Editor behavior is unchanged when those
 hooks are absent.
+
+`GPXEditorController.set_track_selection(...)` publishes map/table selection
+using stable internal IDs, synchronizing highlighted rows and retained views
+without dirty state, metric invalidation, map rendering or viewport changes.
+The workspace selection callback changes the active subject of an already open
+profile, not its window. `PlotView` records a bounded route hit on mouse-down and
+commits track selection only on a short release. Crossing the existing 5-point
+pan threshold cancels the pending click; Option-drag bypasses selection. Media
+and info-box hit targets take precedence. Command-click toggles tracks, while
+Command-drag from empty space remains media selection. Only a sole selected track
+can arm waypoint editing; selected-point/range clicks and Shift markers commit
+on release, and the existing long-press mutation/Undo path remains unchanged.
 
 The full GUI imports and calls:
 
@@ -472,6 +497,27 @@ legacy Adventure migration is intentionally absent. Parameter-registry
 normalization remains independent of the Adventure file-format version.
 
 ## Adventure Parameter Editor
+
+Track-name prefix removal is presentation-only: `slideshow.remove_name_prefix`
+is in Slide Show/Header, `pdf.remove_name_prefix` in PDF Export. The latter seeds
+the retained report field, whose custom override is preserved on Settings Apply.
+`track_name_utils.display_track_name` removes one exact, case-sensitive prefix
+after leading whitespace. Slideshow Python uses `track_name_prefix`; the CLI
+uses `--remove-track-name-prefix`, including live Apply and stage-cache refresh.
+The old `trackmaps.remove_name_prefix` spec is hidden, retained unchanged for
+existing map filenames and processing signatures, and seeds missing new keys.
+Changing either display setting never changes this compatibility value or map
+freshness. PDF table and detached map-track names each apply the report prefix
+once, without an additional legacy prefix pass.
+
+Track presentation refresh synchronizes scalar type/visibility and every
+Standard/Time-Lapse segment-style entry, even when the scalar fields already
+match. Overview styles remain per segment in document order. A single-track
+slideshow renderer treats scalar track state as authoritative over stale arrays.
+`PRESENTATION_REFRESH_VERSION` in the startup validation signature triggers one
+metadata-only recheck of older successful validations, preserving prepared-track
+cache entries, fingerprints, PNGs, geometry and unknown JSON fields. Subsequent
+unchanged launches retain the existing no-read/no-write cache fast path.
 
 `adventure_parameters.py` is the only source of parameter defaults. Each
 `ParameterSpec` defines its key, section, label, type, range or choices, inline
@@ -827,6 +873,24 @@ restores both. Editor Save also refreshes the inventory so deliberate row
 deletions are recorded, while disabled rows remain members. Related-file
 Adventure rename/copy operations carry the companion inventory with the control
 file; shared-control mode intentionally shares it.
+
+Discovery, inventory commit, media counts, and map media indexing use
+`discover_project_media(...)` recursively. It identifies managed images from
+Adventure/map-summary/control documents, including legacy root-level overviews,
+without classifying all PNGs as generated. Exclusion keys use shared Unicode
+comparison helpers; actual paths and cache identities remain unchanged.
+
+Review-triggered map preparation uses `startAutomaticMapGeneration_`, not a
+second renderer. `media_review_map_preparation` retains presentation choices
+until fresh project status arrives, then invokes the existing append-analysis
+and choice-merging path using current sidecars. No control file is committed
+until explicit Apply (or previously confirmed Prepare-and-Apply). A waiting
+slideshow request survives necessary reference review with `awaiting_review`
+and resumes through normal dependency validation after commit. Provider failure,
+cancellation and project switching clear deferred callbacks and retain the review.
+Old absolute map references require review even when their basename matches a
+newly prepared local asset; otherwise copied Adventures can repeatedly repair the
+local map while continuing to validate the obsolete location.
 
 New media sidecars use one GPS-independent timestamp-selection path. Embedded
 ExifTool fields are authoritative in this order: `DateTimeOriginal`, then the
@@ -1251,6 +1315,29 @@ video gain. Music may remain parallel, be reduced, or be faded and paused;
 video gain is independently reduced during narration. Both playlist-generation
 workflows call the same recursive discovery, label generation, and append-only
 update functions.
+`filename_matching.py` supplies comparison-only NFC keys and per-operation
+multimaps. Case sensitivity is explicit: audio and viewer fallback lookups opt
+into case folding; control-inventory keys retain their existing case-sensitive
+NFC format. Lookups return original discovered `Path` objects. Never construct
+paths, hashes, fingerprints, or persistent cache identities from comparison keys.
+Ambiguous candidates remain separate: inventory/update/import boundaries reject
+collisions rather than using the last dictionary entry. No inventory/cache format
+or version changes are involved. Media imports still require same-file identity
+or equal size and SHA-256 before reuse; different bytes receive numbered names.
+
+The incremental audit covers playlist resolution, media import, control review
+and membership, viewer ordering, media-derived track grouping, sidecar declared
+names, and GPX recovery-name ranking. Actual map filenames, asset ownership,
+source signatures, watcher identities and persistent cache keys deliberately
+retain their existing rules. Sorting, directive keywords and extension checks
+are not identity comparisons and are not globally rewritten.
+
+Audio filename lookup compares NFC-normalized, case-folded strings for absolute,
+relative, basename and extensionless matches, returning the actual discovered
+path. It never renames files or rewrites playlist spelling. Canonically equivalent
+but distinct ambiguous candidates remain errors; compatibility characters are not
+folded. Repeated references to the same physical pathname retain their authored
+playlist positions without becoming ambiguous lookup candidates.
 
 The effective music gain is the configured music percentage multiplied by the
 0–9 directive level and the retained slot's crossfade envelope. A level change
@@ -1258,6 +1345,15 @@ therefore updates both players during a crossfade. Video players use the
 separate configured video percentage. Runtime `n` replaces an active player
 item with the normalized/original counterpart, seeks to the prior timestamp,
 and restores its playing state.
+`Ctrl-+/-` changes `Config.session_volume_percent` in five-point steps between
+0 and 100. `playback_audio_gain` multiplies music, narration and video gains
+without altering configured channel levels, authored directives, or transport.
+Music and narration retain per-player fade envelopes so live changes, including
+mute followed by unmute during a fade, preserve the mix. Existing video ducking
+also remains multiplicative. The master resets to 100 when a new player session
+is constructed and is not saved in Adventure settings or resume checkpoints.
+`Cmd-+/-` continues to adjust Time-Lapse stage duration; both shortcuts appear
+in the retained `h` help overlay.
 
 The transport supports ordered target queues that return to the interrupted
 playlist title and time position, permanent playlist jumps, continue,
@@ -1292,6 +1388,13 @@ changed values; its `restore_display` flag still reactivates the player,
 restores missing fullscreen roles, and redraws the retained overview. Pressing
 Continue while that player is already alive sends `restart` so the current
 control row is rebuilt instead of launching a second subprocess.
+
+`GPSTrackShowApp` initializes both window and presenter handles to `None` before
+resume preparation or native window creation. Single and joined layouts retain
+`map_window = None`; fullscreen waits and restart/settings restoration may read
+it unconditionally. Startup profile placement resolves an unselected stage by
+its map filename (or loads the variant directly when outside the stage list),
+so an unpopulated stage cache is not reported as a missing map image.
 
 `GPSTrackShowWindowDelegate` gives every Cocoa window a stable `photo` or `map`
 role. Closing the primary photo window quits playback. Closing the secondary
@@ -1462,14 +1565,47 @@ role follows `slideshow.map_header_enabled`, so swapping physical displays
 does not swap header policy. Simple mode keeps text, statistics, and the clock
 while suppressing weather and the speedometer.
 Generated Time-Lapse basemaps continue beneath the runtime header. Off and
-Semi-transparent retain the full presentation frame and anchor overlays to the
-fitted image edge. Header area creates a real band in the configured slideshow
-background color and fits media beneath it; Time-Lapse maps use independent X/Y
-display scales so all map pixels remain visible across the complete screen
-width without regenerating map assets. GPS overlays use the same display scales.
+Semi-transparent retain the full presentation frame. Header geometry always uses
+window bounds, not the fitted image edge. Header area creates a real band in the configured slideshow
+background color and fits media beneath it. Maps always preserve their aspect
+ratio and top-align in the available rectangle, leaving surplus space below or
+beside them. Standard presenters receive the displayed image's own map metadata,
+including when a profile composite uses the Time-Lapse variant. Shared header
+metadata supplies content, not another window's geometry. GPS and profile overlays
+use the same fitted coordinates, without regenerating map assets. For modern
+background-only maps, the display transform excludes only the metadata-declared
+unused upper margin; geographic content and bottom attribution remain visible.
+`responsive_header_layout` measures statistics and reserves disjoint clock/date,
+speedometer, center-text, weather, and statistics columns. Its immutable view-local
+result keeps the central rectangle symmetric around the window midpoint, limited
+by the larger side reservation. Configured widgets retain their slots when values
+are absent. Stage-level numerical reservations prevent layout changes as the
+walker moves. Measurements are cached by bounds, font, content and visibility.
+Stage name, stage statistics and location retain three semantic row slots, including
+empty rows. `SlideshowHeaderState.central_styles` carries their independent styles
+(bold, italic, regular by default), overriding general or caption font styling.
+The settings use `slideshow.header_stage_name_style`,
+`slideshow.header_stage_statistics_style`, and `slideshow.header_location_style`;
+standalone playback exposes corresponding `--header-stage-name-style`,
+`--header-stage-statistics-style`, and `--header-location-style` options and Python
+parameters. `fitted_header_text` caches fitting and uses display-only
+place variants before reducing font size or ellipsizing; original metadata and
+Info content remain intact. Narrow views omit secondary weather locally, without
+altering the saved option. Component frames refresh together after layout changes.
 `create_clock_overlay_image(...)` applies the configured shadow color at 50%
 opacity, offset down/right by one stroke width, before drawing the clock and
-date in the configured header font color. The clock time comes from the interpolated current
+date in the configured header font color. Optional hour/minute values permit
+date-only drawing; `reserve_date_space=True` keeps the clock/date slots fixed
+even when either is absent. `SlideshowHeaderState.date_visible` is independent
+of `clock_visible`, but both follow the existing Clock setting and header policy.
+Introductory map/profile phases resolve time through `stage_start_clock_values`:
+recorded track start, then the first enabled medium in authored order, then
+date-only track/media/stage fallback. Relative timeline origins are excluded.
+`_stage_start_clock_values` reuses the stage presentation cache, keyed by timing
+metadata, first control row and sidecar/source signatures; the Standard path also
+retains a one-entry memo. It reads existing sidecars only and performs no extraction
+or enrichment. Motion and media phases bypass that resolver.
+During route motion, the clock time comes from the interpolated current
 track-point time. Once progress reaches the track endpoint,
 `time_lapse_clock_datetime(...)` advances it to the current medium's later
 capture timestamp while leaving the marker at the endpoint. The view draws the

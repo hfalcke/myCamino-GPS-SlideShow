@@ -1784,6 +1784,9 @@ class PlotView(NSView):
         self.clicked_workspace_media_target = None
         self.workspace_media_selection_active = False
         self.workspace_track_selection_consumed = False
+        self.workspace_track_click_target = None
+        self.workspace_mouse_modifiers = 0
+        self.workspace_click_cancelled = False
         self.photo_thumbnail_cache = ThumbnailMemoryCache()
         self.photo_thumbnail_futures = {}
         self.photo_thumbnail_generation = 0
@@ -2053,12 +2056,11 @@ class PlotView(NSView):
     def waypoint_editing_enabled(self) -> bool:
         if not getattr(self.controller, "track_mutations_enabled", True):
             return False
+        if self.adventure_workspace_delegate is not None:
+            return len(self.controller.selected_tracks()) == 1
         if self.mode == "track":
             return True
-        return bool(
-            self.adventure_workspace_delegate is not None
-            and len(self.controller.selected_tracks()) == 1
-        )
+        return False
 
     def track_sequence(self) -> list[TrackRecord]:
         if self.mode != "track":
@@ -2101,6 +2103,9 @@ class PlotView(NSView):
             for track in self.controller.tracks:
                 if track.nr == current_nr:
                     return track
+        if getattr(self, "adventure_workspace_delegate", None) is not None:
+            selected = self.controller.selected_tracks()
+            return selected[0] if len(selected) == 1 else None
         sequence = self.track_sequence()
         if not sequence:
             return None
@@ -3184,6 +3189,10 @@ class PlotView(NSView):
             if workspace is not None and hasattr(workspace, "cancelWorkspaceMediaSelection_"):
                 workspace.cancelWorkspaceMediaSelection_(None)
         self.workspace_media_selection_active = False
+        self.workspace_track_click_target = None
+        self.workspace_track_selection_consumed = False
+        self.workspace_mouse_modifiers = 0
+        self.workspace_click_cancelled = True
         self.mouse_down_started_at = None
         self.mouse_down_click_count = 0
         self.dragged_point_index = self.dragged_point_track = None
@@ -3210,6 +3219,12 @@ class PlotView(NSView):
         self.clicked_media_target = None
         self.clicked_workspace_media_target = None
         self.workspace_track_selection_consumed = False
+        self.workspace_track_click_target = None
+        self.workspace_mouse_modifiers = 0
+        self.workspace_click_cancelled = False
+        if self.long_press_timer is not None:
+            self.long_press_timer.invalidate()
+            self.long_press_timer = None
         closes_info = self.show_info and self.point_inside_rect(location, self.info_overlay_close_rect)
         if closes_info or (self.show_info and self.point_inside_rect(location, self.info_overlay_rect)):
             self.info_overlay_mouse_active = True
@@ -3229,25 +3244,24 @@ class PlotView(NSView):
                     location.y - self.info_overlay_rect.origin.y,
                 )
             return
+        self.workspace_mouse_modifiers = int(event.modifierFlags())
+        workspace = self.adventure_workspace_delegate
+        if workspace is not None and hasattr(workspace, "workspace_media_target_at_location"):
+            self.clicked_workspace_media_target = workspace.workspace_media_target_at_location(location)
         for rect, track, point_index, path in reversed(self.photo_thumbnail_hit_targets):
+            if self.clicked_workspace_media_target is not None:
+                break
             if (
                 rect.origin.x <= location.x <= rect.origin.x + rect.size.width
                 and rect.origin.y <= location.y <= rect.origin.y + rect.size.height
             ):
                 self.clicked_media_target = (track, point_index, path)
-                self.active_media_path = path.resolve(strict=False)
-                self.move_cursor_to_track_point(
-                    track,
-                    point_index,
-                    self.inspector,
-                    sync_table=True,
-                    focus_plot=False,
-                )
+                if workspace is None:
+                    self.active_media_path = path.resolve(strict=False)
+                    self.move_cursor_to_track_point(
+                        track, point_index, self.inspector, sync_table=True, focus_plot=False,
+                    )
                 break
-        workspace = self.adventure_workspace_delegate
-        if workspace is not None and hasattr(workspace, "workspace_media_target_at_location"):
-            self.clicked_workspace_media_target = workspace.workspace_media_target_at_location(location)
-        self.update_pointer_location(location)
         self.mouse_down_started_at = time.monotonic()
         self.mouse_down_click_count = int(event.clickCount())
         self.pan_origin = location
@@ -3256,6 +3270,12 @@ class PlotView(NSView):
         self.pan_active = bool(event.modifierFlags() & NSEventModifierFlagOption)
         self.last_gesture_location = location
         self.context_overlay_coordinate = None
+        self.long_press_target = None
+        self.long_press_origin = None
+        if workspace is not None and (self.pan_active or self.clicked_media_target is not None
+                                      or self.clicked_workspace_media_target is not None):
+            return
+        self.update_pointer_location(location)
         target = self.edit_target_for_mouse_down(location)
         selected_target = self.selected_range_at_target(target)
         if (
@@ -3283,6 +3303,7 @@ class PlotView(NSView):
                 and self.clicked_media_target is None
                 and self.clicked_workspace_media_target is None
                 and target is not None
+                and workspace is None
             ):
                 self.move_cursor_to_event(event)
                 target = self.edit_target_for_mouse_down(location)
@@ -3296,25 +3317,30 @@ class PlotView(NSView):
                 self.long_press_timer.invalidate()
             if not self.pan_active:
                 self.schedule_point_editing_long_press()
-        if self.waypoint_editing_enabled() and self.cursor is not None and event.modifierFlags() & NSEventModifierFlagShift:
+        if workspace is None and self.waypoint_editing_enabled() and self.cursor is not None and event.modifierFlags() & NSEventModifierFlagShift:
             self.set_selection_marker()
 
     def edit_target_for_mouse_down(self, location):
-        """Resolve an edit target after an Adventure track has been selected."""
+        """Defer track clicks until release, before allowing waypoint editing."""
         workspace = self.adventure_workspace_delegate
-        if workspace is not None and self.mode == "overview":
+        if workspace is not None:
             nearest = self.nearest_track_for_location(location)
             if nearest is not None and nearest[0] <= 12.0:
                 _distance, track, _point_index = nearest
+                self.workspace_track_click_target = nearest
                 selected = self.controller.selected_tracks()
-                if len(selected) != 1 or selected[0] is not track:
-                    self.controller.select_track_in_table(track.nr)
-                    self.cursor = None
-                    self.marker = None
+                if (getattr(self, "workspace_mouse_modifiers", 0) & NSEventModifierFlagCommand
+                        or len(selected) != 1 or selected[0] is not track):
                     self.workspace_track_selection_consumed = True
-                    if hasattr(workspace, "workspaceTrackSelectedForEditing_"):
-                        workspace.workspaceTrackSelectedForEditing_(track)
                     return None
+            else:
+                target = self.nearest_edit_target(location) if self.waypoint_editing_enabled() else None
+                if target is not None:
+                    self.workspace_track_click_target = (0.0, target[1], target[2])
+                    if getattr(self, "workspace_mouse_modifiers", 0) & NSEventModifierFlagCommand:
+                        self.workspace_track_selection_consumed = True
+                        return None
+                return target
         return self.nearest_edit_target(location) if self.waypoint_editing_enabled() else None
 
     def schedule_point_editing_long_press(self):
@@ -3404,6 +3430,8 @@ class PlotView(NSView):
             )
             if distance > 5.0:
                 self.pan_active = True
+                self.workspace_click_cancelled = True
+                self.workspace_track_click_target = None
                 if self.long_press_timer is not None:
                     self.long_press_timer.invalidate()
                     self.long_press_timer = None
@@ -3445,12 +3473,16 @@ class PlotView(NSView):
             self.pan_active = False
             self.pan_origin = None
             self.pan_start_extent = None
+            self.workspace_track_click_target = None
+            self.workspace_track_selection_consumed = False
             self.schedule_interactive_tiles(immediate=True)
             self.controller.sync_elevation_profile_to_plot_view(self)
             self.controller.set_status("Map moved; loading visible tiles.")
             return
         self.pan_origin = None
         self.pan_start_extent = None
+        if getattr(self, "workspace_click_cancelled", False):
+            return
         if (
             self.dragged_point_index is None
             and self.dragged_point_track is None
@@ -3461,7 +3493,8 @@ class PlotView(NSView):
         ):
             # A short click moves the range end. Holding the same red range
             # still starts the existing whole-range drag operation.
-            self.move_cursor_to_event(event)
+            if self.adventure_workspace_delegate is None:
+                self.move_cursor_to_event(event)
         workspace = self.adventure_workspace_delegate
         if (
             workspace is not None
@@ -3469,6 +3502,11 @@ class PlotView(NSView):
             and self.dragged_point_track is None
             and not self.dragged_segment_rows
         ):
+            if (click_target is not None and not self.workspace_track_selection_consumed
+                    and self.clicked_media_target is None and self.clicked_workspace_media_target is None):
+                self.move_cursor_to_event(event)
+                if event.modifierFlags() & NSEventModifierFlagShift:
+                    self.set_selection_marker()
             if hasattr(workspace, "workspaceMapClicked_clickCount_modifierFlags_"):
                 workspace.workspaceMapClicked_clickCount_modifierFlags_(
                     self,
@@ -3598,6 +3636,8 @@ class PlotView(NSView):
         if not displayed:
             return None
         track = self.current_track_for_title() or displayed[0]
+        if not any(item is track for item in displayed):
+            return None
         points = track.points()
         if not points:
             return None
@@ -5096,7 +5136,7 @@ class PlotView(NSView):
 
     def move_cursor_to_event(self, event):
         tracks = self.display_tracks()
-        if self.adventure_workspace_delegate is not None and self.mode == "overview":
+        if self.adventure_workspace_delegate is not None:
             selected = self.controller.selected_tracks()
             if len(selected) != 1:
                 return
@@ -5549,6 +5589,9 @@ class ElevationProfileView(NSView):
 
     def shows_all_tracks(self):
         scope = getattr(self, "profile_scope", None)
+        if (getattr(self.plot_view, "adventure_workspace_delegate", None) is not None
+                and len(self.controller.selected_tracks()) > 1):
+            return True
         return scope == "all" or (scope is None and self.plot_view.mode == "overview")
 
     def profile_tracks(self):
@@ -8135,9 +8178,10 @@ class PDFMapRenderer:
             )
             name = record.element.find("gpx:name", NS)
             if name is not None:
-                name.text = report_name(report_name(track.name, options.name_prefix),
-                                        self.project_parameters.get("trackmaps.remove_name_prefix", ""))
+                name.text = report_name(track.name, options.name_prefix)
             self.tracks.append(record)
+        # Detached names are formatted once; overview labels must not strip again.
+        self.project_parameters["pdf.remove_name_prefix"] = ""
 
     def __getattr__(self, name):
         if name in self._render_methods:
@@ -8478,10 +8522,14 @@ class GPXEditorController(NSObject):
 
     def apply_project_parameters(self, settings=None):
         """Apply project-scoped settings to an embedded editor instance."""
+        previous_prefix = getattr(self, "project_parameters", {}).get("pdf.remove_name_prefix", "")
         previous_processing_signature = self.processing_parameter_signature() if hasattr(
             self, "horizontal_smoothing_distance_m"
         ) else None
         self.project_parameters = normalize_parameters(settings)
+        prefix_field = getattr(self, "pdf_summary_name_prefix", None)
+        if prefix_field is not None and str(prefix_field.stringValue()) == previous_prefix:
+            prefix_field.setStringValue_(self.project_parameters["pdf.remove_name_prefix"])
         self._apply_parameter_attributes()
         timer = getattr(self, "autosave_timer", None)
         if timer is not None:
@@ -10334,9 +10382,22 @@ class GPXEditorController(NSObject):
     def select_track_in_table(self, nr: int):
         if nr not in {track.nr for track in self.tracks}:
             return
-        self.selected_nrs = [nr]
+        self.set_track_selection([nr])
+
+    def set_track_selection(self, identities, *, reveal=None):
+        """Publish selection without source edits, metric work, or viewport changes."""
+        requested = set(identities)
+        selected = [track.nr for track in self.tracks if track.nr in requested]
+        if selected == self.selected_nrs:
+            return
+        self.selected_nrs = selected
         self.update_selection_field()
         self.highlight_selected_rows()
+        if reveal in selected:
+            self.track_table.scrollRowToVisible_(next(index for index, track in enumerate(self.tracks) if track.nr == reveal))
+        workspace = getattr(self, "adventure_workspace_delegate", None)
+        if workspace is not None and hasattr(workspace, "workspaceTrackSelectionChanged_"):
+            workspace.workspaceTrackSelectionChanged_(self.selected_tracks())
         self.redraw_open_plot_views()
 
     def recalculate(self, reload_table: bool = True):
@@ -12458,6 +12519,7 @@ class GPXEditorController(NSObject):
             self.pdf_summary_checkboxes[identifier] = checkbox
         label("Remove name prefix", 20, 409, 155)
         self.pdf_summary_name_prefix = place(NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 480, FIELD_HEIGHT)), 180, 409, 620, FIELD_HEIGHT, True)
+        self.pdf_summary_name_prefix.setStringValue_(self.project_parameters.get("pdf.remove_name_prefix", ""))
         self.pdf_summary_name_prefix.setToolTip_("Remove this exact text from the start of names in this PDF only. Leading blanks are always removed.")
         label("Optional map pages", 20, 449, 200, 13, True)
         self.pdf_summary_options = {}
@@ -13254,7 +13316,7 @@ class GPXEditorController(NSObject):
             processed = self.processed_track(track)
             if not processed.points:
                 continue
-            name = report_name(track.name, self.project_parameters.get("trackmaps.remove_name_prefix", ""))
+            name = report_name(track.name, self.project_parameters.get("pdf.remove_name_prefix", ""))
             date = track.metrics.get("time") or processed.start_time
             details = [date.astimezone().strftime("%d.%m.%Y") if date else "", f"{processed.length_km:.1f} km"]
             labels.append(name + "\n" + " · ".join(item for item in details if item))
@@ -13841,11 +13903,8 @@ class GPXEditorController(NSObject):
         result = self.track_metadata_options("Select Tracks by Type", selection=True)
         if result is not None:
             kind, _, include_hidden, _ = result
-            self.selected_nrs = [track.nr for track in self.tracks if track.track_type == kind
-                                 and (include_hidden or not track.hidden)]
-            self.update_selection_field()
-            self.highlight_selected_rows()
-            self.redraw_open_plot_views()
+            self.set_track_selection([track.nr for track in self.tracks if track.track_type == kind
+                                      and (include_hidden or not track.hidden)])
 
     @objc.IBAction
     def saveSelectedTracksAs_(self, _sender):
@@ -14056,52 +14115,39 @@ class GPXEditorController(NSObject):
 
     @objc.IBAction
     def selectAllTracks_(self, _sender):
-        self.selected_nrs = [track.nr for track in self.tracks]
-        self.update_selection_field()
-        self.highlight_selected_rows()
-        self.redraw_open_plot_views()
+        self.set_track_selection([track.nr for track in self.tracks])
         self.set_status(f"Selected all {len(self.selected_nrs)} tracks.")
 
     @objc.IBAction
     def unselectAllTracks_(self, _sender):
-        self.selected_nrs = []
-        self.update_selection_field()
-        self.highlight_selected_rows()
-        self.redraw_open_plot_views()
+        self.set_track_selection([])
         self.set_status("Selection cleared.")
 
     @objc.IBAction
     def invertTrackSelection_(self, _sender):
         selected = set(self.selected_nrs)
-        self.selected_nrs = [track.nr for track in self.tracks if track.nr not in selected]
-        self.update_selection_field()
-        self.highlight_selected_rows()
-        self.redraw_open_plot_views()
+        self.set_track_selection([track.nr for track in self.tracks if track.nr not in selected])
         self.set_status(f"Inverted selection: {len(self.selected_nrs)} track(s) selected.")
 
     @objc.IBAction
     def selectionFieldCommitted_(self, _sender):
         by_number = {track.track_number: track.nr for track in self.tracks if track.track_number is not None}
-        self.selected_nrs = [by_number[number] for number in parse_track_numbers(str(self.selection_field.stringValue())) if number in by_number]
-        self.update_selection_field()
-        self.highlight_selected_rows()
-        self.redraw_open_plot_views()
+        self.set_track_selection([by_number[number] for number in parse_track_numbers(str(self.selection_field.stringValue())) if number in by_number])
 
     def table_selection_changed(self):
         if self.suppress_selection_change:
             return
         indexes = self.track_table.selectedRowIndexes()
         if indexes.count() == 0:
-            self.selected_nrs = []
+            selected_nrs = []
         else:
             selected_rows = [
                 index
                 for index in range(indexes.firstIndex(), indexes.lastIndex() + 1)
                 if indexes.containsIndex_(index) and index < len(self.tracks)
             ]
-            self.selected_nrs = [self.tracks[row].nr for row in selected_rows]
-        self.update_selection_field()
-        self.redraw_open_plot_views()
+            selected_nrs = [self.tracks[row].nr for row in selected_rows]
+        self.set_track_selection(selected_nrs)
 
     def update_selection_field(self):
         by_id = {track.nr: track for track in self.tracks}

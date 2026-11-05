@@ -110,6 +110,7 @@ class TypeAndStageTests(unittest.TestCase):
         controller = SimpleNamespace(tracks=tracks, selected_nrs=[9, 6],
             update_selection_field=Mock(), highlight_selected_rows=Mock(),
             redraw_open_plot_views=Mock(), set_status=Mock())
+        controller.set_track_selection = lambda ids: GPXEditorController.set_track_selection(controller, ids)
         GPXEditorController.invertTrackSelection_.callable(controller, None)
         self.assertEqual(controller.selected_nrs, [2])
         GPXEditorController.invertTrackSelection_.callable(controller, None)
@@ -350,6 +351,7 @@ class TypeAndStageTests(unittest.TestCase):
         controller = SimpleNamespace(tracks=tracks, selected_nrs=[3],
             track_metadata_options=Mock(return_value=("bike", "all", False, None)),
             update_selection_field=Mock(), highlight_selected_rows=Mock(), redraw_open_plot_views=Mock())
+        controller.set_track_selection = lambda ids: GPXEditorController.set_track_selection(controller, ids)
         GPXEditorController.selectTracksByType_.callable(controller, None)
         self.assertEqual(controller.selected_nrs, [1])
 
