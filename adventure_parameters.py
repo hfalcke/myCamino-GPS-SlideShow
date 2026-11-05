@@ -14,7 +14,7 @@ from gpx_processing import (
 )
 
 
-PARAMETER_SCHEMA_VERSION = 29
+PARAMETER_SCHEMA_VERSION = 30
 PARAMETER_SIGNATURE_ALIASES = {
     "maps.provider": "maps.output_provider",
 }
@@ -92,7 +92,7 @@ PARAMETER_SPECS = (
     ParameterSpec("audio.video_normalization_max_boost_db", "Audio", "Maximum video boost", 12.0, "float", "Maximum gain applied to a quiet video during normalization.", 0.0, 30.0, unit="dB"),
     ParameterSpec("audio.video_normalization_true_peak_db", "Audio", "Maximum true peak", -1.5, "float", "True-peak ceiling used while preparing normalized video audio.", -10.0, 0.0, unit="dBTP"),
 
-    ParameterSpec("timelapse.stage_duration_seconds", "Slide Show", "Stage duration", 30.0, "float", "Active arrow-motion duration for one stage.", 1.0, 3600.0, unit="s", subsection="Time-Lapse"),
+    ParameterSpec("timelapse.stage_duration_seconds", "Slide Show", "Stage duration", 30.0, "float", "Active arrow-motion duration for one consecutive stage block. Returning to a Stage later starts another block with the same duration.", 1.0, 3600.0, unit="s", subsection="Time-Lapse"),
     ParameterSpec("timelapse.media_min_fraction", "Slide Show", "Preferred media minimum", 0.5, "fraction", "Preferred minimum framed-media size; track-free space can allow larger media.", 0.01, 1.0, unit="%", subsection="Time-Lapse"),
     ParameterSpec("timelapse.adaptive_media_overlap", "Slide Show", "Automatically enlarge small Time-Lapse media", True, "bool", "Allow a photo or video to overlap the route at 48-60% size when track-clear placement would be smaller than 45%.", subsection="Time-Lapse"),
     ParameterSpec("timelapse.overview_as_media", "Slide Show", "Overview inside track map", True, "bool", "In single-window mode, show the overview as a framed medium over the stage map. Disable this to show it full-screen before the stage.", subsection="Time-Lapse"),
@@ -106,13 +106,16 @@ PARAMETER_SPECS = (
     ParameterSpec("slideshow.weather_primary", "Slide Show", "Primary weather value", "temperature", "choice", "Primary historical-weather value shown in the header.", choices=_choice(("temperature", "Temperature"), ("wind", "Wind"), ("precipitation", "Precipitation"), ("humidity", "Humidity"), ("pressure", "Pressure"), ("cloud_cover", "Cloud cover"), ("none", "None")), subsection="Header"),
     ParameterSpec("slideshow.weather_secondary", "Slide Show", "Secondary weather value", "none", "choice", "Optional second historical-weather value shown when space permits.", choices=_choice(("none", "None"), ("temperature", "Temperature"), ("wind", "Wind"), ("precipitation", "Precipitation"), ("humidity", "Humidity"), ("pressure", "Pressure"), ("cloud_cover", "Cloud cover")), subsection="Header"),
 
-    ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order maps by recording date or original track number.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
+    ParameterSpec("trackmaps.ordering", "Map Generation", "Track ordering", "track_number", "choice", "Order the batch map/table listing by recording date or original track number. New slideshow control files always follow the current Track Table order; this does not reorder playback.", choices=_choice(("date", "Date"), ("track_number", "Track number"))),
     ParameterSpec("trackmaps.route_source", "Map Generation", "Journey source", "automatic", "choice", "Use GPX tracks when available, require GPX tracks, or build date stages from media locations.", choices=_choice(("automatic", "Automatic"), ("gpx", "GPX tracks"), ("media", "Media locations"))),
     ParameterSpec("trackmaps.gpx_overlay", "Map Generation", "GPX route display", "line", "choice", "Draw the measured GPX route dynamically or hide it.", choices=_choice(("line", "Line"), ("hidden", "Hidden"))),
     ParameterSpec("trackmaps.media_overlay", "Map Generation", "Media route display", "dots", "choice", "Show measured photo positions as dots, connect them by an estimated line, or hide them.", choices=_choice(("dots", "Photo dots"), ("interpolated", "Interpolated line"), ("hidden", "Hidden"))),
     ParameterSpec("trackmaps.dynamic_header", "Map Generation", "Show map header", True, "bool", "Draw map titles and dates dynamically so their appearance can be changed without rebuilding the basemap."),
     ParameterSpec("trackmaps.track_title", "Slide Show", "Track title", "endpoint_places", "choice", "Choose the first GPX-stage header line: reverse-geocoded start and destination places, with the GPX track name as fallback, or always the original GPX track name.", choices=_choice(("endpoint_places", "Start - destination"), ("track_name", "GPX track name")), subsection="Header"),
     ParameterSpec("slideshow.remove_name_prefix", "Slide Show", "Remove track name prefix", "", "text", "Remove this exact leading text from displayed GPX track names, including the name fallback for endpoint titles. Does not change place names, tracks, or map files.", subsection="Header"),
+    ParameterSpec("slideshow.title_number", "Slide Show", "Title number", "stage", "choice", "Prefix the active track title with its Stage number or stable Track ID. Display only; filenames and identities never change.", choices=_choice(("none", "None"), ("stage", "Stage number"), ("track", "Track ID")), subsection="Header"),
+    ParameterSpec("slideshow.title_number_format", "Slide Show", "Number format", "period", "choice", "Use 7. TITLE / 7b. TITLE or #7 TITLE / #7b TITLE, without leading zeros.", choices=_choice(("period", "Number with period"), ("hash", "Hash prefix")), subsection="Header"),
+    ParameterSpec("slideshow.include_hidden_tracks", "Slide Show", "Include hidden tracks in slideshow", False, "bool", "Include hidden tracks and their associated media when starting generated-stage playback. Hidden routes remain gray and never contribute to stage statistics. Takes effect on the next Start; legacy authored control files retain their existing behavior."),
     ParameterSpec("trackmaps.image_size", "Map Generation", "Image size", "1920x1080", "image_size", "Output map dimensions in pixels."),
     ParameterSpec("trackmaps.zoom", "Map Generation", "Map zoom", 16, "int", "Requested basemap zoom level.", 0, 22),
     ParameterSpec("trackmaps.route_width", "Map Generation", "Route width", 4.0, "float", "Width of the plotted route line.", 0.1, 50.0),

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import urllib.error
 import unittest
+from unittest.mock import patch
 
 from network_availability import NetworkAvailabilityCoordinator, is_connectivity_error
 
@@ -26,16 +27,18 @@ class NetworkAvailabilityTests(unittest.TestCase):
             probe=lambda: False,
             clock=lambda: now[0],
         )
-        coordinator.report_failure(ConnectionError("offline"))
-        self.assertEqual(coordinator.state, "online")
+        # Fake-clock state tests must not leave a real probe loop running.
+        with patch.object(coordinator, "_ensure_monitor_locked"):
+            coordinator.report_failure(ConnectionError("offline"))
+            self.assertEqual(coordinator.state, "online")
 
-        now[0] = 14.9
-        coordinator.report_failure(ConnectionError("offline"))
-        self.assertEqual(coordinator.state, "online")
+            now[0] = 14.9
+            coordinator.report_failure(ConnectionError("offline"))
+            self.assertEqual(coordinator.state, "online")
 
-        now[0] = 15.1
-        coordinator.report_failure(ConnectionError("offline"))
-        self.assertEqual(coordinator.state, "offline")
+            now[0] = 15.1
+            coordinator.report_failure(ConnectionError("offline"))
+            self.assertEqual(coordinator.state, "offline")
 
 
 if __name__ == "__main__":

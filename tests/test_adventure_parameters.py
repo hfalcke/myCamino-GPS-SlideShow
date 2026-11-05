@@ -301,6 +301,8 @@ class AdventureParameterTests(unittest.TestCase):
                 "slideshow.font_style",
                 "slideshow.header_stage_name",
                 "slideshow.remove_name_prefix",
+                "slideshow.title_number",
+                "slideshow.title_number_format",
                 "slideshow.header_stage_name_style",
                 "slideshow.header_stage_statistics_style",
                 "slideshow.header_location_style",

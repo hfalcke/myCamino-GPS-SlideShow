@@ -418,8 +418,8 @@ class TypeAndStageTests(unittest.TestCase):
         self.assertEqual([row.cells[0] for row in summary_rows(multiple)[:2]], ["3a", "3c"])
         both = SummarySnapshot("Test", rows, SummaryOptions(columns=("stage", "track_id", "name")))
         self.assertEqual(both.options.columns, ("track_id", "name"))
-        self.assertEqual(report_stage_title(tracks[1], [tracks[1]], ids), "Stage 3: Track 2")
-        self.assertEqual(report_stage_title(tracks[2], [tracks[0], tracks[2]], ids), "Stage 3 · Track 3c: Track 3")
+        self.assertEqual(report_stage_title(tracks[1], [tracks[1]], ids), "Track 3b: Track 2")
+        self.assertEqual(report_stage_title(tracks[2], [tracks[0], tracks[2]], ids), "Track 3c: Track 3")
 
     def test_marker_sources_and_unassigned_fallback(self):
         from GPSTrackShow import time_lapse_marker_style

@@ -3833,7 +3833,35 @@ class PlotView(NSView):
             if menu.numberOfItems() > 0:
                 menu.addItem_(NSMenuItem.separatorItem())
             self.add_view_context_items(menu)
+        if workspace is not None and hasattr(workspace, "start_slideshow_at_track"):
+            track, _point = self.slideshow_context_selection(resolve_point=False)
+            if track is not None:
+                menu.addItem_(NSMenuItem.separatorItem())
+                item = self._plot_context_item(menu, "Start Slide Show Here", "startContextSlideShow:")
+                item.setToolTip_("Start at the selected waypoint's timestamp, or at the beginning of the selected track.")
         return menu
+
+    def slideshow_context_selection(self, *, resolve_point=True):
+        selected = self.controller.selected_tracks()
+        target = getattr(self, "context_target", None)
+        cursor = getattr(self, "cursor", None)
+        if target is not None and target[0] == "point":
+            if not resolve_point:
+                return target[1], None
+            if cursor is not None and cursor[2] is target[1] and cursor[0] == target[2]:
+                return target[1], cursor[1]
+            points = target[1].points()
+            return (target[1], points[target[2]]) if 0 <= target[2] < len(points) else (None, None)
+        context_track = getattr(self, "context_track_target", None)
+        track = context_track[0] if context_track else (selected[0] if len(selected) == 1 else None)
+        return track, cursor[1] if cursor is not None and cursor[2] is track else None
+
+    @objc.IBAction
+    def startContextSlideShow_(self, _sender):
+        workspace = self.adventure_workspace_delegate
+        track, point = self.slideshow_context_selection()
+        if workspace is not None and track is not None:
+            workspace.start_slideshow_at_track(track, point)
 
     def add_location_context_items(self, menu):
         coordinate_available = self.coordinate_for_view_point(self.context_location) is not None

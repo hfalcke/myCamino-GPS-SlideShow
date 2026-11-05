@@ -494,6 +494,7 @@ def parse_gpx_file(
         )
         original_sequence_number = internal_ids[source_sequence_number - 1]
         track["original_sequence_number"] = original_sequence_number
+        track["source_table_position"] = source_sequence_number - 1
         track["internal_id"] = original_sequence_number
         track["display_track_number"] = track_number(track_element, source_sequence_number)
         track["track_type"] = element_track_type(track_element)
@@ -913,7 +914,7 @@ def build_table_rows(tracks, include_original_sequence=False):
 
 # AI prompt: "Write a helper that builds structured JSON-ready summary data for
 # the sorted tracks, including table fields and extra timing/coordinate details."
-def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
+def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5, *, stage_filename_base=None):
     """Return compact summary data; point geometry remains in plot sidecars."""
     cumulative_km = 0.0
     track_items = []
@@ -923,6 +924,7 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
             {
                 "nr": track["table_number"],
                 "original_sequence_number": track["original_sequence_number"],
+                "source_table_position": track.get("source_table_position", len(track_items)),
                 "internal_id": track.get("internal_id", track["original_sequence_number"]),
                 "display_track_number": track.get("display_track_number", track["original_sequence_number"]),
                 "track_name": track["name"],
@@ -935,12 +937,14 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "hidden": bool(track.get("hidden")),
                 "stage_number": track.get("stage_number", track.get("original_sequence_number")),
                 "track_id": track.get("track_id"),
+                "segment_count": track.get("segment_count", len(track.get("segments", []))),
                 "track_plot_image_filename": track.get("track_plot_image_filename"),
                 "track_plot_time_lapse_image_filename": track.get("track_plot_time_lapse_image_filename"),
                 "track_data_sidecar": track.get("track_data_sidecar"),
                 "erstellungsdatum": format_datetime_local(track["time"]),
                 "dauer": format_duration(track["duration"]),
                 "laenge_km": round(track["length_km"], 1),
+                "length_km": float(track["length_km"]),
                 "ascent_m": round(track.get("ascent_m", 0.0), 1),
                 "descent_m": round(track.get("descent_m", 0.0), 1),
                 "moving_average_speed_kmh": (
@@ -974,9 +978,28 @@ def build_table_summary_data(gpx_path, tracks, fallback_walking_speed_kmh=3.5):
                 "processing_options": track.get("processing_options", {}),
             }
         )
+    from slideshow_stages import build_stage_groups, stage_statistics, track_identity
+
+    stages = []
+    for group in build_stage_groups(track_items, stage_filename_base or Path(gpx_path).stem):
+        first = group.members[0]
+        statistics = stage_statistics(group.members)
+        stages.append({
+            "stage_key": group.key,
+            "stage_number": first.get("stage_number"),
+            "stage_member_ids": [track_identity(row) for row in group.members],
+            "track_name": first.get("track_name"),
+            "track_id": first.get("track_id"),
+            "track_plot_image_filename": group.filename,
+            "track_plot_time_lapse_image_filename": time_lapse_track_map_name(group.filename),
+            "stage_statistics": statistics,
+            **statistics,
+        })
     return {
         "source_gpx": os.path.abspath(gpx_path),
+        "stage_plan_version": 1,
         "tracks": track_items,
+        "stages": stages,
     }
 
 
@@ -1366,8 +1389,9 @@ def render_track_plot(
     media_map_title="",
     map_cache_only=False,
     defer_install=False,
+    extent_media_points=(),
 ):
-    """Render one overview or one single-track plot."""
+    """Render a background for an overview, one track, or a shared stage."""
     automatic_overview_labels = overview_label_items == [["AUTOMATIC"]]
     if automatic_overview_labels:
         overview_label_items = [["LENGTH"], ["TRACKNAME"], ["DATE"]]
@@ -1486,15 +1510,23 @@ def render_track_plot(
     if not overview_mode and map_layout == "time-lapse":
         selected_extent, selected_optimized_corner, extent_shift, media_clear_options = optimized_track_extent(
             standard_extent,
-            projected_tracks[0],
+            [point for projected in projected_tracks for point in projected],
             (width_px, height_px),
             axes_box,
             track_edge_margin_fraction,
             DEFAULT_GRID_LONG_AXIS,
-            connect_points=media_map_date is None,
+            connect_points=media_map_date is None and len(tracks) == 1,
         )
     else:
         selected_extent = standard_extent
+    route_only_extent = selected_extent
+    if extent_media_points:
+        from slideshow_stages import bounded_media_extent
+        projected_media = [lonlat_to_web_mercator(float(point["lon"]), float(point["lat"]))
+                           for point in extent_media_points]
+        selected_extent, _accepted = bounded_media_extent(selected_extent, projected_media)
+        if selected_extent != route_only_extent:
+            media_clear_options = None
     min_x, max_x, min_y, max_y = selected_extent
     effective_zoom = fitted_zoom_level(
         min(int(zoom_level), int(maximum_map_zoom)),
@@ -1621,6 +1653,7 @@ def render_track_plot(
             "min_y": min_y,
             "max_y": max_y,
         },
+        "route_only_extent_mercator": dict(zip(("min_x", "max_x", "min_y", "max_y"), route_only_extent)),
         "basemap": provider_display_name("esri" if use_esri else map_provider),
         "map_attribution": provider_attribution(
             "esri" if use_esri else map_provider,
@@ -1675,11 +1708,14 @@ def render_track_plot(
         for track in tracks for _ in (track.get("segments") or [track.get("points", [])])]
     metadata["overlay_hidden_tracks"] = [bool(track.get("hidden"))
         for track in tracks for _ in (track.get("segments") or [track.get("points", [])])]
+    metadata["overlay_track_internal_ids"] = [track.get("internal_id", track.get("original_sequence_number"))
+        for track in tracks for _ in (track.get("segments") or [track.get("points", [])])]
     if overview_mode and overview_label_items:
         metadata["overview_dynamic_labels"] = [
             {
                 "lat": float(track["points"][len(track["points"]) // 2][0]),
                 "lon": float(track["points"][len(track["points"]) // 2][1]),
+                "internal_id": track.get("internal_id", track.get("original_sequence_number")),
                 "text": "\n".join(overview_label_lines(track, overview_label_items)),
             }
             for track in tracks
@@ -1688,13 +1724,13 @@ def render_track_plot(
     if not overview_mode:
         if media_clear_options is None:
             media_clear_options = clear_box_options_for_extent(
-                projected_tracks[0],
+                [point for projected in projected_tracks for point in projected],
                 selected_extent,
                 (width_px, height_px),
                 axes_box,
                 track_edge_margin_fraction,
                 DEFAULT_GRID_LONG_AXIS,
-                connect_points=media_map_date is None,
+                connect_points=media_map_date is None and len(tracks) == 1,
             )
         metadata.update(
             {
@@ -2465,6 +2501,8 @@ def refresh_track_presentation_metadata(context, *, read_metadata=None):
                 continue
             if not isinstance(data, dict) or (key != "track_data_sidecar" and not map_uses_dynamic_overlays(data)):
                 continue
+            if key != "track_data_sidecar" and data.get("stage_plan_version"):
+                continue  # Shared ownership is resolved from the current summary at playback.
             identity_key = "track_data_fingerprint" if key == "track_data_sidecar" else "track_geometry_fingerprint"
             if track.get(identity_key) and data.get(identity_key) != track[identity_key]:
                 continue
@@ -2600,6 +2638,7 @@ def execute_run_context(context, print_table_output=True, write_summary=True):
             gpx_path,
             tracks,
             args.fallback_walking_speed_kmh,
+            stage_filename_base=context["output_base"],
         )
         table_summary["gpx_processing"] = tracks[0].get("processing_options", {}) if tracks else {}
         processing_parameters = getattr(args, "adventure_processing_parameters", None)

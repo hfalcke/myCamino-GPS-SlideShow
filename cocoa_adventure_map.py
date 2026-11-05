@@ -380,6 +380,7 @@ class AdventureMapController(NSObject):
         self.control_assets_pending = False
         self.auto_processed_paths: set[Path] = set()
         self.pending_start_after_processing = False
+        self.pending_slideshow_track_start = None
         self.pending_control_media: set[Path] = set()
         self.pending_route_timing_media: set[Path] = set()
         self.pending_route_timing_track_nr: int | None = None
@@ -849,6 +850,9 @@ class AdventureMapController(NSObject):
             return False
         self._reset_optional_enrichment()
         self._stop_media_watcher()
+        self.pending_slideshow_track_start = None
+        self.pending_start_after_processing = False
+        self.slideshow_launch_queued = False
         self.startup_track_loading = False
         self.startup_media_scan_deferred = False
         self.startup_watcher_deferred = False
@@ -922,6 +926,9 @@ class AdventureMapController(NSObject):
         self.startup_pending_media_paths.clear()
         self.startup_media_extent_pending = False
         loaded_payload = dict(record.payload)
+        self.pending_slideshow_track_start = None
+        self.pending_start_after_processing = False
+        self.slideshow_launch_queued = False
         self.missing_gpx_reference = ""
         self.pending_gpx_recovery_review = False
         referenced_gpx = str(loaded_payload.get("gpx_file", "")).strip()
@@ -2900,6 +2907,7 @@ class AdventureMapController(NSObject):
         self.control_assets_pending = False
         controller = self.full_gui_controller
         if not bool(success) or controller is None:
+            self.pending_slideshow_track_start = None
             self._journal(
                 "Control File",
                 "The control file was not created because required maps are unavailable.",
@@ -2916,6 +2924,8 @@ class AdventureMapController(NSObject):
         self._start_optional_enrichment()
         if self.demo_coordinator is not None:
             self.demo_coordinator.controlFileDidOpen()
+        if getattr(self, "pending_slideshow_track_start", None) is not None:
+            self.performSelector_withObject_afterDelay_("finishPendingStart:", None, 0.0)
 
     @objc.python_method
     def _new_adventure_choice_for_gpx_drop(self, gpx_paths):
@@ -4826,10 +4836,25 @@ class AdventureMapController(NSObject):
     def slideshowDidFinishEnrichmentPriority_(self, _state=None):
         self.enrichment_queue.clear_playback_position()
 
+    @objc.python_method
+    def start_slideshow_at_track(self, track, point=None):
+        if not any(item is track for item in self.gpx_controller.tracks):
+            return
+        if track.hidden and not self.parameters.get("slideshow.include_hidden_tracks", False):
+            show_alert("This track is excluded from the slide show.",
+                       "Show the track, or enable Include hidden tracks in slideshow in Settings, before starting here.")
+            return
+        when = getattr(point, "time", None)
+        if point is not None and when is None:
+            self._journal("Start", "The selected waypoint has no timestamp; starting at the track beginning.")
+        self.startSlideShow_({"internal_id": track.nr, "timestamp": when.isoformat() if when else None})
+
     @objc.IBAction
     def startSlideShow_(self, _sender):
         controller = self.full_gui_controller
         if (self.slideshow_launch_queued or self.pending_start_after_processing
+                or (getattr(self, "control_assets_pending", False)
+                    and getattr(self, "pending_slideshow_track_start", None) is not None)
                 or (controller is not None and (
                     controller.slideshow_dependency_preflight_running
                     or controller.pending_slideshow_after_map_generation
@@ -4837,6 +4862,7 @@ class AdventureMapController(NSObject):
                 ))):
             self._journal("Start", "Slide-show preparation or playback is already active.")
             return
+        self.pending_slideshow_track_start = dict(_sender) if isinstance(_sender, dict) else None
         self.slideshow_launch_queued = True
         self._set_background_progress("slideshow", "Preparing slideshow…", 0, 0)
         # Let AppKit paint the feedback before any synchronous window setup/save.
@@ -4844,9 +4870,12 @@ class AdventureMapController(NSObject):
 
     @objc.IBAction
     def beginSlideShowPreparation_(self, _sender):
+        if not self.slideshow_launch_queued:
+            return
         self.slideshow_launch_queued = False
-        if self.adventure_file is None or self.gpx_controller.dirty:
+        if self.adventure_file is None or self.gpx_controller.dirty or getattr(self, "pending_slideshow_track_start", None) is not None:
             if not self.saveWorkspace_(None):
+                self.pending_slideshow_track_start = None
                 self._clear_background_progress("slideshow")
                 return
         if self.processing_active or self.pending_media:
@@ -4864,17 +4893,27 @@ class AdventureMapController(NSObject):
         controller = self._ensure_full_gui(show_window=False, preparing_slideshow=True)
         self._journal("Slideshow startup", f"Controller setup: {time.perf_counter() - started:.2f}s")
         if controller is None:
+            self.pending_slideshow_track_start = None
             self._clear_background_progress("slideshow")
             return
         self._clear_background_progress("slideshow")
         self._synchronize_control_file_from_full_gui()
         control_path = controller._control_file_path()
         if control_path is not None and control_path.is_file():
-            controller.startSlideShow_(None)
+            selection = getattr(self, "pending_slideshow_track_start", None)
+            self.pending_slideshow_track_start = None
+            if selection is not None:
+                controller._start_slide_show(transient_resume_position={"track_start": selection})
+            else:
+                controller.startSlideShow_(None)
         else:
             controller._finish_slideshow_startup("Preparing maps and the initial control file before playback.")
             self._journal("Start", "Preparing maps and the initial control file before playback.")
-            controller.makePlots_(None)
+            if getattr(self, "pending_slideshow_track_start", None) is not None:
+                self.control_assets_pending = True
+                controller._start_assistant_control_assets_creation()
+            else:
+                controller.makePlots_(None)
 
     @objc.IBAction
     def showHelp_(self, _sender):
@@ -4914,6 +4953,7 @@ class AdventureMapController(NSObject):
                 "Click a track to select its table row without changing the map view. Command-click a track to add or remove it from the selection. The table and elevation profile follow this selection. Click an already selected track to choose a waypoint; Shift-click keeps its marker behavior. Marked ranges are red.\n\n"
                 "Choose Show Hidden Tracks in the map context menu to display hidden tracks in dashed light gray. Visible tracks use their type colors, selected tracks have a stronger outlined stroke, and marked ranges stay red. This does not change saved visibility or include hidden tracks in totals. Choose Hide Hidden Tracks to hide them again.\n\n"
                 "Double-click a track to open the Track Table. Double-click it there to open its Waypoint Table. Right-click a track on the map to open either table, fit the view, or show the synchronized Elevation Profile.\n\n"
+                "Start Slide Show Here in the map context menu starts at the selected track's beginning. If a waypoint is selected, its timestamp sets the start; a waypoint without time falls back to the track beginning. Required maps and track data are prepared through the normal startup workflow.\n\n"
                 "Double-click empty map space, or press Command-0, to return to the Adventure overview at its remembered zoom and position. Choose Fit Entire Adventure in the map context menu to fit all visible tracks. Drag the map or use two-finger scrolling to pan.\n\n"
                 "MEDIA\n\n"
                 "Crowded media are grouped and expand into thumbnails when enough room is available. Click a group to select it; Command-click adds or removes groups. Command-drag from empty map space draws a selection rectangle. Selected media have a red outline.\n\n"
@@ -5454,7 +5494,7 @@ def build_adventure_map_menu(controller):
     help_menu.addItem_(NSMenuItem.separatorItem())
     help_menu.addItem_(menu_item("Adventure Map Help", "showHelp:", controller))
     help_menu.addItem_(menu_item("GPX Editor Help", "showGPXEditorHelp:", controller))
-    help_menu.addItem_(menu_item("Control Directive Help", "showControlDirectiveHelp:", controller))
+    help_menu.addItem_(menu_item("Control File Help", "showControlDirectiveHelp:", controller))
     help_menu.addItem_(menu_item("Music and Narration Help", "showAudioDirectiveHelp:", controller))
     return main_menu
 

@@ -168,9 +168,8 @@ def report_stage_title(track, tracks, ids=None):
     if stage is None:
         number = track_number(track.element, track.nr)
         return f"Track {number}: {track.name}" if number is not None else track.name
-    count = sum(stage_number(item.element, item.nr) == stage for item in tracks)
     identity = (ids or track_ids(tracks))[track.nr]
-    return f"Stage {stage}" + (f" \u00b7 Track {identity}" if count > 1 else "") + f": {track.name}"
+    return f"Track {identity}: {track.name}"
 
 
 def track_color(track, parameters=None):

@@ -44,6 +44,24 @@ def atomic_write_json(path: str | os.PathLike, payload: Any) -> Path:
     return destination
 
 
+def atomic_write_text(path: str | os.PathLike, text: str) -> Path:
+    """Durably install a complete UTF-8 document beside its destination."""
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
+
+
 def parameter_subset_payload(values: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
     """Return a versioned parameter payload containing only the requested keys."""
     selected = {}

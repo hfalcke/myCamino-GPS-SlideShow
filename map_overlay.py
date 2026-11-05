@@ -65,7 +65,7 @@ def overlay_track_presentation(metadata: dict, segment_index: int, stage_kind: s
     hidden = metadata.get("overlay_hidden_tracks") or []
     kind = types[segment_index] if segment_index < len(types) else metadata.get("track_type")
     is_hidden = bool(hidden[segment_index]) if segment_index < len(hidden) else False
-    if stage_kind == "gpx_track":
+    if stage_kind == "gpx_track" and not metadata.get("stage_plan_version"):
         kind = metadata.get("track_type", kind)
         is_hidden = bool(metadata.get("hidden", is_hidden))
     return kind, is_hidden

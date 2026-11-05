@@ -379,6 +379,70 @@ needed, requests both map layouts, and atomically installs the list. Map errors
 are accumulated in `media_map_options["map_failures"]`; a valid list remains
 installed while map readiness stays incomplete.
 
+## Track-ordered slideshow stage plans
+
+`slideshow_stages.py` is the shared pure planner. Compact GPX summaries declare
+`stage_plan_version: 1` and preserve `source_table_position` independently of
+internal identity and visible numbering. Groups own shared backgrounds; consecutive
+blocks follow source row order. `GetGeoLocations.ProjectMapPlan` carries both
+date-only media-map specs and stage-map specs through the existing renderer.
+Stage asset keys depend on member identities, not mutable Stage numbers or titles.
+The same compact summary contains a point-free `stages` manifest for preview
+titles, shared statistics and map lookup; detailed member geometry stays in the
+canonical derived sidecars.
+
+New control files contain one `#Map` per block and structural member rows such as
+`#Track: internal_id=12`. Optional relations are `before`, `after`, `between`,
+`adjacent_before`, and `adjacent_after`; omitted relation means `route`.
+Track contexts cannot carry REPEAT_UNTIL and are declared non-repeatable in the
+shared directive capability registry. Editor, update preview and serializer retain
+them. Legacy files without contexts retain their original date/map behavior.
+
+Ownership is determined before hidden filtering. Timed matches take precedence;
+same-date boundaries use elapsed-time proximity and GPS tie-breaking. The old
+adjacent-day radius rule remains the final attachment pass. Leftovers form date
+blocks. Runtime exclusion leaves authored rows and structural labels intact.
+Reviewed legacy conversion carries original directive/media bundles, including
+intentional duplicate media rows; it never runs merely to open a project.
+
+The player loads verified canonical per-track derived data into its existing
+five-stage LRU. Block fractions are monotonic while real member timestamps may
+go backward. Binary-search interpolation never crosses member/segment boundaries.
+Repeated blocks reuse the retained base image; their gray masks are presentation
+overlays. Stage totals use actual visibility, not those gray masks. Resume
+checkpoints are version 7, with control-row and block-fraction context.
+
+`missing_stage_route_insertions` detects absent media-free member contexts in
+unambiguous consecutive source blocks. Startup raises `StageRoutesIncomplete`
+and defers the original request through the existing control-review path, not
+map generation. Only explicit Apply writes the proposed contexts. Repeated or
+ambiguous authored blocks and explicitly disabled routes are not guessed.
+
+Retained views reuse the pilgrim's fixed start-to-end marker heading for every
+directional symbol. Resolve endpoints from the active member's cached span,
+not from the combined block, and project them only when track/map context changes.
+The overview uses the same member reference in its own map projection. Individual
+GPS edges never change heading or mirroring; vector markers still account for
+their artwork's native facing direction. Timeline interpolation does no heading
+calculation, and no map, thumbnail or sidecar work occurs on ticks.
+
+Map **Start Slide Show Here** captures an immutable internal ID and optional
+waypoint timestamp, then uses the existing Save/required-preparation path.
+`slideshow_track_start_position` resolves the current control-file block only
+after preparation and review. The internal `--resume-track-start` payload is
+consumed once against prepared member spans; it does not rewrite control rows,
+timestamps or resume history. Standard playback chooses the next authored media
+row at or after the selected time; Time-Lapse starts at the exact member fraction.
+
+`bounded_media_extent` preserves aspect and caps every edge at 20 percent of the
+route-only extent. Only the resulting fitted extent affects the map signature:
+new media already inside the frame, or beyond the admission limit, needs no new
+background. Startup also checks authored attached-media coordinates against that
+extent, without decoding media or requesting enrichment.
+Stage/map regeneration uses the existing provider checks, serialized renderer,
+tile cache and atomic PNG/JSON installation; failures preserve the previous pair.
+Title-number settings are display-only and do not enter asset identities.
+
 ## Adventure Files
 
 Adventure files use the extension `.adv`, contain JSON, and require
@@ -459,7 +523,7 @@ obsolete asynchronous geometry loads. Only the settled stage reconstructs
 CONTROL/audio state and prepares media timing and profiles. A five-stage LRU
 retains validated map assets, rendered overlays, profiles, and media queues.
 `PlaybackPhase` records Intro information, clean Intro overview, Stage Map,
-marked Stage Overview, Media, and Time-Lapse states. Resume files version 2
+marked Stage Overview, Media, and Time-Lapse states. Resume files version 7
 store the stage, phase, medium position, style, and Time-Lapse progress rather
 than depending on retained rendered-image history.
 

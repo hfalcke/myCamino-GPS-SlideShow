@@ -23,7 +23,8 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import MappingProxyType
 from adventure_parameters import normalize_speedometer_mode
-from track_name_utils import display_track_name
+from track_name_utils import display_track_name, numbered_track_title
+from slideshow_stages import parse_track_context, filter_hidden_track_lines, normalize_track_start, track_control_start, track_identity
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -324,7 +325,7 @@ WIPE_TRANSITION_STEPS = 100
 FIRST_STAGE_OVERVIEW_STARTUP_GRACE_SECONDS = 1.0
 FULLSCREEN_PLAYBACK_START_TIMEOUT_SECONDS = 3.0
 INTRO_AUTO_ADVANCE_SECONDS = 10.0
-SLIDESHOW_CHECKPOINT_VERSION = 6
+SLIDESHOW_CHECKPOINT_VERSION = 7
 MUSIC_RESUME_STATE_VERSION = 1
 DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
@@ -346,7 +347,7 @@ KEY_HELP_LINES = [
     "space                 start show / next image / pause auto",
     "right / down          next image",
     "left / up             previous image",
-    "Cmd + arrows          jump to previous/next stage",
+    "Cmd + arrows          jump to previous/next stage block",
     "m                     toggle auto/manual mode",
     "e                     toggle elevation profiles",
     "g                     toggle GPS route tracking",
@@ -354,7 +355,7 @@ KEY_HELP_LINES = [
     "a                     toggle background audio",
     "n                     toggle normalized/original video audio",
     "+ / -                 change duration in auto mode",
-    "Cmd-+ / Cmd--         change Time-Lapse stage duration",
+    "Cmd-+ / Cmd--         change Time-Lapse block duration",
     "Ctrl-+ / Ctrl--       increase/decrease all playback audio",
     "c                     cycle the presentation header: Full, Off, Simple",
     "s                     open Slide Show settings in the myCamino window",
@@ -594,6 +595,7 @@ class Config:
     resume_progress: Optional[float] = None
     resume_media_index: Optional[int] = None
     resume_phase: Optional[str] = None
+    resume_track_start: Optional[dict] = None
     resume_audio_state: Optional[dict] = None
     resume_narration_state: Optional[dict] = None
     resume_control_state: Optional[dict] = None
@@ -632,6 +634,9 @@ class Config:
     map_header_font_factor: float = 2.2
     track_title_mode: str = "endpoint_places"
     track_name_prefix: str = ""
+    title_number: str = "stage"
+    title_number_format: str = "period"
+    include_hidden_tracks: bool = False
     adventure_title: str = ""
     adventure_description: str = ""
     adventure_title_image: Optional[Path] = None
@@ -757,6 +762,7 @@ class TimeLapseStage:
     media_date_texts: list[Optional[str]]
     relation: Optional[str] = None
     next_date_text: Optional[str] = None
+    member_contexts: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -768,6 +774,7 @@ class StageDescriptor:
     directive: MapDirective
     date_text: Optional[str]
     media_indexes: tuple[int, ...]
+    member_contexts: tuple = ()
 
 
 @dataclass
@@ -970,6 +977,8 @@ def parse_stage_descriptors(lines: list[str]) -> list[StageDescriptor]:
                 directive,
                 date_text,
                 media_indexes,
+                tuple(context for index in range(map_index + 1, next_index)
+                      if (context := parse_track_context(lines[index])) is not None),
             )
         )
     return stages
@@ -1014,6 +1023,7 @@ def parse_args(argv: list[str]) -> Config:
     parser.add_argument("--resume-index", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--resume-progress", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--resume-media-index", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--resume-track-start", type=json.loads, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--resume-phase",
         choices=[phase.value for phase in PlaybackPhase],
@@ -1156,6 +1166,9 @@ def parse_args(argv: list[str]) -> Config:
         help="GPX-stage title source: reverse-geocoded endpoints or the GPX track name.",
     )
     parser.add_argument("--remove-track-name-prefix", default="", help="Remove this exact prefix from displayed GPX track names only.")
+    parser.add_argument("--title-number", choices=("none", "stage", "track"), default="stage", help="Prefix titles with the Stage number or stable Track ID.")
+    parser.add_argument("--title-number-format", choices=("period", "hash"), default="period", help="Format title numbering as 7. TITLE or #7 TITLE.")
+    parser.add_argument("--include-hidden-tracks", action=argparse.BooleanOptionalAction, default=False, help="Include hidden tracks in modern stage playback (gray; excluded from statistics).")
     parser.add_argument(
         "--arrow-length",
         type=float,
@@ -1229,6 +1242,12 @@ def parse_args(argv: list[str]) -> Config:
         parser.error("--resume-progress must be between 0 and 1")
     if args.resume_media_index is not None and args.resume_media_index < 0:
         parser.error("--resume-media-index must be at least 0")
+    try:
+        args.resume_track_start = normalize_track_start(args.resume_track_start)
+        if args.resume_track_start is not None and args.resume_index is None:
+            raise ValueError("--resume-track-start requires --resume-index")
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.duration <= 0:
         parser.error("--duration must be greater than 0")
     if args.transition_duration_ms < 0:
@@ -1396,6 +1415,7 @@ def parse_args(argv: list[str]) -> Config:
         resume_progress=args.resume_progress,
         resume_media_index=args.resume_media_index,
         resume_phase=args.resume_phase,
+        resume_track_start=args.resume_track_start,
         resume_audio_state=resume_audio_state,
         resume_narration_state=resume_narration_state,
         resume_control_state=resume_control_state,
@@ -1430,6 +1450,9 @@ def parse_args(argv: list[str]) -> Config:
         map_header_font_factor=float(args.map_header_font_factor),
         track_title_mode=str(args.track_title),
         track_name_prefix=str(args.remove_track_name_prefix),
+        title_number=str(args.title_number),
+        title_number_format=str(args.title_number_format),
+        include_hidden_tracks=bool(args.include_hidden_tracks),
         adventure_title=str(args.adventure_title or "").strip(),
         adventure_description=str(args.adventure_description or "").strip(),
         adventure_title_image=(
@@ -1587,6 +1610,7 @@ def config_from_options(
     resume_progress: Optional[float] = None,
     resume_media_index: Optional[int] = None,
     resume_phase: Optional[str] = None,
+    resume_track_start: Optional[dict] = None,
     resume_audio_state: Optional[dict] = None,
     resume_narration_state: Optional[dict] = None,
     resume_control_state: Optional[dict] = None,
@@ -1621,6 +1645,9 @@ def config_from_options(
     map_header_font_factor: float = 2.2,
     track_title_mode: str = "endpoint_places",
     track_name_prefix: str = "",
+    title_number: str = "stage",
+    title_number_format: str = "period",
+    include_hidden_tracks: bool = False,
     adventure_title: str = "",
     adventure_description: str = "",
     adventure_title_image: str | Path | None = None,
@@ -1646,6 +1673,9 @@ def config_from_options(
         raise ValueError("resume_media_index must be at least 0")
     if resume_phase is not None and resume_phase not in {phase.value for phase in PlaybackPhase}:
         raise ValueError(f"unsupported resume phase: {resume_phase}")
+    resume_track_start = normalize_track_start(resume_track_start)
+    if resume_track_start is not None and resume_index is None:
+        raise ValueError("resume_track_start requires resume_index")
     if duration <= 0:
         raise ValueError("duration must be greater than 0")
     if transition_duration_ms < 0:
@@ -1696,6 +1726,8 @@ def config_from_options(
         raise ValueError("header_mode must be full, off, or simple")
     if track_title_mode not in {"endpoint_places", "track_name"}:
         raise ValueError("track_title_mode must be endpoint_places or track_name")
+    if title_number not in {"none", "stage", "track"} or title_number_format not in {"period", "hash"}:
+        raise ValueError("Invalid title numbering option")
     if arrow_length < 0:
         raise ValueError("arrow_length must be 0 or greater")
     if font_size < 8:
@@ -1815,6 +1847,7 @@ def config_from_options(
         resume_progress=resume_progress,
         resume_media_index=resume_media_index,
         resume_phase=resume_phase,
+        resume_track_start=resume_track_start,
         resume_audio_state=(
             dict(resume_audio_state)
             if isinstance(resume_audio_state, dict)
@@ -1861,6 +1894,9 @@ def config_from_options(
         map_header_font_factor=float(map_header_font_factor),
         track_title_mode=str(track_title_mode),
         track_name_prefix=str(track_name_prefix),
+        title_number=str(title_number),
+        title_number_format=str(title_number_format),
+        include_hidden_tracks=bool(include_hidden_tracks),
         adventure_title=str(adventure_title or "").strip(),
         adventure_description=str(adventure_description or "").strip(),
         adventure_title_image=(
@@ -2819,6 +2855,8 @@ def write_json_atomic(path: Path, payload: dict) -> None:
 
 def timed_points_from_metadata(metadata: Optional[dict]) -> list[dict]:
     """Load sidecar timing, falling back safely to distance-based estimates."""
+    if isinstance(metadata, dict) and isinstance(metadata.get("block_timeline_points"), list):
+        return metadata["block_timeline_points"]
     payload = metadata.get("timed_track_points") if isinstance(metadata, dict) else None
     points = []
     if isinstance(payload, list):
@@ -3017,13 +3055,27 @@ def interpolate_timeline_state(points: list[dict], fraction: float) -> Optional[
             "lon": point["lon"],
             "time": point.get("time"),
             "stage_distance_km": safe_float(point.get("cumulative_distance_km")) or 0.0,
+            "profile_distance_km": safe_float(point.get("profile_distance_km")),
             "elevation_m": safe_float(point.get("elevation_m")),
             "running_speed_kmh": safe_float(point.get("running_speed_kmh")),
+            "member_id": point.get("member_id"),
+            "has_absolute_time": bool(point.get("has_absolute_time", True)),
         }
     fraction = max(0.0, min(1.0, fraction))
     first_time, last_time = points[0].get("time"), points[-1].get("time")
     target_time = None
-    if not isinstance(first_time, datetime) or not isinstance(last_time, datetime) or any(
+    if "block_fraction" in points[0]:
+        import bisect
+        lower = max(0, min(len(points) - 2, bisect.bisect_right(
+            points, fraction, key=lambda point: point["block_fraction"]) - 1))
+        start, end = points[lower], points[lower + 1]
+        span = end["block_fraction"] - start["block_fraction"]
+        local = max(0., min(1., (fraction - start["block_fraction"]) / span)) if span > 0 else 0.
+        if start.get("member_id") != end.get("member_id") or start.get("segment_index") != end.get("segment_index"):
+            return interpolate_timeline_state([end if local >= 1 else start], 0)
+        if isinstance(start.get("time"), datetime) and isinstance(end.get("time"), datetime):
+            target_time = start["time"] + (end["time"] - start["time"]) * local
+    elif not isinstance(first_time, datetime) or not isinstance(last_time, datetime) or any(
         not isinstance(point.get("time"), datetime) for point in points
     ):
         position = fraction * (len(points) - 1)
@@ -3071,8 +3123,13 @@ def interpolate_timeline_state(points: list[dict], fraction: float) -> Optional[
         "lon": start["lon"] + (end["lon"] - start["lon"]) * local,
         "time": target_time,
         "stage_distance_km": start_distance + (end_distance - start_distance) * local,
+        "profile_distance_km": (float(start["profile_distance_km"]) +
+            (float(end["profile_distance_km"]) - float(start["profile_distance_km"])) * local
+            if start.get("profile_distance_km") is not None and end.get("profile_distance_km") is not None else None),
         "elevation_m": elevation_m,
         "running_speed_kmh": running_speed_kmh,
+        "member_id": start.get("member_id"),
+        "has_absolute_time": bool(start.get("has_absolute_time", True) and end.get("has_absolute_time", True)),
     }
 
 
@@ -3119,6 +3176,9 @@ def photo_track_state(
     if not isinstance(metadata, dict):
         return None
     points = metadata.get("timed_track_points")
+    if metadata.get("stage_plan_version") and metadata.get("block_timeline_points"):
+        span = metadata.get("block_member_spans", {}).get(metadata.get("active_member_id"))
+        points = span[3] if span and len(span) > 3 else []
     candidates: list[dict] = []
     for point in points if isinstance(points, list) else ():
         if not isinstance(point, dict):
@@ -3132,9 +3192,10 @@ def photo_track_state(
             "lat": point_lat,
             "lon": point_lon,
             "stage_km": max(0.0, stage_km),
+            "profile_distance_km": point.get("profile_distance_km"),
             "elevation_m": safe_float(point.get("elevation_m", point.get("elevation"))),
             "running_speed_kmh": safe_float(point.get("running_speed_kmh")),
-            "time": parse_iso_datetime(point.get("time_iso", point.get("time"))),
+            "time": point["time"] if isinstance(point.get("time"), datetime) else parse_iso_datetime(point.get("time_iso", point.get("time"))),
         })
     selected = None
     if candidates and isinstance(media_datetime, datetime):
@@ -3382,13 +3443,15 @@ def dynamic_stage_header_lines(
     payload = metadata if isinstance(metadata, dict) else {}
     scene = scene_from_metadata(payload, show_header=True)
     if scene.stage_kind == "gpx_track":
-        return track_header_lines(
+        lines = track_header_lines(
             payload,
             getattr(config, "track_title_mode", "endpoint_places"),
             omit_date=clock_visible,
             details_override=relation_title,
             remove_prefix=getattr(config, "track_name_prefix", ""),
         )
+        return ((numbered_track_title(lines[0], payload, getattr(config, "title_number", "stage"),
+                                      getattr(config, "title_number_format", "period")),) + lines[1:]) if lines else lines
     if scene.stage_kind == "media_stage" and clock_visible:
         stage_title = str(
             payload.get("media_stage_name")
@@ -3417,7 +3480,8 @@ def selected_stage_header_lines(
             details_override=relation_title,
             remove_prefix=getattr(config, "track_name_prefix", ""),
         )
-        stage_name = available[0] if available else ""
+        stage_name = numbered_track_title(available[0], payload, getattr(config, "title_number", "stage"),
+                                          getattr(config, "title_number_format", "period")) if available else ""
         track_details = available[1] if len(available) > 1 else ""
     else:
         stage_name = str(
@@ -4297,12 +4361,13 @@ if APPKIT_AVAILABLE:
             )
 
         def fixedStageTangent(self):
-            """Keep the arrow perpendicular to the stage start/end line."""
-            if len(self.route_points) < 2:
+            """Keep all marker styles stable along the active track's start/end line."""
+            points = marker_reference_points(self.map_metadata, self.route_points)
+            if len(points) < 2:
                 return None
             endpoints = [
-                self.imagePixelForLat_lon_(self.route_points[0]["lat"], self.route_points[0]["lon"]),
-                self.imagePixelForLat_lon_(self.route_points[-1]["lat"], self.route_points[-1]["lon"]),
+                self.imagePixelForLat_lon_(points[0]["lat"], points[0]["lon"]),
+                self.imagePixelForLat_lon_(points[-1]["lat"], points[-1]["lon"]),
             ]
             if any(point is None for point in endpoints):
                 return None
@@ -4352,12 +4417,12 @@ if APPKIT_AVAILABLE:
                     )
                 draw_marker_at(view_point[0], view_pixel_y, view_height, self.marker_color, self.marker_radius)
             else:
-                if self.marker_style in {"hiking", "horse", "rest", "sightseeing", "bus", "train", "metro"}:
+                if self.marker_style == "rest":
                     if self.arrow_factor > 0:
                         size = max(24, self.marker_radius * 5) * self.arrow_factor
                         center = offset_track_symbol_center(view_point, size, self.marker_radius, display_tangent)
                         draw_cocoa_symbol(self.marker_style, center, size, ns_color(self.marker_color))
-                elif self.marker_style in {"bike", "car", "plane"}:
+                elif self.marker_style in DIRECTIONAL_VECTOR_MARKERS and self.arrow_factor > 0:
                     draw_transport_marker_at(
                         view_point[0],
                         view_pixel_y,
@@ -4778,7 +4843,8 @@ if APPKIT_AVAILABLE:
                         max(1.5, line_width * 0.55),
                     )
             if self.media_marker_latlon is not None:
-                marker_pixel = self.imagePixelForLat_lon_(self.media_marker_latlon[0], self.media_marker_latlon[1])
+                marker_pixel = (self.imagePixelForLat_lon_(self.media_marker_latlon[0], self.media_marker_latlon[1])
+                                if map_coordinate_is_visible(self.map_metadata, *self.media_marker_latlon) else None)
                 if (
                     marker_pixel is not None
                     and 0.0 <= float(marker_pixel[0]) <= float(image_w)
@@ -4890,6 +4956,18 @@ def safe_float(value: object) -> Optional[float]:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def map_coordinate_is_visible(metadata, latitude, longitude):
+    """Geographic visibility excludes unused image/header margins as well."""
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("extent_mercator"), dict):
+        return False
+    try:
+        x, y = lonlat_to_web_mercator(float(longitude), float(latitude))
+        bounds = metadata["extent_mercator"]
+        return bounds["min_x"] <= x <= bounds["max_x"] and bounds["min_y"] <= y <= bounds["max_y"]
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def relation_title_band(
@@ -5192,6 +5270,13 @@ def endpoint_track_tangent(metadata: dict, image) -> Optional[tuple[float, float
     return tangent_x / length, tangent_y / length
 
 
+def marker_reference_points(metadata: Optional[dict], route_points: list[dict]) -> list[dict]:
+    """Reuse the active member's cached route for a stable, per-track heading."""
+    metadata = metadata or {}
+    span = metadata.get("block_member_spans", {}).get(metadata.get("active_member_id"))
+    return span[2] if span is not None else route_points
+
+
 def endpoint_tangent(points: list[tuple[float, float]]) -> Optional[tuple[float, float]]:
     """Return one fixed tangent along the line joining route start and end."""
     if len(points) < 2:
@@ -5349,16 +5434,19 @@ def draw_pilgrim_at_marker(
         NSGraphicsContext.restoreGraphicsState()
 
 
+DIRECTIONAL_VECTOR_MARKERS = frozenset({"hiking", "horse", "sightseeing", "bus", "train", "metro", "bike", "car", "plane"})
+
+
 def transport_marker_orientation(
     style: str,
     tangent: Optional[tuple[float, float]],
 ) -> tuple[float, bool]:
     """Use the pilgrim convention so vehicles follow the route without inversion."""
-    if style in {"bike", "car"}:
+    if style not in {"plane", "train", "metro"}:
         return pilgrim_orientation_for_tangent(tangent)
     direction = tangent or (1.0, 0.0)
     return (
-        math.degrees(math.atan2(-float(direction[1]), float(direction[0]))),
+        math.degrees(math.atan2(-float(direction[1]), float(direction[0]))) + (90. if style in {"train", "metro"} else 0.),
         False,
     )
 
@@ -5374,19 +5462,20 @@ def draw_transport_marker_at(
     size_factor: float,
 ) -> None:
     """Draw the shared vector artwork aligned with the route."""
-    if style not in {"bike", "car", "plane"} or size_factor <= 0:
+    if style not in DIRECTIONAL_VECTOR_MARKERS or size_factor <= 0:
         return
     size = max(float(radius) * 5, float(image_height) * .055 * size_factor)
     rotation, mirrored = transport_marker_orientation(style, tangent)
+    center = offset_track_symbol_center((pixel_x, image_height - pixel_y), size, radius, tangent)
     NSGraphicsContext.saveGraphicsState()
     try:
         transform = NSAffineTransform.transform()
-        transform.translateXBy_yBy_(pixel_x, image_height - pixel_y)
+        transform.translateXBy_yBy_(*center)
         transform.rotateByDegrees_(rotation)
         if mirrored:
             transform.scaleXBy_yBy_(-1., 1.)
         transform.concat()
-        draw_cocoa_symbol(style, (0, radius * 1.5 + size * .3), size, ns_color(color))
+        draw_cocoa_symbol(style, (0, 0), size, ns_color(color))
     finally:
         NSGraphicsContext.restoreGraphicsState()
 
@@ -5694,8 +5783,17 @@ def colorized_profile_image(image, metadata, color):
     result.lockFocus()
     try:
         ns_color(color).setStroke()
-        for segment in segments:
+        for segment_index, segment in enumerate(segments):
             path = NSBezierPath.bezierPath()
+            if metadata.get("stage_plan_version"):
+                types = metadata.get("profile_track_types", [])
+                hidden = metadata.get("profile_hidden_tracks", [])
+                kind = types[segment_index] if segment_index < len(types) else "unassigned"
+                muted = hidden[segment_index] if segment_index < len(hidden) else False
+                palette = metadata.get("profile_type_colors", ())
+                ns_color((.67, .67, .67, 1.) if muted else type_route_color(kind, palette)).setStroke()
+                if muted:
+                    path.setLineDash_count_phase_([5., 4.], 2, 0.)
             for index, (distance, elevation) in enumerate(segment):
                 point = (left + (distance - x_min) / max(1e-9, x_max - x_min) * width,
                          bottom + (elevation - y_min) / max(1e-9, y_max - y_min) * height)
@@ -7007,7 +7105,7 @@ def draw_overview_overlay(
     header_background: bool = True,
     show_caption: bool = True,
 ):
-    """Return the overview map with endpoints and date drawn on top."""
+    """Highlight current-block routes in red, with inactive members in gray."""
     debug_print(config, "Drawing overview overlay with track endpoints and date")
     result = copy_image(overview_image)
     width, height = image_size_tuple(result)
@@ -7015,7 +7113,8 @@ def draw_overview_overlay(
 
     scene = scene_from_metadata(track_metadata, show_header=False)
     projected_segments: list[list[tuple[float, float]]] = []
-    for segment in scene.segments:
+    projected_hidden = []
+    for segment_index, segment in enumerate(scene.segments):
         projected = []
         for point in segment:
             try:
@@ -7036,12 +7135,15 @@ def draw_overview_overlay(
                 continue
         if projected:
             projected_segments.append(projected)
+            _kind, hidden = overlay_track_presentation(track_metadata, segment_index, scene.stage_kind)
+            projected_hidden.append(hidden)
 
     if scene.stage_kind != "media_stage":
         projected_segments = adaptive_overview_segments(projected_segments)
 
+    highlighted_segments = []
     if scene.stage_kind == "media_stage":
-        for segment in projected_segments:
+        for segment_index, segment in enumerate(projected_segments):
             for pixel_x, pixel_y in segment:
                 draw_marker_at(
                     pixel_x,
@@ -7052,18 +7154,29 @@ def draw_overview_overlay(
                     COLOR_NAMES["white"],
                 )
     else:
-        for segment in projected_segments:
+        # Paint inactive members first so coincident routes cannot cover the
+        # current block's red highlight.
+        draw_order = [index for index, hidden in enumerate(projected_hidden) if hidden]
+        draw_order.extend(index for index, hidden in enumerate(projected_hidden) if not hidden)
+        for segment_index in draw_order:
+            segment = projected_segments[segment_index]
             if len(segment) < 2:
                 continue
+            hidden = projected_hidden[segment_index]
+            if not hidden:
+                highlighted_segments.append(segment)
             path = NSBezierPath.bezierPath()
             configure_round_stroke(path)
+            if hidden:
+                path.setLineDash_count_phase_([5., 4.], 2, 0.)
             path.moveToPoint_((segment[0][0], height - segment[0][1]))
             for pixel_x, pixel_y in segment[1:]:
                 path.lineToPoint_((pixel_x, height - pixel_y))
             ns_color(COLOR_NAMES["black"]).setStroke()
             path.setLineWidth_(max(5.0, width * 0.0055))
             path.stroke()
-            ns_color(COLOR_NAMES["red"]).setStroke()
+            route_color = (.67, .67, .67, 1.) if hidden else COLOR_NAMES["red"]
+            ns_color(route_color).setStroke()
             path.setLineWidth_(max(3.0, width * 0.0035))
             path.stroke()
 
@@ -7098,7 +7211,7 @@ def draw_overview_overlay(
             config.dot_size,
             config.arrow_length,
         )
-    elif (direction := overview_route_direction(projected_segments)) is not None:
+    elif (direction := overview_route_direction(highlighted_segments)) is not None:
         direction_point, tangent = direction
         cue_length = max(18.0, min(42.0, width * 0.018))
         half_length = cue_length / 2.0
@@ -7236,7 +7349,7 @@ def draw_dynamic_map_overlay(
                 continue
             projected.append((pixel_x, pixel_y))
         if projected:
-            if scene.stage_kind == "overview":
+            if scene.stage_kind == "overview" or metadata.get("stage_plan_version"):
                 projected = simplify_display_path(projected)
             projected_segments.append(projected)
 
@@ -7244,6 +7357,9 @@ def draw_dynamic_map_overlay(
     try:
         if scene.mode in {"line", "interpolated"}:
             for index, segment in enumerate(projected_segments):
+                excluded = metadata.get("overlay_excluded_tracks", [])
+                if index < len(excluded) and excluded[index]:
+                    continue
                 kind, hidden = overlay_track_presentation(metadata, index, scene.stage_kind)
                 route_color = config.media_point_color if scene.stage_kind == "media_stage" else type_route_color(kind, config.track_type_colors)
                 if len(segment) < 2:
@@ -7491,6 +7607,204 @@ def try_read_plot_metadata(path: Path) -> Optional[dict]:
         return None
 
 
+def overview_hidden_track_policy(metadata, rows, include_hidden=False):
+    """Filter real hidden routes without confusing block-gray presentation."""
+    if not isinstance(metadata, dict) or include_hidden:
+        return metadata
+    current = {track_identity(row): row for row in rows}
+    identities = metadata.get("overlay_track_internal_ids")
+    owners = metadata.get("tracks") or rows
+    if not identities:
+        identities = [track_identity(row) for row in owners
+                      for _ in range(int(current.get(track_identity(row), row).get("segment_count", 1)))]
+    excluded = {identity for identity, row in current.items() if row.get("hidden")}
+    result = {**metadata, "overlay_excluded_tracks": [identity in excluded for identity in identities]}
+    labels = metadata.get("overview_dynamic_labels")
+    if isinstance(labels, list):
+        result["overview_dynamic_labels"] = [label for index, label in enumerate(labels)
+            if (label.get("internal_id", track_identity(owners[index]) if index < len(owners) else 0)) not in excluded]
+    return result
+
+
+def load_shared_stage_members(metadata, directory, current_rows=()):
+    """Load verified per-track payloads while retaining one shared map geometry."""
+    combined = dict(metadata)
+    included = set(metadata.get("stage_included_member_ids", []))
+    if not included:
+        raise RuntimeError("Shared stage map has no valid member ownership; prepare its maps again")
+    members = {}
+    current = {track_identity(row): row for row in current_rows}
+    profile_segments, map_segments, profile_members = [], [], []
+    distance = 0.
+    source_members = metadata.get("stage_members", [])
+    ordered_members = sorted(enumerate(source_members), key=lambda item:
+        (current.get(track_identity(item[1]), item[1]).get("source_table_position", item[0]), item[0]))
+    for _position, row in ordered_members:
+        if track_identity(row) not in included:
+            continue
+        updated_row = current.get(track_identity(row))
+        if updated_row and row.get("track_geometry_fingerprint") != updated_row.get("track_geometry_fingerprint"):
+            raise RuntimeError("Shared stage map has outdated route geometry; prepare its maps again")
+        row = {**row, **current.get(track_identity(row), {})}
+        identity = track_identity(row)
+        path = Path(str(row.get("track_data_sidecar") or ""))
+        if not path.is_absolute():
+            path = directory / path
+        data = try_read_plot_metadata(path)
+        if (not isinstance(data, dict) or not row.get("track_data_fingerprint")
+                or data.get("track_data_fingerprint") != row["track_data_fingerprint"]):
+            raise RuntimeError(f"Stage member {row.get('track_id') or identity} needs current derived track data")
+        member = {**data, **row, "track_length_km": row.get("length_km", row.get("laenge_km", 0)),
+                  "track_duration": row.get("dauer", ""), "member_distance_offset_km": distance}
+        points = timed_points_from_metadata(member)
+        segments, profiles = {}, {}
+        for point in points:
+            index = point.get("segment_index", 0)
+            segments.setdefault(index, []).append([point["lat"], point["lon"]])
+            if point.get("elevation_m") is not None:
+                profiles.setdefault(index, []).append({
+                    "cumulative_distance_km": distance + float(point.get("cumulative_distance_km") or 0),
+                    "elevation_m": point["elevation_m"]})
+        member["track_segments"] = list(segments.values())
+        member["track_points"] = [point for segment in segments.values() for point in segment]
+        members[identity] = member
+        map_segments.extend(segments.values())
+        profile_segments.extend(profiles.values())
+        profile_members.extend([identity] * len(profiles))
+        distance += float(member.get("track_length_km") or 0)
+    combined["stage_member_data"] = members
+    combined["track_segments"] = map_segments
+    combined["track_points"] = [point for segment in map_segments for point in segment]
+    combined["processed_track_segments"] = profile_segments
+    combined["profile_member_ids"] = profile_members
+    from slideshow_stages import stage_statistics
+    combined["stage_statistics"] = stage_statistics([
+        {**row, **current.get(track_identity(row), {})} for row in metadata.get("stage_members", [])])
+    combined["overlay_track_types"] = [members.get(identity, {}).get("track_type", "unassigned")
+                                       for identity in metadata.get("overlay_track_internal_ids", [])]
+    return combined
+
+
+def active_stage_member(metadata, identity):
+    """Switch header/marker context, never replace the stage's map geometry."""
+    if metadata.get("active_member_id") == identity:
+        return metadata
+    member = metadata.get("stage_member_data", {}).get(identity)
+    if not member:
+        return metadata
+    updated = dict(metadata)
+    for key in ("track_name", "track_type", "hidden", "stage_number", "track_id", "internal_id",
+                "display_track_number", "track_endpoint_places", "running_speed", "start_time", "end_time",
+                "has_absolute_time", "start_point", "end_point"):
+        if key in member:
+            updated[key] = member[key]
+        elif key == "track_endpoint_places":
+            updated.pop(key, None)
+    updated["active_member_id"] = identity
+    updated["track_start_time"] = member.get("start_time")
+    updated["track_end_time"] = member.get("end_time")
+    stats = metadata.get("stage_statistics", {})
+    updated["track_length_km"] = float(stats.get("track_length_km") or 0)
+    duration = float(stats.get("duration_seconds") or 0)
+    updated["track_duration"] = f"{int(duration // 3600)}:{int(duration % 3600 // 60):02d}"
+    for key in ("ascent_m", "descent_m"):
+        updated[key] = stats.get(key)
+    return updated
+
+
+def shared_stage_block_metadata(metadata, lines, map_index, end_index):
+    """Compile monotonic block fractions while retaining each real track clock."""
+    if not isinstance(metadata, dict) or not metadata.get("stage_member_data"):
+        return metadata
+    contexts = [(index, parse_track_context(lines[index])) for index in range(map_index + 1, end_index)]
+    contexts = [(index, context) for index, context in contexts if context is not None]
+    if not contexts:
+        # A singleton background annotated by preparation can still be used by
+        # an unchanged legacy control file, with its original one-track clock.
+        identity = next(iter(metadata["stage_member_data"]), None)
+        if identity is None:
+            return metadata
+        member = metadata["stage_member_data"][identity]
+        return active_stage_member({**metadata, "timed_track_points": member.get("timed_track_points", [])}, identity)
+    member_data = metadata["stage_member_data"]
+    routes = [(index, context[0]) for index, context in contexts
+              if context[1] == "route" and context[0] in member_data]
+    weights, route_points = [], []
+    for index, identity in routes:
+        member = member_data[identity]
+        points = timed_points_from_metadata(member)
+        elapsed = (points[-1]["time"] - points[0]["time"]).total_seconds() if len(points) >= 2 else 0
+        weights.append(max(elapsed, float(member.get("track_length_km") or 0) / 3.5 * 3600 if elapsed <= 0 else 0, 1))
+        route_points.append(points)
+    total = sum(weights) or 1.
+    already = {context[0] for line in lines[:map_index]
+               if (context := parse_track_context(line)) is not None and context[1] == "route"}
+    stage_distance = sum(float(member.get("track_length_km") or 0) for identity, member in member_data.items()
+                         if identity in already and not member.get("hidden"))
+    timeline, spans, endpoints, preceding_endpoints = [], {}, {}, {}
+    start_fraction = 0.
+    for piece, ((context_row, identity), points, weight) in enumerate(zip(routes, route_points, weights)):
+        end_fraction = start_fraction + weight / total
+        elapsed = (points[-1]["time"] - points[0]["time"]).total_seconds() if len(points) > 1 else 0
+        member = member_data[identity]
+        preceding_endpoints[identity] = timeline[-1] if timeline else None
+        first_point_index = len(timeline)
+        for point_index, point in enumerate(points):
+            local = ((point["time"] - points[0]["time"]).total_seconds() / elapsed if elapsed > 0
+                     else point_index / max(1, len(points) - 1))
+            timeline.append({**point, "member_id": identity,
+                             "segment_index": piece * 1_000_000 + point.get("segment_index", 0),
+                             "block_fraction": start_fraction + local * (end_fraction - start_fraction),
+                             "profile_distance_km": float(member.get("member_distance_offset_km") or 0) + float(point.get("cumulative_distance_km") or 0),
+                             "cumulative_distance_km": stage_distance + (0 if member.get("hidden")
+                                 else float(point.get("cumulative_distance_km") or 0))})
+        spans[identity] = (start_fraction, end_fraction, points, timeline[first_point_index:])
+        if len(timeline) > first_point_index:
+            endpoints[identity] = (timeline[first_point_index], timeline[-1])
+        if not member.get("hidden"):
+            stage_distance += float(member.get("track_length_km") or 0)
+        start_fraction = end_fraction
+    result = {**metadata, "block_timeline_points": timeline, "block_member_spans": spans,
+              "block_member_endpoints": endpoints, "block_preceding_endpoints": preceding_endpoints,
+              "block_maximum_running_speed_kmh": max((safe_float(point.get("running_speed_kmh")) or 0. for point in timeline), default=0.),
+              "active_member_id": None,
+              "block_stage_prior_distance_km": sum(float(member.get("track_length_km") or 0)
+                  for identity, member in member_data.items() if identity in already and not member.get("hidden")),
+              "block_member_ids": tuple(identity for _index, identity in routes),
+              "block_contexts": tuple(contexts)}
+    active = set(result["block_member_ids"])
+    actual_hidden = {identity for identity, member in member_data.items() if member.get("hidden")}
+    result["overlay_hidden_tracks"] = [identity not in active or identity in actual_hidden
+                                       for identity in metadata.get("overlay_track_internal_ids", [])]
+    result["profile_track_types"] = [member_data[identity].get("track_type", "unassigned")
+                                     for identity in metadata.get("profile_member_ids", [])]
+    result["profile_hidden_tracks"] = [identity not in active or identity in actual_hidden
+                                       for identity in metadata.get("profile_member_ids", [])]
+    return active_stage_member(result, contexts[0][1][0])
+
+
+def track_start_in_stage(metadata, lines, map_index, end_index, request):
+    """Resolve an exact walker time using the already prepared member timeline."""
+    request = normalize_track_start(request)
+    identity = request["internal_id"]
+    spans = (metadata or {}).get("block_member_spans", {})
+    if spans:
+        if identity not in spans:
+            raise ValueError("The selected track is not part of this slideshow block.")
+        start, end, points, _decorated = spans[identity]
+        row = next(index + 1 for index, context in metadata["block_contexts"] if context == (identity, "route"))
+    else:
+        start, end, points, row = 0., 1., timed_points_from_metadata(metadata), map_index + 1
+    when = parse_iso_datetime(request["timestamp"]) if request["timestamp"] else None
+    fraction = 0.
+    if when is not None and len(points) >= 2 and any(point.get("has_absolute_time") for point in points):
+        first = points[0]["time"].astimezone(UTC)
+        elapsed = (points[-1]["time"].astimezone(UTC) - first).total_seconds()
+        fraction = max(0., min(1., (when.astimezone(UTC) - first).total_seconds() / elapsed)) if elapsed > 0 else 0.
+    return {"member_id": identity, "fraction": start + fraction * (end - start),
+            "row_index": min(row, end_index), "timestamp": when}
+
+
 def combined_stage_metadata(
     track_path: Path,
     summary_row: object,
@@ -7499,6 +7813,9 @@ def combined_stage_metadata(
     """Load map metadata and its map-independent derived track payload."""
     metadata = try_read_plot_metadata(track_path.with_suffix(".json"))
     row = summary_row if isinstance(summary_row, dict) else None
+    if isinstance(metadata, dict) and metadata.get("stage_plan_version"):
+        return load_shared_stage_members(metadata, track_path.parent,
+                                         row.get("_stage_tracks", ()) if row else ())
     if row is not None:
         metadata = dict(metadata or {})
         for key in ("ascent_m", "descent_m", "track_extent_mercator", "track_type", "hidden", "stage_number", "track_id", "internal_id", "display_track_number"):
@@ -9911,6 +10228,7 @@ class GPSTrackShowApp:
         self.photo_presenter: Optional[CocoaImagePresenter] = None
         self.map_presenter: Optional[CocoaImagePresenter] = None
         self.playlist_lines = self._load_playlist_lines()
+        self.uses_member_contexts = any(parse_track_context(line) for line in self.playlist_lines)
         self.stages = parse_stage_descriptors(self.playlist_lines)
         self.default_caption_font = CaptionFontState(
             float(config.font_size),
@@ -10039,6 +10357,7 @@ class GPSTrackShowApp:
         self.resume_progress_pending = config.resume_progress
         self.resume_media_index_pending = config.resume_media_index
         self.resume_phase_pending = config.resume_phase
+        self.resume_track_start_pending = config.resume_track_start
         self.resume_standard_map_index_pending = None
         self.resume_start_pending = config.resume_index is not None
         self.completed_naturally = False
@@ -10167,6 +10486,18 @@ class GPSTrackShowApp:
             line = raw_line.strip()
             if line:
                 lines.append(line)
+        if any(parse_track_context(line) for line in lines):
+            overview = next((line.partition(":")[2].strip() for line in lines
+                             if line.startswith("#Overviewmap:")), "")
+            if overview:
+                path = resolve_path(self._track_asset_dir(), overview)
+                summary = path.with_name(f"{path.stem}-summary.json")
+                try:
+                    rows = json.loads(summary.read_text(encoding="utf-8")).get("tracks", [])
+                except (OSError, ValueError):
+                    rows = []
+                self.playlist_track_rows = rows
+                lines = filter_hidden_track_lines(lines, rows, getattr(self.config, "include_hidden_tracks", False))
         return lines
 
     def _track_asset_dir(self) -> Path:
@@ -10225,8 +10556,11 @@ class GPSTrackShowApp:
                     if entry is not None and entry.map_path == self.current_track_path:
                         entry.elevation_profile = self.current_elevation_profile_image
         metadata = getattr(self, "current_track_metadata", None) or {}
+        if metadata.get("stage_plan_version"):
+            metadata["profile_type_colors"] = self.config.track_type_colors
         color = type_route_color(metadata.get("track_type"), self.config.track_type_colors)
-        key = (id(metadata), color)
+        key = ((metadata.get("stage_geometry_signature"), tuple(metadata.get("block_member_ids", ())),
+                tuple(self.config.track_type_colors)) if metadata.get("stage_plan_version") else (id(metadata), color))
         previous = getattr(self, "current_profile_colored_image", None)
         if self.current_elevation_profile_image is not previous or key != getattr(self, "current_profile_color_key", None):
             source = (getattr(self, "current_profile_source_image", None) if self.current_elevation_profile_image is previous
@@ -10256,7 +10590,8 @@ class GPSTrackShowApp:
         if not isinstance(state, dict):
             return None
         distance = safe_float(
-            state.get("stage_distance_km", state.get("stage_km"))
+            state.get("profile_distance_km") if state.get("profile_distance_km") is not None
+            else state.get("stage_distance_km", state.get("stage_km"))
         )
         elevation = safe_float(state.get("elevation_m"))
         if distance is None:
@@ -10498,6 +10833,8 @@ class GPSTrackShowApp:
         row = self._summary_tracks_by_map_filename().get(
             canonical_track_map_name(track_path.name)
         )
+        if row is None:
+            row = {"_stage_tracks": (self._load_compact_track_summary() or {}).get("tracks", [])}
         return combined_stage_metadata(
             track_path,
             row,
@@ -10524,7 +10861,14 @@ class GPSTrackShowApp:
             ):
                 filename = row.get(key)
                 if isinstance(filename, str) and filename.strip():
-                    result[canonical_track_map_name(Path(filename).name)] = row
+                    result[canonical_track_map_name(Path(filename).name)] = {**row, "_stage_tracks": rows}
+        for stage in summary.get("stages", []):
+            if not isinstance(stage, dict):
+                continue
+            filename = stage.get("track_plot_image_filename")
+            if isinstance(filename, str) and filename.strip():
+                key = canonical_track_map_name(Path(filename).name)
+                result[key] = {**result.get(key, {}), **stage, "_stage_tracks": rows}
         self.summary_tracks_by_map_cache = result
         return result
 
@@ -10550,6 +10894,7 @@ class GPSTrackShowApp:
             self._path_signature(track_path),
             self._path_signature(track_path.with_suffix(".json")),
             self._path_signature(derived_path),
+            self._path_signature(getattr(self, "compact_track_summary_path", None)),
             self._path_signature(self.config.inputlist),
             (
                 tuple(getattr(self.config, "route_color", ())),
@@ -10621,21 +10966,27 @@ class GPSTrackShowApp:
         row = self._summary_tracks_by_map_filename().get(
             canonical_track_map_name(track_path.name)
         )
-        try:
-            image = load_nsimage(track_path)
-        except Exception as exc:
-            warn_message(f"could not load stage map {track_path}: {exc}")
-            return None
-        metadata = combined_stage_metadata(
-            track_path,
-            row,
-            self.compact_track_summary_path,
-        )
+        if row is None:
+            row = {"_stage_tracks": (self._load_compact_track_summary() or {}).get("tracks", [])}
+        signature = self._stage_asset_signature(track_path, row)
+        shared = next((entry for entry in self.stage_presentation_cache.values()
+                       if entry.map_path == track_path and entry.signature == signature), None)
+        if shared is not None:
+            image, metadata = shared.image, shared.metadata
+        else:
+            try:
+                image = load_nsimage(track_path)
+            except Exception as exc:
+                warn_message(f"could not load stage map {track_path}: {exc}")
+                return None
+            metadata = combined_stage_metadata(track_path, row, self.compact_track_summary_path)
+        metadata = shared_stage_block_metadata(metadata, self.playlist_lines,
+                                              stage.map_index, stage.next_index)
         return self._store_stage_entry(
             stage_index,
             prefer_time_lapse,
             StagePresentationCacheEntry(
-                signature=self._stage_asset_signature(track_path, row),
+                signature=signature,
                 map_path=track_path,
                 image=image,
                 metadata=metadata,
@@ -10987,13 +11338,22 @@ class GPSTrackShowApp:
             status_presenter.set_status_text(label)
             status_presenter.set_status_visible(True)
 
-    def _stage_summary_row(self, stage_index: int) -> Optional[dict]:
+    def _stage_summary_row(self, stage_index: int, *, last_member=False) -> Optional[dict]:
         if not 0 <= stage_index < len(self.stages):
             return None
         filename = canonical_track_map_name(
             Path(self.stages[stage_index].directive.filename).name
         )
         row = self._summary_tracks_by_map_filename().get(filename)
+        contexts = self.stages[stage_index].member_contexts
+        if isinstance(row, dict) and contexts:
+            identity = contexts[-1 if last_member else 0][0]
+            member = next((item for item in row.get("_stage_tracks", [])
+                           if track_identity(item) == identity), None)
+            if member is not None:
+                # Stage totals are shared; the active track still owns its
+                # title, date, type and numbering when a stage is revisited.
+                row = {**row, **member, **row.get("stage_statistics", {})}
         return row if isinstance(row, dict) else None
 
     def _cancel_stage_navigation_handles(self) -> None:
@@ -11038,13 +11398,20 @@ class GPSTrackShowApp:
         stage_km = self._summary_track_length(row)
         total_before = 0.0
         summary_by_map = self._summary_tracks_by_map_filename()
-        for preceding in self.stages[:stage_index]:
-            if preceding.directive.is_special:
-                continue
-            preceding_row = summary_by_map.get(
-                canonical_track_map_name(Path(preceding.directive.filename).name)
-            )
-            total_before += self._summary_track_length(preceding_row)
+        if any(stage.member_contexts for stage in self.stages):
+            identities = {identity for preceding in self.stages[:stage_index]
+                          for identity, relation in preceding.member_contexts if relation == "route"}
+            total_before = sum(self._summary_track_length(item)
+                for item in (self._load_compact_track_summary() or {}).get("tracks", [])
+                if track_identity(item) in identities and not item.get("hidden"))
+        else:
+            for preceding in self.stages[:stage_index]:
+                if preceding.directive.is_special:
+                    continue
+                preceding_row = summary_by_map.get(
+                    canonical_track_map_name(Path(preceding.directive.filename).name)
+                )
+                total_before += self._summary_track_length(preceding_row)
         metrics = format_time_lapse_metrics(total_before, 0.0, None) if stage_km else ()
         state = self._build_header_state(lines, metrics, row)
         for presenter, role in (
@@ -13659,10 +14026,12 @@ class GPSTrackShowApp:
             if stage.directive.relation in {None, ""}
         ] or list(self.stages)
         summary_by_map = self._summary_tracks_by_map_filename()
-        for stage in endpoint_stages:
-            row = summary_by_map.get(
-                canonical_track_map_name(Path(stage.directive.filename).name)
-            )
+        modern = any(stage.member_contexts for stage in endpoint_stages)
+        endpoint_indexes = {stage.map_index for stage in endpoint_stages}
+        for stage_index, stage in enumerate(self.stages):
+            if stage.map_index not in endpoint_indexes:
+                continue
+            row = self._stage_summary_row(stage_index)
             distance = self._summary_track_length(row)
             if distance > 0.0:
                 total_distance += distance
@@ -13670,10 +14039,17 @@ class GPSTrackShowApp:
             start_place, destination = stage_name_endpoints(
                 row.get("track_name") if isinstance(row, dict) else None
             )
+            if modern:
+                last_row = self._stage_summary_row(stage_index, last_member=True)
+                _unused_start, destination = stage_name_endpoints(
+                    last_row.get("track_name") if isinstance(last_row, dict) else None)
             if first_stage_place is None and start_place:
                 first_stage_place = start_place
             if destination:
                 last_stage_place = destination
+        if modern:
+            total_distance = self._time_lapse_total_distance()
+            has_distance = total_distance > 0
         if not summary_by_map and endpoint_stages:
             endpoint_metadata = []
             for stage in (endpoint_stages[0], endpoint_stages[-1]):
@@ -14204,6 +14580,7 @@ class GPSTrackShowApp:
         stage_index: int,
         resume_media: Optional[tuple[int, PhotoListEntry]] = None,
         start_fraction: float = 0.0,
+        track_start=None,
     ) -> None:
         """Start the shared timed scheduler with Standard media presentation."""
         if not 0 <= stage_index < len(self.stages):
@@ -14222,6 +14599,7 @@ class GPSTrackShowApp:
             resume_media=resume_media,
             relation=stage.directive.relation,
             standard_tracking=True,
+            track_start=track_start,
         )
 
     def _start_standard_route_tracking_at_current_media(self) -> None:
@@ -14275,7 +14653,8 @@ class GPSTrackShowApp:
     ) -> TimeLapseStage:
         stage_date_text = self.current_date
         date_text = stage_date_text
-        media_indexes, media_entries, media_date_texts = [], [], []
+        media_indexes, media_entries, media_date_texts, member_contexts = [], [], [], []
+        member_context = None
         next_index = len(self.playlist_lines)
         for index in range(map_index + 1, len(self.playlist_lines)):
             line = self.playlist_lines[index]
@@ -14285,10 +14664,13 @@ class GPSTrackShowApp:
                 break
             if content.startswith("#Datum:"):
                 date_text = content.partition(":")[2].strip()
+            elif parse_track_context(content):
+                member_context = parse_track_context(content)
             elif not content.startswith("#"):
                 media_indexes.append(index)
                 media_entries.append(parse_photo_entry(line))
                 media_date_texts.append(date_text)
+                member_contexts.append(member_context)
         return TimeLapseStage(
             map_index,
             next_index,
@@ -14299,10 +14681,25 @@ class GPSTrackShowApp:
             media_date_texts,
             relation,
             date_text,
+            tuple(member_contexts),
         )
 
     def _time_lapse_distance_before_stage(self, map_index: int) -> float:
         """Sum the route lengths of preceding control-file stages."""
+        modern = getattr(self, "uses_member_contexts", None)
+        if modern is None:
+            modern = any(parse_track_context(line) for line in self.playlist_lines)
+        if modern:
+            cached = getattr(self, "stage_start_distance_cache", {})
+            if map_index in cached:
+                return cached[map_index] - float((self.current_track_metadata or {}).get("block_stage_prior_distance_km", 0))
+            summary = self._load_compact_track_summary() or {}
+            identities = {context[0] for line in self.playlist_lines[:map_index]
+                          if (context := parse_track_context(line)) is not None and context[1] == "route"}
+            distance = sum(self._summary_track_length(row) for row in summary.get("tracks", [])
+                           if track_identity(row) in identities and not row.get("hidden"))
+            cached[map_index] = distance
+            return distance - float((self.current_track_metadata or {}).get("block_stage_prior_distance_km", 0))
         if map_index in self.stage_start_distance_cache:
             return self.stage_start_distance_cache[map_index]
         summary_by_map = self._summary_tracks_by_map_filename()
@@ -14348,7 +14745,17 @@ class GPSTrackShowApp:
 
     def _time_lapse_total_distance(self) -> float:
         """Return the known complete route length without opening per-stage sidecars."""
-        if self.tour_total_distance_cache is not None:
+        if getattr(self, "tour_total_distance_cache", None) is not None:
+            return self.tour_total_distance_cache
+        modern = getattr(self, "uses_member_contexts", None)
+        if modern is None:
+            modern = any(parse_track_context(line) for line in self.playlist_lines)
+        if modern:
+            summary = self._load_compact_track_summary() or {}
+            identities = {context[0] for line in self.playlist_lines
+                          if (context := parse_track_context(line)) is not None and context[1] == "route"}
+            self.tour_total_distance_cache = sum(self._summary_track_length(row) for row in summary.get("tracks", [])
+                                               if track_identity(row) in identities and not row.get("hidden"))
             return self.tour_total_distance_cache
         summary_by_map = self._summary_tracks_by_map_filename()
         total_km = 0.0
@@ -14435,6 +14842,21 @@ class GPSTrackShowApp:
                 return weather
         return None
 
+    def _current_attached_media_context(self):
+        stage = getattr(self, "time_lapse_stage", None)
+        medium = getattr(self, "time_lapse_current_media", None)
+        if stage is None or medium is None:
+            return None
+        contexts = getattr(stage, "member_contexts", ())
+        if not contexts:
+            return None
+        try:
+            position = stage.media_indexes.index(medium[0])
+        except ValueError:
+            return None
+        context = contexts[position] if position < len(contexts) else None
+        return context if context and context[1] != "route" else None
+
     def _set_time_lapse_views(self):
         special_stage = self.time_lapse_stage is not None and self.time_lapse_stage.relation is not None
         media_map_stage = (
@@ -14452,19 +14874,35 @@ class GPSTrackShowApp:
             self.time_lapse_points,
             self.time_lapse_progress,
         )
+        attached = self._current_attached_media_context()
+        if marker_state is not None and marker_state.get("member_id") is not None and attached is None:
+            self.current_track_metadata = active_stage_member(self.current_track_metadata, marker_state["member_id"])
+        if attached:
+            identity, relation = attached
+            self.current_track_metadata = active_stage_member(self.current_track_metadata, identity)
+            spans = self.current_track_metadata.get("block_member_spans", {})
+            span = spans.get(identity)
+            if span:
+                if relation in {"after", "adjacent_after"}:
+                    pair = self.current_track_metadata.get("block_member_endpoints", {}).get(identity)
+                    marker_state = interpolate_timeline_state([pair[1]], 0) if pair else None
+                else:
+                    preceding = self.current_track_metadata.get("block_preceding_endpoints", {}).get(identity)
+                    marker_state = interpolate_timeline_state([preceding], 0) if preceding else None
         arrow = None if marker_state is None else (marker_state["lat"], marker_state["lon"])
         stage_distance_km = 0.0 if marker_state is None else float(marker_state.get("stage_distance_km") or 0.0)
-        if marker_state is not None and stage_distance_km <= 0.0 and self.time_lapse_progress > 0.0:
+        if (marker_state is not None and stage_distance_km <= 0.0 and self.time_lapse_progress > 0.0
+                and not (self.current_track_metadata or {}).get("stage_plan_version")):
             stage_distance_km = track_length_from_metadata(self.current_track_metadata) * self.time_lapse_progress
         elevation_m = None if marker_state is None else safe_float(marker_state.get("elevation_m"))
         running_speed_kmh = None if marker_state is None else safe_float(marker_state.get("running_speed_kmh"))
         speed_metadata = self.current_track_metadata.get("running_speed", {}) if isinstance(self.current_track_metadata, dict) else {}
         speedometer_maximum = nice_speedometer_maximum(
             safe_float(speed_metadata.get("maximum_running_speed_kmh"))
-            or max(
+            or ((self.current_track_metadata or {}).get("block_maximum_running_speed_kmh") if "block_maximum_running_speed_kmh" in (self.current_track_metadata or {}) else max(
                 (safe_float(point.get("running_speed_kmh")) or 0.0 for point in self.time_lapse_points),
                 default=0.0,
-            )
+            ))
         )
         metrics_lines = format_time_lapse_metrics(
             self.time_lapse_stage_start_distance_km + stage_distance_km,
@@ -14472,6 +14910,8 @@ class GPSTrackShowApp:
             elevation_m,
         ) if not special_stage else ()
         marker_time = None if marker_state is None else marker_state.get("time")
+        if marker_state is not None and not marker_state.get("has_absolute_time", True):
+            marker_time = None
         media_time = None
         if self.time_lapse_current_media is not None:
             media_time = self.time_lapse_media_datetimes.get(self.time_lapse_current_media[0])
@@ -14480,7 +14920,9 @@ class GPSTrackShowApp:
         uses_late_media_time = isinstance(display_time, datetime) and display_time != marker_time
         if isinstance(display_time, datetime) and (
             uses_late_media_time
-            or any(point.get("has_absolute_time") for point in self.time_lapse_points)
+            or (bool(marker_state and marker_state.get("has_absolute_time"))
+                if (self.current_track_metadata or {}).get("stage_plan_version")
+                else any(point.get("has_absolute_time") for point in self.time_lapse_points))
         ):
             local_marker_time = display_time.astimezone() if display_time.tzinfo is not None else display_time
             self.time_lapse_clock_time = (local_marker_time.hour, local_marker_time.minute)
@@ -14605,7 +15047,7 @@ class GPSTrackShowApp:
             overview_view.configureWithImage_metadata_routePoints_arrowLatLon_mediaImage_highlightRoute_(
                 overview_map_image,
                 self.current_overview_metadata,
-                self.time_lapse_points,
+                marker_reference_points(self.current_track_metadata, self.time_lapse_points),
                 arrow,
                 None,
                 False,
@@ -14800,6 +15242,42 @@ class GPSTrackShowApp:
         self.time_lapse_media_cursor = 0
         self._clear_time_lapse_views()
 
+    def _apply_selected_track_start(self, map_index, *, standard=False):
+        request = getattr(self, "resume_track_start_pending", None)
+        if request is None:
+            return None
+        stage_index = stage_index_for_playlist_row(self.stages, map_index)
+        stage = self.stages[stage_index]
+        anchor = track_start_in_stage(self.current_track_metadata, self.playlist_lines,
+                                      map_index, stage.next_index, request)
+        if standard and anchor["timestamp"] is not None:
+            date_text = self.current_date
+            member = (self.current_track_metadata or {}).get("stage_member_data", {}).get(anchor["member_id"], self.current_track_metadata)
+            points = timed_points_from_metadata(member)
+            first_row = anchor["row_index"]
+            anchor["row_index"] = stage.next_index
+            for index in range(first_row, stage.next_index):
+                line = self.playlist_lines[index]
+                context = parse_track_context(line)
+                if context and context[0] != anchor["member_id"]:
+                    anchor["row_index"] = index
+                    break
+                if line.startswith("#Datum:"):
+                    date_text = line.partition(":")[2].strip()
+                elif line and not line.startswith("#"):
+                    when = self._time_lapse_media_datetime(parse_photo_entry(line), points, date_text)
+                    if when is not None and when >= anchor["timestamp"]:
+                        anchor["row_index"] = index
+                        break
+        self.resume_track_start_pending = None
+        self.current_track_metadata = active_stage_member(self.current_track_metadata, anchor["member_id"])
+        self._reconstruct_control_state_before(anchor["row_index"])
+        GPSTrackShowApp._sync_audio_row(self, anchor["row_index"] - 1)
+        for line in self.playlist_lines[map_index:anchor["row_index"]]:
+            if line.startswith("#Datum:"):
+                self.current_date = line.partition(":")[2].strip()
+        return anchor
+
     def _start_time_lapse_stage(
         self,
         map_index: int,
@@ -14808,6 +15286,7 @@ class GPSTrackShowApp:
         resume_media: Optional[tuple[int, PhotoListEntry]] = None,
         relation: Optional[str] = None,
         standard_tracking: bool = False,
+        track_start=None,
     ):
         if self.current_overview_image is None:
             raise RuntimeError("encountered #Map before #Overviewmap")
@@ -14857,6 +15336,14 @@ class GPSTrackShowApp:
         self.current_track_path = cache_entry.map_path
         self.current_elevation_profile_image = cache_entry.elevation_profile
         self.current_track_metadata = cache_entry.metadata
+        track_start = track_start or self._apply_selected_track_start(map_index)
+        self.time_lapse_entry_row = track_start["row_index"] if track_start is not None else map_index
+        if track_start is not None:
+            start_fraction = track_start["fraction"]
+            self.current_track_metadata = active_stage_member(self.current_track_metadata, track_start["member_id"])
+            self.time_lapse_audio_row_cursor = track_start["row_index"] - 1
+            self.time_lapse_control_row_cursor = track_start["row_index"] - 1
+            resume_media = None
         if cache_entry.rendered_image is None:
             cache_entry.rendered_image = draw_dynamic_map_overlay(
                 cache_entry.image,
@@ -14900,6 +15387,9 @@ class GPSTrackShowApp:
         self.time_lapse_stage_start_marker_latlon = first_media_coordinate(
             self.current_track_metadata
         )
+        if self.time_lapse_points and (self.current_track_metadata or {}).get("stage_plan_version"):
+            first = self.time_lapse_points[0]
+            self.time_lapse_stage_start_marker_latlon = (first["lat"], first["lon"])
         self.time_lapse_stage_start_distance_km = self._time_lapse_distance_before_stage(map_index)
         if relation is None and (
             len(self.time_lapse_points) < 2
@@ -14918,21 +15408,32 @@ class GPSTrackShowApp:
         else:
             media_events = []
             self.time_lapse_media_datetimes = {}
-            for row_index, entry, date_text in zip(
+            for media_position, (row_index, entry, date_text) in enumerate(zip(
                 self.time_lapse_stage.media_indexes,
                 self.time_lapse_stage.media_entries,
                 self.time_lapse_stage.media_date_texts,
-            ):
-                media_datetime = self._time_lapse_media_datetime(entry, self.time_lapse_points, date_text)
+            )):
+                context = (self.time_lapse_stage.member_contexts[media_position]
+                           if media_position < len(self.time_lapse_stage.member_contexts) else None)
+                span = (self.current_track_metadata or {}).get("block_member_spans", {}).get(context[0]) if context else None
+                media_points = span[2] if span else self.time_lapse_points
+                media_datetime = self._time_lapse_media_datetime(entry, media_points, date_text)
                 if media_datetime is not None:
                     self.time_lapse_media_datetimes[row_index] = media_datetime
                 fraction = self._time_lapse_media_fraction(
                     entry,
-                    self.time_lapse_points,
+                    media_points,
                     date_text,
                     photo_time=media_datetime,
                     steering=self.walker_steering_by_row.get(row_index),
                 )
+                if span:
+                    if context[1] in {"after", "adjacent_after"}:
+                        fraction = span[1]
+                    elif context[1] != "route":
+                        fraction = span[0]
+                    else:
+                        fraction = span[0] + (fraction or 0.) * (span[1] - span[0])
                 media_events.append((fraction, row_index, entry))
             queue = (
                 [(1.0, row_index, entry) for row_index, entry in zip(
@@ -14945,8 +15446,11 @@ class GPSTrackShowApp:
             cache_entry.media_datetimes = dict(self.time_lapse_media_datetimes)
             cache_entry.media_queue = list(queue)
         self.time_lapse_media_queue = queue
-        self.time_lapse_media_cursor = next((index for index, item in enumerate(queue) if item[0] >= self.time_lapse_progress), len(queue))
+        self.time_lapse_media_cursor = next((index for index, item in enumerate(queue)
+            if item[0] >= self.time_lapse_progress and (track_start is None or item[1] >= track_start["row_index"])), len(queue))
         stored_resume_phase = self.resume_phase_pending
+        if track_start is not None and (track_start["timestamp"] is not None or start_fraction > 0):
+            stored_resume_phase = PlaybackPhase.TIME_LAPSE.value
         if should_restart_time_lapse_stage_intro(
             stored_resume_phase,
             self.time_lapse_progress,
@@ -15312,7 +15816,7 @@ class GPSTrackShowApp:
         if self.time_lapse_stage is None or not self.time_lapse_active:
             return
         if not _repeats_applied and self._run_repeated_directives(
-            self.time_lapse_stage.map_index,
+            getattr(self, "time_lapse_entry_row", self.time_lapse_stage.map_index),
             "all",
             lambda: self._begin_time_lapse_motion(True),
         ):
@@ -15385,7 +15889,7 @@ class GPSTrackShowApp:
         elapsed = max(0.0, now - (self.time_lapse_last_tick or now))
         self.time_lapse_last_tick = now
         if (
-            self.time_lapse_current_media_is_video
+            (self.time_lapse_current_media_is_video or self._current_attached_media_context() is not None)
             and time_lapse_media_minimum_pending(
                 self.time_lapse_current_media is not None,
                 self.time_lapse_media_deadline,
@@ -15395,6 +15899,8 @@ class GPSTrackShowApp:
             self._set_time_lapse_views()
             self._schedule_time_lapse_tick(0.020, generation=current_generation)
             return
+        if self._current_attached_media_context() is not None:
+            self._end_time_lapse_media(redraw=False)
         next_fraction = None
         if self.time_lapse_media_cursor < len(self.time_lapse_media_queue):
             next_fraction = self.time_lapse_media_queue[self.time_lapse_media_cursor][0]
@@ -15514,6 +16020,14 @@ class GPSTrackShowApp:
         self._sync_time_lapse_audio_through(row_index)
         self.playlist_index = row_index + 1
         self.time_lapse_current_media = (row_index, entry)
+        if self.time_lapse_stage is not None and (self.current_track_metadata or {}).get("stage_member_data"):
+            try:
+                position = self.time_lapse_stage.media_indexes.index(row_index)
+                context = self.time_lapse_stage.member_contexts[position]
+            except (ValueError, IndexError):
+                context = None
+            if context:
+                self.current_track_metadata = active_stage_member(self.current_track_metadata, context[0])
         self.time_lapse_current_media_is_video = is_video_path(path)
         self.time_lapse_media_profile_state = None
         self.current_phase = PlaybackPhase.TIME_LAPSE
@@ -16263,6 +16777,10 @@ class GPSTrackShowApp:
         self.current_overview_path = image_path
         metadata_path = image_path.with_suffix(".json")
         self.current_overview_metadata = try_read_plot_metadata(metadata_path)
+        if any(parse_track_context(line) for line in self.playlist_lines):
+            summary = self._load_compact_track_summary() or {}
+            self.current_overview_metadata = overview_hidden_track_policy(self.current_overview_metadata,
+                summary.get("tracks", []), getattr(self.config, "include_hidden_tracks", False))
         if self.current_overview_metadata is not None:
             debug_print(self.config, f"Overview metadata loaded from {metadata_path}")
             self.current_overview_image = draw_dynamic_map_overlay(
@@ -16291,6 +16809,14 @@ class GPSTrackShowApp:
         self.current_elevation_profile_image = None
         metadata_path = track_path.with_suffix(".json")
         self.current_track_metadata = self._load_stage_metadata(track_path)
+        block_index = stage_index_for_playlist_row(self.stages, self.pending_display_index if self.pending_display_index is not None else self.playlist_index - 1)
+        if block_index is not None:
+            descriptor = self.stages[block_index]
+            self.current_track_metadata = shared_stage_block_metadata(
+                self.current_track_metadata, self.playlist_lines, descriptor.map_index, descriptor.next_index)
+        track_start = self._apply_selected_track_start(self.stages[block_index].map_index, standard=True) if block_index is not None else None
+        if track_start is not None:
+            self.playlist_index = track_start["row_index"]
         if self.current_track_metadata is not None:
             debug_print(self.config, f"Track map metadata loaded from {metadata_path}")
             self.current_track_image = draw_dynamic_map_overlay(
@@ -16339,6 +16865,8 @@ class GPSTrackShowApp:
             if self.resume_start_pending
             else 0.0
         )
+        if track_start is not None:
+            tracking_start_fraction = track_start["fraction"]
         tracking_resume_media = None
         if self.resume_start_pending and self.resume_media_index_pending is not None:
             media_index = self.resume_media_index_pending
@@ -16375,10 +16903,11 @@ class GPSTrackShowApp:
                 ),
             ]
             next_callback = (
-                lambda index=stage_index, media=tracking_resume_media, fraction=tracking_start_fraction: self._start_standard_route_tracking_stage(
+                lambda index=stage_index, media=tracking_resume_media, fraction=tracking_start_fraction, anchor=track_start: self._start_standard_route_tracking_stage(
                     index,
                     media,
                     fraction,
+                    track_start=anchor,
                 )
                 if stage_index is not None
                 and self._standard_route_tracking_requested(relation_title)
@@ -16438,6 +16967,12 @@ class GPSTrackShowApp:
             else max(0, self.playlist_index - 1)
         )
         self.current_stage_index = stage_index_for_playlist_row(self.stages, row_index)
+        if isinstance(self.current_track_metadata, dict) and self.current_track_metadata.get("stage_member_data"):
+            context = next((parse_track_context(self.playlist_lines[index])
+                            for index in range(row_index - 1, -1, -1)
+                            if parse_track_context(self.playlist_lines[index])), None)
+            if context:
+                self.current_track_metadata = active_stage_member(self.current_track_metadata, context[0])
         self.current_phase = PlaybackPhase.MEDIA
         self.current_stage_media_position = None
         if self.current_stage_index is not None:
@@ -16589,7 +17124,8 @@ class GPSTrackShowApp:
         needs_marked_track = self.map_presenter is not None or self.config.track_map_before_media
         if self.current_track_image is not None and needs_marked_track:
             marked_track = self.current_track_image
-            if self.current_track_metadata is not None and latitude is not None and longitude is not None:
+            if (latitude is not None and longitude is not None
+                    and map_coordinate_is_visible(self.current_track_metadata, latitude, longitude)):
                 pixel_x, pixel_y = coordinate_to_pixel(latitude, longitude, self.current_track_metadata)
                 scaled_x, scaled_y = scale_metadata_pixel_to_image(
                     pixel_x,
@@ -16997,6 +17533,10 @@ class GPSTrackShowApp:
                 else ("RANDOM" if self.random_transition_mode else self.active_transition.value)
             ),
             "stage_index": getattr(self, "current_stage_index", None),
+            "member_internal_id": (getattr(self, "current_track_metadata", None) or {}).get("active_member_id"),
+            "block_map_index": (self.stages[self.current_stage_index].map_index
+                if isinstance(getattr(self, "current_stage_index", None), int)
+                and 0 <= self.current_stage_index < len(self.stages) else None),
             "phase": (
                 PlaybackPhase.STAGE_MAP.value
                 if getattr(self, "current_phase", None)
@@ -17197,6 +17737,9 @@ class GPSTrackShowApp:
             "trackmaps.font_factor": ("map_header_font_factor", float),
             "trackmaps.track_title": ("track_title_mode", str),
             "slideshow.remove_name_prefix": ("track_name_prefix", str),
+            "slideshow.title_number": ("title_number", str),
+            "slideshow.title_number_format": ("title_number_format", str),
+            "slideshow.include_hidden_tracks": ("include_hidden_tracks", bool),
         }
         for key, (attribute, converter) in simple_values.items():
             if key in values:

@@ -97,6 +97,7 @@ from AppKit import (
     NSDragOperationMove,
     NSEventModifierFlagCommand,
     NSEventModifierFlagControl,
+    NSEventModifierFlagOption,
     NSEventModifierFlagShift,
     NSEventTypeKeyDown,
     NSItalicFontMask,
@@ -162,6 +163,9 @@ from GetGeoLocations import (
     project_map_plan_from_sidecars,
     project_control_plan_text,
     render_project_map_plan,
+    render_stage_map_specs,
+    project_map_spec_is_current,
+    map_covers_attached_media,
     render_media_map_specs,
     run_with_options as run_geolocations_with_options,
     track_endpoint_entry_matches,
@@ -246,7 +250,7 @@ from cocoa_parameter_editor import CocoaParameterEditor
 from cocoa_map_provider_setup import configure_hosted_provider, run_map_provider_setup
 from cocoa_gpx_recovery import recover_missing_adventure_gpx
 from gpx_adventure_identity import build_gpx_identity
-from json_storage import atomic_write_json
+from json_storage import atomic_write_json, atomic_write_text
 from adventure_files import (
     ADVENTURE_FORMAT_VERSION,
     AdventureFormatError,
@@ -457,6 +461,7 @@ CONTROL_ROW_TYPE_KEYWORDS = {
     "CTL": "CONTROL",
     "CAP": "CAPTION",
     "FNT": "FONT",
+    "CTX": "Track",
 }
 CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "IMG": "Image",
@@ -473,6 +478,7 @@ CONTROL_ROW_TYPE_DESCRIPTIONS = {
     "CTL": "Slide-show control",
     "CAP": "Photo/video caption",
     "FNT": "Label font",
+    "CTX": "Track context (shared stage)",
 }
 CONTROL_ROW_TYPES = tuple(CONTROL_ROW_TYPE_DESCRIPTIONS)
 CONTROL_ROW_TYPE_CHOICES = tuple(
@@ -520,7 +526,7 @@ PH_COLLECTION_SUBTYPE_ANY = 9223372036854775807
 PH_ASSET_MEDIA_TYPE_IMAGE = 1
 PROJECT_AUDIO_DIRECTORY_NAME = "audio"
 PROJECT_NARRATION_DIRECTORY_NAME = "narration"
-SLIDESHOW_CHECKPOINT_VERSION = 6
+SLIDESHOW_CHECKPOINT_VERSION = 7
 SLIDESHOW_CHECKPOINT_HISTORY_LIMIT = 20
 
 
@@ -599,9 +605,43 @@ def validated_slideshow_resume_position(
     return dict(position)
 
 
+def slideshow_track_start_position(selection, control_file_path, trackimages_dir, *, include_hidden_tracks=False):
+    """Resolve a map selection after preparation, never against obsolete rows."""
+    from slideshow_stages import filter_hidden_track_lines, normalize_track_start, track_control_start, track_identity
+    selection = normalize_track_start(selection)
+    control = Path(control_file_path).resolve(strict=False)
+    before = control.stat()
+    lines = [line.strip() for line in control.read_text(encoding="utf-8").splitlines() if line.strip()]
+    overview = next((line.partition(":")[2].strip() for line in lines if line.startswith("#Overviewmap:")), "")
+    path = Path(overview)
+    if not path.is_absolute():
+        path = Path(trackimages_dir) / path
+    try:
+        tracks = json.loads(path.with_name(f"{path.stem}-summary.json").read_text(encoding="utf-8")).get("tracks", [])
+    except (OSError, ValueError):
+        tracks = []
+    row = next((row for row in tracks if track_identity(row) == selection["internal_id"]), {})
+    if row.get("hidden") and not include_hidden_tracks:
+        raise ValueError("The selected track is excluded. Enable Include hidden tracks in slideshow, or show the track first.")
+    enabled = filter_hidden_track_lines(lines, tracks, include_hidden_tracks)
+    map_index, _member_start = track_control_start(enabled, selection["internal_id"], tracks)
+    stat = control.stat()
+    if (before.st_size, before.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+        raise ValueError("The control file changed while selecting the start. Please choose Start Slide Show Here again.")
+    return {"version": SLIDESHOW_CHECKPOINT_VERSION, "completed": False,
+            "control_file": str(control), "playlist_index": map_index, "line_text": lines[map_index],
+            "control_file_identity": {"path": str(control), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
+            "track_start": selection}
+
+
 def control_file_update_requires_review(plan) -> bool:
     """Return whether media membership or placement needs explicit review."""
-    if plan is None or getattr(plan, "media", None) is None:
+    if plan is None:
+        return False
+    track_maps = getattr(plan, "track_maps", None)
+    if getattr(track_maps, "stage_replacement_entries", None) is not None:
+        return True
+    if getattr(plan, "media", None) is None:
         return False
     return any(
         int(item.included_count) == 0
@@ -849,24 +889,7 @@ def control_table_recovery_path(control_path: Path) -> Path:
 
 def write_text_atomic(path: Path, text: str) -> None:
     """Write UTF-8 text atomically in the destination directory."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-        delete=False,
-    ) as handle:
-        temporary_path = Path(handle.name)
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.replace(temporary_path, path)
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, text)
 
 
 def nsstring(value: str) -> NSString:
@@ -971,6 +994,8 @@ def parse_slideshow_control_line(line: str) -> dict:
             row_type = "CAP"
         elif normalized == "font":
             row_type = "FNT"
+        elif normalized == "track":
+            row_type = "CTX"
         else:
             row_type = keyword.upper() if keyword else "#"
         return {
@@ -1020,7 +1045,7 @@ def serialize_slideshow_control_row(row: dict) -> str:
             name = serialize_font_parameters(parse_font_parameters(name))
         except FontSyntaxError:
             pass
-    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "PLY", "NAR", "CTL", "CAP", "FNT"}:
+    if row.get("is_keyword") or row_type in {"MAP", "TRK", "BEF", "AFT", "LOC", "DAT", "MUS", "PLY", "NAR", "CTL", "CAP", "FNT", "CTX"}:
         keyword = str(row.get("keyword", "")).strip()
         if not keyword:
             keyword = CONTROL_ROW_TYPE_KEYWORDS.get(row_type, row_type)
@@ -1216,6 +1241,13 @@ def slideshow_dependency_issues(control_text, trackimages_dir, context, *, read_
         for track in tracks
         if str(track.get("table_number", "")).isdigit()
     }
+    from slideshow_stages import attached_media_points, filter_hidden_track_lines, parse_track_context, track_identity
+    playback_lines = filter_hidden_track_lines(str(control_text).splitlines(), tracks,
+                                               bool(context.get("include_hidden_tracks", False)))
+    from slideshow_stages import missing_stage_route_insertions, StageRoutesIncomplete
+    insertions = missing_stage_route_insertions(str(control_text).splitlines(), tracks,
+        include_hidden=bool(context.get("include_hidden_tracks", False)))
+    attached = attached_media_points(playback_lines)
 
     def check_map(path, *, expected_kind):
         if not path.is_file():
@@ -1230,6 +1262,30 @@ def slideshow_dependency_issues(control_text, trackimages_dir, context, *, read_
             metadata = None
         if not map_uses_dynamic_overlays(metadata):
             map_issues.append(path.name)
+            return
+        identities = metadata.get("stage_included_member_ids", [track_identity(track or metadata)])
+        points = ([point for values in attached.values() for point in values] if expected_kind == "overview"
+                  else [point for identity in identities for point in attached.get(identity, [])])
+        if not map_covers_attached_media(metadata, points):
+            map_issues.append(path.name)
+            return
+        if expected_kind == "track" and metadata.get("stage_plan_version"):
+            from slideshow_stages import stage_key
+            current = {track_identity(row): row for row in tracks}
+            members = metadata.get("stage_members", [])
+            included = metadata.get("stage_included_member_ids", [])
+            saved = {track_identity(row): row for row in members}
+            group_key = stage_key(current.get(next(iter(saved), 0), {})) if saved else None
+            expected_members = {identity for identity, row in current.items() if stage_key(row) == group_key}
+            expected_included = {identity for identity in expected_members
+                                 if context.get("include_hidden_tracks") or not current[identity].get("hidden")}
+            if (not saved or not included or set(saved) != expected_members
+                    or set(included) != expected_included
+                    or any(identity not in current or identity not in saved
+                           or not current[identity].get("track_geometry_fingerprint")
+                           or saved[identity].get("track_geometry_fingerprint") != current[identity]["track_geometry_fingerprint"]
+                           for identity in included)):
+                map_issues.append(path.name)
             return
         if expected_kind == "track":
             if track is None:
@@ -1257,7 +1313,12 @@ def slideshow_dependency_issues(control_text, trackimages_dir, context, *, read_
         ] != expected_overview:
             map_issues.append(path.name)
 
-    for raw_line in str(control_text).splitlines():
+    known = {track_identity(row) for row in tracks}
+    for number, line in enumerate(playback_lines, 1):
+        member = parse_track_context(line)
+        if member and member[0] not in known:
+            raise ValueError(f"Control-file row {number} refers to unavailable track identity {member[0]}. Correct or remove this Track context in the Control File editor before starting.")
+    for raw_line in playback_lines:
         if not raw_line.strip():
             continue
         row = parse_slideshow_control_line(raw_line)
@@ -1284,6 +1345,8 @@ def slideshow_dependency_issues(control_text, trackimages_dir, context, *, read_
                 expected_kind="track",
             )
 
+    if insertions and not map_issues and not derived_issues:
+        raise StageRoutesIncomplete([identity for identities in insertions.values() for identity in identities], tracks)
     return {
         "maps": list(dict.fromkeys(map_issues)),
         "derived": list(dict.fromkeys(derived_issues)),
@@ -1838,7 +1901,7 @@ class SlideShowControlTableView(NSTableView):
 
 
 class SlideShowControlTableWindow(NSWindow):
-    """Control-table window with window-wide search shortcuts."""
+    """Control-table window with window-wide help and search shortcuts."""
 
     def sendEvent_(self, event):
         """Give cell text editing priority over whole-row clipboard actions."""
@@ -1850,6 +1913,12 @@ class SlideShowControlTableWindow(NSWindow):
             key = str(event.charactersIgnoringModifiers() or "").lower()
             table = getattr(self.controller, "control_table_view", None)
             editor = table.currentEditor() if table is not None else None
+            if (key == "h" and not shortcut_down
+                    and not modifiers & int(NSEventModifierFlagOption)
+                    and editor is None
+                    and not isinstance(self.firstResponder(), (NSTextView, NSTextField))):
+                self.controller.showControlDirectiveHelp_(self)
+                return
             selector = {"c": "copy_", "x": "cut_", "v": "paste_"}.get(key)
             if shortcut_down and editor is not None and selector is not None:
                 method = getattr(editor, selector, None)
@@ -2633,6 +2702,7 @@ class GPXTrackerController(NSObject):
         self.control_table_undo_stack = []
         self.control_table_redo_stack = []
         self.control_table_hint_label = None
+        self.control_table_help_button = None
         self.control_table_drag_indexes = []
         stored_preview_size = NSUserDefaults.standardUserDefaults().stringForKey_(
             CONTROL_PREVIEW_PREFERENCE_KEY
@@ -4558,10 +4628,12 @@ class GPXTrackerController(NSObject):
             return
         values = self.parameters if parameter_values is None else parameter_values
         context["project_map_plan"] = plan
-        first_number = len(context.get("tracks", [])) + 1
+        first_number = max((int(track.get("table_number", 0)) for track in context.get("tracks", [])), default=0) + 1
         output_dir = Path(context["output_dir"])
         items = []
-        for offset, spec in enumerate(plan.media_map_specs):
+        specs = [*plan.media_map_specs, *[{**spec, "map_plan_kind": "stage"}
+                 for spec in getattr(plan, "stage_map_specs", ()) if len(spec["all_members"]) > 1 or spec["extent_media"]]]
+        for offset, spec in enumerate(specs):
             stale_variants = []
             for layout in ("standard", "time-lapse"):
                 output_name = media_map_output_filename(spec["filename"], layout)
@@ -4575,11 +4647,8 @@ class GPXTrackerController(NSObject):
                         layout,
                     )
                     or not isinstance(metadata, dict)
-                    or not media_map_metadata_matches_coordinates(
-                        metadata,
-                        spec["date"],
-                        spec["coordinates"],
-                    )
+                    or not project_map_spec_is_current(metadata, spec, layout,
+                        self._track_map_parameter_signature(layout, values))
                 ):
                     stale_variants.append(layout)
             items.append(
@@ -5176,11 +5245,8 @@ class GPXTrackerController(NSObject):
                         layout,
                     )
                     or not isinstance(metadata, dict)
-                    or not media_map_metadata_matches_coordinates(
-                        metadata,
-                        item["date"],
-                        item["coordinates"],
-                    )
+                    or not project_map_spec_is_current(metadata, item, layout,
+                        self._track_map_parameter_signature(layout, values))
                 )
                 if stale:
                     media_stale_count += 1
@@ -5359,7 +5425,7 @@ class GPXTrackerController(NSObject):
         elif not status.get("media_only") and status.get("summary_out_of_date"):
             freshness_parts.append("track summary not up-to-date")
         if status.get("media_stale_count"):
-            freshness_parts.append(f"{status['media_stale_count']} media map variant(s) not up-to-date")
+            freshness_parts.append(f"{status['media_stale_count']} stage/media map variant(s) not up-to-date")
         missing_endpoints = int(status.get("endpoint_place_missing_count") or 0)
         if missing_endpoints:
             freshness_parts.append(
@@ -5377,7 +5443,7 @@ class GPXTrackerController(NSObject):
         return (
             f"Standard: {status.get('standard_count', 0)}/{status['track_total']} | "
             f"Time-Lapse: {status.get('time_lapse_count', 0)}/{status['track_total']} | "
-            f"Media maps Standard: {status.get('media_standard_count', 0)}/{status.get('media_map_total', 0)} | "
+            f"Stage/media maps Standard: {status.get('media_standard_count', 0)}/{status.get('media_map_total', 0)} | "
             f"Time-Lapse: {status.get('media_time_lapse_count', 0)}/{status.get('media_map_total', 0)} | "
             f"overview: {overview_text}{freshness_text}"
         )
@@ -7936,13 +8002,18 @@ class GPXTrackerController(NSObject):
             ) and not control_review_required
             if control_review_required and self.pending_slideshow_after_map_generation:
                 self.pending_slideshow_after_map_generation["awaiting_review"] = True
+                if result.get("route_context_repair"):
+                    self.pending_slideshow_after_map_generation.update(
+                        route_context_repair=True, validated_sources=result.get("validated_sources"))
             pending_imported_paths = list(
                 getattr(self, "automatic_map_pending_imported_paths", [])
             )
             self.automatic_map_pending_imported_paths = []
             summary = f"Map generation checked all stages and created {created_count} map file(s)."
             if control_review_required:
-                summary += " Review Control File Updates before starting: some authored map references use older filenames."
+                summary += (" Review Control File Updates to restore missing track entries before starting."
+                            if result.get("route_context_repair") else
+                            " Review Control File Updates before starting: some authored map references use older filenames.")
             if failures:
                 summary += (
                     f" {len(failures)} map operation(s) failed; completed maps were retained."
@@ -9283,6 +9354,11 @@ class GPXTrackerController(NSObject):
             "startSlideShowFromSelectedControlRow:",
         )
         close_button = self._make_button("Close", "closeControlTable:")
+        help_button = self._make_icon_button(
+            "sf:questionmark.circle", "?", "showControlDirectiveHelp:",
+        )
+        help_button.setToolTip_("Control File Help (h): row types, track identifiers, commands, and shortcuts.")
+        help_button.setAccessibilityLabel_("Control File Help")
         buttons = [
             (undo_button, FIELD_HEIGHT),
             (redo_button, FIELD_HEIGHT),
@@ -9295,6 +9371,7 @@ class GPXTrackerController(NSObject):
             (revert_button, 76.0),
             (start_here_button, 156.0),
             (close_button, 76.0),
+            (help_button, FIELD_HEIGHT),
         ]
         x = 16.0
         for button, width in buttons:
@@ -9304,7 +9381,7 @@ class GPXTrackerController(NSObject):
             x += width + 8.0
 
         hint = self._make_label(
-            "Double-click previews media; Jump to Show follows playback. Drag rows. Cmd-I inserts; Cmd-F/Shift-Cmd-F searches; Cmd-C/V/X/Z edits.",
+            "h: Help. Double-click: preview. Drag rows to reorder. Cmd-I: insert. Cmd-F/Shift-Cmd-F: search. Cmd-C/V/X/Z: edit.",
             size=12.0,
         )
         hint.setFrame_(NSMakeRect(16.0, 8.0, 948.0, 16.0))
@@ -9316,6 +9393,7 @@ class GPXTrackerController(NSObject):
         self.control_table_view = table
         self.control_table_data_source = data_source
         self.control_table_hint_label = hint
+        self.control_table_help_button = help_button
         self.control_table_preview_popup = preview_popup
         self.control_table_filter_popup = filter_popup
         self.control_table_reset_filter_button = reset_filter_button
@@ -11465,7 +11543,33 @@ class GPXTrackerController(NSObject):
 
     def _control_directive_help_content(self):
         styles = ", ".join(CONTROL_TRANSITIONS)
+        row_types = "\n".join(f"{code}: {description}" for code, description in CONTROL_ROW_TYPE_DESCRIPTIONS.items())
         return (
+            "Control File Help\n\n"
+            "Press h when not editing text, or click the question-mark button, "
+            "to open this help. Close this window when finished.\n\n"
+            "Editor shortcuts:\n"
+            "Cmd-I: insert a row\n"
+            "Cmd-F / Shift-Cmd-F: next / previous search result\n"
+            "Cmd-C / Cmd-X / Cmd-V: copy / cut / paste\n"
+            "Cmd-Z / Shift-Cmd-Z: undo / redo\n"
+            "Delete / Backspace: delete selected rows\n"
+            "Double-click: preview the selected media\n"
+            "Drag rows: change their playback order\n"
+            "While editing a cell or search field, h types normally. Clipboard "
+            "shortcuts operate on text inside a cell, otherwise on whole rows.\n\n"
+            f"Row types:\n{row_types}\n\n"
+            "CTX means context. It represents a structural #Track row, for example:\n"
+            "#Track: internal_id=9\n"
+            "This selects the active GPX track within the stage's shared map, "
+            "without displaying another map. Following media belongs to that context.\n\n"
+            "internal_id is the track's permanent identifier within the GPX document. "
+            "It is saved in the GPX extensions and is not the table row, editable "
+            "Track Number, Stage number, or displayed Track ID (such as 7c). "
+            "Sorting, renumbering, and hiding tracks do not change it; deleted IDs "
+            "are not reused for other tracks. Keep generated internal_id values "
+            "unless intentionally changing the track association. Manage track "
+            "numbers and stages in Track Table & Editor instead.\n\n"
             "#CONTROL: commands\n\n"
             "Slide-show control rows change playback timing, style, or flow. "
             "Separate multiple commands with commas; commands and $labels are "
@@ -11491,7 +11595,14 @@ class GPXTrackerController(NSObject):
             "#LABEL $CHAPTER2\n"
             "#DURATION 5, #TRANSITION FADE\n"
             "#IGNORE_TIME, #REPEAT_UNTIL $CHAPTER2\n"
-            "#GOTO $CHAPTER2"
+            "#GOTO $CHAPTER2\n\n"
+            "Shared stages:\n"
+            "New lists follow Track Table order. #Map starts a consecutive stage block; "
+            "#Track: internal_id=N selects its member without displaying another map. "
+            "Optional relations before, after, between, adjacent_before, and adjacent_after "
+            "hold the route while the associated media plays. These structural rows cannot repeat. "
+            "A later return to the same Stage shows its shared map again. Legacy date/map lists "
+            "remain playable without these rows."
         )
 
     def _audio_selection_help_content(self):
@@ -11559,7 +11670,7 @@ class GPXTrackerController(NSObject):
             return
 
         target_window = None
-        if anchor_view is self.music_help_button and anchor_view.window() is not None:
+        if isinstance(anchor_view, NSView) and anchor_view is not table and anchor_view.window() is not None:
             window_rect = anchor_view.convertRect_toView_(anchor_view.bounds(), None)
             target_window = anchor_view.window()
             target_rect = target_window.convertRectToScreen_(window_rect)
@@ -11569,19 +11680,18 @@ class GPXTrackerController(NSObject):
             row = int(table.editedRow())
             if row < 0:
                 row = int(table.selectedRow())
-            if row < 0:
-                return
             column = int(table.editedColumn())
             if column < 0:
                 column = int(table.columnWithIdentifier_(nsstring("name")))
             if column < 0:
                 column = int(table.columnWithIdentifier_(nsstring("type")))
-            if column < 0:
-                return
-            cell_rect = table.frameOfCellAtColumn_row_(column, row)
-            window_rect = table.convertRect_toView_(cell_rect, None)
             target_window = table.window()
-            target_rect = target_window.convertRectToScreen_(window_rect)
+            if row >= 0 and column >= 0:
+                cell_rect = table.frameOfCellAtColumn_row_(column, row)
+                window_rect = table.convertRect_toView_(cell_rect, None)
+                target_rect = target_window.convertRectToScreen_(window_rect)
+            else:
+                target_rect = target_window.frame()
 
         screen = target_window.screen()
         if screen is None:
@@ -11654,23 +11764,29 @@ class GPXTrackerController(NSObject):
             self.music_directive_help_window = music_window
 
     def showControlDirectiveHelp_(self, _sender):
-        """Raise the retained, nonmodal #CONTROL syntax reference."""
+        """Raise the shared, retained control-file help and syntax reference."""
         if self.control_directive_help_window is None:
             window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(260.0, 180.0, 390.0, 280.0),
+                NSMakeRect(260.0, 180.0, 520.0, 540.0),
                 NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
                 NSBackingStoreBuffered,
                 False,
             )
-            window.setTitle_("Slide-Show Control Help")
+            window.setTitle_("Control File Help")
             window.setReleasedWhenClosed_(False)
-            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8.0, 8.0, 374.0, 264.0))
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(8.0, 8.0, 504.0, 524.0))
             scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             scroll.setHasVerticalScroller_(True)
             text_view = NSTextView.alloc().initWithFrame_(scroll.bounds())
             text_view.setEditable_(False)
             text_view.setSelectable_(True)
             text_view.setFont_(NSFont.systemFontOfSize_(13.0))
+            text_view.setVerticallyResizable_(True)
+            text_view.setHorizontallyResizable_(False)
+            text_view.setAutoresizingMask_(NSViewWidthSizable)
+            text_view.setMaxSize_(NSMakeSize(1e7, 1e7))
+            text_view.textContainer().setContainerSize_(NSMakeSize(scroll.bounds().size.width, 1e7))
+            text_view.textContainer().setWidthTracksTextView_(True)
             disable_field_editor_text_checking(text_view)
             scroll.setDocumentView_(text_view)
             window.contentView().addSubview_(scroll)
@@ -11678,7 +11794,11 @@ class GPXTrackerController(NSObject):
             self.control_directive_help_text = text_view
         self.control_directive_help_text.setString_(self._control_directive_help_content())
         self._position_control_directive_help_window(_sender)
-        self.control_directive_help_window.orderFront_(None)
+        if _sender is not None and (
+                _sender is self.control_table_window or _sender is self.control_table_help_button):
+            self.control_directive_help_window.makeKeyAndOrderFront_(None)
+        else:
+            self.control_directive_help_window.orderFront_(None)
 
     @objc.IBAction
     def showCaptionDirectiveHelp_(self, _sender):
@@ -12904,6 +13024,7 @@ class GPXTrackerController(NSObject):
         return {
             "output_dir": str(trackimages_dir) if trackimages_dir is not None else "",
             "filename_base": filename_base,
+            "include_hidden_tracks": bool(parameter_values.get("slideshow.include_hidden_tracks", False)),
             "zoom_level": min(int(parameter_values["trackmaps.zoom"]), maximum_zoom),
             "image_size": self._track_map_image_size(parameter_values),
             "font_factor": parameter_values["trackmaps.font_factor"],
@@ -12977,6 +13098,7 @@ class GPXTrackerController(NSObject):
         context = None
         current_map_names = set()
         control_review_required = False
+        route_context_repair = False
         skip_remaining_maps = bool(
             media_only
             and str(self.parameters.get("maps.output_provider", "osm")) == "osm"
@@ -13160,14 +13282,21 @@ class GPXTrackerController(NSObject):
         # were repaired. In particular, old filenames may require user review.
         if required_names is not None and not failures:
             control_text = control_path.read_text(encoding="utf-8")
-            remaining = (slideshow_dependency_issues(control_text, trackimages_dir, context)["maps"]
-                         if context is not None else missing_control_map_assets(control_text, trackimages_dir))
+            from slideshow_stages import StageRoutesIncomplete
+            try:
+                remaining = (slideshow_dependency_issues(control_text, trackimages_dir,
+                             {**context, "include_hidden_tracks": bool(self.parameters.get("slideshow.include_hidden_tracks", False))})["maps"]
+                             if context is not None else missing_control_map_assets(control_text, trackimages_dir))
+            except StageRoutesIncomplete as exc:
+                remaining = []
+                control_review_required = route_context_repair = True
+                report(str(exc))
             external_references = {
                 path.name.casefold()
                 for path in referenced_control_map_assets(control_text, trackimages_dir)
                 if not path.resolve(strict=False).is_relative_to(trackimages_dir.resolve(strict=False))
             }
-            for spec in plan.media_map_specs:
+            for spec in [*plan.media_map_specs, *getattr(plan, "stage_map_specs", ())]:
                 name = spec.get("filename")
                 if name:
                     current_map_names.update((Path(name).name.casefold(), time_lapse_track_map_name(Path(name).name).casefold()))
@@ -13189,6 +13318,8 @@ class GPXTrackerController(NSObject):
             "created_paths": [str(path) for path in created_paths],
             "failures": failures,
             "control_review_required": control_review_required,
+            "route_context_repair": route_context_repair,
+            "validated_sources": (file_signature(gpx_path), file_signature(control_path)) if route_context_repair else None,
             "tracks_summary_path": (
                 str(tracks_summary_path) if tracks_summary_path is not None else None
             ),
@@ -13554,6 +13685,8 @@ class GPXTrackerController(NSObject):
         """Create the control file plus both map variants as one guided operation."""
         if self.geolocations_thread is not None and self.geolocations_thread.is_alive():
             show_alert("A control-file or metadata operation is already running.")
+            return
+        if hasattr(self, "flush_adventure_autosave") and not self.flush_adventure_autosave():
             return
         project_dir = self._resolve_project_directory(allow_create=False, update_gpx_field=False)
         control_path = self._control_file_path()
@@ -14209,6 +14342,14 @@ class GPXTrackerController(NSObject):
                 and not track_status.get("overview_out_of_date")
                 and track_status.get("track_count") == track_status.get("track_total")
             )
+        waiting = getattr(self, "pending_slideshow_after_map_generation", None)
+        if waiting and waiting.get("route_context_repair"):
+            gpx = self._current_single_gpx_path()
+            if (gpx is not None and control_path is not None
+                    and waiting.get("validated_sources") == (file_signature(gpx), file_signature(control_path))):
+                # Startup just verified the referenced assets. Unused per-track
+                # maps or a lagging status panel cannot block a row-only repair.
+                summary_current = True
         automatic = paths is None
         self.media_update_analysis_append = bool(append)
         if not append:
@@ -14337,6 +14478,7 @@ class GPXTrackerController(NSObject):
                     place_equivalence_m=self.parameters["locations.reuse_radius_m"],
                     media_memberships=membership_by_name,
                     media_inventory=inventory,
+                    include_hidden_tracks=bool(self.parameters.get("slideshow.include_hidden_tracks", False)),
                 )
                 if append and self.control_file_update_plan is not None:
                     existing = self.control_file_update_plan
@@ -14663,6 +14805,8 @@ class GPXTrackerController(NSObject):
             lines.append(f"Replace: {old} -> {new}")
         for name in plan.reordered_tracks:
             lines.append(f"Move to canonical stage position: {name}")
+        lines.extend(getattr(plan, "stage_updates", []))
+        lines.extend(getattr(plan, "notes", []))
         for name in plan.obsolete_overview + plan.obsolete_tracks:
             lines.append(f"Remove: {name}")
         media_plan = self.media_update_plan
@@ -15801,6 +15945,16 @@ class GPXTrackerController(NSObject):
         if not assets_preflighted and not self._ensure_running_speed_sidecars_current(trackimages_dir):
             return
 
+        if isinstance(transient_resume_position, dict) and transient_resume_position.get("track_start"):
+            try:
+                transient_resume_position = slideshow_track_start_position(
+                    transient_resume_position["track_start"], control_file_path, trackimages_dir,
+                    include_hidden_tracks=bool(self.parameters.get("slideshow.include_hidden_tracks", False)))
+            except (OSError, ValueError) as exc:
+                self._finish_slideshow_startup("Could not start at the selected track.")
+                show_alert("Could not start the slide show here.", str(exc))
+                return
+
         resume_position = (
             dict(transient_resume_position)
             if isinstance(transient_resume_position, dict)
@@ -15938,6 +16092,7 @@ class GPXTrackerController(NSObject):
             "control_file_path": str(control_file_path.resolve(strict=False)),
             "gpx_path": str(gpx_path.resolve(strict=False)),
             "options_signature": options_signature(options),
+            "source_signatures": (file_signature(gpx_path), file_signature(control_file_path)),
         }
         self._slideshow_startup_progress("Checking current track data and slide-show maps…")
         previous_key = self.slideshow_preflight_cache_key
@@ -15962,6 +16117,7 @@ class GPXTrackerController(NSObject):
                     upgrade=upgrade_timed_track_sidecars, progress=progress,
                     prepared_hint=prepared_hint,
                     prepared_future=prepared_future,
+                    include_hidden_tracks=bool(getattr(self, "parameters", {}).get("slideshow.include_hidden_tracks", False)),
                 )
                 payload = {
                     **result,
@@ -15970,11 +16126,14 @@ class GPXTrackerController(NSObject):
                     "error": "",
                 }
             except Exception as exc:
+                from slideshow_stages import StageRoutesIncomplete
                 payload = {
                     "generation": generation,
                     "request": request,
                     "issues": {"maps": [], "derived": []},
                     "error": str(exc),
+                    "control_review_required": isinstance(exc, StageRoutesIncomplete),
+                    "source_signatures": request["source_signatures"],
                     "retry": False,
                 }
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -16019,7 +16178,7 @@ class GPXTrackerController(NSObject):
             self._finish_slideshow_startup("Tracks changed during preparation; please start again.")
             return
         if (request.get("options_signature") != options_signature(current_options)
-                or (not payload.get("error") and payload.get("source_signatures") !=
+                or ((not payload.get("error") or payload.get("control_review_required")) and payload.get("source_signatures") !=
                     (file_signature(current_gpx), file_signature(current_control)))):
             payload["retry"] = True
         for stage, seconds in payload.get("timings", {}).items():
@@ -16042,6 +16201,14 @@ class GPXTrackerController(NSObject):
             )
             return
         error = str(payload.get("error", ""))
+        if payload.get("control_review_required"):
+            self.slideshow_preflight_cache_key = None
+            self._finish_slideshow_startup("Review the missing track entries before playback.")
+            self.pending_slideshow_after_map_generation = {**request, "awaiting_review": True,
+                "route_context_repair": True, "validated_sources": payload.get("source_signatures")}
+            if not self._start_control_file_update_analysis():
+                self.pending_slideshow_after_map_generation = None
+            return
         if error:
             self.slideshow_preflight_cache_key = None
             self._finish_slideshow_startup(f"Slide-show preparation failed: {error}")
@@ -16409,6 +16576,11 @@ class GPXTrackerController(NSObject):
             str(settings["trackmaps.track_title"]),
             "--remove-track-name-prefix",
             str(settings["slideshow.remove_name_prefix"]),
+            "--title-number",
+            str(settings["slideshow.title_number"]),
+            "--title-number-format",
+            str(settings["slideshow.title_number_format"]),
+            "--include-hidden-tracks" if settings["slideshow.include_hidden_tracks"] else "--no-include-hidden-tracks",
             "--clock",
             "on" if settings["slideshow.clock"] else "off",
             "--header-mode",
@@ -16538,6 +16710,8 @@ class GPXTrackerController(NSObject):
             args.extend(["--command-file", str(command_file)])
         if isinstance(resume_position, dict):
             args.extend(["--resume-index", str(int(resume_position["playlist_index"]))])
+            if resume_position.get("track_start"):
+                args.extend(["--resume-track-start", json.dumps(resume_position["track_start"], separators=(",", ":"))])
             progress = resume_position.get("time_lapse_progress")
             if isinstance(progress, (int, float)):
                 args.extend(["--resume-progress", str(max(0.0, min(1.0, float(progress))))])
@@ -17075,7 +17249,9 @@ class GPXTrackerController(NSObject):
             })
         for item in plot_context.get("media_map_items", []):
             number = int(item["selection_number"])
-            name = "Media locations"
+            name = ("Stage " + str(item["all_members"][0].get("stage_number") or "unassigned")
+                    + " - " + ", ".join(str(row.get("track_id") or row["internal_id"]) for row in item["all_members"])
+                    if item.get("map_plan_kind") == "stage" else "Media locations")
             if number in update_numbers:
                 name = f"* {name}"
             media_day = item.get("date")
@@ -17562,10 +17738,8 @@ class GPXTrackerController(NSObject):
                 return "overview track set changed"
         elif kind == "media":
             item = plan["media"]
-            if not media_map_metadata_matches_coordinates(
-                metadata, item.get("date"), item.get("coordinates", [])
-            ):
-                return "media positions changed"
+            if not project_map_spec_is_current(metadata, item, variant):
+                return "stage geometry or media positions changed"
         return ""
 
     @objc.IBAction
@@ -17907,7 +18081,12 @@ class GPXTrackerController(NSObject):
             if not coordinates:
                 for item in context.get("media_map_items", []):
                     if int(item.get("selection_number", -1)) == int(selected_number):
-                        coordinates = list(item.get("coordinates", []))
+                        if item.get("map_plan_kind") == "stage":
+                            members = {row["internal_id"] for row in item["members"]}
+                            coordinates = [point for track in context.get("tracks", [])
+                                           if track.get("internal_id") in members for point in track.get("points", [])]
+                        else:
+                            coordinates = list(item.get("coordinates", []))
                         break
         if not coordinates:
             return "Tile estimate unavailable; cached tiles will still be reused."
@@ -18236,7 +18415,8 @@ class GPXTrackerController(NSObject):
                         f"Generating media maps {media_index}/{len(selected_media_items)}...",
                         False,
                     )
-                    paths = render_media_map_specs(
+                    renderer = render_stage_map_specs if item.get("map_plan_kind") == "stage" else render_media_map_specs
+                    paths = renderer(
                         [item],
                         Path(item["control_file"]),
                         media_map_options,
@@ -19260,6 +19440,7 @@ class GPXTrackerController(NSObject):
             self.control_table_window_delegate = None
             self.control_table_view = None
             self.control_table_data_source = None
+            self.control_table_help_button = None
             self.control_table_search_field = None
             self.control_table_search_status = None
             self.control_table_search_matches = []
@@ -19430,7 +19611,7 @@ def build_full_gui_menu(controller, window_menu_coordinator=None):
     help_menu = add_menu(main_menu, "Help")
     help_menu.addItem_(menu_item("Quick Start", "showQuickStart:", controller))
     help_menu.addItem_(menu_item("myCamino Help", "showMainHelp:", controller))
-    help_menu.addItem_(menu_item("Control Directive Help", "showControlDirectiveHelp:", controller))
+    help_menu.addItem_(menu_item("Control File Help", "showControlDirectiveHelp:", controller))
     help_menu.addItem_(menu_item("Music and Narration Help", "showMusicDirectiveHelp:", controller))
     return main_menu
 

@@ -386,6 +386,9 @@ class TrackMapReferenceUpdatePlan:
     summary_available: bool = False
     summary_current: bool = True
     warning: Optional[str] = None
+    stage_updates: list[str] = field(default_factory=list)
+    stage_replacement_entries: Optional[list[dict[str, Any]]] = None
+    notes: list[str] = field(default_factory=list)
 
     @property
     def change_count(self) -> int:
@@ -396,6 +399,7 @@ class TrackMapReferenceUpdatePlan:
             + len(self.obsolete_tracks)
             + len(self.reordered_tracks)
             + len(self.special_updates)
+            + len(self.stage_updates)
         )
 
 
@@ -446,6 +450,7 @@ class ProjectMapPlan:
     overview_name: Optional[str]
     overview_points: list[dict[str, Any]]
     tracks_summary: Optional[TracksSummary]
+    stage_map_specs: list[dict[str, Any]] = field(default_factory=list)
 
 
 def discover_media_update_candidates(
@@ -701,6 +706,12 @@ class TrackInfo:
     map_sidecar_paths: tuple[Path, ...] = ()
     timing_status: str = "recorded"
     has_absolute_time: bool = True
+    stage_number: Optional[int] = None
+    track_id: str = ""
+    hidden: bool = False
+    track_type: str = "unassigned"
+    source_table_position: int = 0
+    summary_row: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True)
@@ -728,6 +739,7 @@ class TracksSummary:
     overview_image: Optional[str]
     tracks: list[TrackInfo]
     ignored_photo_names: set[str]
+    stage_plan_version: int = 0
 
 
 def track_start_sort_value(track: TrackInfo) -> datetime:
@@ -2438,10 +2450,17 @@ def load_tracks_summary(tracks_path: Optional[Path], photolist: Path) -> Optiona
                 has_absolute_time=bool(
                     item.get("has_absolute_time", start_time is not None)
                 ),
+                stage_number=item.get("stage_number"),
+                track_id=str(item.get("track_id") or ""),
+                hidden=bool(item.get("hidden")),
+                track_type=str(item.get("track_type") or "unassigned"),
+                source_table_position=int(item.get("source_table_position", len(tracks))),
+                summary_row=dict(item),
             )
         )
 
-    return TracksSummary(overview_image=overview_image, tracks=tracks, ignored_photo_names=ignored_photo_names)
+    return TracksSummary(overview_image=overview_image, tracks=tracks, ignored_photo_names=ignored_photo_names,
+                         stage_plan_version=int(payload.get("stage_plan_version", 0)))
 
 
 class LazyTrackGpsResolver:
@@ -3616,6 +3635,82 @@ def sort_records_for_output(
     return sorted(records, key=sort_key)
 
 
+def stage_summary_rows(summary):
+    """Normalize the existing compact rows without loading point geometry."""
+    return [{**track.summary_row,
+             "internal_id": track.original_sequence_number,
+             "source_table_position": track.source_table_position,
+             "stage_number": track.stage_number, "track_id": track.track_id,
+             "hidden": track.hidden, "track_type": track.track_type,
+             "track_name": track.track_name or "",
+             "track_plot_image_filename": track.track_plot_image_filename,
+             "start_time": track.start_time.isoformat() if track.start_time else None,
+             "end_time": track.end_time.isoformat() if track.end_time else None,
+             "length_km": float(track.summary_row.get("length_km", track.length_km) or 0),
+             "track_data_sidecar": str(track.summary_row.get("track_data_sidecar") or ""),
+             "track_fingerprint": track.track_fingerprint,
+             "start_point": {"lat": track.start_latitude, "lon": track.start_longitude},
+             "end_point": {"lat": track.end_latitude, "lon": track.end_longitude}}
+            for track in summary.tracks]
+
+
+def build_track_ordered_sections(records, summary, media_map_filenames=None):
+    from slideshow_stages import assign_media, build_stage_groups, prepare_media_assignment, stage_blocks, track_identity
+    groups = build_stage_groups(stage_summary_rows(summary), Path(summary.overview_image or "adventure.png").stem)
+    assignment_index = prepare_media_assignment(groups)
+    resolver = LazyTrackGpsResolver(summary)
+    infos = {track.original_sequence_number: track for track in summary.tracks}
+
+    def position(row, when):
+        info = infos.get(track_identity(row))
+        timeline = resolver._load_timeline(info) if info else None
+        value = resolver._interpolate(timeline, when) if timeline else None
+        return value[:2] if value else None
+
+    assigned, leftovers = {}, {}
+    for record in records:
+        ownership = assign_media(record, groups, position_at_time=position, index=assignment_index)
+        if ownership.internal_id is None:
+            day = record.photo_datetime.date() if record.photo_datetime else getattr(record, "known_date", None)
+            leftovers.setdefault(day, []).append(record)
+        else:
+            assigned.setdefault((ownership.internal_id, ownership.relation), []).append(record)
+
+    def sorted_records(values):
+        return sorted(values, key=lambda record: (getattr(record, "control_order", math.inf),
+                                                 record.photo_datetime or datetime.max.replace(tzinfo=LOCAL_TIMEZONE),
+                                                 record.source_filename))
+
+    sections = []
+    for block in stage_blocks(groups):
+        events, block_records = [], []
+        for member in block.members:
+            identity = track_identity(member)
+            for relation in ("adjacent_before", "before", "between", "route", "after", "adjacent_after"):
+                selected = sorted_records(assigned.get((identity, relation), []))
+                if relation != "route" and not selected:
+                    continue
+                events.append({"kind": "track", "internal_id": identity, "relation": relation})
+                events.extend({"kind": "media", "record": record} for record in selected)
+                block_records.extend(selected)
+        first = infos[track_identity(block.members[0])]
+        sections.append({"date": first.start_time.date() if first.start_time else None,
+                         "maps": [("Map", block.group.filename)], "records": block_records,
+                         "relation": None, "stage_key": block.group.key,
+                         "member_ids": [track_identity(row) for row in block.members],
+                         "events": events})
+    # Insert complete date blocks without changing the relative order of tracks.
+    for day, values in sorted(leftovers.items(), key=lambda pair: (pair[0] is None, pair[0] or date.max)):
+        filename = (media_map_filenames or {}).get(day)
+        fallback = filename or (summary.overview_image if day is None or not any(record.latitude is not None and record.longitude is not None for record in values) else None)
+        section = {"date": day, "maps": [("MediaMap", fallback)] if fallback else [],
+                   "records": sorted_records(values), "relation": "media" if filename else None}
+        insert_at = next((index for index, item in enumerate(sections)
+                          if day is not None and item.get("date") is not None and day < item["date"]), len(sections))
+        sections.insert(insert_at, section)
+    return sections
+
+
 def build_control_sections(
     records: list[PhotoRecord],
     tracks_summary: Optional[TracksSummary],
@@ -3625,6 +3720,8 @@ def build_control_sections(
     include_empty_track_sections: bool = False,
 ) -> list[dict[str, Any]]:
     """Build ordered normal, adjacent-day, and leftover date sections."""
+    if tracks_summary is not None and tracks_summary.stage_plan_version:
+        return build_track_ordered_sections(records, tracks_summary, media_map_filenames)
     tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
     ordered_tracks = tracks_with_untimed_context(
         tracks,
@@ -3896,6 +3993,7 @@ def render_media_map_specs(
             "adventure_overview_render_parameters",
             "only_missing_or_stale",
             "requested_filenames",
+            "include_hidden_tracks",
         }
     }
     requested_filenames = options.get("requested_filenames")
@@ -4065,7 +4163,7 @@ def create_media_overview_for_records(
         {
             "lat": record.latitude,
             "lon": record.longitude,
-            "time_iso": record.photo_datetime.isoformat(),
+            "time_iso": record.photo_datetime.isoformat() if record.photo_datetime else "",
             "source_name": record.photo_path.name,
         }
         for record in records
@@ -4176,7 +4274,7 @@ def build_project_map_plan(
         {
             "lat": record.latitude,
             "lon": record.longitude,
-            "time_iso": record.photo_datetime.isoformat(),
+            "time_iso": record.photo_datetime.isoformat() if record.photo_datetime else "",
             "source_name": record.photo_path.name,
         }
         for record in records
@@ -4191,6 +4289,32 @@ def build_project_map_plan(
             or sorted_output_path.stem.removesuffix("-sorted")
         )
         overview_name = f"{filename_base}.png"
+    stage_specs = []
+    if tracks_summary is not None and tracks_summary.stage_plan_version:
+        from slideshow_stages import build_stage_groups, stage_statistics, track_identity
+        groups = build_stage_groups(stage_summary_rows(tracks_summary), Path(overview_name or "adventure.png").stem)
+        attached = {}
+        for section in sections:
+            context = None
+            for event in section.get("events", []):
+                if event["kind"] == "track":
+                    context = event
+                elif context and context["relation"] != "route":
+                    record = event["record"]
+                    if record.latitude is not None and record.longitude is not None:
+                        attached.setdefault(context["internal_id"], []).append({
+                            "lat": record.latitude, "lon": record.longitude,
+                            "source_name": control_record_filename(record)})
+        include_hidden = bool((media_map_options or {}).get("include_hidden_tracks", False))
+        for group in groups:
+            members = [row for row in group.members if include_hidden or not row.get("hidden")]
+            if not members:
+                continue
+            stage_specs.append({"filename": group.filename, "stage_key": group.key,
+                                "members": members, "all_members": list(group.members),
+                                "statistics": stage_statistics(group.members),
+                                "extent_media": [point for row in members
+                                                 for point in attached.get(track_identity(row), [])]})
     return ProjectMapPlan(
         records=list(records),
         sections=sections,
@@ -4198,6 +4322,7 @@ def build_project_map_plan(
         overview_name=overview_name,
         overview_points=overview_points,
         tracks_summary=tracks_summary,
+        stage_map_specs=stage_specs,
     )
 
 
@@ -4207,13 +4332,17 @@ def render_project_map_plan(
     media_map_options: Optional[dict[str, Any]],
     output_writer=None,
 ) -> list[Path]:
-    """Render the media portion of a shared project map plan."""
-    rendered = render_media_map_specs(
+    """Prepare stage backgrounds and media maps through the shared renderer."""
+    rendered = render_stage_map_specs(plan.stage_map_specs, sorted_output_path, media_map_options,
+                                      output_writer=output_writer)
+    rendered.extend(render_media_map_specs(
         plan.media_map_specs,
         sorted_output_path,
         media_map_options,
         output_writer=output_writer,
-    )
+    ))
+    if plan.stage_map_specs:
+        rendered.extend(render_stage_overview(plan, sorted_output_path, media_map_options, output_writer))
     if plan.tracks_summary is None or not plan.tracks_summary.tracks:
         create_media_overview_for_records(
             plan.records,
@@ -4222,6 +4351,230 @@ def render_project_map_plan(
             output_writer=output_writer,
         )
     return rendered
+
+
+def stage_map_spec_signature(spec, metadata=None):
+    """Only geographic dependencies invalidate a reusable stage background."""
+    import hashlib
+    coordinates = sorted(set((float(point["lat"]), float(point["lon"])) for point in spec["extent_media"]))
+    if isinstance(metadata, dict) and isinstance(metadata.get("route_only_extent_mercator"), dict):
+        from gpx_tracks_table import lonlat_to_web_mercator
+        from slideshow_stages import bounded_media_extent
+        extent = metadata["route_only_extent_mercator"]
+        coordinates, _accepted = bounded_media_extent(tuple(extent[key] for key in ("min_x", "max_x", "min_y", "max_y")),
+                                                      [lonlat_to_web_mercator(lon, lat) for lat, lon in coordinates])
+        coordinates = tuple(float(value) for value in coordinates)
+    value = {"version": 1,
+             "members": sorted((int(row["internal_id"]), row.get("track_geometry_fingerprint"))
+                               for row in spec["members"]),
+             "media": coordinates}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def map_covers_attached_media(metadata, points):
+    """Only nearby media outside the current frame requires new map tiles."""
+    if not points:
+        return True
+    from gpx_tracks_table import lonlat_to_web_mercator
+    from slideshow_stages import bounded_media_extent
+    base = metadata.get("route_only_extent_mercator", metadata.get("extent_mercator"))
+    current = metadata.get("extent_mercator")
+    if not isinstance(base, dict) or not isinstance(current, dict):
+        return False
+    keys = ("min_x", "max_x", "min_y", "max_y")
+    try:
+        _fitted, accepted = bounded_media_extent(tuple(base[key] for key in keys),
+            [lonlat_to_web_mercator(point["lon"], point["lat"]) for point in points])
+        return all(current["min_x"] - 1e-6 <= x <= current["max_x"] + 1e-6
+                   and current["min_y"] - 1e-6 <= y <= current["max_y"] + 1e-6 for x, y in accepted)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def project_map_spec_is_current(metadata, spec, layout, parameters=None):
+    """One freshness check for stage groups and date-only media maps."""
+    if spec.get("map_plan_kind") == "stage":
+        from map_overlay import map_uses_dynamic_overlays
+        return bool(map_uses_dynamic_overlays(metadata)
+                    and metadata.get("stage_geometry_signature") == stage_map_spec_signature(spec, metadata)
+                    and (not parameters or map_render_signature_matches(metadata, parameters)))
+    return bool(isinstance(metadata, dict)
+                and media_map_metadata_matches_coordinates(metadata, spec["date"], spec["coordinates"])
+                and (not parameters or map_render_signature_matches(metadata, parameters)))
+
+
+def stage_render_tracks(spec, output_dir):
+    """Read each canonical derived payload once; do not process the GPX again."""
+    from slideshow_stages import timestamp
+    result = []
+    for row in spec["members"]:
+        path = Path(str(row.get("track_data_sidecar") or ""))
+        if not path.is_absolute():
+            path = output_dir / path
+        data = read_json_data(path)
+        if not isinstance(data, dict) or data.get("track_data_fingerprint") != row.get("track_data_fingerprint"):
+            raise ValueError(f"Current derived track data is required for {row.get('track_name', path.name)}")
+        segments = {}
+        for point in data.get("timed_track_points", []):
+            segments.setdefault(int(point.get("segment_index", 0)), []).append((float(point["lat"]), float(point["lon"])))
+        if not segments:
+            raise ValueError(f"No route geometry for {row.get('track_name', path.name)}")
+        start, end = timestamp(row.get("start_time")), timestamp(row.get("end_time"))
+        result.append({**row, "name": row.get("track_name", ""), "time": start,
+                       "duration": end - start if start and end and end >= start else None,
+                       "table_number": row["internal_id"], "segments": list(segments.values()),
+                       "points": [point for segment in segments.values() for point in segment]})
+    return result
+
+
+def render_stage_map_specs(specs, sorted_output_path, options, output_writer=None):
+    if not options or options.get("skip_rendering") or not specs:
+        return []
+    from gpx_tracks_table import render_track_plot
+    from plot_metadata_utils import write_plot_metadata
+    from map_overlay import map_uses_dynamic_overlays
+    directory = Path(options.get("output_dir") or (sorted_output_path.parent / "trackimages"))
+    directory.mkdir(parents=True, exist_ok=True)
+    requested = options.get("requested_filenames")
+    requested = {str(name).casefold() for name in requested} if requested is not None else None
+    layouts = options.get("map_layouts", ("standard", "time-lapse"))
+    rendered = []
+    for spec in specs:
+        loaded = None
+        for layout in layouts:
+            check_cancelled()
+            name = media_map_output_filename(spec["filename"], layout)
+            if requested is not None and name.casefold() not in requested:
+                continue
+            image = directory / name
+            try:
+                metadata = read_json_data(image.with_suffix(".json")) if image.is_file() else None
+            except (OSError, ValueError):
+                metadata = None
+            signature = stage_map_spec_signature(spec, metadata)
+            parameters = options.get("adventure_render_parameters_by_layout", {}).get(layout)
+            current = (map_uses_dynamic_overlays(metadata)
+                       and metadata.get("stage_geometry_signature") == signature
+                       and (not parameters or map_render_signature_matches(metadata, parameters)))
+            # Existing singleton maps are valid backgrounds; annotate them in
+            # place unless attached GPS positions require a new bounded extent.
+            if (not current and map_uses_dynamic_overlays(metadata) and len(spec["members"]) == 1
+                    and metadata.get("track_geometry_fingerprint") == spec["members"][0].get("track_geometry_fingerprint")
+                    and (not parameters or map_render_signature_matches(metadata, parameters))):
+                from slideshow_stages import bounded_media_extent
+                from gpx_tracks_table import lonlat_to_web_mercator
+                bounds = metadata.get("route_only_extent_mercator", metadata.get("extent_mercator"))
+                if isinstance(bounds, dict):
+                    base = tuple(bounds[key] for key in ("min_x", "max_x", "min_y", "max_y"))
+                    fitted, _accepted = bounded_media_extent(base, [lonlat_to_web_mercator(point["lon"], point["lat"])
+                                                                  for point in spec["extent_media"]])
+                    current_bounds = metadata.get("extent_mercator", {})
+                    current = fitted == tuple(current_bounds.get(key) for key in ("min_x", "max_x", "min_y", "max_y"))
+                    if current:
+                        metadata = {**metadata, "route_only_extent_mercator": bounds}
+            try:
+                if not current:
+                    loaded = loaded if loaded is not None else stage_render_tracks(spec, directory)
+                    print(f"Preparing shared {layout} stage map: {name}", file=output_writer)
+                    _zoom, _font, metadata = render_track_plot(
+                        loaded, int(options.get("zoom_level", 15)), tuple(options.get("image_size", (1920, 1080))),
+                        float(options.get("font_factor", 1)), False, image,
+                        str(options.get("line_color", "blue")), float(options.get("line_width", 2)),
+                        "white", 0, str(options.get("background_color", "black")),
+                        str(options.get("title_color", "white")), [], "", False,
+                        map_layout=layout, map_provider=str(options.get("map_provider", "osm")),
+                        custom_map_url=str(options.get("custom_map_url", "")),
+                        custom_map_attribution=str(options.get("custom_map_attribution", "")),
+                        maximum_map_zoom=int(options.get("maximum_map_zoom", 19)),
+                        map_request_timeout_seconds=float(options.get("map_request_timeout_seconds", 12)),
+                        map_credential_id=str(options.get("map_credential_id", "default")),
+                        map_cache_only=bool(options.get("map_cache_only", False)), defer_install=True,
+                        extent_media_points=spec["extent_media"])
+                updated = {**metadata, "stage_plan_version": 1, "stage_key": spec["stage_key"],
+                           "stage_geometry_signature": stage_map_spec_signature(spec, metadata),
+                           "stage_members": spec["all_members"],
+                           "stage_included_member_ids": [row["internal_id"] for row in spec["members"]],
+                           "stage_statistics": spec["statistics"],
+                           "source_track_geometry_fingerprints": [row.get("track_geometry_fingerprint") for row in spec["members"]],
+                           "overlay_track_types": [row.get("track_type", "unassigned") for row in spec["members"]
+                                                   for _ in range(int(row.get("segment_count", 1)))],
+                           "overlay_hidden_tracks": [bool(row.get("hidden")) for row in spec["members"]
+                                                     for _ in range(int(row.get("segment_count", 1)))],
+                           "overlay_track_internal_ids": [row["internal_id"] for row in spec["members"]
+                                                          for _ in range(int(row.get("segment_count", 1)))]}
+                if parameters:
+                    updated["adventure_render_parameters"] = parameters
+                if len(spec["members"]) == 1:
+                    member = spec["members"][0]
+                    updated.update({key: member.get(key) for key in (
+                        "track_geometry_fingerprint", "track_data_fingerprint", "track_fingerprint",
+                        "track_name", "internal_id", "display_track_number", "track_id", "stage_number", "track_type", "hidden")})
+                    updated["track_number"] = member["internal_id"]
+                if updated != metadata or not current:
+                    write_plot_metadata(updated, image.with_suffix(".json"))
+                if not current:
+                    rendered.append(image)
+            except Exception as exc:
+                if not options.get("continue_on_map_error"):
+                    raise
+                options.setdefault("map_failures", []).append({"filename": name, "error": str(exc)})
+                print(f"Could not prepare stage map {name}: {exc}", file=output_writer)
+                return rendered
+    return rendered
+
+
+def render_stage_overview(plan, sorted_output_path, options, output_writer=None):
+    """Bounded expansion of the existing Tour Overview, using the same fitter."""
+    if not options or options.get("skip_rendering") or not plan.overview_name:
+        return []
+    from gpx_tracks_table import render_track_plot, lonlat_to_web_mercator
+    from slideshow_stages import bounded_media_extent
+    from plot_metadata_utils import write_plot_metadata
+    directory = Path(options.get("output_dir") or (sorted_output_path.parent / "trackimages"))
+    path = directory / Path(plan.overview_name).name
+    requested = options.get("requested_filenames")
+    if requested is not None and path.name.casefold() not in {str(name).casefold() for name in requested}:
+        return []
+    try:
+        metadata = read_json_data(path.with_suffix(".json"))
+    except (OSError, ValueError):
+        return []  # Required overview preparation remains the existing GPX phase.
+    if not isinstance(metadata, dict):
+        return []
+    extent = metadata.get("route_only_extent_mercator", metadata.get("extent_mercator"))
+    if not isinstance(extent, dict):
+        return []
+    points = [point for spec in plan.stage_map_specs for point in spec["extent_media"]]
+    base = tuple(extent[key] for key in ("min_x", "max_x", "min_y", "max_y"))
+    fitted, _accepted = bounded_media_extent(base, [lonlat_to_web_mercator(point["lon"], point["lat"]) for point in points])
+    current = metadata.get("extent_mercator", {})
+    bounds = tuple(current.get(key) for key in ("min_x", "max_x", "min_y", "max_y"))
+    if fitted == bounds or not points:
+        return []
+    rows = stage_summary_rows(plan.tracks_summary)
+    spec = {"members": rows}
+    try:
+        tracks = stage_render_tracks(spec, directory)
+        print(f"Preparing Tour Overview including nearby stage media: {path.name}", file=output_writer)
+        _zoom, _font, changed = render_track_plot(
+            tracks, int(options.get("zoom_level", 15)), tuple(options.get("image_size", (1920, 1080))),
+            float(options.get("font_factor", 1)), False, path, "blue", float(options.get("line_width", 2)),
+            "white", 0, str(options.get("background_color", "black")), str(options.get("title_color", "white")),
+            metadata.get("overview_labels", []), metadata.get("header", ""), True,
+            map_provider=str(options.get("map_provider", "osm")),
+            custom_map_url=str(options.get("custom_map_url", "")),
+            custom_map_attribution=str(options.get("custom_map_attribution", "")),
+            maximum_map_zoom=int(options.get("maximum_map_zoom", 19)),
+            map_request_timeout_seconds=float(options.get("map_request_timeout_seconds", 12)),
+            map_credential_id=str(options.get("map_credential_id", "default")),
+            map_cache_only=bool(options.get("map_cache_only", False)), defer_install=True, extent_media_points=points)
+        write_plot_metadata({**metadata, **changed}, path.with_suffix(".json"))
+    except Exception as exc:
+        if not options.get("continue_on_map_error"):
+            raise
+        options.setdefault("map_failures", []).append({"filename": path.name, "error": str(exc)})
+        return []
+    return [path]
 
 
 def project_map_plan_from_sidecars(
@@ -4266,13 +4619,20 @@ def project_map_plan_from_sidecars(
         records.append(record)
     if resolver is not None:
         resolver.emit_summary()
-    return build_project_map_plan(
+    plan = build_project_map_plan(
         records,
         output,
         tracks_summary,
         sort_date_sections_by_tracks,
         media_map_options,
     )
+    if output.is_file() and plan.stage_map_specs:
+        from slideshow_stages import attached_media_points, track_identity
+        authored = attached_media_points(output.read_text(encoding="utf-8").splitlines())
+        for spec in plan.stage_map_specs:
+            spec["extent_media"].extend(point for row in spec["members"]
+                                        for point in authored.get(track_identity(row), []))
+    return plan
 
 
 def add_media_maps_to_control_entries(
@@ -4290,6 +4650,11 @@ def add_media_maps_to_control_entries(
         if affected_dates is not None and media_day not in affected_dates:
             continue
         section_entries = entries[header_index + 1 : end_index]
+        preceding_owner = next((entry for entry in reversed(entries[:header_index])
+                                if entry.get("type") in {"track_context", "map", "map_before", "map_after", "media_map"}), None)
+        if (any(entry.get("type") == "track_context" for entry in section_entries)
+                or preceding_owner and preceding_owner.get("type") == "track_context"):
+            continue
         if any(entry.get("type") in {"map", "map_before", "map_after"} for entry in section_entries):
             continue
         existing_media_map = next(
@@ -4424,8 +4789,10 @@ def write_sorted_output(
             {"filename": "project maps", "error": str(exc)}
         )
         print(f"Could not create project maps: {exc}", flush=True)
-    sorted_output_path.parent.mkdir(parents=True, exist_ok=True)
-    sorted_output_path.write_text(project_control_plan_text(plan), encoding="utf-8")
+    if plan.stage_map_specs and media_map_options and media_map_options.get("map_failures"):
+        raise RuntimeError("Stage map preparation failed; the existing control file was not replaced.")
+    from json_storage import atomic_write_text
+    atomic_write_text(sorted_output_path, project_control_plan_text(plan))
 
 
 def project_control_plan_text(plan: ProjectMapPlan) -> str:
@@ -4448,7 +4815,21 @@ def project_control_plan_text(plan: ProjectMapPlan) -> str:
             lines.append("#Datum:")
             active_date = None
         lines.extend(f"#{keyword}: {filename}" for keyword, filename in section["maps"])
-        lines.extend(sorted_media_output_line(record) for record in section["records"])
+        if "events" in section:
+            from slideshow_stages import track_context_line
+            for event in section["events"]:
+                if event["kind"] == "track":
+                    lines.append(track_context_line(event["internal_id"], event["relation"]))
+                else:
+                    record = event["record"]
+                    record_day = record.photo_datetime.date() if record.photo_datetime else None
+                    if record_day != active_date:
+                        label = format_german_date(record.photo_datetime) if record.photo_datetime else ""
+                        lines.append(f"#Datum: {label}")
+                        active_date = record_day
+                    lines.append(sorted_media_output_line(record))
+        else:
+            lines.extend(sorted_media_output_line(record) for record in section["records"])
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -4470,7 +4851,7 @@ def control_record_filename(record: PhotoRecord) -> str:
 
 def sorted_media_output_line(record: PhotoRecord) -> str:
     """Return one media line in sorted-list format."""
-    time_text = record.photo_datetime.strftime("%H:%M")
+    time_text = record.photo_datetime.strftime("%H:%M") if record.photo_datetime else ""
     gps_text = format_gps_text(record.latitude, record.longitude)
     place_text = format_place_text(record.latitude, record.longitude, record.place, record.geocode_requested)
     return f"{control_record_filename(record)} | {time_text} | {gps_text} | {place_text}"
@@ -4490,6 +4871,7 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     current_date: Optional[date] = None
     current_date_label = ""
+    current_track = None
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -4514,12 +4896,21 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
                 entry.update({"type": "overview"})
             elif normalized == "map":
                 entry.update({"type": "map"})
+                current_track = None
             elif normalized == "mapbefore":
                 entry.update({"type": "map_before", "relation": "before"})
             elif normalized == "mapafter":
                 entry.update({"type": "map_after", "relation": "after"})
             elif normalized == "mediamap":
                 entry.update({"type": "media_map", "relation": "media"})
+                current_track = None
+            elif normalized == "track":
+                from slideshow_stages import parse_track_context
+                context = parse_track_context(content)
+                if context:
+                    entry.update({"type": "track_context", "internal_id": context[0], "relation": context[1]})
+                    if not disabled:
+                        current_track = context
             elif normalized == "music":
                 entry.update({"type": "music", "name": ""})
             elif normalized == "control":
@@ -4535,6 +4926,8 @@ def parse_control_file_entries(lines: list[str]) -> list[dict[str, Any]]:
                         "place": parts[3] if len(parts) > 3 else "",
                     }
                 )
+                if current_track:
+                    entry.update({"track_internal_id": current_track[0], "track_relation": current_track[1]})
                 if len(parts) > 1 and current_date is not None:
                     try:
                         parsed_time = datetime.strptime(parts[1], "%H:%M").time()
@@ -4957,6 +5350,75 @@ def insert_adjacent_media_entry(
     _insert_media_in_section(entries, insert_at, insert_at + 2, record)
 
 
+def insert_stage_media_entry(entries, record, summary):
+    """Insert an approved addition without regrouping existing authored rows."""
+    from slideshow_stages import parse_track_context, track_context_line
+    sections = build_track_ordered_sections([record], summary)
+    context = None
+    for section in sections:
+        previous = None
+        for event in section.get("events", []):
+            if event["kind"] == "track":
+                previous = (event["internal_id"], event["relation"])
+            elif event.get("record") is record:
+                context = previous
+                break
+    matching = [index for index, entry in enumerate(entries)
+                if entry.get("type") == "track_context"
+                and (entry.get("internal_id"), entry.get("relation")) == context]
+    if context and matching:
+        start = matching[0]
+        end = next((index for index in range(start + 1, len(entries))
+                    if entries[index].get("type") in {"track_context", "map", "media_map", "map_before", "map_after"}), len(entries))
+        insert_at = start + 1
+        for index in range(start + 1, end):
+            entry = entries[index]
+            if entry.get("type") == "media":
+                when = entry.get("datetime")
+                if when is not None and record.photo_datetime is not None and when > record.photo_datetime:
+                    break
+                insert_at = index + 1
+        prefix = []
+    elif context:
+        routes = [index for index, entry in enumerate(entries) if entry.get("type") == "track_context"
+                  and entry.get("internal_id") == context[0] and entry.get("relation") == "route"]
+        if routes:
+            if context[1] in {"before", "between", "adjacent_before"}:
+                insert_at = routes[0]
+            else:
+                insert_at = next((index for index in range(routes[0] + 1, len(entries))
+                                  if entries[index].get("type") in {"track_context", "map", "media_map"}), len(entries))
+            prefix = [track_context_line(*context)]
+        else:
+            raise ValueError("The new medium belongs to a track not yet in this control file. Review stage updates first.")
+    else:
+        # A real independent date block, not an accidental continuation of the
+        # preceding track when that date has no usable GPS or clock information.
+        insert_at = len(entries)
+        day = record.photo_datetime.date() if record.photo_datetime else None
+        filename = (media_map_filename(Path(summary.overview_image or "adventure.png").with_suffix(".lst"), day)
+                    if day is not None and record.latitude is not None and record.longitude is not None
+                    else summary.overview_image)
+        prefix = [f"#MediaMap: {Path(filename).name}"] if filename else []
+    day = record.photo_datetime.date() if record.photo_datetime else None
+    label = format_german_date(record.photo_datetime) if record.photo_datetime else ""
+    current_day = entries[insert_at].get("date") if insert_at < len(entries) else (entries[-1].get("date") if entries else None)
+    lines = [*prefix, *([f"#Datum: {label}"] if day != current_day else []), sorted_media_output_line(record)]
+    if insert_at < len(entries) and entries[insert_at].get("date") != day:
+        restore = entries[insert_at].get("date")
+        restore_label = format_german_date(datetime.combine(restore, datetime.min.time())) if restore else ""
+        lines.append(f"#Datum: {restore_label}")
+    inserted = parse_control_file_entries(lines)
+    for entry in inserted:
+        if entry.get("type") != "date" and entry.get("date") is None:
+            entry["date"] = day
+        if entry.get("type") == "media":
+            entry["datetime"] = record.photo_datetime
+            if context:
+                entry.update(track_internal_id=context[0], track_relation=context[1])
+    entries[insert_at:insert_at] = inserted
+
+
 def insert_classified_media_entry(
     entries: list[dict[str, Any]],
     record: PhotoRecord,
@@ -4964,6 +5426,10 @@ def insert_classified_media_entry(
     sort_date_sections_by_tracks: bool,
 ) -> None:
     """Insert merged media into an exact, adjacent, or trailing leftover section."""
+    if (tracks_summary is not None and tracks_summary.stage_plan_version
+            and any(entry.get("type") == "track_context" for entry in entries)):
+        insert_stage_media_entry(entries, record, tracks_summary)
+        return
     tracks = list(tracks_summary.tracks) if tracks_summary is not None else []
     tracks_in_order = tracks_with_untimed_context(
         tracks,
@@ -5056,10 +5522,10 @@ def _media_record_gps_distance(
     return distance_meters(float(old_pair[0]), float(old_pair[1]), float(new_pair[0]), float(new_pair[1]))
 
 
-def _control_media_record(entry: dict[str, Any], media_path: Path) -> Optional[PhotoRecord]:
+def _control_media_record(entry: dict[str, Any], media_path: Path, *, allow_missing_time=False) -> Optional[PhotoRecord]:
     """Build a comparison-only record from one saved control-file media row."""
     timestamp = entry.get("datetime")
-    if not isinstance(timestamp, datetime):
+    if not isinstance(timestamp, datetime) and not allow_missing_time:
         return None
     parts = [part.strip() for part in str(entry.get("line", "")).split("|")]
     latitude = None
@@ -5099,6 +5565,8 @@ def _control_section_description(entries: list[dict[str, Any]], entry_index: int
     entry = entries[entry_index]
     day = entry.get("date")
     prefix = day.isoformat() if isinstance(day, date) else "No date"
+    if entry.get("track_internal_id"):
+        return f"{prefix} - Track"
     header_index = None
     end_index = len(entries)
     for start, end in _control_section_ranges(entries):
@@ -5134,7 +5602,7 @@ def _proposed_media_section(
     sections = build_control_sections([record], tracks_summary, sort_date_sections_by_tracks)
     if not sections:
         return record.photo_datetime.date().isoformat()
-    section = sections[0]
+    section = next((item for item in sections if any(value is record for value in item["records"])), sections[0])
     maps = section.get("maps", [])
     relation = "Media section"
     if maps:
@@ -5144,7 +5612,9 @@ def _proposed_media_section(
             "MapAfter": "Day after",
             "MediaMap": "Media map",
         }.get(str(maps[0][0]), str(maps[0][0]))
-    return f"{section['date'].isoformat()} - {relation}"
+    day = record.photo_datetime.date() if tracks_summary and tracks_summary.stage_plan_version and record.photo_datetime else section.get("date")
+    label = day.isoformat() if day else "Date unknown"
+    return f"{label} - {relation}"
 
 
 def _control_track_map_file_exists(project_dir: Path, filename: str) -> bool:
@@ -5193,6 +5663,143 @@ def _canonical_control_track_map_name(filename: str) -> str:
     return normalize_track_plot_filename_for_match(canonical)
 
 
+def analyze_stage_control_updates(project, control_path, entries, summary, plan, *, include_hidden_tracks=False):
+    """Preview a structural conversion; never write or sort authored files here."""
+    from slideshow_stages import build_stage_groups, stage_key, track_identity, parse_track_context
+    groups = build_stage_groups(stage_summary_rows(summary), Path(summary.overview_image or "adventure.png").stem)
+    owners = {track_identity(row): group for group in groups for row in group.members}
+    modern = any(entry.get("type") == "track_context" for entry in entries)
+    replacement = []
+    if modern:
+        # Preserve authored member/media/directive order, including deliberate
+        # repetitions. Only adjust the structural map ownership when needed.
+        pending_map, current_key = None, None
+        for entry in entries:
+            if entry.get("type") == "map" and not entry.get("disabled"):
+                pending_map, current_key = entry, None
+                continue
+            if entry.get("type") == "track_context" and not entry.get("disabled"):
+                group = owners.get(entry["internal_id"])
+                if group is None:
+                    plan.warning = f"Track context {entry['internal_id']} has no GPX owner. Keep the legacy file or correct that row in the Control File editor."
+                    return plan
+                if group.key != current_key:
+                    replacement.append({"line": f"#Map: {group.filename}", "type": "map", "name": group.filename,
+                                        "date": entry.get("date"), "disabled": False})
+                    current_key = group.key
+                pending_map = None
+            elif entry.get("type") in {"media_map", "map_before", "map_after"}:
+                if pending_map:
+                    replacement.append(pending_map)
+                    pending_map = None
+                current_key = None
+            replacement.append(dict(entry))
+        if pending_map:
+            replacement.append(pending_map)
+        from slideshow_stages import missing_stage_route_insertions, track_context_line
+        lines = [entry["line"] for entry in replacement]
+        insertions = missing_stage_route_insertions(lines, stage_summary_rows(summary), include_hidden=include_hidden_tracks)
+        if insertions:
+            repaired = []
+            for index in range(len(lines) + 1):
+                repaired.extend(track_context_line(identity) for identity in insertions.get(index, []))
+                if index < len(lines):
+                    repaired.append(lines[index])
+            replacement = parse_control_file_entries(repaired)
+            labels = {track_identity(row): row.get("track_id") or track_identity(row) for group in groups for row in group.members}
+            plan.stage_updates.append("Restore route motion for Tracks " + ", ".join(
+                str(labels[identity]) for identities in insertions.values() for identity in identities)
+                + "; retain every authored medium and directive in its existing order.")
+    else:
+        # Carry directive/comment bundles with their following medium. Duplicate
+        # photo rows remain independent authored occurrences, not deduplicated.
+        records, bundles, pending = [], {}, []
+        structural = {"overview", "map", "map_before", "map_after", "media_map", "date"}
+        for position, entry in enumerate(entries):
+            if entry.get("type") in structural:
+                if entry.get("disabled"):
+                    # An authored disabled map is not an automatic GPX exclusion.
+                    plan.notes.append("Legacy disabled map rows were preserved. To adopt shared-stage playback, review those rows in the editor or explicitly create a new control file.")
+                    return plan
+                continue
+            if entry.get("type") != "media":
+                pending.append(entry["line"])
+                continue
+            path = project / str(entry.get("name") or "")
+            record = load_record_from_json(media_sidecar_path(path), path)
+            if record is None:
+                record = _control_media_record(entry, path)
+            if record is None:
+                record = _control_media_record(entry, path, allow_missing_time=True)
+                record.known_date = entry.get("date")
+            record.control_filename = str(entry.get("name") or path.name)
+            record.control_order = position
+            records.append(record)
+            bundles[id(record)] = [*pending, entry["line"]]
+            pending = []
+        new_plan = build_project_map_plan(records, control_path, summary, True, None)
+        # Serialize structural rows using the normal writer, substituting the
+        # exact original media and command bundles instead of regenerated text.
+        lines, active_date = [], None
+        if summary.overview_image:
+            lines.append(f"#Overviewmap: {Path(summary.overview_image).name}")
+        from slideshow_stages import track_context_line
+        for section in new_plan.sections:
+            day = section.get("date")
+            if day != active_date:
+                label = format_german_date(datetime.combine(day, datetime.min.time())) if day else ""
+                lines.append(f"#Datum: {label}")
+                active_date = day
+            maps = section["maps"]
+            if not maps and section.get("records"):
+                # Preparing the independent media map is handled by the same
+                # combined workflow after this preview has been accepted.
+                filename = media_map_filename(control_path, day) if day else summary.overview_image
+                maps = [("MediaMap", filename)] if filename else []
+            lines.extend(f"#{keyword}: {Path(name).name}" for keyword, name in maps)
+            for event in section.get("events", [{"kind": "media", "record": value} for value in section["records"]]):
+                if event["kind"] == "track":
+                    lines.append(track_context_line(event["internal_id"], event["relation"]))
+                    continue
+                record = event["record"]
+                day = record.photo_datetime.date() if record.photo_datetime else getattr(record, "known_date", None)
+                if day != active_date:
+                    label = format_german_date(record.photo_datetime) if record.photo_datetime else ""
+                    lines.append(f"#Datum: {label}")
+                    active_date = day
+                lines.extend(bundles[id(record)])
+        lines.extend(pending)
+        try:
+            from slideshow_control_format import compile_repeat_ranges
+            compile_repeat_ranges(lines, strict=True)
+        except ValueError as exc:
+            plan.notes.append(f"Stage conversion would invalidate an authored directive range: {exc}. The existing control file remains unchanged and usable; adjust that range before conversion.")
+            return plan
+        replacement = parse_control_file_entries(lines)
+    original_lines = [entry["line"] for entry in entries]
+    if original_lines == [entry["line"] for entry in replacement]:
+        return plan
+    plan.stage_replacement_entries = replacement
+    plan.stage_updates.append("Use shared stage maps while preserving track/media/directive order within the reviewed blocks.")
+    labels_by_identity = {track_identity(row): str(row.get("track_id") or track_identity(row))
+                          for group in groups for row in group.members}
+    for block in build_control_sections([], summary, True):
+        if block.get("member_ids"):
+            labels = [labels_by_identity[identity] for identity in block["member_ids"]]
+            plan.stage_updates.append(f"Playback block: Tracks {', '.join(labels)} — {block['maps'][0][1]}")
+    from slideshow_stages import filter_hidden_track_lines
+    enabled = parse_control_file_entries(filter_hidden_track_lines([entry["line"] for entry in replacement],
+                                                                  stage_summary_rows(summary), include_hidden_tracks))
+    required = {(entry["name"], entry.get("type")) for entry in enabled
+                if not entry.get("disabled") and entry.get("type") in {"map", "media_map", "overview"}}
+    missing = [name for name, kind in required if not _control_track_map_file_exists(project, name)
+               or kind == "map" and not _control_track_map_file_exists(project, time_lapse_track_map_name(name))]
+    if missing:
+        plan.summary_current = False
+        plan.warning = f"Prepare {len(missing)} required stage/media map asset(s) before applying these reviewed updates."
+    return plan
+
+
 def analyze_track_map_reference_updates(
     project_dir: Path | str,
     control_file: Path | str,
@@ -5202,6 +5809,7 @@ def analyze_track_map_reference_updates(
     tracks_summary: Optional[TracksSummary] = None,
     summary_current: bool = True,
     sort_date_sections_by_tracks: bool = False,
+    include_hidden_tracks: bool = False,
 ) -> TrackMapReferenceUpdatePlan:
     """Compare control-file Track Map directives with one current summary."""
     project = Path(project_dir).expanduser().resolve(strict=False)
@@ -5230,6 +5838,9 @@ def analyze_track_map_reference_updates(
         control_entries = parse_control_file_entries(
             control_path.read_text(encoding="utf-8").splitlines()
         )
+    if tracks_summary.stage_plan_version:
+        return analyze_stage_control_updates(project, control_path, control_entries, tracks_summary, plan,
+                                             include_hidden_tracks=include_hidden_tracks)
 
     existing_map_keys = {
         (
@@ -5761,6 +6372,7 @@ def analyze_control_file_updates(
     place_equivalence_m: float = DEFAULT_PLACE_GPS_EQUIVALENCE_M,
     media_memberships: Optional[dict[str, MediaMembership]] = None,
     media_inventory: Optional[ControlMediaInventory] = None,
+    include_hidden_tracks: bool = False,
 ) -> ControlFileUpdatePlan:
     """Analyze Track Map references and selected media from one control snapshot."""
     project = Path(project_dir).expanduser().resolve(strict=False)
@@ -5792,6 +6404,7 @@ def analyze_control_file_updates(
                 tracks_summary=tracks_summary,
                 summary_current=summary_current,
                 sort_date_sections_by_tracks=sort_date_sections_by_tracks,
+                include_hidden_tracks=include_hidden_tracks,
             )
             if control_path is not None
             else TrackMapReferenceUpdatePlan(warning="No slide show control file is available.")
@@ -5872,6 +6485,13 @@ def _apply_track_map_reference_updates(
     sort_date_sections_by_tracks: bool,
 ) -> tuple[int, int, int, int]:
     """Apply one validated Track Map reference plan to parsed control entries."""
+    if plan.stage_replacement_entries is not None:
+        if plan.warning or not plan.summary_current:
+            raise ValueError(plan.warning or "Prepare the required stage maps before applying updates")
+        before = [entry["line"] for entry in entries]
+        entries[:] = [dict(entry) for entry in plan.stage_replacement_entries]
+        return (sum(entry.get("type") == "track_context" for entry in entries), 0, 0,
+                int(before != [entry["line"] for entry in entries]))
     obsolete_overview = {
         normalize_filename_for_match(name) for name in plan.obsolete_overview
     }

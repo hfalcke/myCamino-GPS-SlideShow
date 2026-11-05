@@ -15,8 +15,8 @@ from track_map_layout_utils import time_lapse_track_map_name
 
 STARTUP_CACHE_VERSION = 2
 ALGORITHM_VERSIONS = [TRACK_FINGERPRINT_VERSION, PROCESSING_INPUT_FINGERPRINT_VERSION, MAP_CONTENT_VERSION]
-PRESENTATION_REFRESH_VERSION = 1
-PRESENTATION_KEYS = ("track_type", "hidden", "stage_number", "track_id", "internal_id", "display_track_number")
+PRESENTATION_REFRESH_VERSION = 3
+PRESENTATION_KEYS = ("track_type", "hidden", "stage_number", "track_id", "internal_id", "display_track_number", "source_table_position")
 PROCESSING_OPTIONS = (
     "sort_original", "sort_date", "sort_distance", "remove_prefix", "gpx_threshold_distance",
     "gpx_threshold_accuracy", "gpx_horizontal_smoothing_distance", "gpx_elevation_smoothing_distance",
@@ -80,6 +80,7 @@ def prepared_hint_matches(hint, gpx, directory, options):
             and hint["summary"] == file_signature(hint["summary"][0])
             and isinstance(hint["context"]["tracks"], list)
             and all(isinstance(track, dict)
+                    and ("stage_number" not in track or "source_table_position" in track)
                     and all(isinstance(track.get(key), str) and track[key]
                             for key in ("track_data_sidecar", "track_data_fingerprint", "track_geometry_fingerprint"))
                     for track in hint["context"]["tracks"])
@@ -144,10 +145,29 @@ def reuse_prepared_tracks(gpx, directory, options):
     return hint
 
 
-def referenced_control_map_assets(control_text, trackimages_dir, *, include_disabled=False):
+def playback_control_lines(control_text, directory, *, include_hidden_tracks=False, tracks=None):
+    from slideshow_stages import filter_hidden_track_lines, parse_track_context
+    lines = str(control_text).splitlines()
+    if not any(parse_track_context(line) for line in lines):
+        return lines
+    if tracks is None:
+        name = next((line.partition(":")[2].strip() for line in lines if line.startswith("#Overviewmap:")), "")
+        path = Path(name)
+        if not path.is_absolute():
+            path = Path(directory) / path
+        try:
+            tracks = json.loads(path.with_name(f"{path.stem}-summary.json").read_text(encoding="utf-8")).get("tracks", [])
+        except (OSError, ValueError):
+            tracks = []
+    return filter_hidden_track_lines(lines, tracks, include_hidden_tracks)
+
+
+def referenced_control_map_assets(control_text, trackimages_dir, *, include_disabled=False, include_hidden_tracks=False):
     """One shared dependency list for GUI checks and persistent startup validation."""
     paths = []
-    for line in str(control_text).splitlines():
+    lines = (str(control_text).splitlines() if include_disabled else
+             playback_control_lines(control_text, trackimages_dir, include_hidden_tracks=include_hidden_tracks))
+    for line in lines:
         disabled, content = split_disabled_control_line(line.strip())
         if disabled and not include_disabled:
             continue
@@ -167,11 +187,12 @@ def referenced_control_map_assets(control_text, trackimages_dir, *, include_disa
     return list(dict.fromkeys(paths))
 
 
-def validation_signature(gpx, control, directory, options, extra_assets=(), *, context=None):
+def validation_signature(gpx, control, directory, options, extra_assets=(), *, context=None, include_hidden_tracks=False):
     """Stat required dependencies only, including absent files and external maps."""
     directory = Path(directory).resolve(strict=False)
     paths = set(Path(path).resolve(strict=False) for path in extra_assets)
-    for path in referenced_control_map_assets(Path(control).read_text(encoding="utf-8"), directory):
+    for path in referenced_control_map_assets(Path(control).read_text(encoding="utf-8"), directory,
+                                              include_hidden_tracks=include_hidden_tracks):
         paths.update((path.resolve(strict=False), path.with_suffix(".json").resolve(strict=False)))
     if context is not None:
         for track in context.get("tracks", []):
@@ -185,7 +206,7 @@ def validation_signature(gpx, control, directory, options, extra_assets=(), *, c
     return (file_signature(gpx), file_signature(control), str(directory),
             options_signature(preparation_options(options)), tuple(file_signature(path) for path in sorted(paths)),
             # Recheck old successful validation once without discarding prepared tracks.
-            (*ALGORITHM_VERSIONS, PRESENTATION_REFRESH_VERSION))
+            (*ALGORITHM_VERSIONS, PRESENTATION_REFRESH_VERSION, include_hidden_tracks))
 
 
 class StartupMetadataReader:
@@ -208,7 +229,9 @@ class StartupMetadataReader:
         if isinstance(data, dict):
             keys = ("version", "track_fingerprint", "track_data_fingerprint", "track_geometry_fingerprint",
                     "track_number", "map_content_version", "background_only", "source_track_geometry_fingerprints",
-                    "running_speed", "tracks", "overlay_track_types", "overlay_hidden_tracks", *PRESENTATION_KEYS)
+                    "running_speed", "tracks", "overlay_track_types", "overlay_hidden_tracks", "overlay_track_internal_ids",
+                    "extent_mercator", "route_only_extent_mercator",
+                    "stage_plan_version", "stage_members", "stage_included_member_ids", "stage_geometry_signature", *PRESENTATION_KEYS)
             projected = {key: data[key] for key in keys if key in data}
             if "timed_track_points" in data:
                 projected["timed_track_points"] = []
@@ -277,9 +300,15 @@ def refresh_speed_metadata(gpx, directory, options, *, read_metadata, upgrade, p
 
 def validate_startup(gpx, control, directory, options, *, previous_key, extra_assets,
                      prepare, execute, check, read_metadata, upgrade, progress, prepared_hint=None,
-                     prepared_future=None):
+                     prepared_future=None, include_hidden_tracks=False):
     """Reuse successful validation, otherwise validate dependencies on the worker."""
     timings = {}
+
+    def check_dependencies(text, root, prepared, **kwargs):
+        from slideshow_stages import parse_track_context
+        if any(parse_track_context(line) for line in str(text).splitlines()):
+            prepared = {**prepared, "include_hidden_tracks": include_hidden_tracks}
+        return check(text, root, prepared, **kwargs)
 
     def measured(label, callback):
         started = time.perf_counter()
@@ -300,7 +329,7 @@ def validate_startup(gpx, control, directory, options, *, previous_key, extra_as
     context = prepared_hint["context"] if prepared_hint_matches(prepared_hint, gpx, directory, options) else None
     progress("Checking saved preparation", 0, 0)
     before = measured("Dependency signatures", lambda: validation_signature(
-        gpx, control, directory, options, extra_assets, context=context))
+        gpx, control, directory, options, extra_assets, context=context, include_hidden_tracks=include_hidden_tracks))
     if before == previous_key or before == record.get("cache_key"):
         progress("Reusing verified track and map data", 0, 0)
         return dict(issues={"maps": [], "derived": []}, retry=False, cache_key=before,
@@ -310,7 +339,7 @@ def validate_startup(gpx, control, directory, options, *, previous_key, extra_as
     control_text = Path(control).read_text(encoding="utf-8")
     reused_loaded_tracks = context is not None
     if context is not None:
-        issues = measured("Prepared Adventure validation", lambda: check(
+        issues = measured("Prepared Adventure validation", lambda: check_dependencies(
             control_text, directory, context, read_metadata=reader))
         speed_paths = [Path(directory) / track["track_data_sidecar"] for track in context["tracks"]
                        if track.get("track_data_sidecar")]
@@ -332,10 +361,10 @@ def validate_startup(gpx, control, directory, options, *, previous_key, extra_as
     from gpx_tracks_table import refresh_track_presentation_metadata
     measured("Presentation metadata", lambda: refresh_track_presentation_metadata(
         {**context, "output_dir": directory}, read_metadata=reader))
-    validated_files = validation_signature(gpx, control, directory, options, extra_assets, context=context)
+    validated_files = validation_signature(gpx, control, directory, options, extra_assets, context=context, include_hidden_tracks=include_hidden_tracks)
     if not reused_loaded_tracks or validated_files != before or reader.changed():
-        issues = measured("Map validation", lambda: check(control_text, directory, context, read_metadata=reader))
-    after = validation_signature(gpx, control, directory, options, extra_assets, context=context)
+        issues = measured("Map validation", lambda: check_dependencies(control_text, directory, context, read_metadata=reader))
+    after = validation_signature(gpx, control, directory, options, extra_assets, context=context, include_hidden_tracks=include_hidden_tracks)
     retry = before[:2] != after[:2] or validated_files != after or reader.changed()
     successful = not retry and not issues.get("maps") and not issues.get("derived")
     cache_key = after if successful else None

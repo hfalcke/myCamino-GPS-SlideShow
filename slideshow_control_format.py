@@ -117,6 +117,7 @@ class RepeatRange:
 
 
 DIRECTIVE_REPEAT_CAPABILITIES = {
+    "track": {"targets": "none", "commands": {"context": False}},
     "control": {
         "targets": "all",
         "commands": {
@@ -752,6 +753,15 @@ def compile_repeat_ranges(
     duplicates = []
     for row_index, line in enumerate(lines):
         if is_disabled_control_line(line):
+            continue
+        if str(line).strip().lower().startswith("#track:"):
+            from slideshow_stages import parse_track_context
+            if parse_track_context(line) is None:
+                message = f"row {row_index + 1}: #Track requires internal_id=N and an optional media relation; it cannot be repeated"
+                if strict:
+                    raise ControlSyntaxError(message)
+                if warning_callback is not None:
+                    warning_callback(message)
             continue
         try:
             directive = parse_control_directive(line)

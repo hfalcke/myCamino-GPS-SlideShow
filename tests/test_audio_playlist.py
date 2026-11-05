@@ -102,7 +102,7 @@ class AudioPlaylistTests(unittest.TestCase):
     def test_every_directive_family_has_explicit_repeat_capabilities(self):
         self.assertEqual(
             set(DIRECTIVE_REPEAT_CAPABILITIES),
-            {"control", "music", "play", "narrator", "caption", "font"},
+            {"control", "music", "play", "narrator", "caption", "font", "track"},
         )
         self.assertEqual(
             set(DIRECTIVE_REPEAT_CAPABILITIES["control"]["commands"]),

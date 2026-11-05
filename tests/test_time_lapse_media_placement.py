@@ -97,20 +97,29 @@ class TimeLapseMediaPlacementTests(unittest.TestCase):
             with self.subTest(kind=kind), \
                  patch.object(show, 'image_size_tuple', return_value=(100., 100.)), \
                  patch.object(show, 'draw_cocoa_symbol') as symbol, \
+                 patch.object(show, 'draw_transport_marker_at') as transport, \
                  patch.object(show, 'draw_marker_at') as dot, \
                  patch.object(show, 'ns_color', return_value='color'):
                 point = show.TimeLapseMapView.drawMarkerForLat_lon_imageRect_scale_.callable(
                     view, 50., 7., rect, 1.)
                 self.assertEqual(point, (20., 70.))
-                self.assertEqual(symbol.call_args.args[0], kind)
-                self.assertGreater(symbol.call_args.args[1][1], point[1])
+                if kind == 'rest':
+                    self.assertEqual(symbol.call_args.args[0], kind)
+                    self.assertGreater(symbol.call_args.args[1][1], point[1])
+                    transport.assert_not_called()
+                else:
+                    self.assertEqual(transport.call_args.args[3], kind)
+                    self.assertEqual(transport.call_args.args[4], (1., 0.))
+                    symbol.assert_not_called()
                 dot.assert_called_once_with(20., 930., 1000., view.marker_color, 5.)
                 view.arrow_factor = 0.
                 symbol.reset_mock()
+                transport.reset_mock()
                 dot.reset_mock()
                 show.TimeLapseMapView.drawMarkerForLat_lon_imageRect_scale_.callable(
                     view, 50., 7., rect, 1.)
                 symbol.assert_not_called()
+                transport.assert_not_called()
                 dot.assert_called_once()
                 view.arrow_factor = 1.
 

@@ -72,6 +72,15 @@ remain visible at their correct geographic positions until sharper or broader
 tiles replace them. The map therefore does not pass through a black frame while
 the replacement tiles are loading.
 
+Select a track or waypoint and choose **Start Slide Show Here** from the map's
+context menu. A track selection starts at that track's beginning; a waypoint
+starts at its timestamp. In Time-Lapse the walker starts at that exact time,
+including within a shared-stage block. Standard playback starts with the next
+applicable medium in authored control-file order. A waypoint without a timestamp
+falls back to the track beginning. Normal saving and map-freshness checks still
+run before launch; hidden tracks must first be shown or enabled for slideshow
+playback in Settings.
+
 Click a numbered media group to select all media in it. Command-click adds or
 removes another group. Command-drag from empty map space to draw a black selection
 rectangle and add the enclosed groups or thumbnails; a simple empty-map click
@@ -449,6 +458,53 @@ titles and map labels. These controls do not rename tracks or map files and do
 not regenerate maps. Existing Adventures inherit their former Map Generation
 prefix in both settings; that control is no longer shown under Map Generation.
 
+**Slide Show > Header > Title number** offers None, Stage number (the default),
+or Track ID. **Number format** chooses `7. Title` / `7b. Title` or `#7 Title` /
+`#7b Title`, without leading zeros. The active track supplies the title on both
+maps and media. These are display choices only and never change filenames.
+
+### Track-ordered stages and media outside track times
+
+New control files follow the current Track Table order, including tracks recorded
+on different dates. Consecutive tracks sharing a Stage form a playback block.
+They use one shared stage map; returning to that Stage later shows the same map
+again. Tracks outside the current block are gray, without becoming hidden in the
+editor. Command-arrow navigates blocks; each block receives the configured
+Time-Lapse motion duration. Each member retains its own clock and route timeline.
+
+Stage statistics always combine every non-hidden member of the entire Stage,
+not only the current block. **Include hidden tracks in slideshow** defaults off:
+hidden tracks and reliably associated media are omitted, including all-hidden
+stages. When included, hidden routes stay gray and do not enter the totals.
+
+Media is first matched to individual track time ranges. Remaining same-date
+media before the earliest track start, after the latest end, or between tracks
+stays with that Stage and is shown without walker movement at the corresponding
+boundary. If several Stages qualify, the nearest time boundary wins; GPS resolves
+time ties, and ambiguous media remains separate. The previous/next-day attachment
+rule is retained for dates without tracks, including its endpoint-distance limit
+of half the track length. Remaining media forms independent date blocks.
+
+Shared maps can expand by at most 20 percent at each edge to include nearby GPS
+positions of attached out-of-track media. Distant photos still play with their
+Stage, but do not enlarge the map or acquire an artificial on-map marker.
+
+Older control files remain playable unchanged. Previously all media on a track
+date was collected into a date section; the new generator explicitly separates
+track, before/after/between, adjacent-day and leftover media. **Review Control
+File Updates** previews conversion to the new shared-stage structure before
+changing an existing file. Playback never silently sorts authored rows.
+
+If a generated shared-stage block is missing route entries for a visible member,
+Start opens **Review Control File Updates** rather than silently parking its
+marker or downloading maps again. The proposed repair restores unambiguous
+missing route entries without moving media or directives; apply it to continue
+the requested start. Explicitly disabled route entries remain disabled.
+Directional markers use the pilgrim's stable start-to-end heading for each
+active track, rather than turning or flipping with individual GPS samples.
+Vehicles account for their artwork's facing direction. Symbols stay offset
+from the position dot so that both remain visible.
+
 Under **Settings > Map Generation**, **Journey source** controls how stages are
 formed:
 
@@ -757,8 +813,24 @@ to return to the live position.
 
 The compact Type column shows only its short code. Its dropdown menu shows both
 the short type and its meaning, for example `TRK - Track map` and
-`MUS - Music control`. The short code also remains the type used in saved
-directives.
+`MUS - Music control`. Saved directives use the corresponding full keyword,
+for example `#MUSIC` for `MUS`, `#CONTROL` for `CTL`, and `#Track` for `CTX`.
+
+Press `h` while not editing text, or click the question-mark button beside
+**Close**, for **Control File Help**. It lists every row type, editor shortcuts,
+and directive syntax. The retained, scrollable help window stays open until
+closed; closing the control editor hides its help as well. While editing a
+cell or the search field, `h` remains ordinary text input.
+
+`CTX` means **context** and represents a structural `#Track` row, such as
+`#Track: internal_id=9`. It selects the active track within a shared stage map
+and the context for following media; it does not display a second map.
+`internal_id` is the permanent track identifier stored in the GPX extensions,
+unique within that document. It is not the table row, editable Track Number,
+Stage number, or displayed Track ID such as `7c`. Sorting, hiding, and
+renumbering do not change it, and deleted IDs are not reused for other tracks.
+Normally leave these generated values unchanged and use **Track Table &
+Editor** to change stages or visible numbers.
 
 While a table cell is being edited, both Command-C/X/V and Control-C/X/V act
 on the text inside that cell. With no active cell editor, the same shortcuts
@@ -1426,8 +1498,9 @@ IDs `3a`, `3b`, and so on, continuing with `3aa` after `3z`. Hidden tracks count
 when assigning these IDs; sorting and exporting subsets do not renumber them.
 Suffixes follow visible Track Number order, then unnumbered tracks in permanent
 identity order. Changing visible numbers does not automatically reorder the table.
-PDF titles show Stage and add Track ID only when that report includes several
-members of the same stage. Grouping never joins geometry, maps, or statistics.
+PDF titles and the Track column always use the full Track ID, even when the
+report contains only one member of a multi-track Stage. Grouping does not join
+the underlying GPX tracks; slideshow blocks share maps and whole-stage statistics.
 Track Number, Stage and Type changes do not rename assets or rewrite control rows.
 Permanent internal IDs survive Save, restart and recovery; deleted IDs are never
 assigned to a different track. Importing or duplicating tracks allocates fresh IDs.
